@@ -261,7 +261,7 @@ fn source_path(from: &str) -> PathBuf {
 
 /// The scenario a results run is a run of: its directory's name without
 /// the run's `-NN`.
-fn scenario_of(run: &Path) -> Option<String> {
+pub(crate) fn scenario_of(run: &Path) -> Option<String> {
     let name = run.file_name()?.to_str()?;
     let (scenario, k) = name.rsplit_once('-')?;
     (k.len() == 2 && k.bytes().all(|b| b.is_ascii_digit()) && !scenario.is_empty())
@@ -270,7 +270,7 @@ fn scenario_of(run: &Path) -> Option<String> {
 
 /// Whether `name` may name a corpus tape: lower-case letters, digits, `-`
 /// and `.`, a letter or digit first, and a file name's length.
-fn corpus_name(name: &str) -> bool {
+pub(crate) fn corpus_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -315,7 +315,7 @@ fn the_tape(source: &Path) -> Result<PathBuf, String> {
 /// Why a scenario run's summary says the run did not go as its scenario
 /// meant — the `error` it noted (no card, no idle row, a decision never
 /// journaled) or the `exception` it ended on — or `None`.
-fn run_failed(summary: &J) -> Option<String> {
+pub(crate) fn run_failed(summary: &J) -> Option<String> {
     ["error", "exception"].into_iter().find_map(|key| {
         let said = summary.get(key).filter(|v| v.truthy())?;
         let said = said.as_str().map_or_else(|| said.py(), str::to_string);

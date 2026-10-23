@@ -49,7 +49,9 @@ fn verdict(
     if let Some(h) = hold {
         books.hold(h.since_ms);
     }
-    decide(r, hold, &books, g, now_ms)[rule.index()].1.clone()
+    decide(r, hold, &books, g, WAIT_NUDGE_AFTER_MS, now_ms)[rule.index()]
+        .1
+        .clone()
 }
 
 fn cruise() -> Guards {
@@ -88,10 +90,24 @@ fn a_declared_hold_gets_no_nudge_but_hold_room_still_goes() {
         declared: true,
     });
     let b = Books::default();
-    let v = decide(&room(), declared, &b, &cruise(), HOLD_ROOM_AFTER_MS);
+    let v = decide(
+        &room(),
+        declared,
+        &b,
+        &cruise(),
+        WAIT_NUDGE_AFTER_MS,
+        HOLD_ROOM_AFTER_MS,
+    );
     assert_eq!(v[RuleId::WaitNudge.index()].1, Verdict::Quiet);
     assert!(is_due(&v[RuleId::HoldRoom.index()].1, RuleId::HoldRoom));
-    let v = decide(&room(), hold(), &b, &cruise(), WAIT_NUDGE_AFTER_MS);
+    let v = decide(
+        &room(),
+        hold(),
+        &b,
+        &cruise(),
+        WAIT_NUDGE_AFTER_MS,
+        WAIT_NUDGE_AFTER_MS,
+    );
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
 }
 
@@ -297,7 +313,14 @@ fn the_session_pace_holds_a_second_line() {
         }
     );
     assert!(is_due(&at(2 * HOUR + 10 * MIN), RuleId::HoldRoom));
-    let v = decide(&room(), hold(), &Books::default(), &cruise(), 2 * HOUR);
+    let v = decide(
+        &room(),
+        hold(),
+        &Books::default(),
+        &cruise(),
+        WAIT_NUDGE_AFTER_MS,
+        2 * HOUR,
+    );
     assert!(is_due(&v[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
     assert_eq!(
         v[RuleId::HoldRoom.index()].1,
@@ -391,4 +414,44 @@ fn rule_names_read_back() {
         assert_eq!(RuleId::ALL[rule.index()], rule);
     }
     assert_eq!(RuleId::of_name("wait-nudge@v2"), None);
+}
+
+/// The lab's seam (`ATERM_OCCUPANCY_NUDGE_S`) shortens the nudge's wait to its whole seconds and
+/// never lengthens it. NEGATIVE CONTROL: no value, a word, a unit, zero, a negative count and one
+/// past the shipped wait all leave the shipped 30 min.
+#[test]
+fn the_nudge_seam_only_shortens_the_wait() {
+    let of = |v: &str| nudge_after_ms_of(Some(std::ffi::OsStr::new(v)));
+    assert_eq!(of("60"), MIN);
+    assert_eq!(of(" 5 "), 5_000);
+    assert_eq!(of("1800"), WAIT_NUDGE_AFTER_MS);
+    assert_eq!(nudge_after_ms_of(None), WAIT_NUDGE_AFTER_MS);
+    for shipped in ["", "soon", "60s", "0", "-60", "1801", "86400"] {
+        assert_eq!(of(shipped), WAIT_NUDGE_AFTER_MS, "{shipped:?}");
+    }
+}
+
+/// THE WAIT IS THE CALLER'S: a session set up with a 1 min wait (the seam's, carried in its
+/// setup) has the nudge due at 1 min and quiet a millisecond before, and `hold-room` keeps its
+/// own 2 h. NEGATIVE CONTROL: the shipped wait at the same 1 min is quiet.
+#[test]
+fn the_setups_wait_is_the_nudges() {
+    let r = room();
+    let at = |after_ms, now_ms| {
+        let mut b = Books::default();
+        b.hold(0);
+        decide(&r, hold(), &b, &cruise(), after_ms, now_ms)
+    };
+    assert_eq!(
+        at(MIN, MIN - 1)[RuleId::WaitNudge.index()].1,
+        Verdict::Quiet
+    );
+    let due = at(MIN, MIN);
+    assert!(is_due(&due[RuleId::WaitNudge.index()].1, RuleId::WaitNudge));
+    assert_eq!(due[RuleId::HoldRoom.index()].1, Verdict::Quiet);
+    assert_eq!(
+        at(WAIT_NUDGE_AFTER_MS, MIN)[RuleId::WaitNudge.index()].1,
+        Verdict::Quiet,
+        "the shipped wait at 1 min"
+    );
 }

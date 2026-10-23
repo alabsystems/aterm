@@ -110,7 +110,8 @@ mod darwin {
 
     impl Drop for ChangedObserver {
         fn drop(&mut self) {
-            // SAFETY: the pair `register` added.
+            // SAFETY: the pair `register` added; after this no callback names the hook,
+            // which drops with `self` once this returns.
             unsafe {
                 CFNotificationCenterRemoveObserver(
                     CFNotificationCenterGetDarwinNotifyCenter(),
@@ -143,7 +144,8 @@ mod darwin {
         if observer.is_null() || !on_main {
             return;
         }
-        // SAFETY: non-null `observer` is the `Hook` of a live `ChangedObserver` on this thread.
+        // SAFETY: a non-null `observer` is the `Hook` of a live `ChangedObserver` on this thread,
+        // whose `Drop` removes the observer before the hook is freed.
         let hook = unsafe { &*observer.cast::<Hook>() };
         (hook.0)();
     }

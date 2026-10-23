@@ -146,7 +146,11 @@ impl Drop for Rig {
     }
 }
 
-/// THE READER SAYS WHO HOLDS THE TERMINAL. At a signing shell's prompt:
+/// THE READER SAYS WHO HOLDS THE TERMINAL. At a signing shell's prompt, a key-bound program's
+/// report sets the folder while it runs, whether it holds the foreground in a group of its own
+/// or runs in the shell's group, where the reader's program probe sees it; a report the shell's
+/// group writes while no such program runs is a stray, dropped; and the shell's first output
+/// after the program is gone brings the prompt's folder back.
 #[test]
 fn the_reader_lets_a_key_bound_programs_report_set_the_folder_while_it_runs() {
     let rig = Rig::attach();

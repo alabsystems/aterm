@@ -1,30 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared cursor-trail path primitives: the cell sweeps trail engines (fire,
-//! rainbow kitty, phaser, comet, ...) lay their wakes with, so continuity is
-//! solved once while each style keeps its own tuning.
-//!
-//! Consecutive cells of every path are Chebyshev-adjacent (no step larger than
-//! 1 in either axis; the wrap fold's seam is the one designed exception), so a
-//! trail laid along it has no interior hole. Engines observe the cursor once
-//! per frame, so fast typing, key-repeat or a batching PTY can move it several
-//! cells between observations (and ConPTY hides the cursor during each echo
-//! repaint, bridged by [`crate::cursor_trail::HIDE_BRIDGE_MS`]).
-//!
-//! * [`line_cells_tail`]: the bounded Bresenham sweep (tail->head), identical
-//!   to the forward walk and O(limit) whatever the jump distance.
-//! * `row_sweep_cells` and `wrap_fold_cells` (test-only): the same-row
-//!   typed-coalesce and typewriter-fold laws the engines' sweeps follow.
-//! * [`physical_margin_fold`]: the exact margin-fold move shape for a pane.
+//! Shared cell-sweep primitives for laying continuous cursor-trail wakes.
 
-/// Walk the straight cell-line from `origin` toward `destination` and return
-/// (in `out`) the up-to-`limit` cells nearest the destination, ordered
-/// tail->head. `include_destination` controls whether the destination cell
-/// itself is laid (a live cursor usually draws there). The start index is
-/// solved directly on the forward Bresenham lattice, so cost is O(limit), not
-/// O(distance), and the forward walk's asymmetric tie choices on shallow
-/// diagonals are preserved.
+/// Writes the up-to-`limit` Bresenham cells nearest `destination` along `origin` to `destination`
+/// into `out`.
 #[inline]
 pub fn line_cells_tail(
     out: &mut Vec<(i32, i32)>,
@@ -40,8 +20,6 @@ pub fn line_cells_tail(
     let dr = (i64::from(destination.0) - i64::from(origin.0)).abs();
     let dc = (i64::from(destination.1) - i64::from(origin.1)).abs();
     let major = dr.max(dc);
-    // Excluding the destination leaves indices 0..major; including it leaves
-    // 0..=major. Keep the nearest suffix without materialising its prefix.
     let available = major + i64::from(include_destination);
     let keep = available.min(i64::try_from(limit).unwrap_or(i64::MAX));
     if keep <= 0 {
@@ -101,11 +79,7 @@ pub fn line_cells_tail(
     }
 }
 
-/// The same-row typed-coalesce sweep: the cells between two same-row
-/// observations of a typing cursor, excluding the origin (lit by the previous
-/// key) and including the destination (the new head), ordered tail->head and
-/// appended to `out`. A batched echo that advanced `k` columns lays exactly
-/// the `k` cells a per-key observer would have lit.
+/// Appends the same-row cells from `from_col` (exclusive) to `to_col` (inclusive) into `out`.
 #[cfg(test)]
 pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_col: i32) {
     if to_col > from_col {
@@ -115,21 +89,14 @@ pub fn row_sweep_cells(out: &mut Vec<(i32, i32)>, row: i32, from_col: i32, to_co
     }
 }
 
-/// The typewriter fold for a typing wrap: finish the old row from the origin to
-/// the right edge, then continue from the new row's left edge to the landing
-/// cell, instead of sweeping a diagonal across unvisited cells. `prev` is
-/// at/near the right edge and `cur` at/near the new row's start (the caller
-/// classified the wrap); `cols` is the grid width. Ordered tail->head, origin
-/// excluded, destination included.
+/// Writes the typewriter-wrap cell sweep from `prev` across `cols` to `cur` into `out`.
 #[cfg(test)]
 pub fn wrap_fold_cells(out: &mut Vec<(i32, i32)>, prev: (i32, i32), cur: (i32, i32), cols: i32) {
     wrap_fold_cells_in_pane(out, prev, cur, 0, cols);
 }
 
-/// The [`wrap_fold_cells`] law in a pane whose first column is `col0` in the
-/// composed window grid: the old row finishes at `col0 + cols` and the new row
-/// begins at `col0`, so a right-hand split's margin is not mistaken for the
-/// window's.
+/// Writes the typewriter-wrap cell sweep within a pane starting at `col0` of width `cols` into
+/// `out`.
 #[cfg(test)]
 pub fn wrap_fold_cells_in_pane(
     out: &mut Vec<(i32, i32)>,
@@ -146,10 +113,8 @@ pub fn wrap_fold_cells_in_pane(
     out.extend((col0..=cc).map(|c| (cr, c)));
 }
 
-/// Whether one observed move is the exact physical-margin fold shape for a
-/// pane: final pane column -> first pane column on the next row. Morphology
-/// only; callers must still require their normal fresh input license before
-/// minting light.
+/// Returns whether `prev` to `cur` is a physical margin wrap from the last pane column to `col0` on
+/// the next row.
 #[inline]
 #[must_use]
 pub const fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: u16) -> bool {
@@ -167,8 +132,6 @@ pub const fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, 
 mod tests {
     use super::*;
 
-    /// Every consecutive pair of a laid path must be Chebyshev-adjacent, except
-    /// at the wrap fold's seam, where the path wraps the row edge by design.
     fn assert_adjacent(path: &[(i32, i32)], allow_fold_at: Option<usize>) {
         for (i, w) in path.windows(2).enumerate() {
             if allow_fold_at == Some(i) {
@@ -184,10 +147,6 @@ mod tests {
         }
     }
 
-    /// The bounded solver matches the forward Bresenham walk exactly,
-    /// including its direction-sensitive ties (reversed Bresenham differs:
-    /// `(0,0)->(1,2)` picks `(0,1)` forward but `(1,1)` backward). Exhausts
-    /// every small direction, limit and destination policy.
     #[test]
     fn bounded_tail_matches_forward_bresenham_exhaustively() {
         fn reference(origin: (i32, i32), destination: (i32, i32)) -> Vec<(i32, i32)> {
@@ -246,17 +205,13 @@ mod tests {
         }
     }
 
-    /// wrap_fold_cells: finishes the old row, starts the new one; the only
-    /// non-adjacent step is the fold seam.
     #[test]
     fn wrap_fold_finishes_old_row_and_starts_new() {
         let mut out = Vec::new();
-        // Wrap from (5, 38) in a 40-col grid to (6, 1).
         wrap_fold_cells(&mut out, (5, 38), (6, 1), 40);
         assert_eq!(out, vec![(5, 39), (6, 0), (6, 1)]);
         let seam = out.iter().position(|&(r, _)| r == 6).unwrap() - 1;
         assert_adjacent(&out, Some(seam));
-        // Wrap from the very last column: no old-row cells remain.
         wrap_fold_cells(&mut out, (5, 39), (6, 0), 40);
         assert_eq!(out, vec![(6, 0)]);
 

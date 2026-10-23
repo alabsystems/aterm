@@ -1084,7 +1084,7 @@ mod tests {
 
     /// Over real sockets: a port nobody listens on and a server's `503` are not held, and a
     /// server that takes the request and never answers is, once the request's deadline
-    /// (`wait` plus [`FETCH_MARGIN`]) passes.
+    /// passes (here a short one, not [`get_bounded`]'s `wait` plus [`FETCH_MARGIN`]).
     #[test]
     fn a_get_says_which_failures_are_held() {
         let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1106,8 +1106,13 @@ mod tests {
 
         let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/v1/alab", silent.local_addr().expect("addr"));
-        let unanswered =
-            get_bounded(&url, None, Duration::ZERO, Some(LOOK_CONNECT)).expect_err("silent");
+        let unanswered = get_via(
+            &client(Duration::from_millis(250)),
+            &url,
+            None,
+            Some(LOOK_CONNECT),
+        )
+        .expect_err("silent");
         assert!(unanswered.held, "{unanswered:?}");
         drop(silent);
     }

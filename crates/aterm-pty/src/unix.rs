@@ -131,7 +131,9 @@ fn ptsname_r_error(rc: libc::c_int) -> io::Error {
 fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `master` is a live `/dev/ptmx` descriptor.
+        // SAFETY: `master` is a live `/dev/ptmx` descriptor. `TIOCGPTPEER` takes
+        // its argument by value (an `open(2)` flag word, not a pointer) and
+        // returns a fresh descriptor or -1, writing through no memory we own.
         let peer = unsafe {
             libc::ioctl(
                 master,
@@ -336,7 +338,20 @@ fn spawn_termios() -> Option<libc::termios> {
     kernel_default_termios().map(build_spawn_termios)
 }
 
-const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a spawn waits for its child's exec verdict: a hang detector,
+/// never a latency budget. A start that must happen is waited for. A child
+/// that cannot exec writes its failure byte before it exits, so a real
+/// failure is reported at once, however long this is. The bound keeps a
+/// leaked write end (whose EOF never comes) from hanging a spawn for good,
+/// and such a spawn fails closed.
+///
+/// Measured 2026-10-22: `supervise_turn_end_live_headless` in eight binaries
+/// at nice 20 beside 28 CPU hogs, the machine at 1-minute load 71 to 232.
+/// With 10 s here, 55 instance boots failed `spawn failed: `/bin/sh` did not
+/// start within 10 s`, and 49 of the 96 tests with them. The shells were
+/// starved, not hung: with 60 s, 93 of 96 passed at load 34 to 187 and no
+/// boot failed (docs/measured/typing-under-load-2026-10-22.md).
+const EXEC_START_HANG: std::time::Duration = crate::START_HANG;
 
 const EXEC_STATUS_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -496,7 +511,8 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
         };
         if wr < 0 {
             let err = io::Error::last_os_error();
-            // SAFETY: closing the read end we opened in (3) and removing the name we created in (1).
+            // SAFETY: closing the read end we opened in (3) and removing the
+            // name we created in (1). Nothing else was created.
             unsafe {
                 libc::close(rd);
                 libc::unlink(path.as_ptr());
@@ -646,7 +662,66 @@ fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
     }
 }
 
+/// A test's stall of its own spawns' children before their exec: a child
+/// starved between fork and exec, as a loaded machine starves one. It applies
+/// only to spawns from the thread that set it, so every other test's spawn
+/// runs as it is.
+#[cfg(test)]
+pub(crate) mod pre_exec_stall {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static MS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Stall the child of each spawn this thread makes by `ms` before its exec (0: none).
+    pub(crate) fn set(ms: u64) {
+        MS.with(|m| m.set(ms));
+    }
+
+    /// In the child, between fork and exec: a const thread-local read (the
+    /// child's one thread is the copy of the thread that forked it, so it
+    /// reads that thread's value, with no allocation or lock) and `nanosleep`.
+    pub(super) fn in_child() {
+        let ms = MS.with(Cell::get);
+        if ms == 0 {
+            return;
+        }
+        let ts = libc::timespec {
+            tv_sec: libc::time_t::try_from(ms / 1000).unwrap_or(libc::time_t::MAX),
+            tv_nsec: libc::c_long::try_from((ms % 1000) * 1_000_000).unwrap_or(0),
+        };
+        // SAFETY: `ts` is a fully-initialized timespec; `nanosleep` reads it and writes nothing through the null remainder pointer.
+        unsafe {
+            libc::nanosleep(&ts, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The wait a spawn on this thread last gave its exec verdict (tests): what
+/// the spawn passed [`wait_for_exec_status`], whatever its constant says.
+#[cfg(test)]
+pub(crate) mod exec_wait_seen {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    std::thread_local! {
+        static LAST: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn note(wait: Duration) {
+        LAST.with(|l| l.set(Some(wait)));
+    }
+
+    /// The last wait noted on this thread.
+    pub(crate) fn last() -> Option<Duration> {
+        LAST.with(Cell::get)
+    }
+}
+
 fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecStatus {
+    #[cfg(test)]
+    exec_wait_seen::note(budget);
     let deadline = std::time::Instant::now() + budget;
     loop {
         if let Some(status) = read_exec_status_now(rd) {
@@ -1065,7 +1140,9 @@ pub fn spawn_shell_with_pid_cell_px(
         unsafe {
             libc::close(status_rd);
         }
-        // SAFETY: `slave` is this child's inherited pty slave fd; `login_tty`, `dup2` and `close` are all async-signal-safe.
+        // SAFETY: `slave` is this child's inherited pty slave fd; `login_tty`,
+        // `dup2` and `close` are all async-signal-safe. Nothing allocates, takes
+        // a lock, or reads the environment.
         unsafe {
             if libc::login_tty(slave) == -1 {
                 libc::dup2(slave, libc::STDIN_FILENO);
@@ -1125,6 +1202,8 @@ pub fn spawn_shell_with_pid_cell_px(
                 libc::close(master);
             }
         }
+        #[cfg(test)]
+        pre_exec_stall::in_child();
         // SAFETY: exec_target/argv/envp are null-terminated arrays of live C strings that outlive the call; `write`/`_exit` are async-signal-safe.
         unsafe {
             libc::execve(exec_target.as_ptr(), argv.as_ptr(), envp.as_ptr());
@@ -1141,7 +1220,7 @@ pub fn spawn_shell_with_pid_cell_px(
     unsafe {
         libc::close(status_wr);
     }
-    let status = wait_for_exec_status(status_rd, EXEC_STATUS_BUDGET);
+    let status = wait_for_exec_status(status_rd, EXEC_START_HANG);
     retire_spent(status_rd);
     let failure: Option<(io::ErrorKind, String)> = match status {
         ExecStatus::Execed => None,
@@ -1168,7 +1247,7 @@ pub fn spawn_shell_with_pid_cell_px(
             format!(
                 "`{}` did not start within {} s",
                 exec_target.to_string_lossy(),
-                EXEC_STATUS_BUDGET.as_secs()
+                EXEC_START_HANG.as_secs()
             ),
         )),
         ExecStatus::ChannelBroke(err) => Some((

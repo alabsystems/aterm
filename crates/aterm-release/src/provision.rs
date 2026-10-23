@@ -757,7 +757,6 @@ const NO_CHANNEL_ROSTER: &str = "no roster on the channel";
 /// not `gh`.
 #[cfg(unix)]
 fn release_asset_url(slug: &str, asset: &str) -> String {
-    // github.com/{slug}/releases/latest/download/{asset}")
     format!("https://github.com/{slug}/releases/latest/download/{asset}")
 }
 
@@ -1824,9 +1823,9 @@ fn notary_verdict(profile: &str, success: bool, stdout: &str, stderr: &str) -> C
 
 /// The credentials profile a Tier APPLE cut names on its command line. The cut has no
 /// ambient path, so the audit checks the conventional location and validates it with
-/// `sign::ReleaseCredentials::load`, the call the cut makes (`signing_key` required,
-/// owner-only permissions, one notary credential): the audit never passes a profile the
-/// cut refuses.
+/// `sign::ReleaseCredentials::load` under `home`, the call the cut makes under its HOME
+/// (`signing_key` required, owner-only permissions, one notary credential): the audit
+/// never passes a profile the cut refuses.
 #[cfg(unix)]
 fn profile_check(
     home: &str,
@@ -1858,7 +1857,7 @@ fn profile_check(
             fix: format!("re-run `{SHIP} provision --id {id}` — provision writes it"),
         };
     }
-    let creds = match sign::ReleaseCredentials::load(&path) {
+    let creds = match sign::ReleaseCredentials::load(&path, Some(Path::new(home))) {
         Ok(c) => c,
         Err(e) => {
             return Check::Fail {
@@ -2411,6 +2410,19 @@ mod tests {
             0o600,
         );
         refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+
+        // A `~/` roster is looked for under the audited home, not the auditor's.
+        write(
+            &format!("{good}machine_roster = \"~/fleet/roster.toml\"\n"),
+            0o600,
+        );
+        refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        std::fs::create_dir_all(home.join("fleet")).unwrap();
+        std::fs::write(home.join("fleet/roster.toml"), "").unwrap();
+        assert!(matches!(
+            profile_check(&home_s, "m9", Some(&sha1), mine),
+            Check::Pass(_)
+        ));
 
         write(&good, 0o600);
         assert!(matches!(

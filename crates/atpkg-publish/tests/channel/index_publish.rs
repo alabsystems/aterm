@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The index PUBLISH over a fake channel: the number is the head's + 1, the baseline must
-//! be published, the packs are made public BEFORE the index, and the upload is a
-//! compare-and-swap that never clobbers another publisher's `atpkg-index-N` (create /
-//! converge / draft / foreign / half-created / race / unreadable state / unserved), a
-//! moved pin never silently drops an Apple target, and a head whose own roster pair has
-//! lapsed is refused.
+//! Index publication compare-and-swap, baseline, and roster tests over a fake channel.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -26,7 +21,6 @@ const MAC: &str = "aarch64-apple-darwin";
 const MAC_X86: &str = "x86_64-apple-darwin";
 const LINUX: &str = "x86_64-unknown-linux-gnu";
 
-/// The fake, with one failure a publisher meets in the field.
 struct Faulty {
     inner: Arc<FakeHost>,
     /// `release(tag)` answers this instead (a racing read, an unreadable state).
@@ -37,7 +31,6 @@ struct Faulty {
 }
 
 impl Faulty {
-    /// The fake, its download host `probes` probes behind on `tag`.
     fn unserved(inner: Arc<FakeHost>, tag: String, probes: usize) -> Self {
         Self {
             inner,
@@ -115,7 +108,6 @@ impl ReleaseHost for Faulty {
     }
 }
 
-/// A channel at index 21 pinning ay 5, with the pack public.
 fn live(label: &str) -> Rig {
     let rig = Rig::new(label);
     rig.publish_head(&Doc::new(21, &[("ay", 5)]));
@@ -133,8 +125,6 @@ fn request(rig: &Rig, out: &str, upload: bool, delta: Delta) -> IndexRequest {
     }
 }
 
-/// A re-run by the publisher still holding baseline 21 (`--baseline QUAD-DIR`): the signed
-/// quad of the head, on disk, byte-identical to the one the channel serves.
 fn rerun(rig: &Rig, out: &str) -> IndexRequest {
     let base = rig.path("held-21");
     rig.quad_dir(&base, &Doc::new(21, &[("ay", 5)]));
@@ -195,7 +185,6 @@ fn a_dry_run_over_a_quad_on_disk_makes_no_host_call_and_signs_the_next_number() 
         assert!(rig.path("out").join(f).is_file(), "{f}");
     }
 
-    // Over the channel head, a dry run only reads the index repo.
     let (r, _) = publish(
         rig_with_head(&rig),
         &request(&rig, "out2", false, Delta::default()),
@@ -230,7 +219,6 @@ fn upload_needs_the_channel_token_before_anything_is_signed() {
 
 #[test]
 fn the_baseline_must_be_published_on_the_download_host() {
-    // A quad on disk whose release is a draft, absent, or behind a private repo.
     let rig = Rig::new("idx-base");
     let doc = Doc::new(21, &[("ay", 5)]);
     let dir = rig.path("base");
@@ -259,7 +247,6 @@ fn the_baseline_must_be_published_on_the_download_host() {
     assert!(e.to_string().contains("is not published"), "{e}");
     assert!(writes(&rig.host).is_empty(), "{:?}", writes(&rig.host));
     assert!(rig.index_release(22).is_none());
-    // The control: published, it goes through.
     rig.host.set_private(&rig.index_slug(), false);
     let (r, log) = publish(&rig, &req);
     r.unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
@@ -329,8 +316,6 @@ fn an_index_the_download_host_does_not_serve_after_its_create_fails_the_run() {
     assert!(e.to_string().contains("is the repo public?"), "{e}");
 }
 
-/// The download host serves a fresh release only after a while (`atpkg-index-76` still
-/// answered 404 eight seconds after it was published): the publish waits for it.
 #[test]
 fn an_index_the_download_host_serves_late_is_published() {
     let mut rig = live("idx-served-late");
@@ -345,7 +330,6 @@ fn an_index_the_download_host_serves_late_is_published() {
     assert!(log.contains("published atpkg-index-22"), "{}", log.text());
 }
 
-/// Publish once (the fixture's own bytes), then lay `atpkg-index-22` as `shape` makes it.
 fn own_then(label: &str, shape: impl Fn(&Rig, &Path)) -> Rig {
     let rig = live(label);
     let (r, log) = publish(&rig, &request(&rig, "own", true, Delta::default()));
@@ -452,7 +436,6 @@ fn a_create_that_loses_a_race_never_falls_back_to_an_upload() {
         lay(rig, "index.toml", own_file(own, "index.toml"));
     });
     let host = rig.host.clone();
-    // The read saw no release; the other publisher's create landed before ours.
     rig.route(Arc::new(Faulty {
         inner: host,
         release_answer: Some((index_tag(22), HostError::NotFound)),
@@ -526,9 +509,6 @@ fn a_release_whose_state_cannot_be_read_is_refused() {
     assert_eq!(writes(&rig.host).len(), before);
 }
 
-/// A moved pin may not silently drop a darwin target the old pin served
-/// (DESIGN-intel-just-works §3.2): refused before anything is made public, unless named
-/// with a reason; a manifest nobody can read is a refusal, never a pass.
 #[test]
 fn a_moved_pin_may_not_silently_drop_a_darwin_target() {
     let rig = live("idx-triple");
@@ -558,13 +538,11 @@ fn a_moved_pin_may_not_silently_drop_a_darwin_target() {
     r.unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
     assert!(!rig.path("allowed/.triple-gate").exists());
 
-    // The row kept, the new manifest on the public owner: passes without a word.
     let rig = live("idx-triple-kept");
     rig.lay_pack("alabsystems", "ay", 6, &[MAC, MAC_X86]);
     let (r, log) = publish(&rig, &request(&rig, "out", true, move6()));
     r.unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
 
-    // The old manifest unreadable: refused.
     let rig = Rig::new("idx-triple-unread");
     rig.publish_head(&Doc::new(21, &[("ay", 5)]));
     rig.lay_pack("alabsystems", "ay", 6, &[MAC, MAC_X86]);
@@ -578,7 +556,6 @@ fn a_moved_pin_may_not_silently_drop_a_darwin_target() {
 #[test]
 fn a_first_publish_names_its_number_and_never_lands_on_a_live_channel() {
     let rig = Rig::new("idx-first");
-    // The roster comes from the machine's installed pair.
     std::fs::create_dir_all(rig.ctx.identity.roster.parent().expect("dir")).expect("mkdir");
     std::fs::write(&rig.ctx.identity.roster, &rig.keys.roster_bytes).expect("roster");
     std::fs::write(
@@ -608,8 +585,6 @@ fn a_first_publish_names_its_number_and_never_lands_on_a_live_channel() {
     assert!(e.to_string().contains("atpkg-index-4 is published"), "{e}");
 }
 
-/// What a publish does not name is carried from the verified head into the signed bytes:
-/// the yanks, the floor and every overlay — nothing re-passed, nothing dropped.
 #[test]
 fn the_heads_yanks_floor_and_overlays_reach_the_signed_index() {
     let rig = Rig::new("idx-carry");
@@ -640,9 +615,6 @@ fn the_heads_yanks_floor_and_overlays_reach_the_signed_index() {
     assert_eq!(c.pin_by_target[LINUX].get("ay"), Some(&9001));
 }
 
-/// A vendor-direct program's yank binds its client whether or not the index pins it: one
-/// for a program no pin names is signed, and the client's own vendor policy reads it back
-/// in both version spellings.
 #[test]
 fn a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy() {
     let rig = Rig::new("idx-vendor-yank");
@@ -669,9 +641,6 @@ fn a_vendor_yank_with_no_pin_behind_it_reaches_the_clients_policy() {
     assert!(policy.is_yanked("muse", v("1.4.9-R6297.1")));
 }
 
-/// A lapsed head is the channel every client refuses, and re-signing it is the recovery: it is
-/// a baseline like any other (from the channel or on disk), and only carrying its horizon is
-/// refused, naming the flag that re-signs it.
 #[test]
 fn a_lapsed_head_is_re_signed_with_a_new_horizon_and_never_carried() {
     const LAPSED: &str = "2026-01-01T00:00:00Z";
@@ -702,7 +671,6 @@ fn a_lapsed_head_is_re_signed_with_a_new_horizon_and_never_carried() {
     assert_eq!(q.index.valid_until, FAR_FUTURE);
     assert_eq!(q.index.channels[0].pin.get("ay"), Some(&5));
 
-    // A lapsed quad on disk is a baseline too.
     let held = rig.path("held-21");
     rig.quad_dir(&held, &doc);
     let req = IndexRequest {
@@ -721,15 +689,9 @@ fn a_lapsed_head_is_re_signed_with_a_new_horizon_and_never_carried() {
     );
 }
 
-/// A head whose OWN roster pair has lapsed is refused, even beside a newer roster the
-/// paper master signed that this machine holds: the publish verifies the head under the
-/// pair it carries and never re-binds it to a local one (decided: keep refusing a lapsed
-/// roster). The same head under a current pair is built over, and the newer local roster
-/// is then the one shipped — so the local roster is read, and the lapse alone refused.
 #[test]
 fn a_head_whose_own_roster_pair_lapsed_is_refused_under_a_newer_local_roster() {
     let rig = Rig::new("lapsed-roster");
-    // the newest local roster: a later generation, current, master-signed, installed
     let mut newer = rig.keys.roster.clone();
     newer.roster_seq += 1;
     let newer_bytes = newer.to_toml().expect("the roster emits").into_bytes();
@@ -742,7 +704,6 @@ fn a_head_whose_own_roster_pair_lapsed_is_refused_under_a_newer_local_roster() {
     )
     .expect("write local roster sig");
 
-    // the head's own pair: the same machine, a roster whose valid_until has passed
     let mut lapsed = rig.keys.roster.clone();
     lapsed.valid_until = "2020-01-01T00:00:00Z".into();
     let lapsed_bytes = lapsed.to_toml().expect("the roster emits").into_bytes();

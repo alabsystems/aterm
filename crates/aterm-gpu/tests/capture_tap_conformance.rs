@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the presented-destination capture lifecycles: each decision of the
-//! taps' pure transition gates, projected onto the derived model, must be its exact successor.
-//! Mutant controls show a failed map cannot publish pixels or leak a slot, and accepted invalid
-//! metadata cannot vanish without incrementing `dropped`.
+//! Tier-1 conformance tests for presented-destination capture lifecycles.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -66,9 +63,6 @@ fn presented_outcome_code(outcome: PresentedFrameOutcome) -> i64 {
     }
 }
 
-/// Project one gate decision. `phase` and `result` are the decision's; the event supplies only
-/// what the gate does not decide: whether a copy was encoded (`accepted`) and whether the map
-/// succeeded (`mapped`).
 fn project_presented(
     prev: &State,
     event: PresentedFrameEvent,
@@ -138,7 +132,6 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
     assert_eq!(failed.outcome, PresentedFrameOutcome::Error);
     assert_exact_step(&model, &in_flight, &map_error, "MapError");
 
-    // A stale/duplicate callback cannot complete an Armed/Pending/Complete generation.
     assert_eq!(
         presented_frame_transition(PresentedFramePhase::Armed, PresentedFrameEvent::CompleteMap),
         None
@@ -152,8 +145,6 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
         None
     );
 
-    // Negative control: a fail-open decision publishing a frame on map failure
-    // is not the modeled successor and violates the invariant.
     let mut fail_open = map_error;
     fail_open.insert("result", 1);
     assert!(
@@ -167,8 +158,6 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
         "negative control must expose a frame without a successful map"
     );
 
-    // Negative control: a reject arm copied from EnqueueValid reserves the
-    // staging buffer with no copy.
     let copied_arm = project_presented(
         &initial,
         PresentedFrameEvent::RejectEnqueue,
@@ -184,8 +173,6 @@ fn presented_frame_shipping_gate_conforms_on_success_and_every_error_edge() {
     );
     assert!(!model.check_invariant("ReservedPhaseRequiresAcceptedCopy", &copied_arm));
 
-    // Negative control: a failed map whose arm forgot its outcome ends the
-    // one-shot with no error for the waiter to take.
     let silent = project_presented(
         &in_flight,
         PresentedFrameEvent::MapError,
@@ -285,7 +272,6 @@ fn video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted() {
     invalid.insert("dropped", 1);
     assert_exact_step(&model, &initial, &invalid, "RejectInvalidMetadata");
 
-    // Stale/duplicate completions cannot release or corrupt a reused slot.
     assert_eq!(
         video_slot_transition(VideoSlotPhase::Free, VideoSlotEvent::MapOk),
         None
@@ -295,7 +281,6 @@ fn video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted() {
         None
     );
 
-    // Negative control 1: map failure counted a loss but leaked the slot.
     let mut leaked = failed_free.clone();
     leaked.insert("phase", 2);
     assert!(
@@ -307,8 +292,6 @@ fn video_slot_shipping_gate_conforms_and_invalid_metadata_is_counted() {
         "negative control must expose the slot leak"
     );
 
-    // Negative control 2: accepted invalid metadata disappears as client
-    // decimation, understating coverage (also after a counted map error).
     for before in [initial, failed_free] {
         let mut silent_invalid = before.clone();
         silent_invalid.insert("invalid", 1);
@@ -335,13 +318,8 @@ fn captured(seq: u64) -> CapturedFrame {
     }
 }
 
-/// One capture-store push: the shipping `ordered_capture_store_push`, or a
-/// one-line mis-write of it that a negative control replays.
 type Push = fn(&mut VecDeque<CapturedFrame>, &mut usize, usize, CapturedFrame) -> u64;
 
-/// Drive callback arrival 3,1,2 through `push` under a two-frame budget and
-/// project each step the way the model reads the store: its two lowest
-/// entries and the running eviction count.
 fn harvest_3_1_2(model: &Model, push: Push) -> [State; 3] {
     let mut state = model.init_state();
     let mut store = VecDeque::new();
@@ -363,9 +341,6 @@ fn harvest_3_1_2(model: &Model, push: Push) -> [State; 3] {
     })
 }
 
-/// Tier-1 binding for the harvested-store projection in `VideoTapSlot`: with callbacks in the
-/// adversarial order 3,1,2, the shipping insertion and byte-budget eviction must match each
-/// exact modeled successor.
 #[test]
 fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     let model = video_tap_slot_model();
@@ -381,12 +356,9 @@ fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     assert_eq!((state["store_first"], state["store_second"]), (2, 3));
     assert_eq!(state["evicted"], 1);
 
-    // Negative controls: the same arrival through a push with one wrong line
-    // each lands on no model successor and is refused by its own law.
     let three = model.successors("HarvestThree", &model.init_state())[0].clone();
     let one = model.successors("HarvestOne", &three)[0].clone();
 
-    // Append in callback order, evict the front.
     let callback_order: Push = |store, bytes, budget, frame| {
         *bytes += frame.rgba.len();
         store.push_back(frame);
@@ -409,7 +381,6 @@ fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     );
     assert!(!model.check_invariant("BudgetKeepsNewestTail", &wrong_tail));
 
-    // Sorted insertion, but the budget pops the newest frame.
     let evict_newest: Push = |store, bytes, budget, frame| {
         *bytes += frame.rgba.len();
         let at = store
@@ -437,8 +408,6 @@ fn harvested_store_sorts_callbacks_and_evicts_lowest_sequence() {
     assert!(model.check_invariant("EvictionMatchesOverflow", &newest_dropped));
     assert!(!model.check_invariant("BudgetKeepsNewestTail", &newest_dropped));
 
-    // The right tail, but the push never reports what it truncated, so the
-    // take's `head_truncated` reads false.
     let unreported: Push = |store, bytes, budget, frame| {
         let _ = ordered_capture_store_push(store, bytes, budget, frame);
         0

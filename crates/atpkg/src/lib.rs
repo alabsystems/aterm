@@ -91,6 +91,7 @@ pub mod lock;
 pub mod machine;
 /// The Mach-O files of a staged tree, found by magic, for the Developer ID stage gate.
 pub mod macho;
+pub mod managed_launch;
 pub mod manifest;
 mod metadata_io;
 /// The one-line progress meter under a person's typed verb, and the printing every line

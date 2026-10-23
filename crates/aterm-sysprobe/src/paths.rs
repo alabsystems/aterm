@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PATHS — the one rule that places a path under a directory across the spellings Windows hands out for one location.
+//! Path containment rules across Windows path spellings.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -22,8 +22,6 @@ pub fn windows_under(path: &Path, dir: &Path) -> Option<bool> {
     (root(&path) == root(&dir)).then_some(false)
 }
 
-/// A [`windows_key`]'s root (`C:\`, `\\SRV\SHARE\`): through its first `\`,
-/// or a UNC key's fourth.
 fn root(key: &str) -> &str {
     let nth = if key.starts_with(r"\\") { 3 } else { 0 };
     let end = key
@@ -41,7 +39,7 @@ pub fn key_under(key: &str, dir: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || dir.ends_with('\\') || rest.starts_with('\\'))
 }
 
-/// Whether `path` is `dir` or lies under it, by this platform's rule without a mount table: [`windows_under`] on Windows, `Path::starts_with` (always placed) elsewhere.
+/// Whether `path` is `dir` or lies under it on the current platform without a mount table.
 #[must_use]
 pub fn is_under(path: &Path, dir: &Path) -> Option<bool> {
     if cfg!(windows) {
@@ -51,7 +49,7 @@ pub fn is_under(path: &Path, dir: &Path) -> Option<bool> {
     }
 }
 
-/// `p` without the verbatim prefix `std::fs::canonicalize` answers with on Windows, for DISPLAY: `\\?\C:\x` reads `C:\x` and `\\?\UNC\srv\share\x` reads `\\srv\share\x`.
+/// Strips the Windows verbatim prefix (`\\?\`) from `p` for display.
 #[must_use]
 pub fn plain(p: &Path) -> Cow<'_, Path> {
     let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else {
@@ -69,18 +67,18 @@ pub fn plain(p: &Path) -> Cow<'_, Path> {
     }
 }
 
-/// An absolute Windows path [`windows_key`] refuses ONLY for its names shaped like generated 8.3 short names, cut where the mount table and the file system each answer for it ([`short_spelled`]; `crate::volumes::Table::long_spelling` spells it long).
+/// Split representation of an absolute Windows path containing 8.3 short-name components.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShortSpelled<'a> {
-    /// The part before its first short name, in the path's own spelling (`C:\Users\` of `C:\Users\ANDREW~1\x`, `\\?\C:\` of `\\?\C:\PROGRA~1\y`).
+    /// Path prefix before the first 8.3 short name.
     pub lead: &'a Path,
-    /// The part through its LAST short name, verbatim, as Win32 opens it at any length (`\\?\C:\Users\ANDREW~1` of `C:\Users\ANDREW~1\x`; a `\??\` prefix spelled `\\?\`, a plain path's `/` and doubled separators as Win32 reads them): the one part the file system is asked to spell long.
+    /// Verbatim Win32 path through the last 8.3 short name.
     pub through: PathBuf,
-    /// The names after its last short name, in order (`["x"]` of `C:\Users\ANDREW~1\x`; empty when the path ends with one).
+    /// Path components after the last 8.3 short name.
     pub rest: Vec<&'a str>,
 }
 
-/// `p` cut for its long spelling ([`ShortSpelled`]), when names shaped like generated 8.3 short names are the ONLY reason [`windows_key`] refuses it.
+/// Splits `p` into [`ShortSpelled`] when 8.3 short names are the only reason [`windows_key`] refuses it.
 #[must_use]
 pub fn short_spelled(p: &Path) -> Option<ShortSpelled<'_>> {
     let s = p.to_str()?;
@@ -109,12 +107,8 @@ pub fn short_spelled(p: &Path) -> Option<ShortSpelled<'_>> {
     })
 }
 
-/// The root `root` of a path [`root_of`] cut (`C:\`, `C:/`, `\\?\C:\`,
-/// `\??\C:\`, `\\srv\share\`, `\\?\UNC\srv\share\`), spelled verbatim with
-/// its separator: `\\?\C:\`, `\\?\UNC\srv\share\`.
 fn verbatim_root(root: &str, verbatim: bool) -> String {
     if verbatim {
-        // `\\?\` and `\??\` are both four characters.
         return format!(r"\\?\{}", &root[4..]);
     }
     match root.as_bytes() {
@@ -126,14 +120,10 @@ fn verbatim_root(root: &str, verbatim: bool) -> String {
     }
 }
 
-/// [`windows_key`] of the text `s`.
 fn key_of(s: &str) -> Option<String> {
     key_with(s, false)
 }
 
-/// [`key_of`], admitting names shaped like 8.3 short names when `short`
-/// ([`short_spelled`]: the key such a path would have once it is spelled
-/// long — never a key to compare by).
 fn key_with(s: &str, short: bool) -> Option<String> {
     let (mut key, rest, verbatim) = root_of(s)?;
     if verbatim && s.contains('/') {
@@ -165,9 +155,6 @@ fn key_with(s: &str, short: bool) -> Option<String> {
     Some(key)
 }
 
-/// The keyed root of `s` (`C:\`, `\\SRV\SHARE\`), the text after it, and
-/// whether `s` is verbatim (`\\?\`, `\??\`: nothing after it is
-/// normalized).
 fn root_of(s: &str) -> Option<(String, &str, bool)> {
     if let Some(v) = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\??\")) {
         let (root, rest) = match v.get(..4) {
@@ -190,8 +177,6 @@ fn root_of(s: &str) -> Option<(String, &str, bool)> {
     }
 }
 
-/// `X:\` keyed (`C:\`) and the text after it; a verbatim path takes only
-/// `\` after the colon.
 fn drive_root(s: &str, verbatim: bool) -> Option<(String, &str)> {
     match s.as_bytes() {
         [drive, b':', sep, ..]
@@ -206,8 +191,6 @@ fn drive_root(s: &str, verbatim: bool) -> Option<(String, &str)> {
     }
 }
 
-/// `srv\share` keyed (`\\SRV\SHARE\`) and the text after it: both names
-/// present and non-empty.
 fn unc_root(s: &str) -> Option<(String, &str)> {
     let mut it = s.splitn(3, ['\\', '/']);
     let (server, share) = (it.next()?, it.next()?);
@@ -222,9 +205,6 @@ fn unc_root(s: &str) -> Option<(String, &str)> {
     Some((root, it.next().unwrap_or("")))
 }
 
-/// Whether the name `name` has the shape of a generated 8.3 short name
-/// (`PROGRA~1`, `ABCDE~10.TXT`, `AB12CD~1`): at most eight characters, the
-/// last of them `~` and digits, then at most one dot and three more.
 fn short_shaped(name: &str) -> bool {
     let (base, ext) = name.rsplit_once('.').unwrap_or((name, ""));
     let Some((_, digits)) = base.rsplit_once('~') else {
@@ -237,12 +217,6 @@ fn short_shaped(name: &str) -> bool {
         && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The characters whose simple uppercase differs from both themselves and
-/// what `char::to_uppercase` answers: Rust's mapping is Unicode's FULL one
-/// (`SpecialCasing.txt`), which spells each of these as two characters
-/// (`ᾀ` as `ἈΙ`), while their simple uppercase — the one NTFS's `$UpCase`
-/// folds by — is one character: the Greek letters with ypogegrammeni, each
-/// to its prosgegrammeni form.
 const SIMPLE_ONLY: &[(u32, u32, u32)] = &[
     (0x1F80, 0x1F87, 8),
     (0x1F90, 0x1F97, 8),
@@ -252,15 +226,12 @@ const SIMPLE_ONLY: &[(u32, u32, u32)] = &[
     (0x1FF3, 0x1FF3, 9),
 ];
 
-/// `c` folded as Windows folds a name to compare it blind to case, one UTF-16 unit to one (`RtlUpcaseUnicodeChar`, which a file name's key ([`windows_key`]) and an environment variable's lookup both compare by): its simple uppercase where both are one unit, else `c`.
+/// Folds `c` to its single-unit simple uppercase as Windows case-insensitive comparison does.
 #[must_use]
 pub fn fold_case(c: char) -> char {
     fold(c)
 }
 
-/// `c`'s simple uppercase where both are one UTF-16 unit, else `c`
-/// ([`windows_key`]): `char::to_uppercase` where that is one character,
-/// [`SIMPLE_ONLY`] where it is two or more.
 fn fold(c: char) -> char {
     let u = u32::from(c);
     if u > 0xFFFF {

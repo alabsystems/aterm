@@ -5,8 +5,6 @@ use aterm_messages::{GLYPH_COL, Glyph, Intent, Message, Severity, tags};
 
 use crate::{App, WindowId, term_lock};
 
-/// Fill the scratch from the engine, splice the band and partition the
-/// frame, as the compose does on the way to every present and capture.
 fn compose(app: &mut App, wid: WindowId, theme: aterm_render::Theme) {
     let (rows, cols) = {
         let ws = &app.windows[&wid];
@@ -26,7 +24,6 @@ fn compose(app: &mut App, wid: WindowId, theme: aterm_render::Theme) {
     app.set_scroll_band(wid);
 }
 
-/// The characters of composed row `row`, one per cell.
 fn row_chars(app: &App, wid: WindowId, row: usize) -> Vec<char> {
     app.windows[&wid].input_scratch.cells[row]
         .iter()
@@ -34,15 +31,10 @@ fn row_chars(app: &App, wid: WindowId, row: usize) -> Vec<char> {
         .collect()
 }
 
-/// `0xRRGGBB`, as the CPU frame packs a pixel.
 fn packed(rgb: [u8; 3]) -> u32 {
     (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2])
 }
 
-/// Row 0 of the capture holds the row's title whole at 80 columns with its
-/// capsule where the width law placed it, the grid starts below the chrome
-/// (`grid_top_row == chrome_rows`), and the terminal's first line follows
-/// the band intact.
 #[test]
 fn introspection_capture_paints_the_message_band() {
     let mut app = App::headless_for_test();
@@ -94,9 +86,6 @@ fn introspection_capture_paints_the_message_band() {
     assert_eq!(app.windows[&wid].input_scratch.cells.len(), 25);
 }
 
-/// The band's cells are a pure function of the center's state and the
-/// prepared instant: the same instant composes the same cells, and another
-/// instant moves only the meter's surface, the spinner and the time slots.
 #[test]
 fn a_capture_at_an_injected_instant_is_deterministic() {
     let mut app = App::headless_for_test();
@@ -119,8 +108,6 @@ fn a_capture_at_an_injected_instant_is_deterministic() {
     assert_eq!(first, again, "the same instant is the same frame");
     let later = shoot(&mut app, at + std::time::Duration::from_millis(400));
     assert_ne!(first, later, "another frame instant moves the comet");
-    // The meter spans the row, so another instant may move any cell's
-    // ground; characters change only in the glyph cell and the time slots.
     let layout = app.band_presentation(80).rows[0].clone();
     assert_eq!(layout.track, Some((0, 80)), "the comet's track is the row");
     let words_may_move = |x: usize| {
@@ -142,13 +129,6 @@ fn a_capture_at_an_injected_instant_is_deterministic() {
     }
 }
 
-/// Every admitted glyph (and the `!` fallback) paints ink in the glyph cell
-/// through the headless CPU renderer; skipped with no system monospace font.
-///
-/// Two rows are posted so the probed row is not the band's last, whose seam
-/// underline would read as ink; the blank cell left of the glyph is the
-/// control. No retry: `Renderer::render_input` resolves a fresh renderer's
-/// provisional `.notdef`, and a retry would hide a regression there.
 #[test]
 fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
     let theme = aterm_render::Theme::default();
@@ -161,8 +141,6 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
     let (x_pad, y0) = (cpu.pad(), cpu.grid_top());
     let mut glyphs: Vec<char> = Glyph::ALLOWED.to_vec();
     glyphs.push(Glyph::or_fallback('\u{2699}').ch());
-    // No spinner frames: a moving comet keeps the row's own glyph, and each
-    // admitted glyph is drawn as a band icon through the row's chrome raster.
     for ch_ in glyphs {
         app.clear_messages_for_test();
         let admitted = Glyph::new(ch_).expect("admitted");
@@ -175,7 +153,6 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
         let cell = cells[0][GLYPH_COL];
         assert_eq!(cell.ch, ch_);
         assert!(cell.text_presentation, "{ch_:?}");
-        // Drawn as underlines or as rails, as this cell height allows.
         let (divider, seam) = (
             crate::message_band::closing_line(scratch, 0),
             crate::message_band::closing_line(scratch, 1),
@@ -195,7 +172,6 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
             frame.width >= x_pad + (GLYPH_COL + 1) * cw && frame.height >= y0 + ch,
             "{ch_:?}"
         );
-        // The row's divider is a rule, not ink.
         let colors = crate::chrome_band::band_colors(theme);
         let divider = packed(crate::chrome_band::mix3(
             colors.bar_bg,
@@ -211,8 +187,6 @@ fn every_admitted_glyph_paints_a_non_blank_cell_headless() {
                 })
                 .count()
         };
-        // The icon may spill into the blank cells beside it, never as far as
-        // the middle of either.
         assert_eq!(
             ink(x_pad..x_pad + cw / 2),
             0,

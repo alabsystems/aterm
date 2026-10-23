@@ -1306,7 +1306,7 @@ struct Hosted {
     /// The latest recorded query's time and the wake it was answered with.
     last_query: Option<(i128, Option<i128>)>,
     /// How many live inputs were recorded at the logical time instead of their own, earlier
-    /// one (the module docs' "Time").
+    /// one (`Hosted::logical`).
     clamped: u64,
     /// The latest time among the keys queued in the current pause (within the horizon).
     queued_at: Option<i128>,
@@ -1403,7 +1403,7 @@ impl Hosted {
     }
 
     /// The logical time of a live call the host stamped `now`: `max(floor, now − epoch)`
-    /// (the module docs' "Time"), and whether that moved it.
+    /// and whether that moved it.
     #[inline]
     fn logical(&self, now: Instant) -> (i128, bool) {
         let at = offset_of(self.epoch(), now);

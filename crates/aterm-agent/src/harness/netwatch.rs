@@ -223,7 +223,8 @@ struct Measure {
     since: Instant,
 }
 
-/// The one instance's measure and its schedule (module header).
+/// The one instance's measure and its schedule ([`Self::next_probe`]), shared by every session
+/// that asks.
 #[derive(Debug)]
 pub struct NetState {
     /// One probe's budget ([`PROBE_BUDGET`]; a test shortens it).

@@ -2,16 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Runs the adversarial determinism corpora and asserts that, under a fixed
-//! clock, the screen state is a pure function of the output-byte log: every
-//! corpus folds to the same checkpoint whether fed per record, all at once, or
-//! one byte at a time.
+//! Adversarial determinism corpus replay and [`aterm_models_session::coalesce_model`] tests.
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
-// The corpus records are generated and their layout is their content
-// (`aterm_verify::fmt::EXCLUDED`). A trustfmt from Trust `77d28e49f5` on follows a
-// literal `include!` and formats the file it names; the skip keeps it out.
 #[rustfmt::skip]
 include!("support/replay_corpus_data.rs");
 
@@ -47,12 +41,8 @@ fn every_corpus_folds_chunk_independently() {
         let one_shot = fold(&[&flat[..]], c).checkpoint();
         let per_byte_chunks: Vec<&[u8]> = flat.iter().map(std::slice::from_ref).collect();
         let per_byte = fold(&per_byte_chunks, c).checkpoint();
-        // Re-run the reference chunking: a second fold must be bit-identical
-        // (no rng / hashmap-iteration-order / global-state leak into output).
         let by_record_again = fold(records, c).checkpoint();
 
-        // Every single cut point [..k][k..] must also fold to the reference
-        // (catches bulk-vs-single write-lane divergence).
         let all_cuts_ok =
             (1..flat.len()).all(|k| fold(&[&flat[..k], &flat[k..]], c).checkpoint() == by_record);
 
@@ -78,11 +68,6 @@ fn every_corpus_folds_chunk_independently() {
     );
 }
 
-/// Tier-1 bind of `aterm_models_session::coalesce_model()`: the two write lanes,
-/// compared after every parser-ground prefix rather than only at the end.
-///
-/// Negative control: a diverging record from a real prefix is rejected by the committed model
-/// and admitted by `Buggy = 1` at `SKIPAT`.
 #[test]
 fn every_corpus_record_conforms_to_coalesce_model() {
     use aterm_models_session::coalesce_model;
@@ -146,7 +131,6 @@ fn every_corpus_record_conforms_to_coalesce_model() {
         "the corpora were checked at intermediate prefixes, not only at their ends"
     );
 
-    // Negative control from a real prefix of the first corpus.
     let (_, records) = CORPORA[0];
     let prev = st(1, false);
     let diverging = st(2, true);

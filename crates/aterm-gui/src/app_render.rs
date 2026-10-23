@@ -17926,7 +17926,9 @@ fn reflow_worker_ceiling_for(physical: Option<usize>, logical: Option<usize>) ->
 fn physical_cpu_count() -> Option<usize> {
     let mut cores: libc::c_int = 0;
     let mut len: libc::size_t = std::mem::size_of::<libc::c_int>();
-    // SAFETY: the name is a NUL-terminated literal.
+    // SAFETY: the name is a NUL-terminated literal; `cores` and `len` are live
+    // locals written only during the call, `len` holds the buffer's real size,
+    // and the new-value pair is null/0 (read only). No pointer escapes.
     let rc = unsafe {
         libc::sysctlbyname(
             c"hw.physicalcpu".as_ptr(),

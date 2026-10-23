@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! OSC 8 hyperlink scheme allowlist and URI guards, observed end to end: feed
-//! `OSC 8 ; ; URI ST  X  OSC 8 ; ; ST` and check whether the printed cell
-//! carries the link (`Screen::hyperlink_at`). The allowlist and its rationale
-//! are `is_allowed_scheme` in aterm-core's `handler_osc.rs`.
+//! End-to-end OSC 8 hyperlink scheme allowlist and URI guard tests.
 
 use aterm_conformance::Screen;
 
-/// Feed `OSC 8 ;;<uri> ST`, print "X" at (0,0), close the link.
-/// Returns the screen for hyperlink inspection.
 fn screen_with_link(uri: &str) -> Screen {
     let mut s = Screen::new(24, 80);
     let seq = format!("\x1b]8;;{uri}\x1b\\X\x1b]8;;\x1b\\");
@@ -29,7 +24,6 @@ fn osc8_allowed_schemes_retained() {
         ("http://example.com/a", "plain web link"),
         ("https://example.com/path?q=1", "TLS web link"),
         ("mailto:user@example.com", "mail compose"),
-        // Unlike ssh:, sftp: feeds no hostname into a command line.
         ("sftp://host.example.com/file", "sftp transfer"),
         ("tel:+15551234567", "telephone"),
     ];
@@ -44,7 +38,6 @@ fn osc8_allowed_schemes_retained() {
 
 #[test]
 fn osc8_allowed_scheme_is_case_insensitive() {
-    // RFC 3986 §3.1: schemes are case-insensitive.
     let uri = "HTTPS://EXAMPLE.COM/Path";
     assert_eq!(
         link_retained(uri).as_deref(),
@@ -65,7 +58,6 @@ fn osc8_dangerous_schemes_rejected() {
             "origin-less phishing/XSS payload",
         ),
         ("file:///etc/passwd", "local file disclosure / local exec"),
-        // A hostname like `-oProxyCommand=...` is an argument to ssh.
         (
             "ssh://-oProxyCommand=evil/host",
             "ssh argument injection / local exec",
@@ -78,7 +70,6 @@ fn osc8_dangerous_schemes_rejected() {
             "ftp://example.com/file",
             "cleartext fetch / legacy handler abuse",
         ),
-        // Registered app handlers: why the check is an allowlist.
         ("slack://settings", "attacker-registered app URL handler"),
         ("vscode://payload", "attacker-registered app URL handler"),
     ];
@@ -94,7 +85,6 @@ fn osc8_dangerous_schemes_rejected() {
 #[test]
 fn osc8_garbage_schemes_rejected() {
     let garbage: &[(&str, &str)] = &[
-        // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
         (
             "1http://example.com",
             "scheme must start with ALPHA, not a digit",
@@ -117,33 +107,25 @@ fn osc8_garbage_schemes_rejected() {
     }
 }
 
-// Each guard rejects alone: one bad property on an otherwise allowed https URI.
 #[test]
 fn osc8_overlength_uri_rejected_independently() {
-    // Only too long: over `MAX_HYPERLINK_URL_BYTES` (8192).
     let long_uri = format!("https://example.com/{}", "a".repeat(8200));
     assert_eq!(
         link_retained(&long_uri),
         None,
         "over-length URI must be rejected by the length guard alone"
     );
-    // Control: the same shape under the cap is accepted, proving the
-    // rejection above came from length, not scheme/charset.
     let ok_uri = format!("https://example.com/{}", "a".repeat(100));
     assert_eq!(link_retained(&ok_uri).as_deref(), Some(ok_uri.as_str()));
 }
 
 #[test]
 fn osc8_control_char_in_uri_rejected_independently() {
-    // Only an embedded control char. DEL (0x7F) is OSC string data to the
-    // parser, so the handler must refuse it.
     assert_eq!(
         link_retained("https://example.com/\x7Ffoo"),
         None,
         "DEL inside URI must be rejected by the control-char guard alone"
     );
-    // C1 control U+0085 (NEL) arriving as raw UTF-8 bytes (0xC2 0x85):
-    // same guard, multi-byte path.
     assert_eq!(
         link_retained("https://example.com/\u{0085}foo"),
         None,
@@ -153,14 +135,11 @@ fn osc8_control_char_in_uri_rejected_independently() {
 
 #[test]
 fn osc8_bidi_override_in_uri_rejected_independently() {
-    // Only a BiDi override: U+202E (Trojan Source, CVE-2021-42574) reorders a
-    // preview to spoof the host. Rejected outright, never stripped.
     assert_eq!(
         link_retained("https://safe.example\u{202E}moc.live"),
         None,
         "RLO inside URI must be rejected by the BiDi guard alone"
     );
-    // Isolate form (U+2066 LRI) — same guard, different codepoint family.
     assert_eq!(
         link_retained("https://example.com/\u{2066}x"),
         None,

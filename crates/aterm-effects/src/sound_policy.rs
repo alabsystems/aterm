@@ -188,6 +188,7 @@ mod voice_gain_tests {
 
 /// The per-event trail-audio policy the host resolves once per drain and
 /// stamps on every emitted [`crate::trail_sound::SoundEvent`], so the synth stays policy-free.
+#[derive(Clone, Copy, Debug)]
 pub struct TrailSoundPolicy {
     /// The `trail_sound_style` override (default `Style` = follow the visual trail style).
     pub voice: crate::trail_sound::SoundVoice,

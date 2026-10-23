@@ -2,20 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Who raised an update floor.
-//!
-//! Both update lanes keep monotonic floors a signed manifest can raise: the macOS
-//! `floor.toml` (`min_build`, `high_water`) and the Linux state's `min_build`. Manifests
-//! are signed by rostered machines, and a stolen machine's release could raise a floor
-//! past every genuine release. So a floor records who raised it, and revoking a machine
-//! takes back exactly its part. [`FloorSources::step`] is the one rule for both lanes.
 
 use serde::{Deserialize, Serialize};
 
 /// The contributions to one floor, by the machine whose signed manifest raised it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloorSources {
-    /// The part no revocation lowers: unattributed observations (no roster tier, no
-    /// machine named), and all of a record written without provenance.
+    /// The part no revocation lowers: unattributed observations and records without provenance.
     #[serde(default)]
     pub base: u64,
     /// The highest value each machine asked for.
@@ -24,8 +17,7 @@ pub struct FloorSources {
 }
 
 impl FloorSources {
-    /// Nothing recorded; skipped when written, so an unattributed floor is written as a
-    /// bare number.
+    /// Whether nothing is recorded, so an unattributed floor writes as a bare number.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.base == 0 && self.machines.is_empty()
@@ -37,14 +29,7 @@ impl FloorSources {
         self.machines.values().copied().fold(self.base, u64::max)
     }
 
-    /// One step of a floor recorded as `recorded` with these sources: machines in
-    /// `revoked` lose their part, then `raise` is recorded for `machine` (unattributed
-    /// when `None`) unless that machine is revoked. Returns the new floor and its sources,
-    /// in the form they are written in.
-    ///
-    /// First the sources are made to explain `recorded`: a number they do not reach was
-    /// raised by a writer that recorded no provenance, so all of it becomes unattributed
-    /// (never a lower floor); a source above it (a hand edit) is capped at it.
+    /// Apply revocations and a new raise to a floor recorded as `recorded`, returning the new floor and sources.
     #[must_use]
     pub fn step(
         &self,
@@ -79,7 +64,6 @@ impl FloorSources {
             }
         }
         let value = next.value();
-        // Sources that name no machine say nothing the number does not.
         if next.machines.is_empty() {
             next.base = 0;
         }
@@ -102,48 +86,37 @@ mod tests {
         let (v, s) = s.step(v, &[], 50, None);
         let (v, s) = s.step(v, &[], 9_999_999_999, Some("m11"));
         assert_eq!(v, 9_999_999_999);
-        // An unrelated revocation moves nothing.
         let (same, s) = s.step(v, &revoked(&["m20"]), 0, None);
         assert_eq!(same, 9_999_999_999);
-        // m11's revocation: back to what m3 and the unattributed observation asked.
         let (v, s) = s.step(same, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 900);
-        // m11's word never counts again.
         let (v, s) = s.step(v, &revoked(&["m11"]), 10_000_000_000, Some("m11"));
         assert_eq!(v, 900);
-        // A trusted machine still raises it.
         let (v, s) = s.step(v, &revoked(&["m11"]), 1_000, Some("m3"));
         assert_eq!(v, 1_000);
-        // Its later, lower ask lowers nothing: a machine's part is the most it asked.
         let (v, _) = s.step(v, &revoked(&["m11"]), 10, Some("m3"));
         assert_eq!(v, 1_000);
     }
 
-    /// A number the sources do not explain is unattributed, so no revocation lowers it.
     #[test]
     fn an_unexplained_floor_is_unattributed_and_a_hand_edit_is_capped() {
         let mut attributed = FloorSources::default();
         attributed.machines.insert("m11".into(), 9_000);
-        // The record says 9_500 but the sources explain only 9_000: all of it stands.
         let (v, s) = attributed.step(9_500, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 9_500);
         assert!(s.is_empty(), "written as before provenance: {s:?}");
-        // The record says 100 but a source claims 9_000: capped at the record.
         let (v, _) = attributed.step(100, &[], 0, None);
         assert_eq!(v, 100);
         let (v, _) = attributed.step(100, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 0, "the capped part was m11's alone");
-        // An unattributed part above the record is capped at it too.
         let based = FloorSources {
             base: 9_000,
             ..FloorSources::default()
         };
         assert_eq!(based.step(100, &[], 0, None).0, 100);
-        // A zero ask names no machine: the record stays the number alone.
         let (v, s) = FloorSources::default().step(100, &[], 0, Some("m3"));
         assert_eq!(v, 100);
         assert!(s.is_empty(), "{s:?}");
-        // Negative control: explained exactly, the same revocation takes it all back.
         let (v, _) = attributed.step(9_000, &revoked(&["m11"]), 0, None);
         assert_eq!(v, 0);
     }

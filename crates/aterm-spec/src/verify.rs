@@ -268,7 +268,9 @@ fn lookup_account_home() -> Option<PathBuf> {
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 4096];
     let mut out: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: `pw`, `buf` (of the stated length) and `out` are valid writable out-params, and getpwuid_r writes nothing past buflen.
+    // SAFETY: `pw`, `buf` (of the stated length) and `out` are valid writable out-params, and
+    // getpwuid_r writes nothing past buflen. `pw_dir` is read only on success (`out` non-null),
+    // when it is a NUL-terminated string inside `buf`, copied out while `buf` lives.
     unsafe {
         let rc = libc::getpwuid_r(
             libc::getuid(),

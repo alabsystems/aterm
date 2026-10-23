@@ -485,7 +485,8 @@ fn runs_a_posix_runtime(pid: u32) -> bool {
 fn pids_in(job: HANDLE) -> Vec<u32> {
     // SAFETY: a zeroed id list is a valid out-buffer.
     let mut list: ffi::JOBOBJECT_BASIC_PROCESS_ID_LIST = unsafe { std::mem::zeroed() };
-    // SAFETY: the session's live job handle and a buffer of the stated size.
+    // SAFETY: the session's live job handle and a buffer of the stated size. A job
+    // with more processes than fit fails with ERROR_MORE_DATA and still fills it.
     unsafe {
         ffi::QueryInformationJobObject(
             job,

@@ -1,30 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A warmed `TrickListener` allocates nothing.
-//!
-//! It sits on the typing path: every printed key, Backspace and Enter in every window goes
-//! through it, feature on or off. Its cost is one inline push per letter and one fold plus one
-//! hash probe per closed token; once the fold scratch has grown to the widest token the window
-//! holds, nothing allocates (not a fire, a borrowed event word or the command surfaces beside it,
-//! the boundary snapshot, a held address word, a parked fire, an IME commit, a session switch, or
-//! the glued reading of a no-space run, which probes borrowed halves of the inline token, hit or
-//! miss).
-//!
-//! Counted by the suite's per-thread allocator (`alloc_count`), so the pin
-//! shares `effects_suite` with every other test and no parallel test bleeds
-//! into its count.
+//! Zero-allocation regression tests for a warmed [`TrickListener`].
 
 use aterm_effects::typed_tricks::{TrickEvent, TrickListener};
 use aterm_lexicon::TrickLexicon;
 use aterm_time::{Duration, Instant};
 
-/// How many allocations `f` makes on this thread.
 fn allocations_during(f: impl FnOnce()) -> usize {
     crate::alloc_count::allocations_during(f).1
 }
 
-/// The scripts the no-space lanes need; English rides the embedded file.
 const LANES: &str = r#"
 [[trick]]
 id    = "sit"
@@ -84,9 +70,6 @@ impl Heard {
     }
 }
 
-/// A typed script: `␣` Space, `⏎` Enter, `⌫` Backspace, `⌃` Ctrl+U, `⌥`
-/// Ctrl+W, `⇥` Tab; anything else a typed character. Fed the way a host
-/// feeds: the vocabulary is handed over only when the listener asks.
 fn type_script(
     listener: &mut TrickListener,
     lexicon: &TrickLexicon,
@@ -122,40 +105,29 @@ fn one_pass(
 ) -> Heard {
     let mut heard = Heard::default();
     for script in [
-        // Tentative, revoked, confirmed, final at Enter.
         "sit␣tight␣while␣I␣check⏎",
         "sit␣kitty␣⏎",
         "sit⏎",
-        // Held, parked, drawn out, capitals.
         "good␣kitty!!␣⏎",
         "goooood␣kitty.⏎",
         "KITTY␣JUMP␣⏎",
-        // The phrase law.
         "sit␣down␣⏎",
-        // Code and prose.
         "npm␣run␣build⏎",
         "sleep␣0.5␣&&␣curl␣-s␣localhost:8080⏎",
         "play.py⏎",
         "roll␣back␣the␣last␣commit⏎",
-        // Typo recovery: the snapshot, the count, the word-kill, the reset.
         "siy␣⌫⌫t␣⏎",
         "sot⌫⌫⌫⌫⌫⌫sit␣⏎",
         "kitty␣sot⌥sit␣⏎",
         "ls␣-la⌃sit␣⌃",
         "kitty␣sit␣⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫sit␣⏎",
-        // Poison.
         "si⇥t␣sit␣⏎",
-        // A token past the window, and one exactly filling it.
         "pspspspspspspspspspspspspspspspspspsps␣⏎",
         "pspspspspspspspspspspspspspspsps␣⏎",
-        // A marked no-space run past the window (fourteen three-scalar
-        // clusters), taken back a cluster a press; then a word-kill on the
-        // emptied line.
         "นั่นั่นั่นั่นั่นั่นั่นั่นั่นั่นั่นั่นั่นั่⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌫⌥sit␣⏎",
     ] {
         type_script(listener, english, now, script, &mut heard);
     }
-    // IME commits: a syllable at a time, and a whole sentence.
     for commit in ["앉", "아"] {
         let lexicon = listener.ime_needs_lexicon(commit).then_some(lanes);
         heard.hear(listener.note_ime(*now, commit, lexicon));
@@ -165,9 +137,6 @@ fn one_pass(
     let lexicon = listener.ime_needs_lexicon(sentence).then_some(lanes);
     heard.hear(listener.note_ime(*now, sentence, lexicon));
     type_script(listener, lanes, now, "⏎", &mut heard);
-    // A name glued to its command either way round, a run read at two cuts,
-    // and the glued reading's costliest miss: a run filling the window, no
-    // name and command at any of its 31 cuts.
     const FULL_WINDOW_MISS: &str =
         "ねこかわいいねこかわいいねこかわいいねこかわいいねこかわいいねこ";
     assert_eq!(
@@ -186,7 +155,6 @@ fn one_pass(
         type_script(listener, lanes, now, "␣⏎", &mut heard);
     }
     heard.glued_fires = heard.fires - fires_before;
-    // Session switches: a dirty line left behind and come back to.
     listener.rekey(1);
     type_script(listener, english, now, "si", &mut heard);
     listener.rekey(2);
@@ -207,10 +175,6 @@ fn a_warmed_listener_is_allocation_free_on_every_lane() {
     let mut listener = TrickListener::new();
     let mut now = Instant::now();
 
-    // Warmup. The fold scratch is the listener's only heap, and it grows to
-    // the widest token looked up: the window's worth of four-byte letters
-    // sizes it once and for all. Then one full pass, whose tally is the
-    // oracle for the counted one.
     let widest = "𝐚".repeat(TrickLexicon::MAX_SURFACE_CHARS);
     let mut warmup = Heard::default();
     type_script(&mut listener, english, &mut now, &widest, &mut warmup);

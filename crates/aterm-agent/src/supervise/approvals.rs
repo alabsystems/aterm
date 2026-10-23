@@ -14,7 +14,7 @@ use super::policy::turn_end::{Conversation, LimitTry};
 pub const COMMAND_BYTES: usize = 4096;
 
 /// What every rule of the facts seam opens with (`fact-hold@v1`, `fact-would@v1`,
-/// `fact-intent@v1`; [`super::facts`]).
+/// `fact-intent@v1`, `fact-held@v1`; [`super::facts`]).
 pub const FACT_RULE_PREFIX: &str = "fact-";
 
 /// A FACT ROW IS NO ACT (the occupancy red-team's F13): a line the facts seam typed

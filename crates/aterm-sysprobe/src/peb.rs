@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PEB — another process of this account on Windows, read through a handle.
+//! PEB reader for processes of the current Windows account.
 
 use crate::win_paths::{self, Plain};
 use std::ffi::OsString;
@@ -9,12 +9,8 @@ use std::os::windows::ffi::OsStringExt as _;
 use std::os::windows::io::{AsHandle as _, BorrowedHandle};
 use std::path::PathBuf;
 
-/// `RTL_USER_PROC_PARAMS_NORMALIZED`: the strings' `Buffer`s are addresses.
 const PARAMS_NORMALIZED: u32 = 0x1;
 
-/// The access [`parameters`] and [`crate::process_cwd`] open a process with:
-/// `PROCESS_QUERY_LIMITED_INFORMATION` (its image, where its PEB is),
-/// `PROCESS_VM_READ` (the PEB) and `SYNCHRONIZE` (whether it exited).
 const PEB_READ: u32 = win_paths::PROCESS_QUERY_LIMITED_INFORMATION
     | win_paths::PROCESS_VM_READ
     | win_paths::SYNCHRONIZE;
@@ -22,18 +18,18 @@ const PEB_READ: u32 = win_paths::PROCESS_QUERY_LIMITED_INFORMATION
 /// The largest environment block [`parameters`] reads, in bytes.
 pub const ENVIRONMENT_CAP: usize = 16 << 20;
 
-/// What one Windows process was started with, as its process environment block holds it now ([`parameters`]).
+/// Startup parameters read from a Windows process environment block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessParameters {
-    /// The image it runs, as the kernel names the file (`QueryFullProcessImageNameW`: `C:\...\x.exe`).
+    /// Executable image path from `QueryFullProcessImageNameW`.
     pub image: PathBuf,
-    /// Its command line (`ProcessParameters.CommandLine`), whole, with no terminating NUL.
+    /// Command line (`ProcessParameters.CommandLine`) without a terminating NUL.
     pub command_line: Vec<u16>,
-    /// Its environment block (`ProcessParameters.Environment`, its `EnvironmentSize` bytes).
+    /// Environment block (`ProcessParameters.Environment`).
     pub environment: Vec<u16>,
 }
 
-/// Read `pid`'s [`ProcessParameters`] from its PEB (including WOW64 32-bit PEB) via [`PEB_READ`].
+/// Read `pid`'s [`ProcessParameters`] from its PEB (including WOW64 32-bit PEB).
 #[must_use]
 pub fn parameters(pid: u32) -> Option<ProcessParameters> {
     let process = win_paths::open_process(pid, PEB_READ)?;
@@ -63,7 +59,7 @@ pub(crate) fn cwd(pid: u32) -> Option<PathBuf> {
     (!win_paths::exited(h)).then(|| without_trailing_separator(cwd))
 }
 
-/// Read `CurrentDirectory.DosPath` of process `h` (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`).
+/// Read `CurrentDirectory.DosPath` of process `h`.
 #[must_use]
 pub fn cwd_of(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     let before = params(h)?;
@@ -81,10 +77,6 @@ pub fn image_of(h: BorrowedHandle<'_>) -> Option<PathBuf> {
     win_paths::image_path(h)
 }
 
-/// `cwd` without the one trailing separator a process environment block
-/// keeps (`C:\x\` reads `C:\x`), unless what is left would no longer end in
-/// a name: a root keeps it (`C:\`, `\\srv\share\`), as `GetCurrentDirectoryW`
-/// answers one.
 fn without_trailing_separator(cwd: PathBuf) -> PathBuf {
     let Some(s) = cwd.to_str() else {
         return cwd;
@@ -119,7 +111,6 @@ struct Params {
 }
 
 impl Params {
-    /// What [`parameters`] reads, which must not move while it reads.
     fn started_with(&self) -> (u64, usize, u64, u64, u64) {
         (
             self.command_line.0,
@@ -131,9 +122,6 @@ impl Params {
     }
 }
 
-/// `h`'s parameters, through its PEB (its `PEB32` under WOW64), read whole;
-/// `None` when a read fails, the PEB names none, or they are not normalized
-/// or shorter than the structure read.
 fn params(h: BorrowedHandle<'_>) -> Option<Params> {
     if let Some(peb32) = win_paths::wow64_peb(h) {
         let head: win_paths::PebHead32 = win_paths::read_plain(h, peb32)?;
@@ -164,10 +152,6 @@ fn params(h: BorrowedHandle<'_>) -> Option<Params> {
     }
 }
 
-/// The parameters structure `P` at `at` in `h`, read whole: `None` for a
-/// null address, a read that fails, or one whose own `Length` (with its
-/// `Flags`, from `length_flags`) says it is shorter than `P` or not yet
-/// normalized.
 fn read_whole<P: Plain>(
     h: BorrowedHandle<'_>,
     at: u64,
@@ -182,12 +166,10 @@ fn read_whole<P: Plain>(
     (whole && flags & PARAMS_NORMALIZED != 0).then_some(p)
 }
 
-/// A 64-bit process's string as an address and a length in bytes.
 fn string64(s: win_paths::RemoteString64) -> (u64, usize) {
     (s.buffer, usize::from(s.length))
 }
 
-/// A WOW64 process's string as an address and a length in bytes.
 fn string32(s: win_paths::RemoteString32) -> (u64, usize) {
     (u64::from(s.buffer), usize::from(s.length))
 }
@@ -249,8 +231,6 @@ mod tests {
         assert_eq!(size_of::<ProcessParameters32>(), 0x298);
     }
 
-    /// A working directory reads as `GetCurrentDirectoryW` answers it: the
-    /// PEB's trailing separator dropped below a root, kept at one.
     #[test]
     fn a_working_directory_drops_its_trailing_separator_but_at_a_root() {
         let read = |s: &str| without_trailing_separator(PathBuf::from(s));
@@ -262,9 +242,6 @@ mod tests {
         assert_eq!(read(r"C:\x").as_os_str(), r"C:\x");
     }
 
-    /// This process's own working directory reads through its environment
-    /// block as `std` reads it, in its own spelling (`GetCurrentDirectoryW`'s:
-    /// no trailing separator).
     #[test]
     fn a_processs_working_directory_is_read_from_its_environment_block() {
         let own = crate::process_cwd(std::process::id()).expect("our own working directory");

@@ -1,46 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The machine-wide full-pass rule: atpkg's `update` pass as the writer of `status.toml`'s
-//! stamps; the window's gate, the session lane and a queued pass's own stand-down as its
-//! readers; and the store lock between a lane's decision and its pass.
+//! Machine-wide atpkg full-pass scheduling and store-lock model.
 
 use aterm_spec::derive::*;
 
-/// One tick is the spacing (five minutes), `Interval` the six-hour walk, `MaxAge` "longer ago
-/// than that"; the record's ages saturate there. A pass takes no ticks.
-///
-/// The record is what the readers see: `rec` (`last_pass`: 0 none, 1 ok, 2 failed or offline),
-/// `pass_age` (`last_pass_at`), `ever_ok`/`ok_age` (`last_success_at`), `write_age`
-/// (`updated_at`, every writer's), `running` (a pass's progress file). The truth is what
-/// happened, in ghosts the readers never see: `last` (how the last full pass really ended) and
-/// `since_end` (idle ticks since). The writers: a pass ends (it reached the signed index, or
-/// failed: offline, or served from the §14 cache after a refusal), and `OtherWrite`, every other
-/// writer (a vendor head-watch pass, a typed verb), moves `updated_at` alone. The pass makes no
-/// metered request, so there is no rate-limit hold.
-///
-/// The lock: a lane that decides spawns a child (`queued`), which runs only once it holds the
-/// store lock; lanes cannot see each other's children, so several decide in the gap. A child
-/// that found the lock held and saw a full pass end since (`behind`) stands down behind it,
-/// whatever it ended; one that took the lock at once runs (the lock keeps one pass in flight, so
-/// that is no invariant here). `behind` is read off the store's full-pass count (`pass_seq`),
-/// read when the child starts, before any lock attempt: a moved count is an end in front of it,
-/// exact where the whole-second `last_pass_at` cannot tell an end in the second the child first
-/// found the lock held from one before the wait.
-///
-/// The readers: `SessionLook` (a tab opens: `pkg_check::full_pass_owed` over
-/// `atpkg::status::pass_stamps`), `WindowWalk` (the gate before the six-hour walk) and
-/// `WindowLaunch` (a window opens: its launch rule, then the gate). `verdict` is what the last
-/// look read of the record: did the last full pass fail.
-///
-/// `Buggy = 1`: the writer records no pass end; the readers take a failure from the order of
-/// `updated_at` and the success and spacing from `updated_at`; a queued child stands down only
-/// behind a success. Each invariant has its own counterexample. The progress obligation
-/// (`NoOwedPassHeldBack`) is stated on the truth, never the record, so a lane that parks an owed
-/// pass (a failed one too) is caught at `Buggy = 0`: with `Interval` past `MaxAge` the record can
-/// never say "an interval old". Tier 1: atpkg's `status` conformance (the writers, the session
-/// lane, the old reader against `Buggy = 1`), its `cli` one (the queued child's stand-down), and
-/// aterm-gui's (the gate and the launch rule).
+/// Machine-wide full-pass scheduling model across `status.toml` writers, readers, and queued store-lock waiters.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
@@ -70,8 +35,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
     };
     let idle = || eq(v("running"), n(0));
     let due = || or_(eq(v("ever_ok"), n(0)), le(cst("Interval"), v("ok_age")));
-    // Did the last full pass fail, read off the record: its own word (`Stamps::last_failed`),
-    // or (Buggy) a write after the last success, or any write and none.
     let failed_now = || {
         and_(
             eq(v("rec"), n(2)),
@@ -93,7 +56,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
     let read_failed = || either(failed_now(), failed_then());
     let spaced_now = || le(cst("Spacing"), v("pass_age"));
     let spaced_then = || le(cst("Spacing"), v("write_age"));
-    // The three readers' decisions.
     let session = || {
         either(
             and_(
@@ -118,8 +80,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
             and_(and_(idle(), spaced_then()), or_(failed_then(), due())),
         )
     };
-    // The obligation, on the truth: nothing running, and never a full pass, or the last one
-    // (ok or failed) an interval ago.
     let owed = || {
         and_(
             idle(),
@@ -141,8 +101,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
             updates,
         }
     };
-    // A child that holds the lock and runs: a pass within the spacing of another's end is
-    // what the invariant forbids.
     let starts = |runs: Expr| {
         vec![
             up("running", if_(runs.clone(), n(1), n(0))),
@@ -158,8 +116,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
             ),
         ]
     };
-    // A pass ends: the truth, `updated_at`, the children queued behind it — and, fixed, its
-    // recorded end.
     let ends = |name: &'static str, ok: bool| {
         let mut updates = vec![
             up("running", n(0)),
@@ -215,7 +171,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
                 guard: Some(idle()),
                 updates: vec![up("write_age", n(0))],
             },
-            // Time passes only with no child at a free lock: one takes it within the tick.
             Action {
                 name: "Tick",
                 guard: Some(and_(idle(), eq(v("queued"), n(0)))),
@@ -236,8 +191,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
             look("SessionLook", session(), true),
             look("WindowWalk", walk(), false),
             look("WindowLaunch", launch(), true),
-            // A child that waited and saw a full pass end since takes the lock: it stands
-            // down (Buggy: only behind a success, and ran behind a failure).
             Action {
                 name: "TakeLockBehind",
                 guard: Some(and_(idle(), le(n(1), v("behind")))),
@@ -253,7 +206,6 @@ pub fn atpkg_full_pass_rule_model() -> Model {
                     updates
                 },
             },
-            // A child that no pass ended in front of takes the lock and runs.
             Action {
                 name: "TakeLockFresh",
                 guard: Some(and_(idle(), le(v("behind"), sub(v("queued"), n(1))))),

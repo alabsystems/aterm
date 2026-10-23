@@ -3,20 +3,6 @@
 // Author: Andrew Yates
 
 //! Embed the community theme pack (`contrib/themes/pack/`).
-//!
-//! Reads `manifest.tsv`, refuses a row whose licence the policy does not
-//! admit, whose id the themes folder could not hold, whose id or name
-//! another row answers to, or whose upstream or licence file is missing,
-//! and writes `$OUT_DIR/pack.rs`: the rows as `PackTheme`s (sorted by id,
-//! ignoring ASCII case), the withdrawn ids with the theme standing for each,
-//! every licence text the rows, the collection and the built-in ports name,
-//! and the collection's identity. A built-in port's licence file is derived from its source
-//! (`LICENSES/<spdx>-<repo>.txt`, [`port_licence_file`]), so no second list
-//! names them; and a file in the pack folder that nothing names refuses the
-//! build (TP-FOLDER, TP-PORTS). File text is pulled in with `include_str!`, so the compiler
-//! tracks it too. A row whose `<id>.conf` is not there yet gets empty text
-//! and a warning: the bless step (`ATERM_BLESS_GOLDEN=1 targo --unverified
-//! test -p aterm-theme-pack`) writes it.
 
 #[path = "src/policy.rs"]
 #[expect(
@@ -29,7 +15,6 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// The manifest's header row, column for column.
 const HEADER: [&str; 10] = [
     "id",
     "upstream",
@@ -48,17 +33,11 @@ struct Row {
     cols: Vec<String>,
 }
 
-/// The licence file of a built-in port whose source is `project`
-/// (`owner/repo`) under `spdx`: `LICENSES/<spdx>-<repo>.txt`.
 fn port_licence_file(project: &str, spdx: &str) -> String {
     let repo = project.rsplit('/').next().unwrap_or(project);
     format!("LICENSES/{spdx}-{repo}.txt")
 }
 
-/// The entries of the pack folder (one subfolder deep, relative to it) that
-/// nothing names: a `.conf` with no row, an upstream file no row converts, a
-/// licence file not in `licences`, or anything else but the README, the
-/// manifest and ATTRIBUTION.md.
 fn unlisted(pack: &Path, rows: &[Row], licences: &BTreeSet<String>) -> Vec<String> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(pack).unwrap_or_else(|e| panic!("{}: {e}", pack.display())) {
@@ -97,8 +76,6 @@ fn unlisted(pack: &Path, rows: &[Row], licences: &BTreeSet<String>) -> Vec<Strin
 fn main() {
     let manifest_dir =
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets it"));
-    // A directory literal (trailing '/'): aterm-verify seeds this crate from
-    // any changed file beneath it.
     let pack = manifest_dir.join("../../contrib/themes/pack/");
     let pack = pack
         .canonicalize()
@@ -179,8 +156,6 @@ fn main() {
         licence_files.insert(name.to_string());
     };
     licence(&collection_licence, 0);
-    // Every built-in port's source names its licence file by rule; a
-    // built-in without a source is one of aterm's own designs.
     let mut ports: Vec<(String, String)> = Vec::new();
     for builtin in aterm_types::scheme::builtin_theme_list() {
         let Some(source) = builtin.source else {
@@ -205,7 +180,6 @@ fn main() {
         licence(&file, 0);
         ports.push((source.project.to_string(), file));
     }
-    // What `find` answers to: every id, and every name the chooser shows.
     let mut ids = BTreeSet::new();
     for row in &rows {
         let c = &row.cols;

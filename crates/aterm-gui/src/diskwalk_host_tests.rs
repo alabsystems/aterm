@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The disk walker host against scratch trees these tests create (never the
-//! owner's home): root discovery, the report's arithmetic, the §10.8
-//! hysteresis and its digest entry, and the thread end to end.
+//! Tests for disk walker root discovery, report totals, huge-folder hysteresis, and the walker thread.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,6 +11,17 @@ use std::time::{Duration, Instant};
 use aterm_diskwalk::{Deny, HugeDir, Policy, Refusal, Sums, canonical};
 
 use super::*;
+
+/// The class the end-to-end walker test runs the walker thread in: a CPU
+/// class the scheduler keeps running and disk reads its QoS class decides,
+/// so its hang detector waits on the walker's own work, not on the
+/// product's background class or its throttled reads ([`WALKER_CLASS`]),
+/// either of which a saturated machine may hold back before the walker's
+/// first publication.
+const TEST_WALKER_CLASS: WalkerClass = WalkerClass {
+    role: crate::qos::Role::Responsive,
+    disk: aterm_diskwalk::DiskIo::Inherited,
+};
 
 fn write(path: &Path, bytes: usize) {
     std::fs::write(path, vec![5u8; bytes]).expect("write scratch file");
@@ -33,9 +42,7 @@ fn kinds(list: &[RootKind]) -> BTreeSet<RootKind> {
     list.iter().copied().collect()
 }
 
-/// A scratch home holding a worktree `w` with a `target → target.noindex`
-/// link, atpkg's build cache for `w`, a protected folder, and an agent temp
-/// root beside it.
+/// Creates a scratch home with worktree `w`, its build cache, a protected folder, and an agent temp root.
 fn scratch_home(b: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let home = b.join("home");
     let w = home.join("w");
@@ -70,7 +77,6 @@ fn a_tab_claims_its_cwd_processes_worktree_build_output_and_agent_temp_root() {
         shell_pid: 10,
         reported_cwd: Some(w.join("crates/x")),
     };
-    // The shell's child (an agent) works in `w`; its child in a session temp folder.
     let procs = [(20, 10), (30, 20), (99, 1)];
     let cwd_of = |pid: u32| match pid {
         20 => Some(w.clone()),
@@ -101,8 +107,6 @@ fn a_tab_claims_its_cwd_processes_worktree_build_output_and_agent_temp_root() {
     );
     assert_eq!(by_path.len(), 5, "{by_path:#?}");
 
-    // A cwd in a protected folder is claimed (and refused when walked), but
-    // nothing in it is looked at: no worktree search, no build output.
     let private = TabFacts {
         key: 8,
         label: "Tab 2".into(),
@@ -119,11 +123,7 @@ fn a_tab_claims_its_cwd_processes_worktree_build_output_and_agent_temp_root() {
     assert_eq!(claims[0].kinds, kinds(&[RootKind::Cwd]));
 }
 
-/// `writes`: each regular file a descendant holds open for writing anchors at
-/// the build folder above it, else its worktree, else its session temp
-/// folder, else its folder; a file in a protected folder anchors at that
-/// folder unread. `build`: a descendant's `CARGO_TARGET_DIR`, absolute or
-/// relative to its cwd, when it is a folder (a link read, never followed).
+/// Open write descriptors and `CARGO_TARGET_DIR` settings anchor at their build, worktree, scratch, or parent folders.
 #[test]
 fn a_tab_claims_where_its_processes_write_and_their_cargo_target_dirs() {
     let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
@@ -181,34 +181,26 @@ fn a_tab_claims_where_its_processes_write_and_their_cargo_target_dirs() {
     let claims = discover_tab(&tab, &procs, &reads, &policy, Some(&home), Some(&scratch));
     let by_path: BTreeMap<PathBuf, Claim> =
         claims.into_iter().map(|c| (c.path.clone(), c)).collect();
-    // Two files in one profile: one anchor, the target folder (CACHEDIR.TAG)
-    // past the profile's `.cargo-lock`, which `w/target` already claims.
     assert_eq!(
         by_path[&w.join("target.noindex")].kinds,
         kinds(&[RootKind::Writes, RootKind::Build])
     );
-    // A file in the worktree with no build folder above it: the worktree.
     assert!(
         by_path[&w].kinds.contains(&RootKind::Writes),
         "{by_path:#?}"
     );
-    // A file in a session temp folder: that folder.
     assert_eq!(
         by_path[&scratch.join("-proj/session-1")].kinds,
         kinds(&[RootKind::Writes])
     );
-    // A file outside any worktree, build or temp folder: its own folder.
     assert_eq!(
         by_path[&home.join("elsewhere/logs")].kinds,
         kinds(&[RootKind::Writes])
     );
-    // A protected folder is claimed as written into, never looked in.
     assert_eq!(
         by_path[&home.join("Documents/proj")].kinds,
         kinds(&[RootKind::Writes])
     );
-    // CARGO_TARGET_DIR: a link read to its folder; a relative one against the
-    // process's cwd; an absent one claims nothing.
     assert_eq!(
         by_path[&home.join("shared-target")].kinds,
         kinds(&[RootKind::Build])
@@ -231,7 +223,6 @@ fn a_data_volume_spelling_is_read_as_its_firmlinked_one() {
         firmlinked(Path::new("/System/Volumes/Data/usr/local/var/db")),
         PathBuf::from("/usr/local/var/db")
     );
-    // Not firmlinked: the data volume's own folders keep their spelling.
     assert_eq!(
         firmlinked(Path::new("/System/Volumes/Data/.Spotlight-V100/x")),
         PathBuf::from("/System/Volumes/Data/.Spotlight-V100/x")
@@ -242,9 +233,7 @@ fn a_data_volume_spelling_is_read_as_its_firmlinked_one() {
     );
 }
 
-/// One fact, one wire spelling: a refused root's state reads as the refusal's
-/// own word (a too-broad root as `too-broad`, the word a nested row's reason
-/// uses), and no two kinds share a word.
+/// Refused root states use the refusal's wire word and every [`RootKind`] word is distinct.
 #[test]
 fn a_root_state_reads_as_its_refusals_word_and_kinds_are_distinct() {
     assert_eq!(RootState::OneLevel.word(), Refusal::TooBroad.word());
@@ -345,9 +334,7 @@ fn claim_of(path: &str, k: &[RootKind]) -> Claim {
     }
 }
 
-/// Σ exclusive + Σ shared over the outermost rows, a root inside another a
-/// pinned child counted once, a root two tabs claim counted in the lower
-/// key's tab, two spellings of one folder one row.
+/// Outermost roots are counted once across exclusive and shared totals, deduplicating pinned children and aliases.
 #[test]
 fn a_report_counts_each_folder_once_and_names_who_shares_it() {
     let huge = HugeDir {
@@ -356,7 +343,6 @@ fn a_report_counts_each_folder_once_and_names_who_shares_it() {
         executables: true,
         warning: true,
     };
-    // A build profile outside every root, raised by the slow tier.
     let outside_row = HugeDir {
         path: PathBuf::from("/old/target/debug/deps"),
         entries: 120_000,
@@ -422,7 +408,6 @@ fn a_report_counts_each_folder_once_and_names_who_shares_it() {
             ),
             (
                 PathBuf::from("/alias"),
-                // The same folder as `/tmp/s` (one `(dev, ino)`): the same figures.
                 record(
                     "/alias",
                     RootState::Complete,
@@ -506,11 +491,7 @@ fn a_report_counts_each_folder_once_and_names_who_shares_it() {
     assert!(gone.unknown_tab && gone.roots.is_empty());
 }
 
-/// The balance across panes when one pane's root lies inside another's: the
-/// inner folder's bytes are shared, counted once in the aterm scope and in
-/// neither pane's exclusive total, so Σ pane-exclusive + shared = aterm
-/// distinct (design §10.4). NEGATIVE CONTROL: with the inner claim gone, no
-/// byte is shared.
+/// When one pane's root lies inside another's, the inner folder's bytes are shared and counted once.
 #[test]
 fn nested_roots_of_two_panes_share_the_inner_folder_once() {
     let complete_rec = |path: &str, alloc: u64, id: Option<(u64, u64)>| {
@@ -592,8 +573,7 @@ fn huge(path: &str, entries: u32) -> (PathBuf, HugeDir) {
     )
 }
 
-/// Raised at 100,000, kept down to 75,000, lowered under it; a walk of one
-/// root never touches another root's raised folders.
+/// Huge folders are raised at 100,000 entries, kept down to 75,000, and scoped to their walked root.
 #[test]
 fn the_huge_folder_set_has_hysteresis() {
     let root = Path::new("/w");
@@ -613,9 +593,7 @@ fn the_huge_folder_set_has_hysteresis() {
     );
 }
 
-/// The slow tier's fold: a counted profile follows the walk's hysteresis;
-/// one it raised and no longer counts is lowered, unless a walked root now
-/// holds it; a walk's own raised folders are never touched.
+/// The slow tier folds outside profiles with the same hysteresis without disturbing walked roots.
 #[test]
 fn the_slow_tier_folds_outside_profiles_with_the_same_hysteresis() {
     let counted = |rows: &[(&str, u32)]| -> BTreeMap<PathBuf, Option<HugeDir>> {
@@ -672,10 +650,7 @@ fn the_slow_tier_folds_outside_profiles_with_the_same_hysteresis() {
     );
 }
 
-/// The slow tier over a scratch home: each checkout's build folder (a link to
-/// `target.noindex` read, never followed), each profile's `deps/` counted,
-/// a cross build's too, never a `doc` folder's, and nothing under a protected
-/// folder looked at.
+/// The slow tier counts `deps/` entries across each checkout's build profiles while skipping `doc/` and protected folders.
 #[test]
 fn the_slow_tier_counts_build_profiles_of_the_homes_checkouts() {
     let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
@@ -723,15 +698,9 @@ fn the_slow_tier_counts_build_profiles_of_the_homes_checkouts() {
             ),
         ]
     );
-    // A profile at the note line is walked for its executables: a whole
-    // listing without one says no.
     let deps = home.join("one/target/debug/deps");
     let ample = Duration::from_secs(60);
     assert_eq!(profile_executables(&deps, &policy, ample), Some(false));
-    // A walk the budget cuts before it lists the whole folder knows nothing,
-    // so the slow tier keeps no answer and asks again (on a loaded machine a
-    // 100,000-entry `deps/` outlasted the budget, and the cut walk's "none"
-    // was kept for an hour).
     let mut stingy = policy.clone();
     stingy.slice = Duration::ZERO;
     assert_eq!(profile_executables(&deps, &stingy, Duration::ZERO), None);
@@ -762,7 +731,6 @@ fn a_huge_folder_entry_is_a_well_formed_digest_entry() {
     assert_eq!(huge_entry(&h).key(), e.key(), "one folder, one key");
     let (_, other) = huge("/w/other", 104_211);
     assert_ne!(huge_entry(&other).key(), e.key());
-    // A folder with no executables is no build folder: its step says so.
     let plain = HugeDir {
         executables: false,
         ..h.clone()
@@ -801,25 +769,20 @@ fn growth_compares_against_a_walk_a_window_old() {
     assert_eq!(growth_of(&VecDeque::from([(at(5), 1)]), at(5)), None);
 }
 
-/// The thread end to end on its own board, the loop played by the test: a
-/// tab demanded with [`Detail::Frees`] has its worktree walked with private
-/// sizes and link totals, its build output inside the worktree is read from
-/// that walk, not walked again, and a protected cwd is a named refusal. The
-/// walker shares no lock with the reader: what it measured arrives by message.
+/// The walker thread sizes a demanded tab's worktree, derives nested build roots from that walk, and refuses protected folders.
 #[test]
 fn the_walker_thread_sizes_a_demanded_tab_and_reads_nested_roots_from_one_walk() {
     let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
     let b = base(&tmp);
     let (home, w, _scratch) = scratch_home(&b);
     let shared: &'static Shared = Box::leak(Box::new(Shared::new()));
-    let from_walker = spawn_walker(shared, None).expect("the walker starts");
+    let from_walker = spawn_walker(shared, None, TEST_WALKER_CLASS).expect("the walker starts");
     assert_eq!(shared.walker_state(), WalkerState::Running);
     shared.send(ToWalker::Facts(Facts {
         tabs: vec![
             TabFacts {
                 key: 1,
                 label: "Tab 1".into(),
-                // No such process: its descendants and cwd read as nothing.
                 shell_pid: u32::MAX - 7,
                 reported_cwd: Some(w.clone()),
             },
@@ -836,7 +799,6 @@ fn the_walker_thread_sizes_a_demanded_tab_and_reads_nested_roots_from_one_walk()
     shared.demand(DiskScope::Tab(1), Detail::Frees, Instant::now());
     shared.demand(DiskScope::Tab(2), Detail::Sizes, Instant::now());
     assert!(shared.demanded(Instant::now()));
-    // A hang detector, not a latency budget: the walk must end.
     let deadline = Instant::now() + Duration::from_secs(60);
     let (one, two) = loop {
         shared.absorb(&from_walker);
@@ -898,10 +860,7 @@ fn the_walker_thread_sizes_a_demanded_tab_and_reads_nested_roots_from_one_walk()
     );
 }
 
-/// The lifetime law (§10.4): a scope demanded anew has its roots walked at
-/// once; a root that appears later is walked at its second consecutive
-/// discovery (one sighting is a `cd`), a missed discovery restarts the count,
-/// and a root no discovery names is kept a minute, then retired.
+/// Newly demanded roots walk immediately, later roots promote on their second consecutive sighting, and unnamed roots retire after a minute.
 #[test]
 fn a_root_is_walked_at_its_second_sighting_and_retired_a_minute_after_its_last() {
     let t0 = Instant::now();
@@ -927,8 +886,7 @@ fn a_root_is_walked_at_its_second_sighting_and_retired_a_minute_after_its_last()
     assert!(!life.contains_key(x) && life.contains_key(w));
 }
 
-/// A complete walk is owed another at 30 s, or at twenty times its own
-/// duration when that is later: at most a 5 % duty on a root left demanded.
+/// A completed walk is scheduled again after 30 seconds or twenty times its own duration, whichever is later.
 #[test]
 fn a_walk_is_walked_again_after_thirty_seconds_or_twenty_times_its_cost() {
     let mut c = complete(1, Vec::new(), None);
@@ -938,10 +896,7 @@ fn a_walk_is_walked_again_after_thirty_seconds_or_twenty_times_its_cost() {
     assert_eq!(c.rewalk_at(), c.at + Duration::from_secs(80));
 }
 
-/// The walk owed next: a root holding a `writes` root first (outermost, so
-/// the folder inside it is read from its walk), then the rest outermost
-/// first; a root inside one still to walk waits; a complete walk is owed
-/// again at its re-walk time, or now when a scope wants what frees it.
+/// `pick_root` prioritizes outermost `writes` roots, defers nested roots until their parent finishes, and re-walks when due or upgraded to [`Detail::Frees`].
 #[test]
 fn the_next_walk_holds_a_writes_root_first_and_a_nested_root_waits() {
     let now = Instant::now();
@@ -1000,8 +955,7 @@ fn the_next_walk_holds_a_writes_root_first_and_a_nested_root_waits() {
     );
 }
 
-/// `[sys] disk_roots` (O20) reads `~/` against the home, keeps an absolute
-/// folder and drops a relative one; with no `[sys]` table nothing is opted in.
+/// `[sys] disk_roots` expands `~/` against `home`, keeps absolute paths, and drops relative ones.
 #[test]
 fn the_disk_roots_opt_in_reads_the_home_and_drops_a_relative_folder() {
     let config: crate::app_config::Config = aterm_toml::from_str(

@@ -56,11 +56,6 @@ fn osc21_dynamic_cursor_tracks_osc10_in_main_frame_pixels_and_wake() {
     );
 }
 
-/// The default cursor wears the cursor colour too: `draw_cursor` (and its GPU twin) paints
-/// `cursor_fill_override` instead of `frame_cursor(input)` whenever the host sets one, so a
-/// body effect (the rainbow block and the `phaser` emitter) must bloom from the cursor colour
-/// or it eats OSC 12 and `cursor_color`. A settled caret (no keystrokes) freezes the hue phase,
-/// so only the base can move the fill between ticks.
 #[test]
 fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
     use crate::cursor_glow::BlockFillOwner;
@@ -73,7 +68,6 @@ fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some(style.into());
         app.config.trail_sounds = Some(false);
-        // No pinned trail colour: the cursor colour is what the effects follow.
         app.config.cursor_trail_color = None;
         let wid = WindowId(0);
         app.windows.get_mut(&wid).expect("fixture window").focused = true;
@@ -84,7 +78,6 @@ fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
                 wid,
                 CursorFxInputs {
                     live_cursor_rgb: rgb,
-                    // A pinned colour (OSC 12 or a configured `cursor_color`).
                     cursor_color_pinned: true,
                     ..CursorFxInputs::sample_for_test(now)
                 },
@@ -110,7 +103,6 @@ fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
             bb > hi && br < lo && bg < lo,
             "{style}: OSC 12 #0000FF must reach the block, got {blue:#08x}"
         );
-        // The theme cursor arrives through the same channel when no OSC 12 is in force.
         let (tr, tg, tb) = chans(theme);
         assert!(
             tg > hi && tg > tr && tg > tb,
@@ -119,9 +111,6 @@ fn osc12_recolours_the_effect_owned_block_cursor_not_only_the_plain_one() {
     }
 }
 
-/// `trail status` reports who owns the block fill and from what base: the
-/// owner named is the style that just painted the caret, and the base is
-/// the cursor colour that tick was fed, against the real host seam.
 #[test]
 fn trail_status_names_the_style_that_owns_the_block_fill() {
     let mut app = App::headless_for_test();
@@ -141,8 +130,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
                 wid,
                 CursorFxInputs {
                     live_cursor_rgb: rgb,
-                    // Pinned iff the config has a `cursor_color`; the row's provenance
-                    // must track it.
                     cursor_color_pinned: app.config.cursor_color.is_some(),
                     ..CursorFxInputs::sample_for_test(now)
                 },
@@ -160,8 +147,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         app.trail_status().expect("a front window exists")
     };
 
-    // The default, unpinned: the rainbow block owns the caret and, with no `cursor_color`
-    // configured, builds from white (`base=none from=white`).
     let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
     assert!(
         line.contains(" block_fill=rainbow")
@@ -181,8 +166,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
          got {painted:#08x}"
     );
 
-    // A pinned colour still reaches the caret: the user wrote one, so the
-    // block blooms from it.
     app.config.cursor_color = Some("#ff0000".into());
     let line = status_after_projection(&mut app, "rainbow kitty", [0xFF, 0x00, 0x00], t0);
     assert!(
@@ -191,7 +174,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
             && line.contains(" block_fill_base_from=cursor_color"),
         "a pinned cursor colour reaches the caret and the row must say so: {line}"
     );
-    // The painted colour (`block_fill_rgb`) tracks the base.
     let painted = line
         .split(" block_fill_rgb=")
         .nth(1)
@@ -203,7 +185,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         "the painted caret must be the red it was told to bloom from, got {painted:#08x}"
     );
 
-    // The phaser: the same provenance from a different cursor colour.
     let line = status_after_projection(
         &mut app,
         "phaser",
@@ -217,8 +198,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         "the phaser owns the caret and blooms from the cursor colour: {line}"
     );
 
-    // Fire owns its body colour by design (warm metal); the row says
-    // `style_identity` so a deliberate owner reads differently from a leak.
     let line = status_after_projection(
         &mut app,
         "fire",
@@ -232,8 +211,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
         "fire owns its body colour deliberately: {line}"
     );
 
-    // An unfocused window paints no body: the caret takes the terminal's own cursor
-    // colour, and the row stops naming last frame's owner.
     app.windows.get_mut(&wid).expect("fixture window").focused = false;
     let line = status_after_projection(
         &mut app,
@@ -249,13 +226,6 @@ fn trail_status_names_the_style_that_owns_the_block_fill() {
     );
 }
 
-/// The native host floors the caret against the cell it sits on, read from
-/// the frame the window renders (`input_scratch`), as the web page does:
-/// Fire's ember on a reverse-video cell (SGR 7, its ground the default ink)
-/// keeps the effect's 4.5:1 against that cell, the background the renderer
-/// cuts the block's glyph out in. Negative control: the same caret over a
-/// plain cell is floored against the page alone and sits under that floor
-/// on the reverse cell's colour.
 #[test]
 fn the_caret_floor_reads_the_cell_under_the_caret_from_the_rendered_frame() {
     let fill_on = |reverse: bool| {

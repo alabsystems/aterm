@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Resizing keeps on-screen non-BMP cells (emoji, CJK-SMP) instead of turning them into
-//! U+FFFD, including bases stored apart from their cluster tails. The write path stores a
-//! non-BMP codepoint in a per-viewport `ComplexCharRing`; every resize path, rows-only and
-//! no-reflow included, migrates it into the persistent extras before invalidating the rings.
-//! A host resizes rows-only when a font change alters cell metrics.
+//! Resizing preserves on-screen non-BMP cells and cluster extras across rows-only and reflow paths.
 
 use aterm_core::terminal::Terminal;
 
-/// Written through `process`, its 😀 lands in the complex ring.
 const EMOJI_LINE: &[u8] = b"Q\xf0\x9f\x98\x80Z"; // Q😀Z
 
 fn emoji_row(t: &Terminal, max_rows: u16) -> Option<String> {
@@ -20,9 +15,6 @@ fn emoji_row(t: &Terminal, max_rows: u16) -> Option<String> {
     })
 }
 
-/// An on-screen non-BMP cell survives every resize path: a rows-only grow and
-/// shrink, a font re-fit (the wild bug: a small rows delta right after the
-/// emoji rendered on a non-top row) and a column reflow.
 #[test]
 fn every_resize_path_preserves_non_bmp_cells() {
     type Case = (
@@ -83,7 +75,6 @@ fn column_reflow_preserves_parser_clusters_and_render_payloads() {
         assert_eq!(before.clusters[0].len(), 4);
         assert_eq!(before.combining[0].len(), 1);
 
-        // No-wrap shrink, split, merge and restore, all through the real parser and grid.
         for cols in [52, 7, 128, 80] {
             terminal.resize(28, cols);
             let text: String = (0..28)
@@ -179,10 +170,6 @@ fn column_reflow_preserves_ring_rgb_with_structured_extras() {
     }
 }
 
-/// A width change lays a line whose head is in history out from its head
-/// (`Grid::prepare_rewrap` brings the head onto the screen first, moving the
-/// screen's rows down past the dense rings' last row). The tail left on the
-/// screen keeps its ring-held non-BMP bases and true colours.
 #[test]
 fn a_width_change_that_brings_a_line_head_back_preserves_non_bmp_cells() {
     for (line, tail) in [
@@ -194,8 +181,6 @@ fn a_width_change_that_brings_a_line_head_back_preserves_non_bmp_cells() {
         ),
     ] {
         let mut t = Terminal::new(10, 8);
-        // The line wraps over three rows at eight columns; eight more lines
-        // leave only its last row on the screen, its head in history.
         t.process(format!("\x1b[48;2;1;2;3m{line}\x1b[0m\r\n").as_bytes());
         t.process(&b"x\r\n".repeat(8));
         assert!(

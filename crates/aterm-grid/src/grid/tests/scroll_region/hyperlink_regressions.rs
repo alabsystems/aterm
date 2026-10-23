@@ -7,32 +7,27 @@ use std::sync::Arc;
 use super::lettered;
 use crate::{CellCoord, Grid};
 
-/// Link column 0 of `row` to `url`; returns the url for later comparison.
 fn link(grid: &mut Grid, row: u16, url: &str) -> Arc<str> {
     let url: Arc<str> = Arc::from(url);
     grid.cell_extra_mut(row, 0).set_hyperlink(Some(url.clone()));
     url
 }
 
-/// The url column 0 of `row` links to, if any.
 fn link_at(grid: &Grid, row: u16) -> Option<Arc<str>> {
     grid.extras()
         .get(CellCoord::new(row, 0))
         .and_then(|e| e.hyperlink().cloned())
 }
 
-/// `row` carries hyperlinks and column 0 links to `url`.
 fn assert_link_at(grid: &Grid, row: u16, url: Arc<str>) {
     assert!(grid.extras().row_has_hyperlinks(row));
     assert_eq!(link_at(grid, row), Some(url));
 }
 
-/// `scroll_region_up` shifts CellExtras with their rows within the region.
 #[test]
 fn grid_scroll_region_up_shifts_hyperlinks() {
     let mut grid = lettered(Grid::new(8, 10));
 
-    // Row 1 above the 2..=5 region, row 3 inside, row 6 below.
     let url_outside_above = link(&mut grid, 1, "https://above.com");
     let url_inside = link(&mut grid, 3, "https://inside.com");
     let url_outside_below = link(&mut grid, 6, "https://below.com");
@@ -43,15 +38,12 @@ fn grid_scroll_region_up_shifts_hyperlinks() {
 
     assert_link_at(&grid, 1, url_outside_above);
 
-    // Row 3 was inside the region: now row 2.
     assert_link_at(&grid, 2, url_inside);
     assert!(!grid.extras().row_has_hyperlinks(3));
 
     assert_link_at(&grid, 6, url_outside_below);
 }
 
-/// The top-anchored archival path splits metadata two ways: row 0's extras enter history, the
-/// protected footer's stay at their visible coordinates.
 #[test]
 fn grid_top_anchored_partial_scroll_preserves_history_and_footer_hyperlinks() {
     let mut grid = lettered(Grid::with_scrollback(5, 10, 10));
@@ -79,7 +71,6 @@ fn grid_top_anchored_partial_scroll_preserves_history_and_footer_hyperlinks() {
     grid.assert_invariants();
 }
 
-/// scroll_region_down shifts CellExtras with their rows within the region.
 #[test]
 fn grid_scroll_region_down_shifts_hyperlinks() {
     let mut grid = lettered(Grid::new(8, 10));
@@ -97,9 +88,6 @@ fn grid_scroll_region_down_shifts_hyperlinks() {
     assert_link_at(&grid, 7, url_outside);
 }
 
-/// Links at row 1 (above the 2..=5 region), row 4 (inside) and row 7 (below);
-/// with the cursor at row 3, `op` runs. The outside links stay put and the
-/// inside link lands on `moved_to`, leaving row 4.
 fn assert_line_op_shifts_inside_link(op: impl FnOnce(&mut Grid), moved_to: u16) {
     let mut grid = lettered(Grid::new(8, 10));
 
@@ -120,16 +108,12 @@ fn assert_line_op_shifts_inside_link(op: impl FnOnce(&mut Grid), moved_to: u16) 
     assert_link_at(&grid, 7, url_below);
 }
 
-/// insert_lines shifts CellExtras down within [cursor_row, region.bottom].
 #[test]
 fn grid_insert_lines_shifts_hyperlinks() {
-    // Rows 3-5 shift down by 1: the row 4 link lands on row 5.
     assert_line_op_shifts_inside_link(|grid| grid.insert_lines(1), 5);
 }
 
-/// delete_lines shifts CellExtras up within [cursor_row, region.bottom].
 #[test]
 fn grid_delete_lines_shifts_hyperlinks() {
-    // Rows 4-5 shift up by 1: the row 4 link lands on row 3.
     assert_line_op_shifts_inside_link(|grid| grid.delete_lines(1), 3);
 }

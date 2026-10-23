@@ -1,41 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The image anchor, bound to a real process whose bundle moves under it.
-//!
-//! The table test proves the classification; this binds its input (the
-//! kernel's path for the image, see [`aterm_containment::ImageAnchor`]) to a
-//! child running from a real `.app`, through the updater's two moves: the
-//! atomic swap to `A.app.rollback`, then the boot-health delete. Step 1 reads
-//! `live` before anything moves; a second child launched through a symlink
-//! retargeted mid-run must stay `live`.
-//!
-//! The child is this test binary, re-entered through the first real test,
-//! which dispatches `anchor_probe_child` before its parent assertions. It runs
-//! from a new copy, which macOS assesses at its first exec: its first reading is
-//! the proof it runs, and until then nothing moves or removes the scratch
-//! directory (a child killed first leaves it in place,
-//! [`aterm_uds::deadline::KeptUntilRan`]).
+//! Live process image-anchor tests across bundle rollback and removal.
 
 #![cfg(target_os = "macos")]
 
 use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-// `spawnfd`'s: the probe holds its stdio and nothing else of this process. A
-// std child on a std without the SP-1 strip keeps any descriptor another test
-// thread had open unflagged at the spawn, for as long as the child lives.
+
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 const CHILD_MARKER: &str = "ATERM_ANCHOR_PROBE_CHILD";
-/// Readings are tagged: `--nocapture` interleaves the harness's own output.
 const TAG: &str = "ANCHOR=";
-/// A hang detector, not a latency budget: every reading the child is nudged for must come.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The child, killed and reaped on every exit path, including a failed assert.
 struct Probe {
     child: Child,
     readings: Receiver<String>,
@@ -75,13 +56,10 @@ impl Probe {
         }
     }
 
-    /// The child's first reading, the proof its copy runs: within the system's first-exec
-    /// wait, a hang detector of its own.
     fn first(&mut self, step: &str) -> String {
         self.within(step, FIRST_EXEC_HANG)
     }
 
-    /// The child's next reading; fails rather than hanging on a silent child.
     fn read(&mut self, step: &str) -> String {
         self.within(step, READ_TIMEOUT)
     }
@@ -95,7 +73,6 @@ impl Probe {
         })
     }
 
-    /// Let the child take its next reading.
     fn nudge(&mut self) {
         let stdin = self.child.stdin.as_mut().expect("child stdin");
         stdin.write_all(b"\n").expect("nudging the child");
@@ -110,7 +87,6 @@ impl Drop for Probe {
     }
 }
 
-/// Lay `<root>/<name>/Contents/MacOS/probe`, a copy of this test binary.
 fn lay_bundle(root: &Path, name: &str) -> PathBuf {
     let macos = root.join(name).join("Contents/MacOS");
     std::fs::create_dir_all(&macos).expect("bundle layout");
@@ -131,26 +107,20 @@ fn the_anchor_follows_a_bundle_renamed_and_then_deleted_under_a_live_process() {
     let mut probe = Probe::spawn(&exe);
 
     let before = probe.first("before");
-    // The one copy started has run: what follows may move and delete it.
     scratch.ran();
     assert_eq!(before, "live", "the negative control");
 
-    // The apply's swap: the incoming bundle takes the name, the running one
-    // lands at `A.app.rollback`.
     lay_bundle(root, "incoming.app");
     std::fs::rename(root.join("A.app"), root.join("A.app.rollback")).expect("displace");
     std::fs::rename(root.join("incoming.app"), root.join("A.app")).expect("install");
     probe.nudge();
     assert_eq!(probe.read("after swap"), "displaced");
 
-    // Boot-health confirmation collects the rollback.
     std::fs::remove_dir_all(root.join("A.app.rollback")).expect("collect");
     probe.nudge();
     assert_eq!(probe.read("after gc"), "deleted");
 }
 
-/// A launch symlink retargeted mid-run moves nothing the kernel resolves, so
-/// the anchor must stay `live`: the bundle this process runs from is untouched.
 #[test]
 fn a_retargeted_launch_symlink_is_not_a_displacement() {
     let mut scratch = KeptUntilRan::new(aterm_tempfile::tempdir().expect("tempdir").keep());
@@ -162,7 +132,6 @@ fn a_retargeted_launch_symlink_is_not_a_displacement() {
     let mut probe = Probe::spawn(&shim);
 
     let before = probe.first("before");
-    // The one copy started has run (`S.app`'s never is).
     scratch.ran();
     assert_eq!(before, "live");
     std::fs::remove_file(&shim).expect("unlink shim");
@@ -171,8 +140,6 @@ fn a_retargeted_launch_symlink_is_not_a_displacement() {
     assert_eq!(probe.read("after retarget"), "live");
 }
 
-/// The child half: one tagged reading per nudge, dispatched only when the
-/// parent test is re-entered with [`CHILD_MARKER`].
 fn anchor_probe_child() {
     let stdin = std::io::stdin();
     loop {

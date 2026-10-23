@@ -388,7 +388,8 @@ impl Grid {
         let mut new_rows = Vec::with_capacity(self.storage.visible_rows as usize);
         for i in 0..self.storage.visible_rows {
             let idx = (live_top + i as usize) % self.storage.rows.len();
-            // SAFETY: `new_rows` and `new_pages` are installed into `self` together.
+            // SAFETY: `new_rows` and `new_pages` are installed into `self`
+            // together before the rebuilt rows can outlive this method.
             let mut row = unsafe { Row::new(self.storage.cols, &mut new_pages) };
             row.copy_from(&self.storage.rows[idx]);
             new_rows.push(row);

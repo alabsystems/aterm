@@ -30,7 +30,7 @@ mod tests;
 
 use fs::{Appender, Held, JournalFs};
 
-/// The errnos the journal tells apart (module docs). A target without POSIX
+/// The errnos the journal tells apart. A target without POSIX
 /// errnos (Windows) gets values no raw OS error carries, so there only the
 /// `io::ErrorKind` arms and the defaults decide.
 #[cfg(unix)]
@@ -508,7 +508,7 @@ impl Clock for HostClock {
     }
 }
 
-/// THE WRITER THREAD's loop (module docs). `park_timeout` is its only wait.
+/// The writer thread's loop. `park_timeout` is its only wait.
 fn run(
     shared: &Arc<Shared>,
     logs: &std::path::Path,
@@ -1120,7 +1120,7 @@ impl<T: Targets> Writer<T> {
         self.report.say(Attention::Paused(cause));
     }
 
-    /// What an errno does (module docs).
+    /// What an errno does.
     fn failed(&mut self, error: &io::Error) {
         match error.raw_os_error() {
             Some(errno::ENOSPC | errno::EDQUOT) => {
@@ -1366,7 +1366,7 @@ impl<T: Targets> Writer<T> {
         }
     }
 
-    /// One pass (module docs).
+    /// One pass: the tracks' new lines ([`Self::batch`]), in one `write(2)` ([`Self::write`]).
     pub(crate) fn pass(&mut self) -> usize {
         match self.state {
             State::Stopped => return 0,

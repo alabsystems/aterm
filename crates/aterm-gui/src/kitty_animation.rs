@@ -1,25 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kitty animation playback, the host's half: the loop's clock for the frames
-//! the engine plays ([`aterm_core::terminal::Terminal::advance_kitty_animations`]
-//! shows every due frame and says when the next one is).
-//!
-//! One instant per session wakes the loop, so an animation costs a scheduled wake
-//! per frame, never a busy redraw, and an idle terminal never wakes for it. A
-//! session's clock is looked at when its program writes
-//! ([`App::tick_kitty_animations`] from the output wake) and when its frame comes
-//! due ([`App::service_kitty_animations`] on every wake, so a busy loop never
-//! re-arms a past instant). A session no window shows keeps its animation parked,
-//! with no wake, until a wake finds it shown again.
+//! Event-loop clock scheduling for Kitty animation playback.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::App;
 
-/// How long a due frame waits when its terminal is mid-batch: the reader holds
-/// the lock for one chunk, and its output wake looks at the clock again.
 const LOCK_RETRY: Duration = Duration::from_millis(4);
 
 /// Each session's next Kitty animation frame: `Some(at)` due at `at`, `None`
@@ -36,8 +24,6 @@ impl KittyAnimationClocks {
         self.next.values().flatten().min().copied()
     }
 
-    /// The sessions to look at `now`: a frame due, or parked (to see whether
-    /// a window shows them again).
     fn due(&self, now: Instant) -> Vec<u64> {
         let mut due: Vec<u64> = self
             .next
@@ -67,8 +53,6 @@ impl App {
         if !shown && self.kitty_animations.next.get(&session) == Some(&None) {
             return;
         }
-        // A shown frame is the session's styled frame too: the hold that
-        // steps it rings the session's screen readers as it ends (`TermGuard`).
         let Some(mut term) = crate::term_try_lock(&term) else {
             if let Some(Some(at)) = self.kitty_animations.next.get_mut(&session) {
                 *at = (*at).max(now + LOCK_RETRY);
@@ -117,7 +101,6 @@ impl App {
 mod tests {
     use super::*;
 
-    /// One Kitty graphics command.
     fn apc(control: &str, payload: &[u8]) -> Vec<u8> {
         let mut seq = format!("\x1b_G{control}").into_bytes();
         if !payload.is_empty() {
@@ -132,14 +115,6 @@ mod tests {
         seq
     }
 
-    /// The host plays the engine's animation on the loop's clock: an idle
-    /// terminal arms nothing; a running animation on screen arms exactly its
-    /// next frame, and serving that wake shows the frame and arms the one
-    /// after; a stopped one disarms. Before 2026-09-29 nothing played frames
-    /// on a clock at all. A shown frame also rings the session's screen
-    /// readers (the hold that steps it moves its frame), so a content
-    /// subscription pushes it on that ring; a look that shows no frame rings
-    /// nobody.
     #[test]
     fn a_playing_animation_arms_one_wake_per_frame_and_an_idle_one_none() {
         let mut app = App::headless_for_test();
@@ -206,8 +181,6 @@ mod tests {
         assert_eq!(app.kitty_animation_deadline(), None, "stopped: no wake");
     }
 
-    /// An animation in a tab no window shows is parked (no wake, frame held) and
-    /// plays on at the first look after the tab is shown.
     #[test]
     fn an_animation_in_a_hidden_tab_waits_until_the_tab_shows() {
         let mut app = App::headless_for_test();
@@ -251,8 +224,6 @@ mod tests {
         assert_eq!(app.kitty_animation_deadline(), Some(ms(140)));
     }
 
-    /// The loop wakes for the soonest frame only, parked sessions arm nothing,
-    /// and a parked session is always looked at (to be resumed once shown).
     #[test]
     fn the_clock_wakes_for_the_soonest_frame_and_never_for_a_parked_one() {
         let t0 = Instant::now();

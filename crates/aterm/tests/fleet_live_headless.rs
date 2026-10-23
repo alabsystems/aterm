@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FLEET LISTENER through the one `aterm` binary against a real `aterm --headless` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5).
+//! End-to-end fleet listener and remote drive tests against `aterm --headless`.
 
 #![cfg(unix)]
 
@@ -21,31 +21,22 @@ use aterm_net::fleet_member::{
 
 use crate::headless_boot::{self, Instance, POLL_GAP, boot_session, ctl, ctl_ok, field, status};
 
-/// A wait for something that MUST happen (AGENTS.md: a hang detector).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// The stand-in `claude` a worker spawned over the drive runs: `--version`
-/// answers at once (`headless_boot::standin` runs every fake once so), and
-/// any other call exits 0, so its pane's shell draws its next prompt.
 const STANDIN_CLAUDE: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
     exit 0\n";
 
-/// This test's fleet secret: 160 bits, what a join code carries.
 const SECRET: [u8; 20] = [0x5a; 20];
 
-/// The secret it is rotated to.
 const ROTATED: [u8; 20] = [0xa5; 20];
 
-/// A port of the loopback this test holds until it lets go.
 fn hold_a_port() -> (TcpListener, u16) {
     let holder = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
     let port = holder.local_addr().expect("its address").port();
     (holder, port)
 }
 
-/// `state/fleet.key` as `aterm fleet init` writes it: `secret`'s lowercase
-/// hex and a newline, 0600, in the 0700 state root.
 fn write_key(state: &Path, secret: &[u8]) {
     use std::os::unix::fs::PermissionsExt as _;
     let key = state.join(KEY_FILE);
@@ -59,13 +50,8 @@ fn fleet_table(port: u16, allow: &str) -> String {
     format!("[fleet]\nlisten = \"127.0.0.1:{port}\"\nallow = \"{allow}\"\n")
 }
 
-/// How often this instance's listener tries a held port or an unusable key
-/// again, and reads its served key again: the product's `RETRY` (2 s) through
-/// its development seam.
 const RETRY_MS: &str = "100";
 
-/// A refused boot ends the test COULD NOT RUN, never a pass that checked
-/// nothing (`headless_boot::boot_with`).
 fn boot(port: u16) -> Instance {
     headless_boot::boot_with(
         "aflt",
@@ -84,7 +70,6 @@ fn boot(port: u16) -> Instance {
     )
 }
 
-/// Poll the boot session's `status` until its `fleet=` reads `want`.
 fn fleet_reads(inst: &Instance, sid: &str, want: &str) {
     let mut last = String::new();
     let seen = aterm_spec::wait::within(HANG, POLL_GAP, || {
@@ -97,7 +82,6 @@ fn fleet_reads(inst: &Instance, sid: &str, want: &str) {
     );
 }
 
-/// Send `line` and read the one reply line (its newline dropped).
 fn ask<S: Read + Write>(stream: &mut S, line: &str) -> String {
     stream
         .write_all(format!("{line}\n").as_bytes())
@@ -120,7 +104,6 @@ fn read_line<S: Read>(stream: &mut S) -> String {
     String::from_utf8(line).expect("a utf-8 reply")
 }
 
-/// Send `line` and read its Lines reply: the `OK <n>` head's `n` lines.
 fn ask_lines<S: Read + Write>(stream: &mut S, line: &str) -> Vec<String> {
     let head = ask(stream, line);
     let n: usize = head
@@ -130,8 +113,6 @@ fn ask_lines<S: Read + Write>(stream: &mut S, line: &str) -> Vec<String> {
     (0..n).map(|_| read_line(stream)).collect()
 }
 
-/// Whether the peer has closed: the next read ends (EOF, or the TLS end of a
-/// shut socket), never by the hang detector's timeout.
 fn closed<S: Read>(stream: &mut S) -> bool {
     let mut rest = Vec::new();
     match stream.read_to_end(&mut rest) {
@@ -328,8 +309,6 @@ fn a_fleet_peer_reads_version_and_is_refused_everything_else() {
     fleet_reads(&inst, &sid, "retrying");
 }
 
-/// A scratch world of its own (HOME, config, state), removed on drop: a fleet
-/// member with no aterm running.
 struct World(PathBuf);
 
 impl Drop for World {
@@ -338,9 +317,6 @@ impl Drop for World {
     }
 }
 
-/// `aterm fleet <args>` in the scratch world `root` — its HOME and config,
-/// `root/state` the state directory — with `stdin` piped in (or none); its
-/// output once it exits, within the hang detector.
 fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
@@ -368,16 +344,10 @@ fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         .unwrap_or_else(|| panic!("aterm fleet {args:?} did not exit"))
 }
 
-/// `aterm ctl <args>` in the scratch world `root`, as [`fleet`] runs `aterm
-/// fleet`: its output once it exits, within the hang detector.
 fn ctl_in(root: &Path, args: &[&str]) -> Output {
     ctl_fed(root, args, None)
 }
 
-/// [`ctl_in`] with `stdin` its standard input (`None`: nothing). Asked again, a
-/// fresh client each time, while the instance has not yet accepted it or answers
-/// it busy ([`headless_boot::until_served`]): the client's own 10 s accept budget
-/// is a person's, and a loaded machine can miss it.
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     headless_boot::until_served(|| {
         let aterm = crate::launch_isolation::aterm_executable();
@@ -403,7 +373,6 @@ fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     })
 }
 
-/// [`fleet`] that must succeed: its stdout.
 fn fleet_ok(root: &Path, args: &[&str], stdin: Option<&str>) -> String {
     let out = fleet(root, args, stdin);
     assert!(
@@ -812,23 +781,18 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     );
 }
 
-/// `aterm ctl --host <args>` in the scratch world `root`: [`ctl_in`] with
-/// `--host` before the request — the step-in, which dials the fleet and no
-/// control socket.
 fn drive_in(root: &Path, host: &str, args: &[&str]) -> Output {
     let mut all = vec!["--host", host];
     all.extend_from_slice(args);
     ctl_in(root, &all)
 }
 
-/// [`drive_in`] with `stdin` its standard input: a spawn's task.
 fn drive_fed(root: &Path, host: &str, args: &[&str], stdin: &[u8]) -> Output {
     let mut all = vec!["--host", host];
     all.extend_from_slice(args);
     ctl_fed(root, &all, Some(stdin))
 }
 
-/// [`drive_in`] that must succeed: its stdout and stderr.
 fn drive_ok(root: &Path, host: &str, args: &[&str]) -> (String, String) {
     let out = drive_in(root, host, args);
     assert!(
@@ -841,7 +805,6 @@ fn drive_ok(root: &Path, host: &str, args: &[&str]) -> (String, String) {
     )
 }
 
-/// [`drive_in`] that must be refused (exit 1): its stderr.
 fn drive_refused(root: &Path, host: &str, args: &[&str]) -> String {
     let out = drive_in(root, host, args);
     assert_eq!(
@@ -852,9 +815,6 @@ fn drive_refused(root: &Path, host: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// THE STEP-IN between two real aterms (§5.1): an issuer, and a member whose
-/// person lets the issuer drive it (`aterm fleet allow drive --from <the
-/// issuer's node>`) and nobody else, its boot session a worker.
 #[test]
 fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let (holder, port) = hold_a_port();

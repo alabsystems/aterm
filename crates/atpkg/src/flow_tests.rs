@@ -179,8 +179,8 @@ fn fixture_with(dir: &Path, kind: &str, ay_content: &[u8], ay_mode: &[u8; 8]) ->
 }
 
 /// The `tree_root` a producer signs for `archive`: a throwaway stage into `probe` through
-/// the extractor's own fold, which on Windows folds the declared modes (`crate::tree`'s
-/// module docs) where the plain on-disk walk folds `0`.
+/// the extractor's own fold, which on Windows folds the declared modes
+/// (`crate::tree::DeclaredModes`) where the plain on-disk walk folds `0`.
 fn signed_root_of(archive: &Path, probe: &Path) -> String {
     let _ = std::fs::remove_dir_all(probe);
     crate::extract::extract_tar_zst_tree(
@@ -832,7 +832,8 @@ fn probe_an_install_under_an_open_umask() {
     let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
         return;
     };
-    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
+    // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+    // process runs this one test (`--exact`), so no other create sees the mask.
     unsafe { libc::umask(0) };
     let dir = PathBuf::from(dir);
     let fake = fixture(&dir);

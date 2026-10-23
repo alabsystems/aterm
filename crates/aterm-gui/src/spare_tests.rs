@@ -2549,7 +2549,7 @@ impl TerminalSession {
 
     fn end_leader(&mut self) {
         if let Some(leader) = self.leader.take() {
-            // SAFETY: this process's own unreaped child.
+            // SAFETY: this process's own unreaped child, so the pid is still it.
             unsafe { libc::kill(leader, libc::SIGKILL) };
             let mut status = 0;
             // SAFETY: reaps `leader`.

@@ -8,7 +8,7 @@
 //! `kproc::SDK_ROWS`, `identity::SDK_ROWS` and `aterm_uds::holders::SDK_ROWS`
 //! (a flavor, a flag, a struct's size, a field's offset) becomes one
 //! `_Static_assert` that clang compiles against `sys/proc_info.h`,
-//! `sys/sysctl.h`, `sys/event.h`, `vis.h`, `xlocale.h` and
+//! `sys/sysctl.h`, `sys/event.h`, `mach/machine.h`, `vis.h`, `xlocale.h` and
 //! `Kernel/kern/cs_blobs.h` for `arm64` and `x86_64`, through aterm-objc's
 //! shared probe
 //! (`crates/aterm-objc/tests/support/sdk_consts.rs`, mounted here). The
@@ -49,6 +49,7 @@ const HEADERS: &str = "#include <stddef.h>\n\
                        #include <sys/sysctl.h>\n\
                        #include <sys/proc.h>\n\
                        #include <sys/proc_info.h>\n\
+                       #include <mach/machine.h>\n\
                        #include <libproc.h>\n\
                        #include <vis.h>\n\
                        #include <xlocale.h>\n\

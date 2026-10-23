@@ -2,32 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Window-operations capability: a structural gate on XTWINOPS dispatch.
-//!
-//! XTWINOPS (`CSI t`) hands attacker-chosen window operations to a host callback
-//! ([`super::handler::TerminalHandler::invoke_window_callback`]) that takes a
-//! `&WindowOpsCapability`, so a handler that skips the policy check has no token to pass
-//! and does not compile. The only constructor is
-//! [`WindowMintAuthority::try_mint_with_engine`], which the parser's `ActionSink` path
-//! cannot reach. The title-stack sub-operations (22/23) do not invoke the callback and
-//! always run.
-//!
-//! Two consumers mint: the XTWINOPS dispatch (`handler_window.rs`) and the XTSMGRAPHICS
-//! sixel-geometry read (`Pi=2, Pa=1`, `handler_xtsmgraphics.rs`), which reports the same
-//! pixel size as `CSI 14 t` and rides the `Ps = 14` gate. XTWINOPS reports usually also
-//! need a `response_capability` token.
+//! Structural capability gate on XTWINOPS (`CSI t`) host callback dispatch.
 
-/// Zero-sized proof that the calling context may invoke the window callback for an
-/// XTWINOPS dispatch. Passed by reference, so several callback calls in one dispatch
-/// share one token.
+/// Proof that the caller may invoke the window callback for an XTWINOPS dispatch.
 #[derive(Debug)]
 pub(super) struct WindowOpsCapability {
     /// Private seal: no construction outside this module.
     _seal: super::Seal,
 }
 
-/// Zero-sized minting authority for [`WindowOpsCapability`]: holds no policy, and
-/// [`Self::try_mint_with_engine`] is the one place a capability comes into existence.
+/// Minting authority for [`WindowOpsCapability`].
 #[derive(Debug, Default)]
 pub(super) struct WindowMintAuthority {
     _seal: (),
@@ -41,18 +25,8 @@ impl WindowMintAuthority {
         Self { _seal: () }
     }
 
-    /// Mint a [`WindowOpsCapability`] from the resolved policy gate:
-    ///
-    /// * a sequence-specific rule with response `Execute` mints;
-    /// * a rule with any other response refuses, whatever `allow_window_ops` says;
-    /// * only a universal wildcard `Execute` rule (`response any`), no matching rule, or
-    ///   no policy ([`super::policy_bridge::BridgeDecision::Fallback`]) falls back to
-    ///   `allow_window_ops`, so broad profiles cannot reopen this deny-by-default sink.
-    ///
-    /// The caller passes a decision, not an engine: the probe ([`probe_xtwinops`]) varies
-    /// only in `ps` and the origin is always `OriginTag::Pty`, so
-    /// [`super::policy_gates::PolicyState::xtwinops_gate`] resolves every `ps` once per
-    /// installed policy and no dispatch allocates or walks rule buckets.
+    /// Mint a [`WindowOpsCapability`] when the policy gate allows, or on fallback when
+    /// `allow_window_ops` does.
     #[inline]
     #[must_use]
     pub(super) const fn try_mint_with_engine(
@@ -69,9 +43,7 @@ impl WindowMintAuthority {
     }
 }
 
-/// The XTWINOPS (`CSI Ps t`) policy probe, shared by the compiled gate table in
-/// [`super::policy_gates`] and its out-of-range live fallback so the two cannot disagree
-/// about which rule bucket a `Ps` lands in.
+/// Build the XTWINOPS (`CSI Ps t`) policy selector probe.
 #[must_use]
 #[inline]
 pub(super) fn probe_xtwinops(ps: u16) -> aterm_policy::selector::DispatchedSequence {
@@ -94,14 +66,12 @@ mod tests {
         )
     }
 
-    /// With no policy rule, `allow_window_ops = false` mints nothing.
     #[test]
     fn disallowed_policy_mints_no_capability() {
         let auth = WindowMintAuthority::new();
         assert!(auth.try_mint_with_engine(Fallback, false).is_none());
     }
 
-    /// With no policy rule, `allow_window_ops = true` mints.
     #[test]
     fn allowed_policy_mints_capability() {
         let auth = WindowMintAuthority::new();

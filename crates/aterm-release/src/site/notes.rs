@@ -234,7 +234,8 @@ fn render_list(items: &[(usize, bool, String)]) -> String {
     out
 }
 
-/// The Markdown subset (module docs) → HTML blocks, one per line.
+/// A Markdown subset → HTML blocks, one per line: headings, paragraphs, lists, fenced code,
+/// block quotes and rules; inline `code`, **bold** and links; everything else escaped text.
 #[must_use]
 pub fn render_markdown(md: &str) -> String {
     let md = md.replace("\r\n", "\n").replace('\r', "\n");

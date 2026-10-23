@@ -2,22 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The leading law, over a dense metrics lattice: for every (ascent, descent, lineGap,
-//! line_height) [`aterm_render::cell_h_baseline`] satisfies
-//!
-//! 1. `cell_h == round((ascent − descent + lineGap) · line_height)` (min 1); and
-//! 2. half-leading split: the total leading `cell_h − (ascent − descent)` lands half above
-//!    and half below the glyph within 1px, i.e. `|space_above − space_below| <= 1` with
-//!    `space_above = baseline − ascent`.
-//!
-//! A rounding law over f32 is outside ty's `Expr` language, so this lattice is its machine
-//! check; the last test pins the real renderer's geometry to the same function.
+//! Half-leading split law for [`aterm_render::cell_h_baseline`] over a dense metrics lattice
+//! and on the live [`Renderer`].
 
 use aterm_render::{Renderer, Theme, cell_h_baseline};
 
-/// Odd/even and fractional lattice: monospace verticals at UI px sizes, descents (negative,
-/// the fontdue convention), line gaps from zero up, and the config `line_height` domain
-/// (0.8..=2.0) plus the renderer's wider clamp bound.
 const ASCENTS: [f32; 7] = [4.0, 7.3, 9.6, 12.0, 15.5, 20.0, 24.8];
 const DESCENTS: [f32; 5] = [-1.0, -2.4, -3.0, -5.7, -8.0];
 const GAPS: [f32; 6] = [0.0, 0.5, 1.0, 2.3, 4.0, 7.9];
@@ -46,13 +35,9 @@ fn half_leading_splits_within_one_px() {
             }
         }
     }
-    // Non-vacuity: nonzero gaps and non-1 scales move the baseline off `round(ascent)`.
     assert!(split_moved_baseline > 100, "got {split_moved_baseline}");
 }
 
-/// The real renderer's `cell_size`/`baseline` follow `cell_h_baseline` at the default
-/// line height, after `set_line_height`, and after `set_adjust_baseline` (which shifts the
-/// baseline only, never the cell box).
 #[test]
 fn renderer_geometry_follows_the_law_live() {
     let bytes = std::fs::read(concat!(
@@ -65,15 +50,12 @@ fn renderer_geometry_follows_the_law_live() {
     let (_, h0) = r.cell_size();
     let b0 = r.baseline();
 
-    // set_line_height re-derives through the same law.
     r.set_line_height(1.5);
     let (_, h1) = r.cell_size();
     let b1 = r.baseline();
     assert!(h1 > h0, "1.5 line-height grows the cell box");
-    // At scale 1.0 cell_h = round(natural), so h0 stands in for the natural line.
     let natural = h0 as f32; // round(natural*1.0)
     assert_eq!(h1, (natural * 1.5).round() as usize, "law at scale 1.5");
-    // The added leading splits: baseline moved down by ~half the delta.
     let delta = h1 as f32 - natural;
     #[allow(clippy::cast_precision_loss, reason = "baseline deltas are tiny")]
     let moved = (b1 - b0) as f32;
@@ -82,7 +64,6 @@ fn renderer_geometry_follows_the_law_live() {
         "baseline moved by ~half the added leading (moved {moved}, delta {delta})"
     );
 
-    // adjust_baseline: a pure baseline shift, clamped; 0 restores the derivation.
     r.set_adjust_baseline(3);
     assert_eq!(r.baseline(), b1 + 3, "escape hatch shifts the baseline");
     assert_eq!(r.cell_size().1, h1, "cell box is untouched");

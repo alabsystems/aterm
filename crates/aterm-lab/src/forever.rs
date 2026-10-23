@@ -582,8 +582,7 @@ pub enum Mode {
     WallUnread,
     /// W7, the per-day dialog answered Stop (`wall-day-stop`): Gemini CLI's
     /// usage-limit dialog that names no reset, answered `2. Stop` as a person
-    /// would, kept trying on its ladder while NEEDS YOU stands (X1 of the
-    /// walls-3 stage).
+    /// would, kept trying on its ladder while NEEDS YOU stands.
     WallDayStop,
     /// W8, a usage wall under Cruise (`wall-cruise`).
     WallCruise,
@@ -781,13 +780,13 @@ pub enum Chain {
     /// W4: the resume typed past the reset meets the wall again, under a new
     /// reset.
     RedrawWall,
-    /// W5 (L1): another agent started in the tab under the first one's
+    /// W5: another agent started in the tab under the first one's
     /// remembered limit ([`switch_step`]).
     SwitchWall,
-    /// W6 (L2): Claude Code's limit held unread past its reset by
+    /// W6: Claude Code's limit held unread past its reset by
     /// `FUTILE_AFTER`, told, then read again ([`unread_step`]).
     UnreadWall,
-    /// W7 (X1): Gemini CLI's per-day dialog answered `Stop`, kept trying
+    /// W7: Gemini CLI's per-day dialog answered `Stop`, kept trying
     /// while a person is told.
     DayStopWall,
     /// W8: a usage wall met by Cruise's act.
@@ -834,11 +833,11 @@ pub enum Scenario {
     W3,
     /// The redraw after a typed resume (`--mode wall-redraw`).
     W4,
-    /// L1, the cross-program end (`--mode wall-switch`).
+    /// The cross-program end (`--mode wall-switch`).
     W5,
-    /// L2, the unread limit told past `FUTILE_AFTER` (`--mode wall-unread`).
+    /// The unread limit told past `FUTILE_AFTER` (`--mode wall-unread`).
     W6,
-    /// X1, the per-day dialog answered Stop (`--mode wall-day-stop`).
+    /// The per-day dialog answered Stop (`--mode wall-day-stop`).
     W7,
     /// A usage wall under Cruise (`--mode wall-cruise`).
     W8,
@@ -5461,8 +5460,7 @@ fn choose_option(
 /// ([`switch_step`]): one whose limits the loop reads and decides on too
 /// (`turn_end.rs`'s `met_under_another`), on another account: Muse Code
 /// after Claude Code, Gemini CLI or agy, Claude Code after Muse Code — the
-/// pairs of the remembered-limit stage's L1 (measured 2026-10-21: each held
-/// the other).
+/// pairs measured on 2026-10-21, where each held the other.
 #[must_use]
 pub fn switch_to(h: Harness) -> Harness {
     match h {
@@ -5475,7 +5473,7 @@ pub fn switch_to(h: Harness) -> Harness {
 /// takes ctrl+c twice (measured: its `exit-confirm` capture); Claude Code
 /// too (`footers.rs`'s quit), but its usage limit's countdown takes the first
 /// ctrl+c for its cancel, so the countdown is cancelled first where it stands
-/// armed ([`CLAUDE_CANCEL`]; measured on 2.1.308, `y4sx-claude`: ctrl+c twice
+/// armed ([`CLAUDE_CANCEL`]; measured on 2.1.308: ctrl+c twice
 /// at the armed countdown drew `Automatic continue cancelled` and left Claude
 /// Code in the tab); agy `/quit` (its relaunch lane's); Gemini CLI's
 /// usage-limit dialog takes the keys first, so it is answered `2. Stop`

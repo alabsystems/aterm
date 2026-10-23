@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `NativeUpdateCarriedHealth` (aterm-spec's `native_update_carried_health_model`):
-//! a check warning and a stall warning a parent raised cross a self-update into a real
-//! successor `App`.
-//!
-//! Every transition of the committed model (`Buggy = 0`) is replayed against the shipping seed
-//! ([`App::seed_carried_messages`]), the one door ([`App::note_update_health`]) and the
-//! watchdog's look ([`App::look_at_update_checker`]); after each step the successor is
-//! projected onto the model's variables ([`project`]). The updater stands in as one flag,
-//! `owes`, set from what the seed handed it (`UPDATER_ADOPTED_HEALTH`); its own transitions are
-//! aterm-update's `persistent_notice_tests`. The ledger and this process's completed checks are
-//! the environment.
-//!
-//! Negative control: each `Buggy = 1` mutant's counterexample, replayed on the real successor,
-//! breaks the invariant the model says it breaks, while the shipping step at the same point
-//! keeps it.
+//! Conformance tests for `NativeUpdateCarriedHealth` across a self-update.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
@@ -30,14 +16,10 @@ use super::{HealthProof, UPDATER_ADOPTED_HEALTH};
 use crate::App;
 use crate::update_words::{self, HealthKind};
 
-/// The model's variables read from the successor. `phase` and `ledger` are
-/// the driver's position and the environment, carried from the model state.
 const PROJECTED: [&str; 7] = ["owed", "up", "entry", "checked", "armed", "stall", "sentry"];
 
-/// The actions a step window drives, each an anchored shipping call.
 const ANCHORED: [&str; 4] = ["Seed", "Recover", "Announce", "StallHeals"];
 
-/// The `Buggy = 1` actions, dead in the committed model.
 const MUTANTS: [&str; 5] = [
     "SeedRemembersOnly",
     "SeedStallRemembersOnly",
@@ -49,7 +31,6 @@ const MUTANTS: [&str; 5] = [
 const BODY: &str = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
 const LATER: &str = "3 failed checks in a row since 2026-09-29T15:00:00Z: another reason.";
 
-/// A parent's carry and the successor it seeds.
 struct Rig {
     carry: crate::session_store::WindowCarry,
     successor: App,
@@ -69,7 +50,6 @@ impl Rig {
         }
     }
 
-    /// This process's checker as the watchdog reads it.
     fn beat(&self) -> aterm_update::checker_watch::CheckerBeat {
         aterm_update::checker_watch::CheckerBeat {
             generation: 1,
@@ -84,7 +64,6 @@ impl Rig {
         }
     }
 
-    /// After the seed: Commit and the landing, as the successor meets them.
     fn land(&mut self) {
         self.successor.messages.after_handoff_commit(Instant::now());
         self.successor.post_update_landed("9.9.9", 7, 0);
@@ -94,7 +73,6 @@ impl Rig {
     }
 }
 
-/// The carry of a parent that said a check warning under `title` and a stall.
 fn parent_carry(title: &str) -> crate::session_store::WindowCarry {
     let mut parent = App::headless_for_test();
     assert!(parent.note_update_health(title, BODY));
@@ -107,7 +85,6 @@ fn parent_carry(title: &str) -> crate::session_store::WindowCarry {
     window_carry(parent.message_band_rows, parent.carried_messages())
 }
 
-/// `model_state` with every [`PROJECTED`] variable read from the successor.
 fn project(rig: &Rig, model_state: &State) -> State {
     let app = &rig.successor;
     let mut state = model_state.clone();
@@ -125,8 +102,6 @@ fn project(rig: &Rig, model_state: &State) -> State {
     state
 }
 
-/// Drive `action` on the rig: the anchored calls inside their own window, the
-/// environment's outside any.
 fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
     match action {
         "Seed" => {
@@ -165,9 +140,6 @@ fn drive(rig: &mut Rig, action: &'static str, ev: &mut StepEvidence) {
     }
 }
 
-/// Replay `schedule` on a fresh rig, checking the projection after every step.
-/// `stand_in` realizes a `Buggy = 1` mutant's step; every other action is
-/// [`drive`]n.
 fn replay(
     model: &Model,
     schedule: &[&'static str],
@@ -197,8 +169,6 @@ fn replay(
     (rig, real)
 }
 
-/// One schedule per reachable transition of `model`: the shortest path to its
-/// source state, then the transition.
 fn transitions(model: &Model) -> Vec<Vec<&'static str>> {
     let mut path: BTreeMap<State, Vec<&'static str>> = BTreeMap::new();
     let mut queue = VecDeque::new();
@@ -263,8 +233,6 @@ fn the_shipping_seed_door_and_watchdog_conform_to_the_model() {
     assert!(audit.stray.is_empty(), "{audit:?}");
 }
 
-/// The stand-ins for the `Buggy = 1` mutants, on the real successor. `true`
-/// when the action was realized here.
 fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
     let seed = |rig: &mut Rig| {
         UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow_mut().clear());
@@ -273,34 +241,28 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
         rig.land();
     };
     match action {
-        // Keep the warning without handing its class to the updater: what the shipping seed
-        // does with a check warning whose title names no ledger class (the strand notice).
         "SeedRemembersOnly" => {
             rig.carry = parent_carry(aterm_update::STRANDED_TITLE);
             seed(rig);
             true
         }
-        // Keep the stall without arming the watchdog's heal.
         "SeedStallRemembersOnly" => {
             seed(rig);
             rig.successor.update_checker_watch = Default::default();
             true
         }
-        // The parent's pending claim of the check's line dies with it.
         "SeedForgetsEntry" => {
             seed(rig);
             rig.successor
                 .except_clear(&update_words::update_health_entry(HealthKind::Check, "").key());
             true
         }
-        // The ledger's healing read as `Checked`, which answers the stall.
         "RecoverHealsStall" => {
             rig.successor
                 .heal_update_health(HealthProof::healed_by_ledger("manifest"));
             rig.owes = false;
             true
         }
-        // The stall's heal with its digest claim left ripening: latch, rows and record only.
         "StallHealKeepsEntry" => {
             let stalled = HealthKind::Stalled;
             let app = &mut rig.successor;
@@ -316,8 +278,6 @@ fn mutant_stand_in(rig: &mut Rig, action: &str) -> bool {
     }
 }
 
-/// Each mutant breaks its invariant on the real successor; the shipping step at the same point
-/// keeps it.
 #[test]
 fn negative_control_each_mutant_breaks_its_invariant_on_the_real_successor() {
     let buggy = interp::with_buggy(&native_update_carried_health_model(), 1);

@@ -5,9 +5,6 @@
 
 use super::*;
 
-/// Phaser: the band spans the last three letters as one continuous bar at a
-/// typing rhythm and never parks: a key typed after a thinking pause is a new
-/// burst with a short base life.
 #[test]
 fn phaser_band_spans_three_letters_and_never_parks() {
     let g = geom();
@@ -16,14 +13,12 @@ fn phaser_band_spans_three_letters_and_never_parks() {
     let mut glow = CursorGlow::default();
     let t0 = Instant::now();
     let mut t = t0;
-    // A steady 50 ms rhythm across row 2.
     glow.tick(Some((2, 0)), t, &c, g, &mut out);
     for i in 1..=12u16 {
         t += Duration::from_millis(50);
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, i)), t, &c, g, &mut out);
     }
-    // The three letters behind the head are all still alive (continuous bar).
     for col in 9..=11u16 {
         assert!(
             glow.sparks.iter().any(|s| {
@@ -34,12 +29,9 @@ fn phaser_band_spans_three_letters_and_never_parks() {
             "cell {col} inside the three-letter band is lit"
         );
     }
-    // A 2 s thinking pause, then one key: it must take the short base life
-    // (well under a second), never a pause-scaled chained one.
     t += Duration::from_secs(2);
     glow.note_synthetic_typed(t, 1);
     glow.tick(Some((2, 13)), t, &c, g, &mut out);
-    // The typing spark lays at the just-typed origin cell, col 12.
     let head = glow
         .sparks
         .iter()
@@ -53,10 +45,6 @@ fn phaser_band_spans_three_letters_and_never_parks() {
     );
 }
 
-/// Echo-run reach: the coalesced-echo law extends to the shared typed-bridge
-/// reach (8 cells, `HIDE_BRIDGE_TYPED_MAX_DIST`). A 4-8 cell typed advance in
-/// one frame (key-repeat across a frame slip, SSH echo batching) must not fall
-/// to `re_anchor`, which lays only the landing cell.
 #[test]
 fn wide_coalesced_echo_still_sweeps_every_cell() {
     let g = geom();
@@ -67,7 +55,6 @@ fn wide_coalesced_echo_still_sweeps_every_cell() {
     glow.tick(Some((2, 4)), t0, &c, g, &mut out);
     glow.note_synthetic_typed(t0 + Duration::from_millis(6), 1);
     glow.tick(Some((2, 5)), t0 + Duration::from_millis(8), &c, g, &mut out);
-    // Six keys echo in one observed move (a frame slip under load).
     glow.note_synthetic_typed(t0 + Duration::from_millis(14), 6);
     glow.tick(
         Some((2, 11)),
@@ -91,9 +78,6 @@ fn wide_coalesced_echo_still_sweeps_every_cell() {
     );
 }
 
-/// Wrap-run law: a coalesced wrap echo mid-burst (last columns → the next
-/// row's first columns) lays typing sparks on the pre-wrap tail and the landed
-/// post-wrap cells, and fires no landing ring.
 #[test]
 fn wrap_echo_continues_the_band_across_the_fold() {
     let g = geom(); // cols: 40
@@ -110,7 +94,6 @@ fn wrap_echo_continues_the_band_across_the_fold() {
         g,
         &mut out,
     );
-    // The coalesced fold echo: (2,37) → (3,2) in one observed move.
     glow.note_synthetic_typed(t0 + Duration::from_millis(14), 5);
     glow.tick(
         Some((3, 2)),
@@ -132,8 +115,6 @@ fn wrap_echo_continues_the_band_across_the_fold() {
         glow.fire_meteors.is_empty(),
         "a typing wrap flies no meteor for any style"
     );
-    // The pre-wrap tail is not snuffed: its sparks keep their chained
-    // lives (the phaser wrap-follow exemption).
     let tail = glow
         .sparks
         .iter()
@@ -148,9 +129,6 @@ fn wrap_echo_continues_the_band_across_the_fold() {
     );
 }
 
-/// Vertical-nav law: Up/Down timestamps are classifier signals, not causal
-/// evidence, so repeated one-row child relocations stay dark in every
-/// direction and build no heat or wake.
 #[test]
 fn vertical_navigation_timestamps_stay_dark() {
     let g = geom();
@@ -160,7 +138,6 @@ fn vertical_navigation_timestamps_stay_dark() {
     let mut glow = CursorGlow::default();
     glow.tick(Some((2, 10)), t0, &c, g, &mut out);
     let mut t = t0;
-    // A held Down arrow at key-repeat cadence, each press hinted.
     for row in 3..=5u16 {
         t += Duration::from_millis(35);
         glow.note_navigation(t);
@@ -177,9 +154,6 @@ fn vertical_navigation_timestamps_stay_dark() {
     assert!(glow.flare < 0.05, "nav scrubbing never slams the flare");
 }
 
-/// Fade as one: the first key of a burst takes the long lone-key base life,
-/// but once the burst follows, the origin cell is retro-clamped to the chained
-/// cadence and cannot outlive the band.
 #[test]
 fn phaser_burst_origin_cannot_outlive_the_band() {
     let g = geom();
@@ -188,13 +162,11 @@ fn phaser_burst_origin_cannot_outlive_the_band() {
     let mut out = Vec::new();
     let mut glow = CursorGlow::default();
     glow.tick(Some((2, 0)), t0, &c, g, &mut out);
-    // First key after an idle window: the lone-key base life (~0.4-0.75s).
     let mut t = t0 + Duration::from_millis(5);
     glow.note_synthetic_typed(t, 1);
     glow.tick(Some((2, 1)), t, &c, g, &mut out);
     let first_life = glow.sparks.iter().find(|s| s.col == 0).unwrap().life;
     assert!(first_life >= 0.40, "a lone first key keeps the base life");
-    // A fast burst follows: 8 ms cadence.
     for col in 2..=8u16 {
         t += Duration::from_millis(8);
         glow.note_synthetic_typed(t, 1);
@@ -214,10 +186,6 @@ fn phaser_burst_origin_cannot_outlive_the_band() {
     );
 }
 
-/// Light-theme law (beam family): additive light cannot brighten a white
-/// ground, so on `dark_theme: false` the band renders as source-over ink
-/// under the letters with no additive quads or halos; dark themes are
-/// untouched.
 #[test]
 fn light_theme_band_is_ink_not_additive() {
     let g = geom();

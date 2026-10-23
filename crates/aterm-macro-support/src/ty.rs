@@ -1,32 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A reading of a type, for analysis only.
-//!
-//! A derive emits a field's type as the tokens it was written as; this tree is
-//! what the derive reads to decide things about it: which type parameters it
-//! mentions (to bound them), which lifetimes it could borrow, whether it is a
-//! slice. The grammar is the Reference's Types chapter. Whatever does not fit
-//! reads as [`Ty::Other`], which mentions nothing, and the compiler, which
-//! sees the type as written, judges it.
+//! Type syntax tree for derive analysis (parameter bounds, lifetimes, slices), falling back to [`Ty::Other`].
 
 use proc_macro::{Delimiter, Ident, Spacing, TokenStream, TokenTree};
 
 use crate::cursor::{is_keyword, is_punct, split_commas, split_top};
 use crate::item::Lifetime;
 
-/// A type.
+/// Parsed Rust type for derive analysis.
 #[derive(Clone, Debug)]
 pub enum Ty {
     /// `a::B<C>`, `<T as Trait>::Assoc`.
     Path(TyPath),
     /// `&'a mut T`.
     Reference {
-        /// The lifetime, when written.
         lifetime: Option<Lifetime>,
-        /// Whether it is `&mut`.
         mutable: bool,
-        /// The referent.
         elem: Box<Ty>,
     },
     /// `*const T`, `*mut T`.
@@ -39,41 +29,39 @@ pub enum Ty {
     Tuple(Vec<Ty>),
     /// `(T)`.
     Paren(Box<Ty>),
-    /// A None-delimited group: a `$t:ty` fragment.
+    /// None-delimited group (`$t:ty` fragment).
     Group(Box<Ty>),
     /// `fn(A) -> B`.
     BareFn {
-        /// The parameter types.
         inputs: Vec<Ty>,
-        /// The return type, when written.
         output: Option<Box<Ty>>,
     },
     /// `dyn A + B`.
     TraitObject(Vec<Bound>),
     /// `impl A + B`.
     ImplTrait(Vec<Bound>),
-    /// `m!(...)`: the macro's input.
+    /// `m!(...)`.
     Macro(TokenStream),
     /// `!`.
     Never,
     /// `_`.
     Infer,
-    /// Anything else.
+    /// Unrecognized type syntax.
     Other,
 }
 
-/// A path type.
+/// Path type, optionally qualified (`<T as Trait>::Assoc`).
 #[derive(Clone, Debug)]
 pub struct TyPath {
     /// `T` in `<T as Trait>::Assoc` or `<T>::Assoc`.
     pub qself: Option<Box<Ty>>,
-    /// Whether the path starts with `::` (as `<T>::Assoc` does).
+    /// Whether the path starts with `::`.
     pub leading_colon: bool,
     /// The segments; for a qualified path, the trait's and then the rest.
     pub segments: Vec<Segment>,
 }
 
-/// A path segment.
+/// Path segment with optional generic arguments.
 #[derive(Clone, Debug)]
 pub struct Segment {
     /// Its name.
@@ -82,23 +70,21 @@ pub struct Segment {
     pub args: PathArgs,
 }
 
-/// A path segment's arguments.
+/// Generic arguments on a [`Segment`].
 #[derive(Clone, Debug)]
 pub enum PathArgs {
     /// None.
     None,
     /// `<A, B>`.
     Angle(Vec<GenericArg>),
-    /// `(A, B) -> C`, the `Fn` sugar.
+    /// `(A, B) -> C` (`Fn`-trait sugar).
     Paren {
-        /// The parameter types.
         inputs: Vec<Ty>,
-        /// The return type, when written.
         output: Option<Box<Ty>>,
     },
 }
 
-/// One argument in `<...>`.
+/// Generic argument inside `<...>`.
 #[derive(Clone, Debug)]
 pub enum GenericArg {
     /// `'a`.
@@ -107,11 +93,11 @@ pub enum GenericArg {
     Type(Ty),
     /// `Item = T`.
     AssocType(Ident, Ty),
-    /// A const argument or a constraint (`Item: Bound`).
+    /// Const argument or constraint (`Item: Bound`).
     Other,
 }
 
-/// A bound in `dyn` or `impl`.
+/// Trait or lifetime bound in `dyn` or `impl`.
 #[derive(Clone, Debug)]
 pub enum Bound {
     /// A trait: its path.
@@ -120,7 +106,7 @@ pub enum Bound {
     Other,
 }
 
-/// Reads `tokens` (one type, as written) as a [`Ty`].
+/// Parse `tokens` as a [`Ty`], returning [`Ty::Other`] if trailing tokens remain.
 #[inline]
 #[must_use]
 pub fn parse_type(tokens: &[TokenTree]) -> Ty {
@@ -196,7 +182,6 @@ impl<'a> Reader<'a> {
             TokenTree::Punct(p) => match p.as_char() {
                 '&' => {
                     self.i += 1;
-                    // `&&T` lexes as two `&`s: a reference to a reference.
                     if self.peek_punct('&') {
                         let inner = self.reference();
                         return Ty::Reference {
@@ -241,13 +226,11 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// `&` already taken by the caller for `&&`; reads `&rest`.
     fn reference(&mut self) -> Ty {
         self.i += 1;
         self.reference_rest()
     }
 
-    /// After a `&`: `'a`? `mut`? type.
     fn reference_rest(&mut self) -> Ty {
         let mut lifetime = None;
         if self.peek_punct('\'')
@@ -273,7 +256,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// A path type, or a macro when `!` follows the path.
     fn after_path(&mut self, path: TyPath) -> Ty {
         if self.peek_punct('!')
             && let Some(TokenTree::Group(g)) = self.toks.get(self.i + 1)
@@ -285,13 +267,11 @@ impl<'a> Reader<'a> {
         Ty::Path(path)
     }
 
-    /// A path, qualified or not.
     fn path(&mut self) -> Option<TyPath> {
         let mut qself = None;
         let mut leading_colon = false;
         let mut segments = Vec::new();
         if self.peek_punct('<') {
-            // `<T as Trait>::rest` or `<T>::rest`.
             let close = self.matching_angle(self.i)?;
             let inner = &self.toks[self.i + 1..close];
             let as_at = top_level_keyword(inner, "as");
@@ -358,7 +338,6 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// `-> T`, when it comes next.
     fn output(&mut self) -> Option<Box<Ty>> {
         if self.peek_arrow() {
             self.i += 2;
@@ -368,7 +347,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// `for<..>`? `unsafe`? `extern "abi"`? `fn(..) -> T`.
     fn bare_fn(&mut self) -> Ty {
         if self.peek_keyword("for") {
             self.i += 1;
@@ -398,7 +376,6 @@ impl<'a> Reader<'a> {
         let inputs = split_commas(inner)
             .iter()
             .map(|arg| {
-                // `name: T` or `_: T`; a bare `T` otherwise.
                 let named = matches!(arg.first(), Some(TokenTree::Ident(_)))
                     && matches!(arg.get(1), Some(TokenTree::Punct(p)) if p.as_char() == ':' && p.spacing() == Spacing::Alone);
                 if named {
@@ -412,7 +389,6 @@ impl<'a> Reader<'a> {
         Ty::BareFn { inputs, output }
     }
 
-    /// `A + B + 'c` up to the end.
     fn bounds(&mut self) -> Vec<Bound> {
         let rest = self.toks[self.i..].to_vec();
         self.i = self.toks.len();
@@ -435,8 +411,7 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
-    /// The index of the `>` closing the `<` at `open` (a `->` closes
-    /// nothing).
+    /// Return the index of the `>` closing the `<` at `open`, ignoring `->`.
     fn matching_angle(&self, open: usize) -> Option<usize> {
         let mut depth = 0usize;
         let mut after_joint_minus = false;
@@ -461,7 +436,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// A bound's trait path, `for<'a>` stripped.
 fn bound_of(toks: &[TokenTree]) -> Bound {
     let mut reader = Reader { toks, i: 0 };
     if reader.peek_keyword("for") {
@@ -480,7 +454,6 @@ fn bound_of(toks: &[TokenTree]) -> Bound {
     }
 }
 
-/// One `<...>` argument.
 fn generic_arg(tokens: &[TokenTree]) -> GenericArg {
     match tokens {
         [TokenTree::Punct(p), TokenTree::Ident(ident)] if p.as_char() == '\'' => {
@@ -514,7 +487,6 @@ fn generic_arg(tokens: &[TokenTree]) -> GenericArg {
     }
 }
 
-/// The index of a top-level `as` keyword in `tokens`.
 fn top_level_keyword(tokens: &[TokenTree], word: &str) -> Option<usize> {
     let mut depth = 0usize;
     for (i, tt) in tokens.iter().enumerate() {
@@ -528,7 +500,6 @@ fn top_level_keyword(tokens: &[TokenTree], word: &str) -> Option<usize> {
     None
 }
 
-/// The index of a lone `=` outside the angle brackets in `tokens`.
 fn top_level_eq(tokens: &[TokenTree]) -> Option<usize> {
     let mut depth = 0usize;
     for (i, tt) in tokens.iter().enumerate() {

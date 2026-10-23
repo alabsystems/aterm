@@ -91,7 +91,7 @@ pub struct Credits {
     pub balance: Option<Word>,
 }
 
-/// One `token_count`'s `rate_limits` (module header, design F10).
+/// One `token_count`'s `rate_limits` (design F10).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexLimits {
     /// When the reading was written, epoch seconds.
@@ -179,7 +179,7 @@ fn limits_line(line: &str) -> Option<CodexLimits> {
     })
 }
 
-/// Every `token_count` reading in `tail`, every family, in the order written (module header).
+/// Every `token_count` reading in `tail`, every family, in the order written.
 #[must_use]
 pub fn rollout_rate_limits(tail: &str) -> Vec<CodexLimits> {
     tail.lines().filter_map(limits_line).collect()
@@ -199,7 +199,7 @@ pub fn opening_account(first_line: &str) -> Option<AccountKey> {
     )
 }
 
-/// Where the rollout at `path`'s own lines begin (module header): the byte
+/// Where the rollout at `path`'s own lines begin: the byte
 /// offset of its first line past a fork's copied prefix, read from its start
 /// through a [`TurnReader`], at most `reach` bytes.
 fn copy_end(path: &Path, reach: u64) -> Option<u64> {
@@ -218,7 +218,8 @@ fn copy_end(path: &Path, reach: u64) -> Option<u64> {
     own.or_else(|| read.complete.then_some(read.read))
 }
 
-/// The usage readings of the rollout at `path` (module header).
+/// The usage readings of the rollout at `path`: those past a fork's copied prefix, each keyed by
+/// the account its first line names ([`opening_account`]).
 #[must_use]
 pub fn rollout_readings(path: &Path, reach: u64) -> Option<Vec<CodexLimits>> {
     let own_from = copy_end(path, reach)?;
@@ -257,7 +258,8 @@ pub struct Pick {
     pub void: Vec<Bucket>,
 }
 
-/// The `family`'s windows at `now_unix` from `rollouts`, each one's readings in the order written ([`rollout_readings`]; module header, design §3.5).
+/// The `family`'s windows at `now_unix` from `rollouts`, each one's readings in the order written
+/// ([`rollout_readings`]; design §3.5).
 #[must_use]
 pub fn pick(rollouts: &[Vec<CodexLimits>], family: &str, now_unix: i64) -> Option<Pick> {
     let has = |r: &&CodexLimits| r.family.as_str() == family && !r.windows.is_empty();
@@ -766,7 +768,7 @@ mod tests {
         assert_eq!(p.windows[0].used_percent, 95.0);
     }
 
-    /// A LEGACY FORK'S COPY GIVES NO READING (module header, design §3.5):
+    /// A LEGACY FORK'S COPY GIVES NO READING (design §3.5):
     /// 0.163.0's fork of a legacy thread copies its parent's counts, their
     /// rate limits among them, under one fresh stamp; the readings of the
     /// file are those past the copy, keyed by the fork's login.

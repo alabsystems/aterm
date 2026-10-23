@@ -1058,7 +1058,7 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Opti
         verb, pkg, target, ..
     } = run;
     snapshot::refuse_root_cargo_config()?;
-    // PATH `cargo`.
+    // The build driver, per lane. Native: `targo` from the Trust stage2 tool dir, never a
     // PATH `cargo`. Compat: stable's `cargo` via the rustup shim (STOCK EXCEPTION, see the
     // module doc).
     let home = std::env::var_os("HOME").ok_or("release build requires HOME")?;

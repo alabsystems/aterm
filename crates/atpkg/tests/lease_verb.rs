@@ -1,26 +1,17 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE HOLDER VERB, run as a PROCESS.
-//!
-//! `aterm pkg lease <dir> -- <command…>` holds the build `<dir>` belongs to for exactly as
-//! long as the command runs. The packers `exec` into it, so the pid their caller holds —
-//! the one `kill`, `timeout` or a closed tab signals — is the HOLDER's. These drive the dev
-//! `atpkg` binary with a temp `HOME` (its default prefix lives under it, so nothing of the
-//! machine's store is read or written) and signal the holder alone, as such a caller does.
+//! `aterm pkg lease <dir> -- <command…>` holds the store build for the command's lifetime.
 
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-// `spawnfd`'s: the holder holds its stdio and nothing else of this process —
-// not a pipe another test thread had open unflagged at the spawn, which the
-// command it leases for would keep as long as it runs.
+
 use aterm_uds::spawnfd::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use atpkg::lease::{Holders, Subject};
 
-/// A temp `HOME`, and the store build `store/trust/9192/bin` under its default prefix.
 struct Fixture {
     root: aterm_tempfile::TempDir,
     home: PathBuf,
@@ -48,8 +39,6 @@ impl Fixture {
     }
 }
 
-/// Wait for `path` to hold a pid — the command's own word that it runs (a backstop bound
-/// only: the file is the event).
 fn pid_in(path: &Path) -> libc::pid_t {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -69,9 +58,6 @@ fn alive(pid: libc::pid_t) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// A SIGTERM TO THE HOLDER ENDS THE COMMAND, NOT JUST THE HOLDER: it is passed on, the
-/// holder waits for the command to end, lets the lease go, and leaves by the same signal
-/// — never dies at once, leaving the command running unleased and orphaned.
 #[test]
 fn a_sigterm_to_the_holder_ends_the_command_it_holds_for() {
     use std::os::unix::process::ExitStatusExt as _;

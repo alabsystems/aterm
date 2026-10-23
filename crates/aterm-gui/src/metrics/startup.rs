@@ -874,7 +874,8 @@ fn render_claim_timeline_log(inputs: &ClaimTimelineInputs) -> String {
 /// Wire schema for the exclusive split of GUI entry → ready for winit.
 const STARTUP_PREPARE_SCHEMA: u64 = 1;
 
-/// The phases in boot order, as their `startup_prepare_<name>_ms` fields:
+/// The phases in boot order, as their `startup_prepare_<name>_ms` fields; each ends at the cut
+/// of the same index in [`STARTUP_PREPARE_CUTS`], and `arm` at ready for winit.
 const STARTUP_PREPARE_PHASES: [&str; PREPARE_PHASES] = [
     "boot",
     "warm",
@@ -1145,7 +1146,7 @@ fn read_gpu_probe() -> StartupGpuSample {
 /// measurement of the same call (`gpu_build_ns`).
 fn close_startup_gpu(sample: StartupGpuSample, gpu_build_ns: u64) -> StartupGpuSample {
     // A zero slot is the probe's UNSET sentinel (a recorded leg floors at 1 ns),
-    // so any zero here means this process never took the GPU path.
+    // so any zero here means a leg never ran in this process.
     if [
         sample.instance_ns,
         sample.adapter_ns,

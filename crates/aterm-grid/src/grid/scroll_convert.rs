@@ -756,6 +756,22 @@ impl LazyBuffer {
         )
     }
 
+    /// Everything staged, moved out whole: a width change's job materializes it on the reflow
+    /// worker (`PendingScrollbackReflow`), where [`drain_all`](Self::drain_all) under the
+    /// caller's lock took 61 ms for the 99,871 rows a flood left staged (the desk,
+    /// 2026-10-22). The pool and the arrival count stay.
+    pub(crate) fn take_staged(&mut self) -> Self {
+        Self {
+            lines: std::mem::take(&mut self.lines),
+            pool: CellPool::default(),
+            cut: self.cut.take(),
+            staged_bytes: std::mem::take(&mut self.staged_bytes),
+            link_bytes: std::mem::take(&mut self.link_bytes),
+            linkless_front: std::mem::take(&mut self.linkless_front),
+            arrivals_since_drain: 0,
+        }
+    }
+
     /// Drain up to `n` of the oldest pending lines, oldest first: the bounded [`drain_all`](Self::drain_all) the compression worker uses to keep each term-lock hold short.
     pub(crate) fn drain_front(&mut self, n: usize) -> impl Iterator<Item = Line> + '_ {
         let n = n.min(self.len());

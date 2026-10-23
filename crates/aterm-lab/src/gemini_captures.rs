@@ -443,7 +443,7 @@ fn refusal_status(spec: &crate::pyjson::J) -> u16 {
 }
 
 /// Gemini CLI's shell mode, YOLO, its UI details hidden and its shortcuts
-/// hint off, each on a lab of its own (module header).
+/// hint off, each on a lab of its own.
 #[allow(clippy::too_many_lines)]
 fn gemini_modes(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     let s = c.screens();
@@ -648,7 +648,7 @@ fn gemini_modes(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
 /// Gemini CLI launched with `ui.collapseDrawerDuringApproval` false, the
 /// shell box kept over the composer: as it comes up, with a draft typed into
 /// the composer, with that draft queued by an Enter, then (Esc, the box
-/// cancelled; Tab twice) again with the UI details hidden (module header).
+/// cancelled; Tab twice) again with the UI details hidden.
 fn gemini_drawer_kept(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     let names = [
         "drawer-kept-box-shell",
@@ -707,7 +707,7 @@ fn gemini_drawer_kept(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> 
 }
 
 /// Gemini CLI's other boxes, on one lab whose project names the lab's own
-/// MCP server (module header).
+/// MCP server.
 fn gemini_boxes(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     let names = [
         "question-multi",
@@ -819,7 +819,7 @@ fn gemini_boxes(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
 }
 
 /// Gemini CLI in a pane of 72 columns: a 401, then with a `GEMINI.md` a 403
-/// and a 404's no-access dialog and its `Stop` (module header).
+/// and a 404's no-access dialog and its `Stop`.
 fn gemini_narrow(c: &Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     let s = c.screens();
     if want("narrow-error-401") {

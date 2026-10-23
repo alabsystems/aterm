@@ -351,7 +351,11 @@ impl AppRt for AppRtMacOS {
         let r = f64::from((bg >> 16) & 0xff) / 255.0;
         let g = f64::from((bg >> 8) & 0xff) / 255.0;
         let b = f64::from(bg & 0xff) / 255.0;
-        // SAFETY: `+colorWithSRGBRed:green:blue:alpha:` is `-(id)(CGFloat, CGFloat, CGFloat, CGFloat)` and returns an AUTORELEASED colour — borrowed for the length of `-setBackgroundColor:`, which is `-(void)(NSColor *)` and RETAINS it.
+        // SAFETY: `+colorWithSRGBRed:green:blue:alpha:` is
+        // `-(id)(CGFloat, CGFloat, CGFloat, CGFloat)` and returns an
+        // AUTORELEASED colour — borrowed for the length of `-setBackgroundColor:`,
+        // which is `-(void)(NSColor *)` and RETAINS it. The pool is the caller's
+        // (the winit event loop's), which is why the borrow is sound.
         unsafe {
             let make: unsafe extern "C-unwind" fn(
                 aterm_objc::Id,
@@ -510,7 +514,9 @@ impl AppRt for AppRtMacOS {
         if ns_window.is_null() {
             return 0.0;
         }
-        // SAFETY: every message below is a side-effect-free geometry read.
+        // SAFETY: every message below is a side-effect-free geometry read. `-bounds` and
+        // `-contentLayoutRect` return `NSRect`, a 32-byte struct, which `msg` sends through
+        // `objc_msgSend_stret` on the x86_64 slice.
         unsafe {
             let content_view = crate::appkit::send_id(ns_window, aterm_objc::sel!(contentView));
             if content_view.is_null() {
@@ -900,7 +906,11 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 
     let _windowed = Windowed::get()?;
     let _main_thread = MainThread::new()?;
-    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil outside a dispatch, which is the fail-closed case; `-timestamp` and `-systemUptime` are `-(NSTimeInterval)`.
+    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton
+    // (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil
+    // outside a dispatch, which is the fail-closed case; `-timestamp` and
+    // `-systemUptime` are `-(NSTimeInterval)`, i.e. `double`, side-effect-free
+    // scalar reads; `+processInfo` is `-(id)`, another immortal singleton.
     let (ts, uptime) = unsafe {
         let app = appkit::send_id(ns_application_class(), sel!(sharedApplication));
         if app.is_null() {
@@ -960,7 +970,9 @@ pub(crate) fn appkit_window_is_key_in_active_app(window: &Window) -> bool {
     if ns_window.is_null() {
         return false;
     }
-    // SAFETY: `+sharedApplication` is `@16#0:8` (the windowed launch created it before any window existed); `-isActive` and `-isKeyWindow` are `B16@0:8` plain getters on live receivers.
+    // SAFETY: `+sharedApplication` is `@16#0:8` (the windowed launch created it
+    // before any window existed); `-isActive` and `-isKeyWindow` are `B16@0:8`
+    // plain getters on live receivers. Main thread, as the caller's wake runs.
     unsafe {
         let app = crate::appkit::send_id(
             aterm_objc::class(c"NSApplication").as_id(),
@@ -1066,7 +1078,10 @@ mod hid_idle {
         static HANDLES: OnceLock<Option<Handles>> = OnceLock::new();
         HANDLES
             .get_or_init(|| {
-                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and returns a dictionary `IOServiceGetMatchingService` consumes.
+                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and returns a
+                // dictionary `IOServiceGetMatchingService` consumes. The service and the
+                // `CFStringCreateWithCString` key (a NUL-terminated UTF-8 literal) are the cache,
+                // kept for the process; the service is released only if the key cannot be made.
                 unsafe {
                     let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
                     if matching.is_null() {
@@ -1095,7 +1110,10 @@ mod hid_idle {
     #[must_use]
     pub(super) fn seconds_since_last_input() -> Option<f64> {
         let h = handles()?;
-        // SAFETY: `h.service` is a live registry entry and `h.key` a live CFString (both process-cached); the Create rule gives us +1 on the returned object, which we release on every path after use.
+        // SAFETY: `h.service` is a live registry entry and `h.key` a live
+        // CFString (both process-cached); the Create rule gives us +1 on the
+        // returned object, which we release on every path after use. The type
+        // is checked before `CFNumberGetValue` writes into the `i64`.
         unsafe {
             let value = IORegistryEntryCreateCFProperty(h.service, h.key, std::ptr::null(), 0);
             if value.is_null() {
@@ -1625,7 +1643,12 @@ fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
 
     let token = autoreleasepool(|_| {
         let reason = appkit::nsstring(REASON)?;
-        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton, and `-beginActivityWithOptions:reason:` is `-(id<NSObject>)(NSActivityOptions, NSString *)` (`@@:Q@`; the `uint64_t` options word is `NSUInteger`-wide on every Apple target, so `send_id_usize_id` is its exact shape).
+        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton, and
+        // `-beginActivityWithOptions:reason:` is `-(id<NSObject>)(NSActivityOptions, NSString *)`
+        // (`@@:Q@`; the `uint64_t` options word is `NSUInteger`-wide on every Apple target, so
+        // `send_id_usize_id` is its exact shape). `reason` is a live +1 NSString this frame owns.
+        // The token comes back autoreleased (+0), so it is retained before the pool pops. This
+        // runs on the main thread (`App::resumed`).
         unsafe {
             let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
             if info.is_null() {
@@ -1877,7 +1900,11 @@ mod reduce_motion {
                 let Some(name) = aterm_objc::ns_string(notification) else {
                     return false;
                 };
-                // SAFETY: `-addObserver:selector:name:object:` is `-(void)(id, SEL, id, id)`, exactly the prototype cast below.
+                // SAFETY: `-addObserver:selector:name:object:` is
+                // `-(void)(id, SEL, id, id)`, exactly the prototype cast below. The
+                // observer is `target`, which the caller keeps alive; the selector
+                // is one this class declares; `name` is a live +1 NSString the pool
+                // outlives; nil `object` means "from any sender".
                 unsafe {
                     let add: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
@@ -2189,12 +2216,16 @@ mod layer_colorspace {
         fn CGColorSpaceRelease(space: CGColorSpaceRef);
     }
 
+    /// # Safety
+    /// `obj` must be nil or a live object.
     unsafe fn is_metal_layer(obj: Id) -> bool {
         let metal = class(c"CAMetalLayer");
         if obj.is_null() || metal.is_null() {
             return false;
         }
-        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free.
+        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free. The argument is a
+        // Class (`@encode` `"#"`, not `"@"`), which `ClassPtr` keeps distinct; hence not
+        // `send_bool_id`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
                 aterm_objc::checked_msg();
@@ -2209,7 +2240,11 @@ mod layer_colorspace {
         let Some(name) = appkit::nsstring(cg_name) else {
             return false;
         };
-        // SAFETY: `view` is this window's live NSView, borrowed on the main thread (only the winit event loop reaches this); the layer walk reads CALayers that view retains.
+        // SAFETY: `view` is this window's live NSView, borrowed on the main thread (only the
+        // winit event loop reaches this); the layer walk reads CALayers that view retains.
+        // `CGColorSpaceCreateWithName` takes a `CFStringRef`, which the toll-free-bridged
+        // NSString is, and returns +1; `-setColorspace:` is `-(void)(CGColorSpaceRef)` (a bare
+        // pointer) and retains, so releasing our reference right after is balanced.
         unsafe {
             let Some(layer) = find_metal_layer(view) else {
                 return false;
@@ -2260,7 +2295,10 @@ mod layer_colorspace {
     /// Read back the CAMetalLayer's live `contentsGravity`, `contentsScale` and `contentsAreFlipped`, the state [`anchor_contents_top_left`] establishes (see [`super::AppRt::window_surface_presentation`]).
     pub(crate) fn read_contents_presentation(window: &Window) -> Option<(String, f64, bool)> {
         let view = ns_view_of(window);
-        // SAFETY: `view` is this window's live NSView (winit owns it for the window's lifetime), borrowed on the main thread as AppKit requires.
+        // SAFETY: `view` is this window's live NSView (winit owns it for the window's lifetime),
+        // borrowed on the main thread as AppKit requires. Every message below is a side-effect-free
+        // property read; the returned `contentsGravity` is a borrowed NSString copied out
+        // immediately.
         unsafe {
             let layer = find_metal_layer(view)?;
             let gravity = appkit::send_id(layer, sel!(contentsGravity));
@@ -2287,6 +2325,8 @@ mod layer_colorspace {
         }
     }
 
+    /// # Safety
+    /// `view` is a live NSView borrowed on the main thread.
     unsafe fn find_metal_layer(view: Id) -> Option<Id> {
         if view.is_null() {
             return None;
@@ -2348,7 +2388,12 @@ mod vibrancy {
         if ns_window.is_null() {
             return;
         }
-        // SAFETY: every message below is a standard AppKit call on the main thread.
+        // SAFETY: every message below is a standard AppKit call on the main
+        // thread. `-contentView` is `-(id)`; `-setOpaque:` is `-(void)(BOOL)`;
+        // `+clearColor` is `-(id)` returning a shared immortal colour and
+        // `+colorWithSRGBRed:green:blue:alpha:` an AUTORELEASED one, both
+        // borrowed only for the length of `-setBackgroundColor:`, which is
+        // `-(void)(NSColor *)` and RETAINS.
         unsafe {
             let content = appkit::send_id(ns_window, sel!(contentView));
             if content.is_null() {
@@ -2389,6 +2434,8 @@ mod vibrancy {
         }
     }
 
+    /// # Safety
+    /// `content` is a live NSView on the main thread.
     unsafe fn remove_effect_views(content: Id) {
         let effect_cls = class(c"NSVisualEffectView");
         if effect_cls.is_null() {
@@ -2422,6 +2469,8 @@ mod vibrancy {
         }
     }
 
+    /// # Safety
+    /// `content` is a live NSView on the main thread.
     unsafe fn install_effect_view(content: Id, material: isize) {
         let effect_cls = class(c"NSVisualEffectView");
         if effect_cls.is_null() {
@@ -2550,7 +2599,10 @@ pub(crate) fn disable_press_and_hold() {
 
     use crate::appkit;
 
-    // SAFETY: standard NSUserDefaults registration.
+    // SAFETY: standard NSUserDefaults registration. `+numberWithBool:` (`-(id)(BOOL)`) and
+    // `+dictionaryWithObject:forKey:` (`-(id)(id, id)`) return autoreleased objects borrowed
+    // inside this pool; `+standardUserDefaults` is the process singleton, and
+    // `-registerDefaults:` copies the dictionary, so nothing has to outlive the pool.
     autoreleasepool(|_| unsafe {
         let Some(key) = appkit::nsstring("ApplePressAndHoldEnabled") else {
             return;

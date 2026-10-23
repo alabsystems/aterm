@@ -80,6 +80,7 @@ impl ToneTracker {
     }
 
     /// Feed one committed printed keystroke and mark a re-inference due when the throttle opens.
+    /// Window maintenance is unconditional; only marking is gated on `infer_active`.
     #[inline]
     pub fn note_char(&mut self, now: Instant, session: u64, ch: char, infer_active: bool) {
         self.rekey(session);

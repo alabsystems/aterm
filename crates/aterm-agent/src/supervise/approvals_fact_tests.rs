@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests verifying that occupancy fact rows (`fact-hold@v1`) do not affect act readers.
+//! Tests verifying that occupancy fact rows (`fact-hold@v1` `typed`, and a held verdict's
+//! `fact-held@v1`) do not affect act readers.
 
 use super::*;
 use crate::supervise::facts::FactKind;
@@ -34,6 +35,31 @@ fn fact_typed(ts: i64) -> String {
     )
 }
 
+/// A held verdict's row (`fact-held@v1`, design §6): `waiting`, its episode and guard.
+fn fact_held(ts: i64) -> String {
+    fact_held_of(ts, SID)
+}
+
+/// [`fact_held`], booked for session `sid`.
+fn fact_held_of(ts: i64, sid: &str) -> String {
+    use crate::supervise::occupancy::rules::{HELD_RULE, RuleId, held_reason};
+    Row {
+        rule_id: HELD_RULE,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &held_reason(
+            RuleId::WaitNudge,
+            0xaa,
+            0,
+            1_800_000,
+            false,
+            crate::supervise::Guard::Person,
+        ),
+        box_seq: 1,
+    }
+    .to_json(ts, Some(sid))
+}
+
 fn body(rows: &[String]) -> String {
     rows.iter().map(|r| format!("{r}\n")).collect()
 }
@@ -42,19 +68,37 @@ fn invisible<T: PartialEq + std::fmt::Debug>(before: &[String], read: impl Fn(&s
     invisible_at(before, before.len(), read);
 }
 
+/// The reader `read` of the ledger `rows` with a fact row put at `at`: the door's typed line and
+/// a held verdict's row each move it nothing. A held row is `waiting` under a rule no reader
+/// names, so even read as an act it moves nothing. NEGATIVE CONTROL: read as an act, the typed
+/// line at the same place moves it, so the reader sees what stands there.
 fn invisible_at<T: PartialEq + std::fmt::Debug>(
     rows: &[String],
     at: usize,
     read: impl Fn(&str) -> T,
 ) {
     let plain = body(rows);
-    let mut rows = rows.to_vec();
-    rows.insert(at, fact_typed(9_000));
-    let told = body(&rows);
+    let with = |fact: String| {
+        let mut rows = rows.to_vec();
+        rows.insert(at, fact);
+        body(&rows)
+    };
+    let told = with(fact_typed(9_000));
+    let held = with(fact_held(9_000));
     assert_eq!(
         read(&told),
         read(&plain),
         "a fact line moves no reader of acts"
+    );
+    assert_eq!(
+        read(&held),
+        read(&plain),
+        "a held verdict's row moves no reader of acts"
+    );
+    assert_eq!(
+        with_facts_counted(|| read(&held)),
+        with_facts_counted(|| read(&plain)),
+        "read as an act, a held verdict's row is still no act: it is waiting"
     );
     assert_ne!(
         with_facts_counted(|| read(&told)),
@@ -262,6 +306,35 @@ fn a_fact_line_asks_nothing_after_an_account_move() {
     invisible(&[moved], |b| {
         account_moves_in(b, Some(SID)).open.map(|o| o.asked)
     });
+}
+
+/// A HELD VERDICT'S ROW IS A FACT ROW (design §6): its rule opens with the facts seam's prefix,
+/// so every reader of acts walks past it ([`act_lines`]), and it reads back as the episode it
+/// books (its rule and its ordinal in the hold), the guard and its stamp, for its own session
+/// alone: `@s-1` reads no row of `s-10`, whose sid holds its own. CONTROL: a row of a policy
+/// rule is no fact row, and `@s-10` reads its own row.
+#[test]
+fn a_held_row_is_a_fact_row_and_reads_back_its_episode_and_guard() {
+    use crate::supervise::occupancy::rules::{HELD_RULE, HeldRow, RuleId, held_rows_in};
+    let held = fact_held(1_000);
+    assert!(is_fact_rule(HELD_RULE));
+    assert!(is_fact_line(&held), "{held}");
+    assert!(!is_fact_line(&continued(1_000)));
+    assert_eq!(act_lines(&body(std::slice::from_ref(&held))).count(), 0);
+    let row = HeldRow {
+        rule: RuleId::WaitNudge,
+        ordinal: 0,
+        guard: crate::supervise::Guard::Person,
+        row_ms: 1_000,
+    };
+    assert_eq!(
+        held_rows_in(&body(&[held, continued(2_000)]), Some(SID)),
+        [row]
+    );
+    assert!(held_rows_in(&body(&[fact_held(1_000)]), Some("@s-2")).is_empty());
+    let other = body(&[fact_held_of(1_000, "@s-10")]);
+    assert!(held_rows_in(&other, Some(SID)).is_empty(), "{other}");
+    assert_eq!(held_rows_in(&other, Some("@s-10")), [row]);
 }
 
 #[test]

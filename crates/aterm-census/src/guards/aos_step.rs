@@ -1,24 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aos-step-clock: the Aos step code reads no clock and draws no randomness (requirement M0-14; docs/DESIGN-aos-hosted-execution-2026-10-21.md §2 and §4.3).
+//! aos-step-clock: the Aos step code reads no clock and draws no randomness.
 
 use super::rules::{
     ClockShape, UseLeaf, first_hit, test_path, type_alias, use_leaves, use_statements,
 };
 use super::{Bound, Finding, Rule, Tree, hits};
 
-/// The Aos step code, as module trees (each a file and the directory of its child modules):
-/// aterm-aos's library source; in aterm-effects the momentum task and the engine it hosts; and
-/// the same-crate modules that engine's shipped step calls into, derived from its imports and
-/// calls (2026-10-22):
-/// * `cursor_glow`: `Geom` and its effects-box clip (`cursor_glow.rs`); `light_floor_at`,
-///   `light_alpha_keeping`, `light_ink_over_floor` and `push_ink_ellipse_shaped`
-///   (`cursor_glow/light_body.rs`); `light_ink_bold` (`cursor_glow/raster.rs`);
-/// * `effect_util`: `mix_rgb`, `push_fx_ramp`;
-/// * `color_math`: `light_charge_in_hue` and the relative-luminance table it and the light
-///   body read;
-/// * `rainbow_kitty/ribbon`: `seen`, which `light_ink_over_floor` asks.
 const AOS_STEP: &[&str] = &[
     "crates/aterm-aos/src/",
     "crates/aterm-effects/src/aos_momentum",
@@ -29,8 +18,6 @@ const AOS_STEP: &[&str] = &[
     "crates/aterm-effects/src/rainbow_kitty/ribbon",
 ];
 
-/// Each clock read, sleep or random draw the step code may not make, its shape, and what it
-/// is.
 const AOS_READS: &[(&str, ClockShape, &str)] = &[
     ("Instant::now", ClockShape::Named, "the monotonic clock"),
     ("SystemTime::now", ClockShape::Named, "the wall clock"),
@@ -133,14 +120,10 @@ const AOS_READS: &[(&str, ClockShape, &str)] = &[
     ),
 ];
 
-/// The modules and crates whose every item is randomness: a path through one, imported or
-/// named as a path's head, is a draw the log does not hold.
 const RANDOM_MODULES: &[&str] = &["rand", "getrandom", "aterm_getrandom", "fastrand"];
 
-/// The module whose glob import binds the wall readers bare.
 const WALL_READER_MODULE: &str = "aterm_time";
 
-/// What a finding says after the needle and what it is.
 const ENTERS_AS_INPUT: &str =
     "in Aos step code: time and randomness enter only as recorded inputs (M0-14)";
 
@@ -193,9 +176,6 @@ fn aos_step_clock(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// A randomness module named as a path's head on one line of code (`rand::random()`,
-/// `aterm_uds::rand::fill(&mut b)`, `getrandom::getrandom(..)`), never a field or a method of
-/// that name (`self.rand`, `x.rand()`), nor a local named `rand`.
 fn random_path(code: &str) -> Option<String> {
     RANDOM_MODULES.iter().find_map(|module| {
         hits(code, module, Bound::Word)
@@ -212,8 +192,6 @@ fn random_path(code: &str) -> Option<String> {
     })
 }
 
-/// The finding for one imported name (or `type` alias) that binds a clock read, a sleep or a
-/// random draw where the lines cannot see it, if any.
 fn imported(leaf: &UseLeaf<'_>) -> Option<String> {
     if leaf.alias == Some("_") {
         return None;
@@ -238,8 +216,6 @@ fn imported(leaf: &UseLeaf<'_>) -> Option<String> {
         let bound = if leaf.glob {
             parts.len() > 1 && ends(parts.len() - 1)
         } else if ends(parts.len()) {
-            // The whole of it: a path read bare from here on (`sleep(d)`), a one-word name
-            // that is itself the door (`RandomState`), or a wall reader passed as a fn item.
             true
         } else {
             leaf.alias.is_some()
@@ -254,7 +230,6 @@ mod tests {
     use super::super::tests::{run, spots};
     use super::*;
 
-    /// Each planted read in a shipped file of the step code, with what the guard says.
     fn findings(files: &[(&str, &str)]) -> Vec<String> {
         run(&AOS_STEP_CLOCK, files)
             .iter()
@@ -262,10 +237,6 @@ mod tests {
             .collect()
     }
 
-    /// The negative control of M0-14: a clock read, a sleep and a random draw planted in each
-    /// file of the step code is found, line by line; the same text in a comment, a string, a
-    /// test-only item, a test file or a module its parent declares test-only is not, and
-    /// neither is a time the caller handed in.
     #[test]
     fn a_planted_clock_or_random_read_in_the_step_code_is_found_and_test_code_is_not() {
         let planted = "use aterm_time::Instant;\n\
@@ -319,9 +290,6 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    /// The aterm-effects helpers the momentum step calls are step code too: a clock read in a
-    /// shipped line of each (the light body's ink solve and ellipse, the aurora's `Geom` and
-    /// raster, the effects quads, the colour math, the ribbon's `seen`) is found.
     #[test]
     fn a_clock_read_in_a_same_crate_helper_the_momentum_step_calls_is_found() {
         let planted = "fn ink(now: Instant) -> u32 { light(now) }\n\
@@ -363,7 +331,6 @@ mod tests {
         );
     }
 
-    /// What each finding says names the read and what it is.
     #[test]
     fn a_finding_names_the_read_and_what_it_is() {
         let found = run(
@@ -386,9 +353,6 @@ mod tests {
         assert!(found.iter().all(|f| f.rule == "aos-step-clock"));
     }
 
-    /// A clock, a sleep or a random draw bound under a name the lines cannot see is named at
-    /// the import; an import under the clock type's own name, `as _` and a plain module are
-    /// not.
     #[test]
     fn an_import_that_hides_a_clock_or_randomness_is_found_where_it_binds() {
         let src = "use std::thread::sleep;\n\
@@ -418,8 +382,6 @@ mod tests {
         );
     }
 
-    /// The randomness modules are named as a path's head, never as a field, a method or a
-    /// local of that name.
     #[test]
     fn a_randomness_module_is_named_only_as_a_path() {
         assert!(random_path("let x = rand::random::<u8>();").is_some());

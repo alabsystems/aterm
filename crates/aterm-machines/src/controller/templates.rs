@@ -5,10 +5,6 @@
 //! asked for. Both are the owner's to edit afterwards; `init` never
 //! overwrites an existing file. The one exception is a starter baseline nobody edited
 //! ([`EARLIER_DEFAULT_BASELINES`]), which follows the starter shipped now.
-//!
-//! Every pin below was downloaded and checked on 2026-10-16: the SHA-256 of the bytes at the
-//! URL, and the Developer ID Team ID on the app or binary inside
-//! (`codesign --verify --deep --strict -R`).
 
 /// `machines.toml` as `init` writes it.
 pub const INVENTORY: &str = r#"# aterm machines: the Macs this controller manages (docs/DESIGN-machines-2026-10-16.md).
@@ -100,28 +96,9 @@ command_line_tools = true
 [aterm]
 toolset = true
 
-[homebrew]
-pkg = { url = "https://github.com/Homebrew/brew/releases/download/7.0.9/Homebrew.pkg", sha256 = "e021295947a4a9b7ca1a8eff310c9ea1db14d923c5acf7d79e325b60a81f1a15", team_id = "927JGANW46" }
-formulae = ["git", "ripgrep", "fd", "jq", "tmux", "fzf", "wget", "htop", "coreutils", "git-lfs"]
-casks = []
-
-[[app]]
-name = "Emacs"
-kind = "dmg-app"
-url = "https://emacsformacosx.com/emacs-builds/Emacs-31.1-universal.dmg"
-sha256 = "f0383bcbf0104947d3a46266aae43e3dc9e38fd68eeb35f11ee6b9444277b8ec"
-team_id = "5BRAQAFB8B"
-bundle = "Emacs.app"
-version = "31.1"
-
-[[app]]
-name = "Caffeine"
-kind = "dmg-app"
-url = "https://github.com/IntelliScape/caffeine/releases/download/1.1.4/Caffeine.dmg"
-sha256 = "1ad34c3299a0c866873c4feb432c3e11186375adb6f43c5f481ae9d46d06d723"
-team_id = "YD6LEYT6WZ"
-bundle = "Caffeine.app"
-version = "1.1.4"
+# Other software is yours to add: a [homebrew] table installs Homebrew and its formulae,
+# an [[app]] row one signed app (docs/DESIGN-machines-2026-10-16.md §8). For keeping a Mac
+# awake and editing a file, aterm has its own `aterm caffeine` and `aterm edit`.
 
 # A per-host GitHub key for each user, registered with the [github] machine user.
 [github]
@@ -152,4 +129,6 @@ pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[
     "e38407721722b11a0faac79954f4906f57eb92d4760bae3f092a00737380a11a",
     // 326cdca677: host_name = "" unsets a HostName set by hand, and the gh package.
     "80dbe78ab51b8dcf737a52074e4c1122c16bcdfa1310077001f2ca6a470ecb52",
+    // a6c1342e82: the gh package gone; Homebrew, its formulae, Emacs and Caffeine still in.
+    "afbb8d95fe3570f560676006cc83f9276a6a21fb4d7c5c652ff6e28458d296d1",
 ];

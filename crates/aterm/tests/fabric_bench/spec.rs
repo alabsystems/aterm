@@ -226,7 +226,12 @@ impl Spec {
 /// Parse a `FABRIC_BENCH` specification string.
 ///
 /// # Errors
-/// Unknown words, invalid counts or options, or missing `out=`.
+/// A word or value it does not know, a count that is not a positive integer
+/// (`warmup`, `bystanders`, `paced` and `horizon_ms` may be 0), a durability
+/// that is not a [`Tier`], a horizon for a tier that is not ordered, a
+/// retention interval on a broker that does not retain, a burst past
+/// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
+/// a bystander count past [`ATTACH_MAX`], or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {

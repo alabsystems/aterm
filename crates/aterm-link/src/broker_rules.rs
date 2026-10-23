@@ -27,7 +27,7 @@ pub const MAIL_BYTES: u64 = 64 * 1024 * 1024;
 /// Every other subject's bytes.
 pub const DEFAULT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// The rules every broker aterm opens retains its log by (the module doc).
+/// The rules every broker aterm opens retains its log by.
 ///
 /// # Panics
 /// Never: every filter and template here is a constant astream's grammar takes.
@@ -97,10 +97,9 @@ mod tests {
     use super::*;
     use astream_broker::{Class, Keep};
 
-    /// The rules as the module doc states them, in astream's own terms: one
-    /// prefix rule over the bulk stream, presence by its last value, mail held
-    /// until its node's inbox read it, and the default rule; every bound the
-    /// doc names.
+    /// The default rules in astream's own terms: one prefix rule over the bulk
+    /// stream, presence by its last value, mail held until its node's inbox
+    /// read it, and the default rule; every bound as the constants name it.
     #[test]
     fn the_default_rules_are_four_and_astream_takes_them() {
         /// One rule as astream reads it back: filter, class, keep, age, bytes.

@@ -4,8 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
-
 // Important: all XIM calls need to happen from the same thread!
 
 mod callbacks;
@@ -50,15 +48,12 @@ pub enum ImeRequest {
 
 #[derive(Debug)]
 pub(crate) enum ImeCreationError {
-    // Boxed to prevent large error type
     OpenFailure(Box<PotentialInputMethods>),
     SetDestroyCallbackFailed(#[allow(dead_code)] XError),
 }
 
 pub(crate) struct Ime {
     xconn: Arc<XConnection>,
-    // The actual meat of this struct is boxed away, since it needs to have a fixed location in
-    // memory so we can pass a pointer to it around.
     inner: Box<ImeInner>,
 }
 
@@ -111,17 +106,12 @@ impl Ime {
         self.inner.is_destroyed
     }
 
-    // This pattern is used for various methods here:
-    // Ok(_) indicates that nothing went wrong internally
-    // Ok(true) indicates that the action was actually performed
-    // Ok(false) indicates that the action is not presently applicable
     pub fn create_context(
         &mut self,
         window: ffi::Window,
         with_ime: bool,
     ) -> Result<bool, ImeContextCreationError> {
         let context = if self.is_destroyed() {
-            // Create empty entry in map, so that when IME is rebuilt, this window has a context.
             None
         } else {
             let im = self.inner.im.as_ref().unwrap();
@@ -136,8 +126,6 @@ impl Ime {
                     with_ime,
                 )?
             };
-            // The focused window's context remade (`set_ime_allowed`) takes the focus its old
-            // one had: IBus composes only in a focused input context.
             if self.inner.focused == Some(window) {
                 if let Err(error) = context.focus(&self.xconn) {
                     self.xconn.report("Failed to focus input context", error);
@@ -165,7 +153,7 @@ impl Ime {
         }
     }
 
-    /// Destroy `window`'s input context: the window is gone, and so is what was noted of it.
+    /// Destroy `window`'s input context and clear its tracked state.
     pub fn remove_context(&mut self, window: ffi::Window) -> Result<bool, XError> {
         self.inner.spots.remove(&window);
         if self.inner.focused == Some(window) {
@@ -174,7 +162,6 @@ impl Ime {
         self.destroy_context(window)
     }
 
-    /// Destroy `window`'s input context, keeping its spot and focus for a new one.
     fn destroy_context(&mut self, window: ffi::Window) -> Result<bool, XError> {
         if let Some(Some(context)) = self.inner.contexts.remove(&window) {
             unsafe {
@@ -186,9 +173,7 @@ impl Ime {
         }
     }
 
-    /// `window` gained the focus: its input context takes it, and the spot its caret moved to
-    /// while it had none, which was not sent (`Self::send_xim_spot`), goes out once, if the
-    /// context does not have it.
+    /// Focus `window`'s input context and apply its latest queued spot.
     pub fn focus(&mut self, window: ffi::Window) -> Result<bool, XError> {
         self.inner.focused = Some(window);
         if self.is_destroyed() {
@@ -219,13 +204,7 @@ impl Ime {
         }
     }
 
-    /// `window`'s caret moved to (`x`, `y`) (`ImeRequest::Position`). Its input context is told
-    /// only while the window has the focus, and only a spot it does not have
-    /// (`ImeContext::set_spot`). Setting the spot is a synchronous request to the input method
-    /// server (`XSetICValues` waits for its reply, with no timeout) made on the event loop's
-    /// thread, so a stalled ibus-x11 froze every window while any window's caret moved, an
-    /// unfocused one's too as its program wrote. An unfocused window's latest spot is sent when
-    /// it gains the focus (`Self::focus`).
+    /// Record `window`'s caret spot and update its input context when focused.
     pub fn send_xim_spot(&mut self, window: ffi::Window, x: i16, y: i16) {
         self.inner.spots.insert(window, ffi::XPoint { x, y });
         if self.is_destroyed() || self.inner.focused != Some(window) {
@@ -247,10 +226,7 @@ impl Ime {
             }
         }
 
-        // Remove context for that window.
         let _ = self.destroy_context(window);
-
-        // Create new context supporting IME input.
         let _ = self.create_context(window, allowed);
     }
 

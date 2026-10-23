@@ -16,9 +16,6 @@ fn stamp(pid: u32, start: &str, cause: Cause, at: u64) -> Stamp {
     }
 }
 
-/// A stamp is one file per tab, written whole: it reads back as written, a second act's replaces
-/// the first, and nothing else is left beside it. Its text carries no `phase`; a tab key that is
-/// not a plain word names no file.
 #[test]
 fn a_stamp_is_one_file_per_tab_written_whole() {
     let tmp = scratch();
@@ -47,9 +44,6 @@ fn a_stamp_is_one_file_per_tab_written_whole() {
     assert_eq!(Cause::parse("exit"), None);
 }
 
-/// Taking a stamp takes only the one meant: one `ours` accepts is removed and returned; one it
-/// refuses is never moved; and a newer stamp landing between the judgement and the move is put
-/// back, never taken.
 #[test]
 fn taking_a_stamp_takes_only_the_one_meant() {
     let tmp = scratch();
@@ -71,7 +65,6 @@ fn taking_a_stamp_takes_only_the_one_meant() {
         Some(newer.clone()),
         "the newer one stands"
     );
-    // Judged in place: the act's watch finds the stamp while a take judges it.
     assert_eq!(
         take_if(state, "s-1", |_| {
             assert_eq!(read(state, "s-1"), Some(newer.clone()), "in place");
@@ -79,8 +72,6 @@ fn taking_a_stamp_takes_only_the_one_meant() {
         }),
         None
     );
-    // A newer stamp landing between the judgement and the move is put back,
-    // never taken for the one judged.
     let newest = stamp(4244, "Wed Sep 23 20:14:05 2026", Cause::Stall, 102);
     assert_eq!(
         take_if(state, "s-1", |_| {
@@ -103,11 +94,6 @@ fn taking_a_stamp_takes_only_the_one_meant() {
     );
 }
 
-/// The reader's lookup: a stamp naming the process whose exit is read gives its cause and stands
-/// until the relaunch takes it; one naming another process that still runs is left alone; one
-/// naming a gone process, or older than `STALE_S`, is removed as it is found. The live process is
-/// this test's own: its start is read on every platform (on Windows by `GetProcessTimes`, where
-/// no `ps` answers).
 #[test]
 fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
     let tmp = scratch();
@@ -115,7 +101,6 @@ fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
     let me = std::process::id();
     let start = kernel_start(me).expect("this process's start");
     let now = aterm_time::unix_secs().expect("clock");
-    // The exit read is the stamped process's: its cause, kept.
     write(
         state,
         "s-1",
@@ -130,7 +115,6 @@ fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
         read(state, "s-1").is_some(),
         "kept for the relaunch to take"
     );
-    // Another process's exit, the stamped one still running: left alone.
     write(state, "s-1", &stamp(me, &start, Cause::Asked, now)).expect("written");
     assert_eq!(
         lookup(state, "s-1", 4242, "Wed Sep 23 20:13:55 2026", now),
@@ -141,7 +125,6 @@ fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
         "the act on a live process stands"
     );
     assert!(alive_as(me, &start));
-    // The stamped process is gone (a start that is not this pid's): swept.
     write(
         state,
         "s-1",
@@ -153,7 +136,6 @@ fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
         None
     );
     assert_eq!(read(state, "s-1"), None, "a gone process's stamp is swept");
-    // Older than STALE_S: swept, even naming the exit read.
     let old = now - super::super::relaunch::STALE_S - 1;
     write(
         state,
@@ -166,13 +148,9 @@ fn the_lookup_names_its_exit_and_sweeps_what_is_over() {
         None
     );
     assert_eq!(read(state, "s-1"), None, "a stale stamp is swept");
-    // No stamp: nothing.
     assert_eq!(lookup(state, "s-9", 4242, "x", now), None);
 }
 
-/// The stamp standing for a process is the one its exit would be read by: the tab's stamp naming
-/// that very process (pid and kernel start), no older than `STALE_S`. Asking writes or removes
-/// nothing.
 #[test]
 fn the_stamp_standing_for_a_process_is_the_one_its_exit_is_read_by() {
     let tmp = scratch();
@@ -227,9 +205,6 @@ fn the_act_reads_a_start_in_the_snapshots_own_spelling() {
     assert!(!s.stale(stale_at) && s.stale(stale_at + 1));
 }
 
-/// The prune removes only a stale stamp: one past `STALE_S` goes whatever its process; one still
-/// standing stays even naming a gone process (its exit may not have been read yet); a file that is
-/// no stamp's is not the prune's.
 #[test]
 fn the_prune_removes_only_a_stale_stamp() {
     let tmp = scratch();
@@ -258,12 +233,6 @@ fn the_prune_removes_only_a_stale_stamp() {
     }
 }
 
-/// THE RELAUNCH THAT FILES AN ASKED EXIT TAKES ITS STAMP: an exit the act
-/// made (its stamp naming the process) is consumed once its relaunch's record
-/// is filed, and the record's cause, `asked`, is a relaunch's — not a restart
-/// that ENDED its agent, whose clock `end_asked_at` dates. NEGATIVE CONTROLS:
-/// an exit no act made (`ExitCause::Exit`) takes nothing, nor does a stamp
-/// naming another process, nor a dry run.
 #[test]
 fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
     use super::super::relaunch::{

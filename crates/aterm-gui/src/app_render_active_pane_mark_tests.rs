@@ -5,8 +5,6 @@ use super::{ActivePaneMark, divider_cell, fill_divider_grid};
 use crate::pane_chrome::{SplitChrome, with_split_chrome};
 use aterm_render::{RenderInput, Theme};
 
-/// Every cell of a composed frame that is not the plain divider seam, as `(row, col, glyph)`:
-/// everything the mark painted.
 fn stripes(dst: &RenderInput, theme: Theme) -> Vec<(usize, usize, char)> {
     let seam = divider_cell(theme);
     let mut out = Vec::new();
@@ -20,17 +18,10 @@ fn stripes(dst: &RenderInput, theme: Theme) -> Vec<(usize, usize, char)> {
     out
 }
 
-/// The mark inks exactly the divider lines touching the active pane, on the side facing it,
-/// and nothing else: not the far divider, not one cell of a pane's rectangle.
 #[test]
 fn the_mark_inks_the_divider_lines_that_touch_the_active_pane_and_no_others() {
-    // The slab and half-block of the Classic split (macOS, Linux); the
-    // Fluent hairline is `pane_chrome`'s.
     with_split_chrome(SplitChrome::Classic, || {
         let theme = Theme::default();
-        // 5x11: [pane 0..5 cols 0..5][divider col 5][pane cols 6..11], with a
-        // horizontal divider at row 2 splitting the right column of panes only.
-        // The active pane is the bottom-right one: rows 3..5, cols 6..11.
         let mut dst = RenderInput::empty();
         fill_divider_grid(
             &mut dst,
@@ -66,12 +57,8 @@ fn the_mark_inks_the_divider_lines_that_touch_the_active_pane_and_no_others() {
     });
 }
 
-/// The other two sides: a top-left pane (rows 0..2, cols 0..5) with a divider below and one
-/// to its right is inked on the side facing each.
 #[test]
 fn a_pane_with_a_divider_below_and_beside_it_is_inked_on_those_two_sides() {
-    // The slab and half-block of the Classic split (macOS, Linux); the
-    // Fluent hairline is `pane_chrome`'s.
     with_split_chrome(SplitChrome::Classic, || {
         let theme = Theme::default();
         let mut dst = RenderInput::empty();
@@ -106,12 +93,8 @@ fn a_pane_with_a_divider_below_and_beside_it_is_inked_on_those_two_sides() {
     });
 }
 
-/// A pane that fills the composite has no divider to mark, so a single-pane (or zoomed)
-/// frame is the plain seam grid even with the mark resolved and the window focused.
 #[test]
 fn a_pane_that_fills_the_window_stamps_nothing() {
-    // The slab and half-block of the Classic split (macOS, Linux); the
-    // Fluent hairline is `pane_chrome`'s.
     with_split_chrome(SplitChrome::Classic, || {
         let theme = Theme::default();
         let mut dst = RenderInput::empty();
@@ -129,7 +112,6 @@ fn a_pane_that_fills_the_window_stamps_nothing() {
     });
 }
 
-/// The two gates that must silence the mark, and the geometry that must not.
 #[test]
 fn the_setting_and_the_windows_own_focus_each_withhold_the_mark() {
     let rect = (0, 0, 2, 3);
@@ -159,8 +141,6 @@ fn the_setting_and_the_windows_own_focus_each_withhold_the_mark() {
     );
 }
 
-/// The RepaintKey term is `0` with no mark (the idle invariant) and moves with the marked
-/// rectangle, so the present early-out never swallows the frame that moves the ring.
 #[test]
 fn the_repaint_key_term_is_zero_for_no_mark_and_moves_with_the_rectangle() {
     assert_eq!(ActivePaneMark::key_term(None), 0);
@@ -174,16 +154,8 @@ fn the_repaint_key_term_is_zero_for_no_mark_and_moves_with_the_rectangle() {
     );
 }
 
-/// THE DIVIDER IS THE SEAM TOKEN, AND HIGH CONTRAST'S ONE INK: with no OS
-/// palette the divider is the seam on the terminal background (an authored
-/// border included), and under each stock High Contrast scheme it is
-/// `COLOR_WINDOWTEXT`, the line HC separates surfaces with. NEGATIVE CONTROL:
-/// the same themes without HC are not the window text, and an authored border
-/// moves the divider off the derived seam.
 #[test]
 fn divider_tracks_high_contrast() {
-    // The slab and half-block of the Classic split (macOS, Linux); the
-    // Fluent hairline is `pane_chrome`'s.
     with_split_chrome(SplitChrome::Classic, || {
         use crate::chrome_band::{ChromePalette, hc_fixtures};
         for name in aterm_types::scheme::builtin_names() {

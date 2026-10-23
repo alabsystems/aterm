@@ -430,7 +430,8 @@ pub(crate) fn session_root(pid: i32) -> Option<SessionRoot> {
 pub(crate) fn pid_bsdinfo(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO fills.
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
     let read = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -648,7 +649,9 @@ mod windows_jobs {
     /// Every live parent -> child link, in one Toolhelp32 pass (~2.2 ms in the kernel plus ~1.6 ms of walk), so one capture answers every shell.
     pub(super) fn capture_links() -> ChildLinks {
         let mut links = Vec::new();
-        // SAFETY: standard Toolhelp walk.
+        // SAFETY: standard Toolhelp walk — the entry is a plain #[repr(C)]
+        // out-param with `dwSize` set as the API requires, and the snapshot
+        // handle is closed on every path.
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap == INVALID_HANDLE_VALUE || snap == 0 {
@@ -683,7 +686,11 @@ mod windows_jobs {
 
     /// Read `pid`'s creation time and image name through a `PROCESS_QUERY_LIMITED_INFORMATION` handle, or `None` when it cannot be opened or timed ([`ChildLinks::has_job`] says why that is "not a job").
     pub(super) fn process_facts(pid: u32) -> Option<ProcessFacts> {
-        // SAFETY: `OpenProcess` returns 0 on failure and a handle otherwise, which is closed on every path past it.
+        // SAFETY: `OpenProcess` returns 0 on failure and a handle otherwise,
+        // which is closed on every path past it; the FILETIMEs and the name
+        // buffer are plain out-params sized as the APIs require, and
+        // `QueryFullProcessImageNameW` writes at most `len` units and reports
+        // how many it wrote.
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if process == 0 {

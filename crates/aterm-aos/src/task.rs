@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The task ABI: a [`Schema`] (what the state, inputs and observations are and how they are
-//! encoded) and a [`Code`] (one implementation of the step function over that schema).
+//! Task ABI: [`Schema`] state/input/observation encodings and [`Code`] step functions.
 
 use core::fmt;
 
@@ -16,11 +15,9 @@ pub const STATE_DOMAIN: &[u8] = b"aterm-aos-state-v1\0";
 /// While a boundary is paused, what an input does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PausedClass {
-    /// It mutates task state the host cannot re-derive (a key, a reset): it waits in the bounded
-    /// queue and is delivered once, in order, when the pause ends.
+    /// Queues in the bounded pause buffer and is delivered in order when the pause ends.
     Queue,
-    /// It is a frame or query the task simply does not observe while paused: it is skipped, neither
-    /// recorded nor delivered.
+    /// Skipped while paused, neither recorded nor delivered.
     Skip,
 }
 
@@ -45,8 +42,7 @@ pub trait Schema {
     fn decode_input(&self, d: &mut Dec<'_>) -> Result<Self::Input, WireFault>;
     /// Writes an observation's canonical encoding (folded into a run's observation chain).
     fn encode_observation(&self, o: &Self::Observation, e: &mut Enc);
-    /// While paused: does this input queue (it mutates task state the host cannot re-derive) or is
-    /// it skipped (a frame/query the task simply does not observe)?
+    /// Whether `i` queues or is skipped while the boundary is paused.
     fn paused_class(&self, i: &Self::Input) -> PausedClass;
 }
 
@@ -130,8 +126,7 @@ pub(crate) fn state_digest_of(schema_digest: &Digest, encoded: &[u8]) -> Digest 
     Digest::of(STATE_DOMAIN, &[&schema_digest.0, encoded])
 }
 
-/// The state's canonical digest: `Digest::of(b"aterm-aos-state-v1\0", [schema digest, encoded
-/// state])`.
+/// Canonical digest of `s` under `schema` (`STATE_DOMAIN`).
 #[inline]
 #[must_use]
 pub fn state_digest<S: Schema>(schema: &S, s: &S::State) -> Digest {

@@ -55,7 +55,8 @@ mod k32 {
 fn io_pending<T>(thread: &JoinHandle<T>) -> bool {
     use std::os::windows::io::AsRawHandle;
     let mut pending = 0;
-    // SAFETY: the join handle's thread handle is open while `thread` lives.
+    // SAFETY: the join handle's thread handle is open while `thread` lives,
+    // and `pending` is a valid out-param.
     let ok = unsafe { k32::GetThreadIOPendingFlag(thread.as_raw_handle() as isize, &mut pending) };
     ok != 0 && pending != 0
 }

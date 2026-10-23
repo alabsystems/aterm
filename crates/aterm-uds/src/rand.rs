@@ -6,8 +6,11 @@
 use std::io;
 
 /// `N` CSPRNG bytes as `2N` lowercase-hex chars: the single-use-token shape.
+///
 /// # Errors
-/// When no OS entropy source is available (see [`fill`]).
+/// When no OS entropy source is available (see [`fill`]). The caller chooses
+/// to fail closed (no token, no socket bind) or degrade with a documented
+/// non-secret fallback; it must never retry with its own device read.
 pub fn hex_token<const N: usize>() -> io::Result<String> {
     let mut buf = [0u8; N];
     fill(&mut buf)?;
@@ -69,6 +72,16 @@ fn fill_from(
     f.read_exact(buf)
 }
 
+/// Block until the kernel CSPRNG has been seeded, once per process: the wait
+/// `getrandom(2)` does on its own and a `/dev/urandom` read does not.
+///
+/// Derived from `wait_until_rng_ready` in getrandom 0.2.17 `src/use_file.rs`
+/// (Copyright 2018-2024 The rust-random Project Developers; MIT OR
+/// Apache-2.0, taken here under Apache-2.0) and modified by the aterm project
+/// in 2026: std opens and closes the device, the answer is remembered in an
+/// atomic rather than in a cached descriptor, and it compiles on every Unix
+/// under test so the poll runs on a macOS box too.
+///
 /// Once is enough: `/dev/random` turns readable when the pool is first
 /// initialised, and before Linux 5.6 it could turn unreadable again as its
 /// entropy estimate drained, which `/dev/urandom` never needs to wait for.
@@ -115,7 +128,8 @@ fn wait_readable(path: &str) -> io::Result<()> {
         revents: 0,
     };
     loop {
-        // SAFETY: pfd is a live, exclusively borrowed struct pollfd for the call and nfds.
+        // SAFETY: `pfd` is a live, exclusively borrowed `struct pollfd` for the
+        // call and `nfds` is 1; `device` keeps the descriptor open.
         let rc = unsafe { poll(&mut pfd, 1, -1) };
         if rc >= 0 {
             return Ok(());

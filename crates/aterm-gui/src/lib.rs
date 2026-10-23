@@ -876,7 +876,7 @@ pub(crate) fn logical_to_device_px(logical: f32, scale: f64) -> usize {
 fn headroom_override() -> usize {
     static HEADROOM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *HEADROOM.get_or_init(|| {
-        aterm_types::dev_seam!("ATERM_HEADROOM_PX")
+        aterm_types::dev_seam!("ATERM_DEV_HEADROOM_PX")
             .and_then(|v| v.to_str()?.trim().parse::<usize>().ok())
             .unwrap_or(0)
     })
@@ -15055,7 +15055,9 @@ impl App {
         else {
             return Some(text);
         };
-        // SAFETY: standard `NSAlert` setters and sheet presentation on the main thread against a live `NSWindow`.
+        // SAFETY: standard `NSAlert` setters and sheet presentation on the main thread against a
+        // live `NSWindow`. The text setters copy; `-addButtonWithTitle:` and `-window` answer +0
+        // and are retained; AppKit copies the `BlockPtr`.
         let (panel, accept, cancel) = unsafe {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
@@ -18955,7 +18957,9 @@ mod cg_display {
     type CGDisplayModeRef = *mut c_void;
     type CGDirectDisplayID = u32;
 
-    // SAFETY: standard CoreGraphics display entry points with Apple's published signatures.
+    // SAFETY (whole block): standard CoreGraphics display entry points with the signatures in
+    // `CGDirectDisplay.h`; the one caller below releases the copied mode exactly once and
+    // dereferences nothing.
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGMainDisplayID() -> CGDirectDisplayID;
@@ -19035,7 +19039,9 @@ mod cg_capture {
     pub(crate) const BITS_PER_COMPONENT: usize = 8;
     pub(crate) const BYTES_PER_PIXEL: usize = 4;
 
-    // SAFETY: standard CoreGraphics C entry points with Apple's published signatures.
+    // SAFETY (whole block): standard CoreGraphics C entry points with Apple's published signatures.
+    // `capture_window_pixels` releases every created object once, passes only live CG objects, and
+    // keeps the context's buffer alive through the read.
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         /// Photograph on-screen windows into a CGImage.

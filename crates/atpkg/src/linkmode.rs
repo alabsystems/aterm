@@ -69,7 +69,7 @@ pub(crate) fn live_dev_links(layout: &Layout) -> (std::collections::BTreeSet<Str
     (live, problems)
 }
 
-/// What a [`link`]/[`refresh`] did: the bins shimmed, and any refused (sensitive-name).
+/// Outcome of [`link`] or [`refresh`]: shimmed bin names and refused protected names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkOutcome {
     /// The bin names shimmed into `bin/`.
@@ -145,8 +145,6 @@ struct LinkMarker {
     linked_at: String,
 }
 
-/// Whether `name` is a single safe path component ([`crate::store::shim_allowed`],
-/// [`crate::ops::uninstall`]).
 fn safe_component(name: &str) -> bool {
     !(name.is_empty()
         || name == "."
@@ -162,13 +160,11 @@ pub fn is_linked(layout: &Layout, program: &str) -> bool {
     safe_component(program) && read_marker_for_program(layout, program).is_ok()
 }
 
-/// The shim name for a bin path.
 fn bin_tool_name(rel: &Path) -> Option<&str> {
     let name = rel.file_name().and_then(|s| s.to_str())?;
     Some(strip_exe_suffix(name, std::env::consts::EXE_SUFFIX))
 }
 
-/// `name` with a trailing `ext` removed, compared case-insensitively.
 fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
     if ext.is_empty() {
         return name;
@@ -181,7 +177,6 @@ fn strip_exe_suffix<'a>(name: &'a str, ext: &str) -> &'a str {
     }
 }
 
-/// What stood at a `bin/<tool>` name before [`link`] replaced it ([`crate::shim_env`]).
 enum PriorShim {
     /// Nothing stood there.
     Absent,
@@ -191,7 +186,6 @@ enum PriorShim {
     Symlink(PathBuf),
 }
 
-/// Read what stands at `shim` into a [`PriorShim`], or refuse to touch it.
 fn capture_shim(shim: &Path) -> Result<PriorShim, LinkError> {
     let meta = match fs::symlink_metadata(shim) {
         Ok(meta) => meta,
@@ -222,7 +216,6 @@ fn capture_shim(shim: &Path) -> Result<PriorShim, LinkError> {
         .map_err(|e| LinkError::Io(format!("{}: {e}", shim.display())))
 }
 
-/// The rollback's temp sibling of `shim`.
 fn rollback_tmp(shim: &Path) -> std::io::Result<PathBuf> {
     let name = shim.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
         std::io::Error::new(
@@ -233,7 +226,6 @@ fn rollback_tmp(shim: &Path) -> std::io::Result<PathBuf> {
     Ok(shim.with_file_name(format!(".{name}.atpkg-rollback-{}", std::process::id())))
 }
 
-/// Put a captured regular-file shim back.
 fn restore_file(shim: &Path, bytes: &[u8], mode: &fs::Permissions) -> std::io::Result<()> {
     let tmp = rollback_tmp(shim)?;
     let _ = fs::remove_file(&tmp);
@@ -268,7 +260,6 @@ fn restore_symlink(shim: &Path, _target: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// Undo the shim mutations of a failed [`link`], best-effort and newest first.
 fn roll_back(replaced: &[(PathBuf, PriorShim)]) {
     for (shim, prior) in replaced.iter().rev() {
         let _ = match prior {
@@ -431,8 +422,7 @@ impl ConditionalLink<'_> {
     }
 }
 
-/// Admit the complete candidate and the exact observed selection under the same store writer lock
-/// used by ordinary link/install/update.
+/// Admits the candidate and observed selection under the store writer lock.
 pub(crate) fn link_if_checkout<'a>(
     guard: &'a mut crate::lock::StoreLock,
     configured: &Layout,
@@ -649,7 +639,7 @@ fn directory_identity(
 }
 
 /// Enumerate linked program names with a strict entry/result cap and explicit diagnostics for a
-/// link-like.
+/// link-like, replaced, or non-directory `links/` path.
 pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> {
     let mut out = Vec::new();
     let directory = layout.links_dir();

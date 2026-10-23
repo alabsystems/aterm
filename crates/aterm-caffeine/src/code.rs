@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bundle copy the mug runs from (see the crate docs, "Where it runs").
+//! The bundle copy the mug runs from.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -80,7 +80,9 @@ fn is_under(exe: &Path, dir: &Path) -> bool {
 /// Copy the bundle `origin` belongs to into `code_dir` (replacing an earlier copy for `label`) and return the copy's executable.
 ///
 /// # Errors
-/// The copy cannot be made.
+/// The copy cannot be made: `label` is not a plain name, `code_dir` is not a directory of
+/// this user's, an entry in it cannot be removed, or the bundle holds something other than
+/// files, directories and links, or cannot be read.
 pub fn prepare_copy(origin: &Path, code_dir: &Path, label: &str) -> io::Result<Option<PathBuf>> {
     let Some(bundle) = own_bundle(origin) else {
         #[cfg(unix)]
@@ -210,7 +212,9 @@ const TRUE_BPLIST: &[u8] = &[
 #[cfg_attr(trust_verify, trust::skip)]
 fn backup_excluded(dir: &std::ffi::CStr) -> bool {
     let mut have = [0u8; 64];
-    // SAFETY: `dir` and the name are NUL-terminated strings live for the call, and `have` is a writable buffer of the length passed.
+    // SAFETY: `dir` and the name are NUL-terminated strings live for the call, and `have` is
+    // a writable buffer of the length passed; `getxattr` writes at most that many bytes and
+    // answers how many, or -1.
     let n = unsafe {
         libc::getxattr(
             dir.as_ptr(),

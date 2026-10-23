@@ -66,7 +66,7 @@ pub(super) fn live_client() -> Client {
 /// Send `method endpoint` to `origin` carrying `token`, with `body` as JSON when it is given.
 /// # Errors
 /// An endpoint that is not one absolute path, a request that failed or was cut short, an
-/// answer over the bound, or a redirect.
+/// answer over the bound, or a redirect. No error carries the token.
 pub(super) fn send(
     client: &Client,
     origin: &str,

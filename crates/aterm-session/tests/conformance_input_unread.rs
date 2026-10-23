@@ -115,7 +115,8 @@ impl Rig {
     fn read_all(&mut self) -> Vec<u8> {
         let want: usize = self.unread.iter().map(|(n, _, _)| n).sum();
         let mut buf = [0u8; 64];
-        // SAFETY: a bounded read into this stack buffer from this test's live slave; the bytes.
+        // SAFETY: a bounded read into this stack buffer from this test's live slave; the bytes
+        // are already queued, so it does not block.
         let r = unsafe { libc::read(self.slave, buf.as_mut_ptr().cast(), buf.len()) };
         let got = usize::try_from(r).expect("read");
         assert_eq!(got, want, "one read() returns every queued byte");
@@ -142,7 +143,8 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        // SAFETY: both fds are this rig's and still open.
+        // SAFETY: both fds are this rig's and still open. The sink shares only the
+        // master's number; nothing writes through it after this.
         unsafe {
             libc::close(self.slave);
             libc::close(self.master);
@@ -163,6 +165,14 @@ fn assert_projects(rig: &Rig, b: &InputBacklog, st: &State, step: &str) {
 }
 
 /// The conformance check proper, for a running job and a stopped one:
+///
+/// * `gate` refuses exactly when the model's `DriverRefused` is enabled and, whenever
+///   the queue has room, exactly when `DriverKey` is disabled;
+/// * `gate` warns exactly when a `DriverKey` fired from this state leaves
+///   `warned = 1`;
+/// * for a running job not yet published, `classify`, fed the watch's evidence for the
+///   model's reader (a frozen reader spins and draws nothing; a reading one is seen
+///   drawing), enters `stalled` exactly when `Publish` is enabled.
 fn assert_gate_is_the_guard(model: &Model, b: &InputBacklog, st: &State, step: &str) {
     let published = st["published"] == 1;
     for stopped in [false, true] {

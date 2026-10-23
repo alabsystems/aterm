@@ -399,8 +399,8 @@ fn checkbox(text: &str) -> Option<(bool, &str)> {
     }
 }
 
-/// The column a numbered row's label starts at, its rows under it with it
-/// (module header): 5, past `N. `, and in multi-select past the checkbox as
+/// The column a numbered row's label starts at, its rows under it with it:
+/// 5, past `N. `, and in multi-select past the checkbox as
 /// drawn ([`checkbox`]: 9 past `[ ] `, 8 past `[✔]` or `[ ]` with no space).
 fn label_col(text: &str, multi: bool) -> usize {
     match checkbox(text).filter(|_| multi) {

@@ -17,7 +17,7 @@ pub const DEFAULT_ECHO_PREFIX: &str = "aterm: yolo (default): running ";
 pub struct Policy {
     /// The vendor flags the posture expands to.
     pub flags: &'static [&'static str],
-    /// Tokens that already decide the posture (module doc, rule 2).
+    /// Tokens that already decide the posture: a launch holding one and no `--yolo` runs as typed.
     pub markers: &'static [&'static str],
     /// First words the injection goes behind (rule 3).
     pub after: &'static [&'static str],
@@ -151,7 +151,7 @@ fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<
     if value { Err(()) } else { Ok(None) }
 }
 
-/// What a launch runs as, per the module doc's three rules.
+/// What a launch runs as ([`decide`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Launch {
     /// The argv as typed, nothing printed.
@@ -162,7 +162,11 @@ pub enum Launch {
     Default(Vec<String>),
 }
 
-/// Decide `program args…` under the module doc's rules.
+/// Decide `program args…`, reading the words ahead of a literal `--`. A program with no policy
+/// runs as typed. An unknown leading option leaves the argv as typed (with a typed `--yolo` too,
+/// when the policy has `after` words); else a typed `--yolo` becomes the policy's flags
+/// ([`Launch::Flag`]); else a marker, a `skip` word or a self-update verb leaves it as typed;
+/// else the flags go in front, or behind an `after` word ([`Launch::Default`]).
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
     let policy = policy_of(program);

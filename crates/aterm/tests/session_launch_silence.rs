@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A session launch prints nothing about updates
-//! (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): nothing prints into a shell
-//! the user did not ask to update.
-//!
-//! The real binary as a person launches it: `aterm --session` with a real terminal on stdin
-//! (the interactive lane, which spawns the background work) over a scratch `HOME`,
-//! `[packages]` enabled, and stderr on a pipe of its own; the assertion is on every byte.
-//! Three machines: a store that has never completed a pass; a malformed `[packages]` table;
-//! and the reroute engaged over a store whose `reroute/` cannot be made, with a configured
-//! prefix this user cannot write.
-//!
-//! Nothing reaches the machine: every root is private ([`launch_isolation`]), the lane's pass
-//! slot is claimed in the scratch prefix first ([`hold_the_pass`]) so no networked `aterm
-//! pkg update` starts, the `[machine]` settings are `leave`, and the app updater is off.
+//! Verifies that `aterm --session` launches print nothing about package updates or reroute failures to stderr or the terminal.
 
 #![cfg(unix)]
 #![allow(
@@ -32,18 +19,16 @@ use std::time::{Duration, Instant};
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// The session gets this long to start the shell, run `exit` and leave, and its pipes this
-/// long to close after it: a hang detector.
+/// One-minute hang detector for session exit and pipe drains.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The `[machine]` table every fixture carries: nothing on the host is touched.
+/// `[machine]` table keeping host settings untouched.
 const MACHINE: &str = "[machine]\nuniversal_control = \"leave\"\n";
 
-/// The `[update]` table every fixture carries: the app updater off, as in every launch
-/// test (`launch_isolation::CONFIG_OFF`).
+/// `[update]` table disabling the app updater.
 const UPDATE: &str = "[update]\nenabled = false\nauto_apply = false\n";
 
-/// A private root with `packages` as the fixture's `[packages]` table.
+/// Creates an isolated root with `packages` as the `[packages]` table.
 fn fixture(label: &str, packages: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "aterm-session-launch-silence-{label}-{}",
@@ -59,12 +44,12 @@ fn fixture(label: &str, packages: &str) -> PathBuf {
     root
 }
 
-/// The default store prefix under the fixture's `HOME`.
+/// Default store prefix under `root/home`.
 fn prefix(root: &Path) -> PathBuf {
     atpkg::store::default_prefix(&root.join("home"))
 }
 
-/// Make the default prefix the way atpkg makes it (every component 0700).
+/// Creates the default store prefix with `0700` permissions on each component.
 fn make_prefix(root: &Path) -> PathBuf {
     let home = root.join("home");
     let prefix = prefix(root);
@@ -81,9 +66,7 @@ fn make_prefix(root: &Path) -> PathBuf {
     prefix
 }
 
-/// Claim the session lane's pass slot in the scratch prefix, so a launch with packages enabled
-/// spawns no pass: the lane's machine-wide rule (`pkg_check::claim` on `session-pass.stamp`)
-/// reads that a sibling just started one.
+/// Writes a fresh `session-pass.stamp` in the scratch prefix so launching with packages enabled spawns no network pass.
 fn hold_the_pass(root: &Path) {
     let layout = atpkg::store::Layout {
         prefix: make_prefix(root),
@@ -92,16 +75,9 @@ fn hold_the_pass(root: &Path) {
     std::fs::write(layout.session_pass_stamp(), format!("{now}\n")).expect("claim the slot");
 }
 
-/// Launch `aterm --session` over `root` on a real pty, type `exit 0`, and answer
-/// `(stderr, screen)`. `reroute` leaves the reroute engaged; without it the launch
-/// carries `--no-reroute`.
+/// Launches `aterm --session` on a real PTY, sends `exit 0`, and returns `(stderr, screen)`.
 fn launch(root: &Path, reroute: bool) -> (String, String) {
-    // Every spawn in this binary is a `launch` that opens a pty. Held from the open until
-    // this launch's slave copies are dropped, this lock keeps a sibling launch's `aterm` from
-    // inheriting this launch's descriptors: the pty's ends are close-on-exec from birth
-    // (`aterm_pty::open_pty_pair`), but std's stderr pipe is made close-on-exec
-    // non-atomically on macOS, and an inherited copy would hold this launch's drains open
-    // for as long as the sibling's session lives.
+    // Serialize spawns until the child's slave fds are dropped so a sibling launch cannot inherit open pipes.
     static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let spawning = SPAWN
         .lock()
@@ -120,8 +96,6 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
         .stdout(Stdio::from(slave.try_clone().expect("dup pty slave")))
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn the aterm binary");
-    // The Command keeps its Stdio (two slave fds) until dropped, and the parent's own
-    // slave must go too, or the master never sees EOF and the drain below never ends.
     drop(cmd);
     drop(slave);
     drop(spawning);
@@ -159,8 +133,6 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
         }
     };
     drop(input);
-    // Bounded joins: a descendant holding a pipe or the slave past the session's exit
-    // must fail this test, never wedge the suite.
     let join = |drain: std::thread::JoinHandle<Vec<u8>>, what: &str| -> String {
         let grace = Instant::now() + DEADLINE;
         while !drain.is_finished() {
@@ -182,7 +154,7 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
     (stderr, screen)
 }
 
-/// Nothing on stderr, and nothing of the package manager or the reroute on the terminal.
+/// Asserts that `stderr` is empty and `screen` contains no package-update or reroute diagnostics.
 fn assert_silent(what: &str, stderr: &str, screen: &str) {
     assert_eq!(
         stderr, "",
@@ -198,8 +170,6 @@ fn assert_silent(what: &str, stderr: &str, screen: &str) {
 
 #[test]
 fn an_interactive_session_launch_over_a_never_checked_store_writes_nothing_to_stderr() {
-    // Packages enabled, with the pass slot held so an interactive launch spawns no network
-    // work.
     let root = fixture("never-checked", "[packages]\nenabled = true\n");
     hold_the_pass(&root);
     let status = prefix(&root).join("status.toml");
@@ -212,14 +182,9 @@ fn an_interactive_session_launch_over_a_never_checked_store_writes_nothing_to_st
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A table atpkg cannot read is reported by a verb the person runs (`aterm pkg doctor`
-/// loads the same file and says so on its own stderr), never by a session launch: here it
-/// is one record in the session's log, and the launch reads the file once.
+/// A malformed `[packages]` table is logged rather than printed into the new shell.
 #[test]
 fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
-    // One typo: `enabled` wants a boolean. An unreadable table still lets what is installed
-    // update (atpkg's `config.rs`), so the pass gate would spawn a real, networked pass: the
-    // slot is held. The table is read ahead of every gate.
     let root = fixture("malformed", "[packages]\nenabled = \"yes\"\n");
     hold_the_pass(&root);
     let (stderr, screen) = launch(&root, false);
@@ -227,14 +192,9 @@ fn a_malformed_packages_table_is_not_reported_into_the_new_shell() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The reroute engaged over a `reroute/` that cannot be made (a regular file stands there),
-/// so both the directory and the background lay fail (the lay on a thread beside the live
-/// shell), plus, where the test is not root, a configured prefix this user cannot write.
-/// Each is a log record, nothing printed.
+/// An engaged reroute over an uncreatable `reroute/` directory and an unwritable prefix logs without printing to the shell.
 #[test]
 fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing() {
-    // `/usr/…`: a root-owned chain the vet admits and this user cannot write, so the
-    // prefix falls back to the default (a log record); never tried as root, who could write it.
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let root_user = unsafe { libc::geteuid() } == 0;
     let foreign_prefix = if root_user {
@@ -246,8 +206,6 @@ fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing(
         "reroute",
         &format!("[packages]\nenabled = true\n{foreign_prefix}"),
     );
-    // The default prefix, made the way atpkg makes it (every component 0700), its pass
-    // slot held, and a regular file where `reroute/` goes.
     let prefix = make_prefix(&root);
     hold_the_pass(&root);
     std::fs::write(prefix.join(atpkg::reroute::DIR_NAME), "not a directory\n")
@@ -259,6 +217,5 @@ fn an_engaged_reroute_that_cannot_be_laid_and_a_misconfigured_table_say_nothing(
         "precondition held: nothing could lay the reroute"
     );
     let _ = std::fs::remove_dir_all(&root);
-    // The unwritable-prefix half did not run as root; the reroute half above did.
     aterm_uds::host::could_not_run_as_root("a root-owned prefix this user cannot write");
 }

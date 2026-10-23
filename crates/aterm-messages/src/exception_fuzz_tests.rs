@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the digest against an independent oracle, the log file (every line the
-//! center drained, kept without a ring). A bug in the ring (a dismissal forgotten after
-//! [`crate::LOG_CAP`] later records), in the order of "the latest word", in the wall
-//! clock an adopted entry ends with, or in a restart shows as a disagreement about one
-//! question: when a fact is posted, was it quiet (`Suppressed`) or new?
-//!
-//! Randomised but deterministic (a fixed xorshift per seed), so a failure names its seed
-//! and step and repeats.
+//! Deterministic randomized tests comparing the digest against the persisted log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -132,8 +125,6 @@ impl Oracle {
         }
     }
 
-    /// Should a post of `kind` at `wall` be quiet? The latest word by
-    /// retirement time is a filing, inside the backed-off span.
     fn quiet(&self, kind: &Kind, wall: u64) -> bool {
         let Some(history) = self.words.get(&kind.key) else {
             return false;
@@ -151,7 +142,6 @@ impl Oracle {
         let n = history
             .iter()
             .filter(|(at, _, h)| {
-                // The span is fixed by the filing that earned it.
                 *at >= t.saturating_sub(FILED_KEEP_MS)
                     && matches!(h, Retired::Dismissed | Retired::Answered { .. })
             })
@@ -174,7 +164,6 @@ fn restart(o: &mut Oracle, c: &mut MessageCenter, now: Instant) -> MessageCenter
     MessageCenter::new(log, now)
 }
 
-/// The whole life of the digest under random operations, against the file.
 #[test]
 fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
     for seed in 1..=20u64 {
@@ -244,8 +233,6 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
                     c = next;
                 }
                 7 => {
-                    // A record under an entry's own key: another fact's word, never a
-                    // resolution and never a forgetting.
                     let k = kind(rng.below(4));
                     c.post(
                         Message::new(tags::HARNESS, Severity::Info, "a wait, recorded")
@@ -256,7 +243,6 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
                     );
                 }
                 8 => {
-                    // Time passes; the digest settles (its clock and its expiry).
                     at_ms += (1 + rng.below(6) as u64) * DAY_MS / 3;
                     let _ = c.settle_digest(
                         WallStamp {
@@ -266,7 +252,6 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
                     );
                 }
                 9 => {
-                    // A flood of unrelated records: the ring turns over.
                     for i in 0..(40 + rng.below(560)) {
                         c.post(
                             Message::new(tags::SYSTEM, Severity::Info, format!("n{i}")).record(),
@@ -279,7 +264,6 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
                     }
                 }
                 10 => {
-                    // The owner does an entry's one action.
                     let e = c
                         .digest()
                         .entries
@@ -290,7 +274,6 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
                     }
                 }
                 _ => {
-                    // A family pass over the upgrade rows: some tabs named.
                     let desired: Vec<Message> = (0..3)
                         .filter(|_| rng.below(2) == 0)
                         .map(|p| entry(p, 3))
@@ -312,10 +295,6 @@ fn the_digest_agrees_with_the_file_through_restarts_floods_and_records() {
     }
 }
 
-/// The seamless update's overlap: a successor loads the file, the parent goes
-/// on (posts, dismisses, clears, sweeps), and at Commit the successor folds
-/// the file's tail in. What the parent put away stays put away in the
-/// successor, and the two agree on what is open.
 #[test]
 fn the_successor_agrees_with_the_parent_after_the_overlap() {
     for seed in 1..=60u64 {
@@ -405,8 +384,6 @@ fn the_successor_agrees_with_the_parent_after_the_overlap() {
     }
 }
 
-/// One fact, one place: a live row and an exception never share a key, whatever
-/// mix of posts, settles and sweeps arrives.
 #[test]
 fn a_key_is_never_both_a_live_row_and_an_open_exception() {
     use crate::need::{Ask, StandingWhy};

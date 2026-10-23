@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one error type for parsing, deserializing and serializing: a message plus an optional
-//! byte span into the source (`span()` to underline, `to_string()` for the text).
+//! Error type for TOML parsing, deserializing, and serializing.
 
 use core::fmt;
 use core::ops::Range;
@@ -117,8 +116,6 @@ fn locate(source: &str, offset: usize) -> (usize, usize, usize) {
     (line, col, line_start)
 }
 
-/// Cut the line containing `span.start` out of `source` and work out where the
-/// carets go under it.
 fn snippet(source: &str, span: &Range<usize>) -> Snippet {
     let start = floor_boundary(source, span.start.min(source.len()));
     let (_, col, line_start) = locate(source, start);
@@ -128,10 +125,6 @@ fn snippet(source: &str, span: &Range<usize>) -> Snippet {
     let text = source[line_start..line_end]
         .trim_end_matches('\r')
         .to_owned();
-    // The caret run stops at the end of the line, so a span that crosses a newline (an
-    // unterminated multi-line string) underlines only the printed line. `line_end` is
-    // before `start` at end of input in a file that ends with a newline: one caret, past
-    // that line's last character.
     let cap = line_end.max(start);
     let end = floor_boundary(source, span.end.clamp(start, cap));
     let span_chars = source[start..end.max(start)].chars().count();
@@ -143,15 +136,6 @@ fn snippet(source: &str, span: &Range<usize>) -> Snippet {
 }
 
 impl fmt::Display for Error {
-    /// The annotated form `toml` and `toml_edit` print, which the config editor shows:
-    ///
-    /// ```text
-    /// TOML parse error at line 1, column 11
-    ///   |
-    /// 1 | font_px = "huge"
-    ///   |           ^^^^^^
-    /// invalid type: string "huge", expected f64
-    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Some((line, col)) = self.line_col else {
             return f.write_str(&self.message);
@@ -171,8 +155,6 @@ impl fmt::Display for Error {
                 carets = snippet.caret_len
             )?;
         }
-        // The trailing newline matches `toml` and `toml_edit`, which this tree's consumers
-        // were written against.
         writeln!(f, "\n{}", self.message)
     }
 }

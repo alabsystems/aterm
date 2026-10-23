@@ -1,19 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wake a pending tool's waiting command when a shim lands in `bin/`, or when the pass it
-//! waits on moves in the prefix.
-//!
-//! The installer atomically renames a staged shim over the pending stub, and lands the
-//! pass's `progress.json` and retires its `pass-owed.json` promise in the prefix, each by a
-//! rename or a removal. A watch on both directories makes those edges promptly visible —
-//! the shim the moment it lands, and the pass's end or the promise's retirement (an offline
-//! first launch's whole answer) the moment it is written rather than up to a poll later:
-//! [`crate::dirwatch::Watcher`] on macOS (kqueue) and Linux (inotify), and this module's
-//! own change notification on Windows, where that watcher has no arm. The old 250 ms poll
-//! remains the fallback on every other platform and after watch failure. A notification is
-//! only a hint: the caller always re-reads the pass first, then the shim, before deciding
-//! whether to run or fail.
+//! Directory-watch notification for commands waiting on pending tool shims or prefix passes.
 
 use std::time::Duration;
 
@@ -48,14 +36,6 @@ impl PendingShimWake {
             let started = std::time::Instant::now();
             match watch.wait(fallback) {
                 Ok(true) => {
-                    // A rename of a directory itself invalidates its old
-                    // vnode (inode, handle). Re-register before the next
-                    // pass/shim read so a subsequent replacement still has a
-                    // live listener; dropping the old watch drops its queue.
-                    // The new one is made BEFORE the old one closes: on Linux
-                    // a close that drops the last watch on a directory waits
-                    // out an SRCU grace period (measured 3.9-4.8 ms on the
-                    // lane), one that leaves the successor's watch 0.15 ms.
                     self.watch = DirWatch::new(&self.dirs).ok();
                     return true;
                 }
@@ -116,8 +96,6 @@ impl DirWatch {
         }
     }
 
-    /// Whether either directory moved within `timeout`. Nothing else wakes this watcher:
-    /// a wake replaces the watch ([`PendingShimWake::wait`]).
     fn wait(&self, timeout: Duration) -> std::io::Result<bool> {
         Ok(!self.watcher.wait(Some(timeout))?.is_empty())
     }
@@ -148,10 +126,6 @@ struct DirWatch {
 
 #[cfg(windows)]
 impl DirWatch {
-    /// A change notification on every directory of `dirs`: a file or directory name
-    /// created in, renamed in or removed from any of them signals its handle and wakes
-    /// [`Self::wait`]. A reparse point (a symlink or junction) is refused, as the macOS
-    /// arm's `O_NOFOLLOW` open refuses a symlink.
     fn new(dirs: &[std::path::PathBuf]) -> std::io::Result<Self> {
         use std::os::windows::ffi::OsStrExt as _;
 
@@ -188,7 +162,6 @@ impl DirWatch {
         const WAIT_OBJECT_0: u32 = 0;
         const WAIT_TIMEOUT: u32 = 0x102;
         const INFINITE: u32 = u32::MAX;
-        // Rounded up, and kept below INFINITE: a long fallback still ends.
         let ms = u32::try_from(timeout.as_nanos().div_ceil(1_000_000))
             .unwrap_or(INFINITE)
             .min(INFINITE - 1);
@@ -242,23 +215,17 @@ mod tests {
             "the test requires a live directory watch"
         );
         assert!(crate::which(&layout, "ty").is_none());
-        // Stage outside the watched directories (bin/ and the prefix): only the
-        // final rename can account for the event this assertion receives.
         let stage = crate::testdir::dir("atpkg-pending-wake-stage-");
         let staged = stage.join("stage-ty");
         symlink(&target, &staged).unwrap();
         std::fs::rename(staged, &shim).unwrap();
         std::fs::remove_dir_all(&stage).unwrap();
 
-        // The rename finished before the wait started: the registered watch keeps the event.
         assert!(wake.wait(aterm_spec::wait::MUST_HAPPEN));
         assert_eq!(crate::which(&layout, "ty"), Some(target));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The pass a stub waits on moves in the prefix, not in `bin/`: the promise retired, the
-    /// progress file landed. Either wakes the waiter at once — an offline first launch's
-    /// pass ends with no shim ever landing, and the stub's answer is that end.
     #[test]
     fn a_retired_promise_or_a_landed_progress_file_wakes_the_waiter() {
         let dir = crate::testdir::dir("atpkg-pending-wake-pass-");
@@ -277,7 +244,6 @@ mod tests {
             wake.wait(aterm_spec::wait::MUST_HAPPEN),
             "the promise retired"
         );
-        // Staged outside the watched directories, so only the landing rename can wake it.
         let stage = crate::testdir::dir("atpkg-pending-wake-pass-stage-");
         let staged = stage.join("progress.json.tmp");
         std::fs::write(&staged, b"{}").unwrap();
@@ -290,10 +256,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The wait's end takes both watches off and keeps the descriptor open
-    /// ([`PendingShimWake::retire`]), so the close at the tool's exec or this process's
-    /// exit is not the one that drops the last watch on the two directories. Read off the
-    /// kernel's own account of the instance, one `inotify wd:` line per watch.
     #[test]
     #[cfg(target_os = "linux")]
     fn retiring_takes_the_watches_off_and_keeps_the_descriptor() {

@@ -101,7 +101,8 @@ impl ShmMem {
         if end > self.len || !offset.is_multiple_of(4) {
             return None;
         }
-        // SAFETY: In-bounds, 4-byte aligned, and uniquely borrowed for `&mut self`.
+        // SAFETY: inside the mapping, word-aligned (mmap is page-aligned and
+        // `offset` is a multiple of 4), and uniquely borrowed for `&mut self`.
         Some(unsafe {
             std::slice::from_raw_parts_mut(self.map.as_ptr().add(offset).cast::<u32>(), count)
         })

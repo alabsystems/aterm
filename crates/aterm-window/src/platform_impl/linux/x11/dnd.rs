@@ -4,6 +4,11 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/dnd.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): percent-decoding is `common/percent.rs`, not the `percent-encoding` crate,
+// and the requests are aterm-x11's encoders, where upstream used x11rb's. A path is the one the
+// source named, not canonicalized; an entry naming no local file is skipped, a list naming none is
+// refused, and a list too large for one property is read through ICCCM INCR.
+
 use std::os::raw::*;
 use std::path::PathBuf;
 use std::str::Utf8Error;

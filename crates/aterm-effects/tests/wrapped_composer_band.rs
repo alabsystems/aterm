@@ -1,25 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! The band in a wrapped composer is one run, on every frame.
-//!
-//! `Ribbon::retract_suffix` states the law: contiguous at every frame, nothing removed from the
-//! middle. Every path that takes light off a row by geometry (Backspace's retract, the kill, the
-//! insert's rewrite, the exit swoosh) obeys it by construction; the content witness takes light
-//! off by name, one cell at a time, and is pinned here.
-//!
-//! Driven at the host seam like `scrub_gaps.rs`: a real `Terminal` fed byte for byte, its rows
-//! sampled as `app_render.rs`'s frame hold samples them, its content-scroll clock read as
-//! `sync_cursor_effect_scroll` reads it. The program is a bottom-pinned wrapping box (the shape
-//! of Claude Code's and Codex's composer): one logical input wrapping at the box's inner width;
-//! the box grows upward from the last row, so a new wrap row scrolls the screen under the band;
-//! every repaint homes to the box's top row, clears to the end of the screen, rewrites every row
-//! and parks the cursor in separate writes, so a present can land between any two.
-//!
-//! The census is of the plan (the coverage the emitter puts in each cell), which is what a pixel
-//! census reads: a retracting cell is light until spent. Where a mid-line Backspace's shifted
-//! text repeats a letter, a per-column comparison would keep that cell while naming its
-//! neighbours, leaving a comb of lit specks; `Witness::walk`'s span closure prevents that.
 
 use crate::common::{
     LIT_COV, caret_sample, coverage, holes_of, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -34,24 +15,16 @@ const ROWS: usize = 14;
 const COLS: usize = 80;
 const CW: usize = 15;
 const CH: usize = 28;
-/// The box's inner width: the terminal's columns less its chrome.
 const W: usize = COLS - 4;
 const PROMPT: &str = "> ";
 const CONT: &str = "  ";
-/// 12 cps.
 const KEY_MS: u64 = 83;
-/// The frame train.
 const FRAME_MS: u64 = 8;
-/// Milliseconds between a repaint's writes; on glass the host presents between them.
 const WRITE_GAP_MS: u64 = 3;
 
-/// The typed paragraph.
 const PARA: &str = "there is a bug that when backspacing in this build the rainbow cursor trail breaks apart and I also see some awkward transitions when going to a new line still with the rainbow please audit that logic";
-/// How much of it the takes type: enough to wrap onto a second row.
 const TYPED: usize = 110;
 
-/// One frame's census of one row: the lit columns, as a map, with the span's
-/// interior dark runs.
 struct RowCensus {
     ms: u64,
     row: u16,
@@ -65,7 +38,6 @@ impl RowCensus {
     }
 }
 
-/// The host: one terminal, the kitty, one clock, and the composer's own state.
 struct Composer {
     term: Terminal,
     glow: CursorGlow,
@@ -90,7 +62,6 @@ impl Composer {
         let now = Instant::now();
         let mut glow = CursorGlow::default();
         glow.note_pane_columns(0, COLS);
-        // The shell's prompt is on the last row; the composer takes it.
         term.process(format!("\x1b[{ROWS};1H").as_bytes());
         let mut c = Self {
             term,
@@ -118,8 +89,6 @@ impl Composer {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The host's order, less the neighbour probe and print anchor: content-scroll
-    /// sync (`sync_cursor_effect_scroll`), the frame hold's samples, then the tick.
     fn frame(&mut self) {
         sync_scroll(&self.term, &mut self.glow, &mut self.scroll, self.now);
         let (c, cur) = caret_sample(&self.term);
@@ -144,7 +113,6 @@ impl Composer {
         }
     }
 
-    /// The next event's instant, `ms` after the last, with the train run to it.
     fn schedule(&mut self, ms: u64) {
         let t = self.last_event + Duration::from_millis(ms);
         self.idle_to(t);
@@ -168,8 +136,6 @@ impl Composer {
             .collect()
     }
 
-    /// The box's repaint, write for write: the grow scroll, the home-and-clear,
-    /// the body, the caret park, with the frame train running between.
     fn paint(&mut self) {
         let rows = self.wrap();
         let n = rows.len();
@@ -180,7 +146,6 @@ impl Composer {
             c.now = t;
         };
         if n > self.prev_rows && self.prev_rows > 0 {
-            // The box grew: scroll the screen so the bottom stays pinned.
             w(self, format!("\x1b[{ROWS};1H").as_bytes());
             w(self, "\n".repeat(n - self.prev_rows).as_bytes());
         }
@@ -218,7 +183,6 @@ impl Composer {
         self.frame();
     }
 
-    /// Alt-B: the caret back one word, as a navigation key.
     fn word_left(&mut self, ms: u64) {
         self.schedule(ms);
         self.glow.note_motion(self.now);
@@ -235,8 +199,6 @@ impl Composer {
         self.frame();
     }
 
-    /// This frame's per-row census of the plan's coverage: what the glass
-    /// shows, not what the pool holds.
     fn record(&mut self) {
         let ms = self.ms();
         for r in 0..ROWS as u16 {
@@ -256,7 +218,6 @@ impl Composer {
         }
     }
 
-    /// Every row-frame of the take whose band had an interior dark run.
     fn broken(&self) -> Vec<&RowCensus> {
         self.census.iter().filter(|c| !c.holes.is_empty()).collect()
     }
@@ -275,7 +236,6 @@ impl Composer {
         s
     }
 
-    /// The take must actually have laid a band, or "no holes" says nothing.
     fn assert_band_was_laid(&self, least_rows: usize, least_span: usize) {
         let lit_rows: std::collections::BTreeSet<u16> = self.census.iter().map(|c| c.row).collect();
         assert!(
@@ -304,8 +264,6 @@ fn typed_paragraph() -> Composer {
     c
 }
 
-/// The caret scrubbed back into the middle of a wrapped line, then a Backspace
-/// run mid-word, every glyph right of the caret shifting one column per erase.
 #[test]
 fn a_backspace_run_mid_word_never_punches_a_hole_in_the_wrapped_band() {
     let mut c = typed_paragraph();
@@ -322,10 +280,6 @@ fn a_backspace_run_mid_word_never_punches_a_hole_in_the_wrapped_band() {
     assert!(c.broken().is_empty(), "{}", c.report("c8_bs_mid"));
 }
 
-/// The same box with the Backspace run at the end of the text. The band
-/// crosses the fold: the box grows a row, the screen scrolls under the
-/// paragraph, and the first row's light rides up with its text while the hand
-/// types on the new one.
 #[test]
 fn a_backspace_run_at_the_end_never_punches_a_hole_in_the_wrapped_band() {
     let mut c = typed_paragraph();
@@ -338,9 +292,6 @@ fn a_backspace_run_at_the_end_never_punches_a_hole_in_the_wrapped_band() {
     assert!(c.broken().is_empty(), "{}", c.report("c2_bs"));
 }
 
-/// The caret moved back into typed text and more typed there, so every glyph
-/// right of the caret shifts one column right per key (the insert's mirror of
-/// the Backspace run).
 #[test]
 fn an_insert_mid_line_never_punches_a_hole_in_the_wrapped_band() {
     let mut c = typed_paragraph();

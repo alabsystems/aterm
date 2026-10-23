@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A band that followed its text once follows it again.
-//!
-//! The follow pass (`rainbow_kitty::witness::Witness::follow_runs`) carries a band onto the row
-//! its text moved to. A record it carried stands on a row whose neighbours it has never seen, and
-//! a second move with no key between (a box relocated twice, an inline chat box pushed down by two
-//! streamed rows, Claude Code's composer growing at a second newline after the first's far-row
-//! read was dropped) must follow as the first did. How the witness keeps its evidence across a
-//! carry, a scroll, a torn repaint and a withheld row is the `rainbow_kitty::witness` module doc.
-//! Every law runs at the host seam (`trail_host::Core`).
+//! Verifies that cursor-trail bands follow text across repeated moves without intervening
+//! keystrokes.
 
 use crate::trail_host::{Core, Opts, Theme};
 use aterm_effects::rainbow_kitty::TypedClass;
 use std::time::Duration;
 
-/// The GUI's frame seam: the content-scroll seam (a frame that scrolled samples nothing), the
-/// frame hold's rows (the caret row's probe, then every row the witness names), then the tick.
 const SEAM: Opts = Opts {
     scroll_seam: true,
     alt_rebaseline: false,
@@ -25,10 +16,6 @@ const SEAM: Opts = Opts {
     pane_columns: false,
 };
 
-/// `trail_host`'s frame seam on a grid of 8×16 cells. `drop_far_frames = 1` drops the next
-/// frame's far-row read: only the caret's row and its `±1` (read under the first terminal lock in
-/// `app_render.rs`) reach the witness, as when the second, generation-checked read loses its race
-/// with a newer grid.
 struct Host {
     c: Core,
 }
@@ -41,7 +28,6 @@ impl Host {
         Self { c }
     }
 
-    /// Idle frames at 16 ms until `ms` have passed.
     fn idle(&mut self, ms: u64) {
         let end = self.now + Duration::from_millis(ms);
         while self.now < end {
@@ -50,8 +36,6 @@ impl Host {
         }
     }
 
-    /// A key `gap` ms after the last frame: the typed hint armed at the
-    /// key, the echo `bytes`, one frame.
     fn key(&mut self, ch: char, bytes: &[u8], gap: u64) {
         self.now += Duration::from_millis(gap);
         let class = if ch == ' ' {
@@ -65,7 +49,6 @@ impl Host {
         self.frame();
     }
 
-    /// Type `s` as a line editor echoes it (the glyph at the caret).
     fn type_str(&mut self, s: &str) {
         for ch in s.chars() {
             let mut b = [0u8; 4];
@@ -73,7 +56,6 @@ impl Host {
         }
     }
 
-    /// A program's own repaint, no key behind it, on the next frame.
     fn program(&mut self, bytes: &[u8]) {
         self.now += Duration::from_millis(16);
         self.term.process(bytes);
@@ -81,10 +63,6 @@ impl Host {
     }
 }
 
-/// An inline chat box (Claude Code outside fullscreen): transcript rows
-/// above it, then a rule, the prompt row with `text`, a rule and a status
-/// row, its top on 0-based `top` and the caret after the text. A full
-/// redraw inside one synchronized update, as a streaming answer repaints.
 fn draw_box(cols: usize, top: usize, text: &str, transcript: usize) -> Vec<u8> {
     let rule = "\u{2500}".repeat(cols);
     let mut s = String::from("\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J");
@@ -106,9 +84,6 @@ fn draw_box(cols: usize, top: usize, text: &str, transcript: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// A line typed into an inline box, then the box re-laid by a streaming answer growing above it
-/// (down) or a transcript row retracted (up), one or two rows a move, 60–300 ms between moves and
-/// no key: every move carries all 33 cells onto the text's new row and retires nothing.
 #[test]
 fn an_inline_box_moved_by_streamed_rows_follows_every_move() {
     const COLS: usize = 100;
@@ -168,11 +143,6 @@ fn an_inline_box_moved_by_streamed_rows_follows_every_move() {
     );
 }
 
-/// An inline box on the screen's last four rows under streamed rows: each streamed row is written
-/// over the box's top rule and the box re-written under it, the last CRLF scrolling the screen,
-/// so the scroll carries the band a row up while the text ends on the same row. The follow pass
-/// brings it back down, which needs the rule row seen above the text to stay seen after the scroll
-/// (`Witness::translate`).
 #[test]
 fn an_inline_box_at_the_screen_s_bottom_keeps_its_band_under_every_streamed_row() {
     const ROWS: usize = 40;
@@ -224,11 +194,6 @@ fn an_inline_box_at_the_screen_s_bottom_keeps_its_band_under_every_streamed_row(
     }
 }
 
-/// Claude Code's bottom-anchored composer on the alternate screen (the
-/// shape of `tests/composer_multiline_wrap.rs`): a rule, the text rows, the
-/// caret row, a rule and a status row. A composer newline (Shift+Enter)
-/// repaints the box one row higher with an empty caret row, inside one
-/// synchronized update.
 struct Composer {
     h: Host,
     rows: usize,
@@ -265,18 +230,14 @@ impl Composer {
         }
     }
 
-    /// The caret row, 1-based (the composer's CUP row).
     fn caret_row1(&self) -> usize {
         self.rows - 2
     }
 
-    /// 0-based row of completed line `i`.
     fn line_row(&self, i: usize) -> u16 {
         (self.caret_row1() - 1 - self.lines.len() + i) as u16
     }
 
-    /// One key: the glyph written at the caret (Ink's cursor-relative
-    /// write), the caret parked after it.
     fn key(&mut self, ch: char) {
         let c = 3 + self.cur.chars().count();
         let row = self.caret_row1();
@@ -289,10 +250,6 @@ impl Composer {
         self.h.key(ch, bytes.as_bytes(), 80);
     }
 
-    /// The composer newline: the box repainted a row higher, the typed row
-    /// now a completed line, an empty caret row. The host arms the newline
-    /// and typed hints at the key, then the repaint lands; the frame is not
-    /// run here.
     fn newline(&mut self) {
         self.lines.push(std::mem::take(&mut self.cur));
         let top = self.caret_row1() - 1 - self.lines.len();
@@ -317,12 +274,6 @@ impl Composer {
     }
 }
 
-/// A far-row read dropped on one newline's frame costs no later follow. A list typed a line at a
-/// time into Claude Code's composer: on the first newline's echo frame only the caret's row and
-/// its `±1` reach the witness, and the first line still follows up (to the caret's `−1`). At the
-/// second newline it moves up again and follows again: the run beside the withheld row waits one
-/// walk, and a carried record's unseen neighbours are no evidence against the move. Line 1 shares
-/// `- ` with line 0 at the same columns; those letters must not read as holes.
 #[test]
 fn a_far_row_read_dropped_on_one_newline_s_frame_costs_no_later_follow() {
     let mut c = Composer::new(53, 91);
@@ -334,8 +285,6 @@ fn a_far_row_read_dropped_on_one_newline_s_frame_costs_no_later_follow() {
         if k + 1 == list.len() {
             break;
         }
-        // Lit cells per line before the newline: the completed lines, then
-        // the caret row's — the line the newline completes.
         let caret_row = (c.caret_row1() - 1) as u16;
         let mut lit: Vec<usize> = (0..c.lines.len())
             .map(|i| c.h.live(c.line_row(i)).len())
@@ -364,9 +313,6 @@ fn a_far_row_read_dropped_on_one_newline_s_frame_costs_no_later_follow() {
     }
 }
 
-/// A row the host has a slot for is never withheld: three bands fill the bands' eight witness
-/// rows and the caret sits on row 20, but `CURSOR_WITNESS_ROWS` slots hold them all. A program
-/// rewriting row 7's text in place retires the band's four cells on that frame, not a frame late.
 #[test]
 fn a_row_the_host_has_a_slot_for_is_never_withheld() {
     let mut h = Host::new(24, 80);
@@ -396,10 +342,6 @@ fn a_row_the_host_has_a_slot_for_is_never_withheld() {
     );
 }
 
-/// A torn repaint still follows: with no synchronized-update bracket, a line re-laid one row away
-/// in two writes on consecutive frames (new row, then the old one's erase) stands on both rows for
-/// a frame as a copy not yet a twin (`Seen::pending`). Longer tears are in
-/// `tests/moves_are_followed.rs`.
 #[test]
 fn a_torn_repaint_that_draws_the_new_row_a_frame_before_it_erases_the_old_still_follows() {
     for (from, to) in [(5u16, 6u16), (20, 19)] {

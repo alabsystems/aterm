@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rows-only shrink→grow round-trip identity: after any shrink+grow the
-//! viewport, cursor line, history order and extras are unchanged.
+//! Rows-only shrink-then-grow round-trip identity tests.
 
 use super::super::super::*;
 use crate::CellCoord;
@@ -31,8 +30,6 @@ fn viewport_texts(grid: &Grid) -> Vec<String> {
         .collect()
 }
 
-/// A full screen with the cursor at the bottom: shrink then grow restores
-/// content, cursor and order.
 #[test]
 fn full_screen_shrink_grow_round_trip_is_identity() {
     let mut grid = Grid::with_scrollback(5, 20, 100);
@@ -42,12 +39,10 @@ fn full_screen_shrink_grow_round_trip_is_identity() {
     assert_eq!(before_view, ["LINE0", "LINE1", "LINE2", "LINE3", "LINE4"]);
 
     grid.resize(3, 20);
-    // Shrink anchors at the cursor: the top rows move to history in reading order.
     assert_eq!(viewport_texts(&grid), ["LINE2", "LINE3", "LINE4"]);
     assert_eq!(history_trimmed(&grid), ["LINE0", "LINE1"]);
 
     grid.resize(5, 20);
-    // Grow pulls the same rows back: the exact inverse.
     assert_eq!(viewport_texts(&grid), before_view, "round trip is identity");
     assert_eq!(
         (grid.cursor_row(), grid.cursor_col()),
@@ -58,9 +53,6 @@ fn full_screen_shrink_grow_round_trip_is_identity() {
     grid.assert_invariants();
 }
 
-/// A prompt at the top with blanks below does not move across height toggles:
-/// trailing blanks trim on shrink (no fake blank history) and grow has nothing
-/// to pull.
 #[test]
 fn prompt_with_trailing_blanks_does_not_walk_across_toggles() {
     let mut grid = Grid::with_scrollback(5, 20, 100);
@@ -90,8 +82,6 @@ fn prompt_with_trailing_blanks_does_not_walk_across_toggles() {
     grid.assert_invariants();
 }
 
-/// With deep history, a shrink+grow leaves scroll-back reading order equal to
-/// write order.
 #[test]
 fn history_reading_order_survives_a_round_trip() {
     let mut grid = Grid::with_scrollback(5, 20, 100);
@@ -110,8 +100,6 @@ fn history_reading_order_survives_a_round_trip() {
     grid.assert_invariants();
 }
 
-/// A hyperlink and a non-BMP scalar on rows that transit through ring history
-/// come back intact after a shrink+grow.
 #[test]
 fn extras_survive_the_round_trip_through_ring_history() {
     let mut grid = Grid::with_scrollback(5, 20, 100);
@@ -120,7 +108,6 @@ fn extras_survive_the_round_trip_through_ring_history() {
     for col in 0..4u16 {
         grid.cell_extra_mut(3, col).set_hyperlink(Some(url.clone()));
     }
-    // The cursor is on the bottom row, so the shrink demotes the top rows.
     grid.resize(2, 20);
     assert_eq!(viewport_texts(&grid), ["link", "bottom"]);
     grid.resize(5, 20);
@@ -141,8 +128,6 @@ fn extras_survive_the_round_trip_through_ring_history() {
     grid.assert_invariants();
 }
 
-/// A full screen with the cursor on the top row: nothing is lost and the cursor's line stays
-/// visible (the one shape that pushes from the bottom).
 #[test]
 fn cursor_near_top_shrink_preserves_all_content() {
     let mut grid = Grid::with_scrollback(5, 20, 100);
@@ -164,18 +149,8 @@ fn cursor_near_top_shrink_preserves_all_content() {
     grid.assert_invariants();
 }
 
-/// Every retained row keeps its absolute key across a rows-only resize.
-///
-/// `oldest_absolute_row()` is `absolute_row_counter - visible - scrollback`. Moving rows across
-/// the live/history boundary keeps the retained total fixed; appending blank rows at the bottom
-/// or trimming trailing blanks changes it, and the counter moves with those rows, so no key
-/// slides. A slide would move every OSC 133 mark off its prompt, and where nothing had been
-/// evicted (`oldest_absolute_row()` saturated at 0) the read map (`oldest + scrollback + r`) and
-/// the write map (`visible_to_absolute`) would name different rows.
 #[test]
 fn a_rows_only_resize_keeps_every_absolute_key() {
-    // Real absolute numbering (rows have scrolled), then `ED 3` takes the history away, so a
-    // later grow has nothing to reveal.
     let cleared = |rows: u16| {
         let mut grid = Grid::with_scrollback(rows, 20, 100);
         let names: Vec<String> = (0..20).map(|i| format!("old {i}")).collect();
@@ -191,13 +166,11 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
         );
         grid
     };
-    // The read map and the write map name the same row for every visible row.
     let maps_agree = |grid: &Grid| {
         let base = grid.oldest_absolute_row() + grid.scrollback_lines() as u64;
         (0..grid.rows()).all(|r| grid.visible_to_absolute(r) == base + u64::from(r))
     };
 
-    // A grow with nothing to reveal: blank rows are appended at the bottom.
     let mut grid = cleared(5);
     write_lines(&mut grid, &["a", "b", "c"]);
     let before = grid.oldest_absolute_row();
@@ -220,7 +193,6 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
     assert!(maps_agree(&grid));
     grid.assert_invariants();
 
-    // A grow that reveals history: a pure relabel, no slide, no epoch bump.
     let mut grid = Grid::with_scrollback(3, 20, 4);
     let names: Vec<String> = (0..20).map(|i| format!("h{i}")).collect();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -243,7 +215,6 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
     assert!(maps_agree(&grid));
     grid.assert_invariants();
 
-    // A shrink that only trims trailing blanks.
     let mut grid = cleared(8);
     write_lines(&mut grid, &["a", "b"]);
     let before = grid.oldest_absolute_row();
@@ -261,8 +232,6 @@ fn a_rows_only_resize_keeps_every_absolute_key() {
     assert!(maps_agree(&grid));
     grid.assert_invariants();
 
-    // A grid that has evicted nothing (a fresh tab, an adopted grid) grows before it holds any
-    // history: the maps agree then, and after output scrolls rows into history.
     let mut grid = Grid::with_scrollback(5, 20, 100);
     assert_eq!(grid.oldest_absolute_row(), 0);
     grid.resize(6, 20);

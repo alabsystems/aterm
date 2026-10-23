@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The receipt of completed network checks. Apply and status writers never refresh its
-//! clock or deferral, and another source cannot reuse it.
-//!
-//! It also counts, machine-wide, how many completed checks in a row have found the
-//! channel head's app build in flight (a release published source-first:
-//! `github::app_build_in_flight`) — the count the check loop's quick re-checks
-//! (`cadence::IN_FLIGHT_RETRY`, for `cadence::IN_FLIGHT_CHECKS` of them) and every
-//! sibling's dedup window (`checker_skip_for`) key on, so whichever process checks
-//! next, the machine walks one ladder.
+//! Receipt tracking for completed network update checks and in-flight channel head builds.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,8 +63,6 @@ fn record_at(
     head_in_flight: Option<&str>,
     now: u64,
 ) -> u32 {
-    // The run continues only across receipts of this source, any build, naming the same
-    // head; a completed check that found none ends it. A failed check writes no receipt.
     let checks = head_in_flight.map(|head| {
         crate::read_ledger_text(&path(staging))
             .and_then(|text| text.parse::<aterm_toml::Value>().ok())
@@ -129,7 +119,6 @@ pub(crate) fn matches(text: &aterm_toml::Value, current_build: u64, source: &Sou
             == Some(current_build)
 }
 
-/// A schema-1 receipt of `source`, whatever build wrote it.
 fn same_source(text: &aterm_toml::Value, source: &Source) -> bool {
     text.get("schema").and_then(aterm_toml::Value::as_integer) == Some(1)
         && text
@@ -176,7 +165,6 @@ mod tests {
                 for same_build in [false, true] {
                     record_at(&staging, 42, &source("one"), false, None, now - age);
                     let bytes = std::fs::read(path(&staging)).unwrap();
-                    // The apply lane's real status writer must not touch the receipt.
                     crate::status::record(
                         &staging,
                         42,
@@ -217,13 +205,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// The dedup window may not outlast the quick wait. At the shipped two-minute base
-    /// a completed check 60 s ago skips every checker (the 84 s window). The same
-    /// receipt carrying a head in flight sizes the window on the one-minute wait (42 s,
-    /// over at 60 s; the negative control: sized on the base, the checker's own
-    /// one-minute re-check would read its own stamp as a sibling's and wait out the
-    /// window), for every count up to `cadence::IN_FLIGHT_CHECKS`; once those are
-    /// spent, or on a deferral, the ordinary window stands.
     #[test]
     fn a_head_in_flight_shrinks_the_dedup_window_to_its_quick_rung() {
         let _guard = crate::STRANDED_TEST_LOCK
@@ -264,7 +245,6 @@ mod tests {
             "the quick waits are spent: the base window again"
         );
 
-        // A deferral's widened window is never shortened by a head in flight.
         std::fs::write(
             path(&staging),
             format!(
@@ -278,11 +258,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// The count is the source's and the
-    /// head's: interleaved checks of builds 42 and 41 count 1, 2, 3, …, and the one
-    /// past `cadence::IN_FLIGHT_CHECKS` has spent the quick waits. Negative controls: a
-    /// different source, a different head, and a completed check that found none each
-    /// restart the run.
     #[test]
     fn two_builds_checking_one_head_in_flight_share_one_ladder() {
         let _guard = crate::STRANDED_TEST_LOCK

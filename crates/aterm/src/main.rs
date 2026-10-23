@@ -143,7 +143,11 @@ fn dispatch_link(args: &[String]) -> ExitCode {
     /// close or replacement) only this startup route can keep.
     #[cfg_attr(trust_verify, trust::skip)]
     fn take_startup_lanes() -> std::io::Result<aterm_link::bridge::InheritedLanes> {
-        // SAFETY: the launcher transfers eligible lanes exclusively to this startup route, and `dispatch_link` is the only route that reaches this function.
+        // SAFETY: the launcher transfers eligible lanes exclusively to this startup
+        // route, and `dispatch_link` is the only route that reaches this function.
+        // No other owner retains them and no thread or callback closes or replaces
+        // either number during adoption. Missing or ineligible lanes are checked
+        // refusals; the once-only guard alone would not establish ownership.
         let (verb, push) = unsafe { aterm_uds::spawnfd::adopt_startup_bridge_lanes() }?;
         Ok(aterm_link::bridge::InheritedLanes { verb, push })
     }

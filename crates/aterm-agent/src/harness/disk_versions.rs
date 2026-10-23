@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CLAUDE CODE'S VERSIONS ([`super::Class::ClaudeStaleVersions`]): which entry of the vendor's `versions/` folder is the LIVE one, and which of the others something still holds.
+//! Claude Code `versions/` directory survey ([`super::Class::ClaudeStaleVersions`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -14,26 +14,26 @@ use super::VersionDir;
 /// The digest cache's file, under the harness state directory.
 pub const HASH_FILE: &str = "claude-version-hashes.json";
 
-/// The most digests the cache keeps: the launcher's and every entry's of its length that one survey read.
+/// The most digests the cache keeps.
 pub const MAX_HASHES: usize = 32;
 
-/// The most bytes of cache file read back; a larger one is no cache.
+/// The most bytes of cache file read back.
 const MAX_HASH_FILE_BYTES: u64 = 64 * 1024;
 
 /// What one survey read of the versions folder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Versions {
-    /// Its entries, each strictly inside it (canonical), sized, and with why it is kept when something still holds it.
+    /// Its entries, each strictly inside it.
     pub entries: Vec<VersionDir>,
     /// The live entry, when the launcher named one.
     pub live: Option<PathBuf>,
-    /// The launcher the live entry was named from BY CONTENT (Windows' `claude.exe` copy); `None` when a link named it.
+    /// The launcher the live entry was named from BY CONTENT (Windows' `claude.exe` copy).
     pub copy_of: Option<PathBuf>,
     /// Why no live entry was named.
     pub unnamed: Option<String>,
 }
 
-/// Read the versions folder `roots` names: its entries ([`list`]), the live one ([`live_of`]), and for every other one what still holds it ([`mark_kept`], the running processes read once through `processes`).
+/// Read the versions folder `roots` names ([`list`], [`live_of`], [`mark_kept`]).
 #[must_use]
 pub fn read(roots: &super::Roots, processes: super::discover::Processes<'_>) -> Versions {
     let Some(root) = roots
@@ -71,7 +71,7 @@ pub fn read(roots: &super::Roots, processes: super::discover::Processes<'_>) -> 
     out
 }
 
-/// Why each of `entries` but the `live` one is KEPT ([`kept`]'s rule), from ONE scan of the running processes over every entry no lock or name already keeps.
+/// Why each of `entries` but the `live` one is KEPT ([`kept`]).
 pub fn mark_kept(
     entries: &mut [VersionDir],
     live: &Path,
@@ -110,7 +110,7 @@ pub fn mark_kept(
     }
 }
 
-/// The entries of the canonical versions folder `root`: each child that canonicalizes to a DIRECT child of `root` (a link inside it leading out is no entry: removing its target would remove what no listing of `versions/` holds), once, sized as what it is — a file by its length (the native installs' layout on every OS), a folder by its walk ([`super::dir_bytes`]).
+/// The entries of the canonical versions folder `root` ([`super::dir_bytes`]).
 #[must_use]
 pub fn list(root: &Path) -> Vec<VersionDir> {
     let mut out: Vec<VersionDir> = Vec::new();
@@ -144,7 +144,8 @@ pub fn list(root: &Path) -> Vec<VersionDir> {
     out
 }
 
-/// The live entry of the canonical versions folder `root`, named by `launcher`, and — when it was named by content — the launcher it is the original of.
+/// The live entry of the canonical versions folder `root`, named by `launcher`, and — when it was
+/// named by content — the launcher it is the original of.
 /// # Errors
 /// Why it names no entry.
 pub fn live_of(
@@ -178,9 +179,11 @@ pub fn live_of(
         })
 }
 
-/// The ONE entry of `entries` that `launcher` is a byte-for-byte copy of: every regular-file entry of the launcher's length is digested ([`Hashes::digest`]) and compared with the launcher's.
+/// The ONE entry of `entries` that `launcher` is a byte-for-byte copy of: every regular-file entry
+/// of the launcher's length is digested ([`Hashes::digest`]).
 /// # Errors
-/// The launcher is a copy of none of them, or of more than one (which is the original is then unknown), or a file could not be read.
+/// The launcher is a copy of none of them, or of more than one (which is the original is then
+/// unknown), or a file could not be read.
 pub fn copy_of(
     launcher: &Path,
     entries: &[VersionDir],
@@ -212,7 +215,7 @@ pub fn copy_of(
     }
 }
 
-/// Why the entry `v` (not the live one, `live`) is KEPT, or `None` when nothing holds it: Claude Code's lock for it in `locks`, (Windows) it is newer than the live one or has no version number, or a running process uses it (`processes`, asked last: it is the one scan of every process).
+/// Why the entry `v` (not the live one, `live`) is KEPT, or `None` when nothing holds it.
 #[must_use]
 pub fn kept(
     v: &VersionDir,
@@ -224,7 +227,7 @@ pub fn kept(
         .or_else(|| super::discover::unused_under(std::slice::from_ref(&v.path), processes).err())
 }
 
-/// [`kept`] but for the process scan: the lock, the name, the order.
+/// [`kept`] but for the process scan.
 fn kept_by_name(v: &VersionDir, live: &Path, locks: Option<&Path>) -> Option<String> {
     let Some(name) = v.path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
         return Some(format!("{} has no name", v.path.display()));
@@ -250,7 +253,7 @@ fn kept_by_name(v: &VersionDir, live: &Path, locks: Option<&Path>) -> Option<Str
     None
 }
 
-/// Why the entry named `name` is not older than the live entry `live` — it is newer (a running `claude.exe` keeps the updater from swapping it in), or one of the two names is no version number, so the order is unknown — else `None`.
+/// Why the entry named `name` is not older than the live entry `live`.
 #[must_use]
 pub fn newer_than(name: &str, live: &Path) -> Option<String> {
     let live_name = live
@@ -269,7 +272,7 @@ pub fn newer_than(name: &str, live: &Path) -> Option<String> {
     }
 }
 
-/// A dotted version number's parts (`2.1.286` → `[2, 1, 286]`), compared part by part; `None` for any other name.
+/// A dotted version number's parts (`2.1.286` → `[2, 1, 286]`), compared part by part.
 #[must_use]
 pub fn version_number(name: &str) -> Option<Vec<u64>> {
     name.split('.')
@@ -281,22 +284,17 @@ pub fn version_number(name: &str) -> Option<Vec<u64>> {
         .collect()
 }
 
-/// The digest cache's schema: 2 since a file's identity is the one export's
-/// full width ([`Stamp::id`]).
+/// The digest cache's schema ([`Stamp::id`]).
 const HASH_SCHEMA: u64 = 2;
 
-/// What a file's own handle says of it: a digest stands while none of it
-/// moved — its length, last write, creation, and its identity, so a file
-/// renamed over the one read is read anew.
+/// What a file's own handle says of it: a digest stands while none of it moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     len: u64,
     written_ns: Option<u64>,
     created_ns: Option<u64>,
-    /// The file's volume and number, as the one identity export reads them
-    /// ([`aterm_sysprobe::volumes::FileId`]: `st_dev` and `st_ino`; on
-    /// Windows the 64-bit volume serial and the 128-bit file id, read from
-    /// the open handle, [`aterm_sysprobe::volumes::file_id_of_handle`]).
+    /// The file's volume and number ([`aterm_sysprobe::volumes::FileId`],
+    /// [`aterm_sysprobe::volumes::file_id_of_handle`]).
     id: Option<(u64, u128)>,
 }
 
@@ -316,8 +314,7 @@ impl Stamp {
     }
 }
 
-/// The identity of the file open as `file` (read as `meta`), by the one
-/// export's width ([`Stamp::id`]).
+/// The identity of the file open as `file` ([`Stamp::id`]).
 fn file_id(
     file: &std::fs::File,
     meta: &std::fs::Metadata,
@@ -344,10 +341,10 @@ fn file_id(
     }
 }
 
-/// THE DIGEST CACHE ([`HASH_FILE`]): each file's SHA-256 under its path and its [`Stamp`].
+/// THE DIGEST CACHE ([`HASH_FILE`]) ([`Stamp`]).
 #[derive(Debug, Default)]
 pub struct Hashes {
-    /// Where it is kept; `None`: nothing is read or written.
+    /// Where it is kept.
     file: Option<PathBuf>,
     /// Path → (stamp, lowercase hex SHA-256).
     known: BTreeMap<String, (Stamp, String)>,
@@ -412,7 +409,7 @@ impl Hashes {
         out
     }
 
-    /// The length and lowercase hex SHA-256 of the regular file at `path`, read through ONE handle: from the cache while the handle's [`Stamp`] matches the one it was kept under, else by reading every byte, the stamp read again after (a file written meanwhile has no digest).
+    /// The length and lowercase hex SHA-256 of the regular file at `path` ([`Stamp`]).
     /// # Errors
     /// It could not be opened or read, is not a regular file, or moved while it was read.
     pub fn digest(&mut self, path: &Path) -> Result<(u64, String), String> {
@@ -452,7 +449,7 @@ impl Hashes {
         Ok((stamp.len, sha))
     }
 
-    /// The cache as its file holds it: the digests this survey used.
+    /// The cache as its file holds it.
     fn encode(&self) -> String {
         let mut files = Map::new();
         for (path, (stamp, sha)) in self
@@ -482,7 +479,7 @@ impl Hashes {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned())
     }
 
-    /// Write the cache back when a digest was read anew or one it held went unused, by temp file and rename.
+    /// Write the cache back when a digest was read anew or one it held went unused.
     pub fn save(&self) {
         let Some(file) = &self.file else {
             return;

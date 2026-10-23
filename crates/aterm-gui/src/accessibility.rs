@@ -2,14 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Accessibility snapshot of the visible terminal grid.
-//!
-//! A pure conversion from the rendered cells and cursor into what an assistive
-//! backend needs: the visible screen as plain text, a role, a label, the grid size
-//! and the cursor's character offset. It holds no GUI state and calls no platform
-//! API; the App includes it in the shared semantic tree while an assistive client
-//! is attached. The text goes through
-//! [`push_visible_row`], as the SIGUSR1 `.txt` snapshot does, so a screen reader and
-//! the text snapshot read the same visible-cell projection.
 
 use aterm_core::terminal::RenderCell;
 
@@ -17,14 +9,7 @@ use aterm_core::terminal::RenderCell;
 #[cfg(a11y_tree)]
 pub(crate) const LABEL: &str = "aterm terminal";
 
-/// Append one grid row to `text`: each cell's glyph char (control/NUL → space),
-/// up to `cols`, trailing blanks trimmed, terminated by `'\n'`. Shared by the
-/// accessibility snapshot and the SIGUSR1 `.txt` snapshot, so the two are identical.
-///
-/// One character per cell, wide glyphs included: the engine pads a double-width
-/// glyph's continuation cell with a space (`aterm_core::terminal::render_cells`),
-/// so `漢 字` reads as separate words. The pad preserves cell-column offsets
-/// within each emitted row, before trailing blanks are trimmed.
+/// Appends one grid row to `text` up to `cols`, trimming trailing spaces and ending with `'\n'`.
 pub(crate) fn push_visible_row<'a>(
     text: &mut String,
     cells: impl IntoIterator<Item = &'a RenderCell>,
@@ -43,11 +28,7 @@ pub(crate) fn push_visible_row<'a>(
     text.push('\n');
 }
 
-/// Rendered rows as a snapshot reads them: row `r`'s cells over the columns
-/// `cols` — fewer for a short row, none for a row past the end. The rendered
-/// rows themselves are one source; the presented frame read as its programs
-/// wrote it, under aterm's glass, is another
-/// (`claude_footer::ProgramCells`).
+/// Rendered rows read by an accessibility snapshot.
 #[cfg(any(a11y_tree, test))]
 pub(crate) trait CellRows {
     /// Row `r`'s cells in `cols`, left to right.
@@ -68,28 +49,23 @@ impl CellRows for [Vec<RenderCell>] {
     }
 }
 
-/// A plain-text + cursor snapshot of the visible grid for assistive technology.
+/// A plain-text and cursor snapshot of the visible grid for assistive technology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(any(a11y_tree, test))]
 pub(crate) struct AccessibleSnapshot {
-    /// The visible screen as text: one line per row (trailing blanks trimmed),
-    /// rows separated and terminated by `'\n'`.
+    /// Visible screen text, one newline-terminated line per row with trailing blanks trimmed.
     pub text: String,
-    /// Grid dimensions.
+    /// Grid height in rows.
     pub rows: usize,
     /// Grid width in columns.
     pub cols: usize,
-    /// Cursor position as `(row, col)`, 0-based, if the cursor is visible.
+    /// Cursor position as 0-based `(row, col)` when visible.
     pub cursor: Option<(usize, usize)>,
 }
 
 #[cfg(any(a11y_tree, test))]
 impl AccessibleSnapshot {
-    /// Build a snapshot from rendered rows of cells (the tests' engine grids; the
-    /// App reads its frame through [`Self::from_cells_in`]).
-    ///
-    /// `cursor` is `Some((row, col))` only when the cursor is visible; pass `None`
-    /// to omit it (e.g. when hidden via DECTCEM).
+    /// Builds a snapshot from rendered rows of cells.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_cells(
@@ -100,15 +76,7 @@ impl AccessibleSnapshot {
         Self::from_cells_in(rows_cells, 0..rows_cells.len(), 0..cols, cursor)
     }
 
-    /// Build a snapshot of one rectangle of the rendered rows: the projection a
-    /// split pane needs. A composed split frame carries every pane side by side
-    /// on the same rows, so a whole row is two programs' output spliced together;
-    /// read through one pane's rectangle of the same cells, it is that pane's
-    /// painted line.
-    ///
-    /// `cursor` is pane-local, `None` when the pane's cursor is off screen. Cells
-    /// outside the supplied rows are absent, not padded: a short row yields a
-    /// short line.
+    /// Builds a snapshot of the rectangle `rows` × `cols` within `rows_cells`.
     #[must_use]
     pub(crate) fn from_cells_in(
         rows_cells: &(impl CellRows + ?Sized),
@@ -129,7 +97,7 @@ impl AccessibleSnapshot {
         }
     }
 
-    /// The accessibility value: the visible screen text (an `AX` value string).
+    /// Returns the visible screen text as an accessibility value string.
     #[must_use]
     pub(crate) fn value(&self) -> &str {
         &self.text
@@ -141,7 +109,6 @@ mod tests {
     use super::*;
     use aterm_core::terminal::Terminal;
 
-    /// A pane's rectangle reads only its own columns of the composed split frame.
     #[test]
     fn a_pane_rectangle_reads_only_its_own_columns() {
         let mut term = Terminal::new(2, 21);

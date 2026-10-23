@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! Rainbow kitty v2 at the seam.
 
 use super::*;
 
-/// A 20-cell same-row nav move puts the meteor's train (`under`), white heat (`out`) and coma
-/// (`halos`) on glass on the tick the caret is observed, with no spark, zoom, starburst, ring,
-/// particle or Sweep/Glide cue beside the engine's one meteor cue.
 #[test]
 fn a_v2_nav_jump_draws_the_meteor_on_the_observed_frame() {
     let g = geom();
@@ -66,13 +62,8 @@ fn a_v2_nav_jump_draws_the_meteor_on_the_observed_frame() {
     );
 }
 
-/// The cell `(row, col)`'s light on this frame: for every pixel column of the
-/// cell, the brightest premultiplied channel of any `under` quad over it; the
-/// cell's light is the darkest column. `ribbon_beam` emits nothing under one
-/// coverage step, so an unlit head end reads `0`.
 fn under_light_at(quads: &[GlowQuad], g: Geom, row: u16, col: u16) -> u32 {
     let (cw, ch) = (g.cw as u32, g.ch as u32);
-    // The body reaches `1.10 ch` above the row and `0.305 ch` below it.
     let (y0, y1) = (
         (u32::from(row) * ch).saturating_sub(2 * ch),
         (u32::from(row) + 2) * ch,
@@ -99,8 +90,6 @@ fn under_light_at(quads: &[GlowQuad], g: Geom, row: u16, col: u16) -> u32 {
         .unwrap_or(0)
 }
 
-/// `trail status` claims the ribbon it lays: `ribbon_segments=` and `ribbon_hue_bands=` count
-/// v2's cells and determine `ribbon_active` (both ≥ 2).
 #[test]
 fn under_v2_trail_status_claims_the_ribbon_it_lays() {
     let g = geom();
@@ -129,9 +118,6 @@ fn under_v2_trail_status_claims_the_ribbon_it_lays() {
     );
 }
 
-/// The frame that echoes a typed key already shows its ribbon cell: the host stamps the key, the
-/// echo lands 0.3 ms later, and the same `tick` that observes the caret's move emits `under`
-/// light over the new cell, at least a quarter of the settled cell's.
 #[test]
 fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     let g = geom();
@@ -141,23 +127,18 @@ fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     let mut out = Vec::new();
     glow.tick(Some((2, 4)), t0, &c, g, &mut out);
     assert!(glow.v2.engaged());
-    // Warm the spine as a live hand does: the cell under test is the fourth of a 90 ms burst, so
-    // `birth_disp` is not the cold floor.
     let mut now = t0;
     for k in 1..=3u16 {
         now = t0 + Duration::from_millis(90 * u64::from(k));
         glow.note_typed_cells(now, 1);
         glow.tick(Some((2, 4 + k)), now, &c, g, &mut out);
     }
-    // The key, stamped by the host at the key.
     let t_key = now + Duration::from_millis(90);
     glow.note_typed_cells(t_key, 1);
-    // The echo: the caret is observed at its landing 0.3 ms later.
     let echo = t_key + Duration::from_micros(300);
     let fp = glow.tick(Some((2, 8)), echo, &c, g, &mut out);
     assert_ne!(fp, 0, "the echo frame is on glass");
     let on_echo = under_light_at(glow.under_quads(), g, 2, 7);
-    // The frame after it, one panel period on.
     let next = echo + Duration::from_millis(17);
     glow.tick(Some((2, 8)), next, &c, g, &mut out);
     let on_next = under_light_at(glow.under_quads(), g, 2, 7);
@@ -169,11 +150,6 @@ fn the_frame_that_echoes_the_key_already_shows_its_ribbon_cell() {
     );
 }
 
-/// A line still being typed has no dark cell inside its live span. A 60-key sentence at 7 cps
-/// (fast words, thinking pauses, one slow word), each echo observed on the tick after its key, at
-/// 60 Hz: on every tick while the hand types, every glyph cell from the first key to the caret's
-/// neighbour is live. The cohort shares one life, so neither a word typed at a dip nor the oldest
-/// cells die under a hand that has not lifted.
 #[test]
 fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     let g = Geom {
@@ -188,8 +164,6 @@ fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     let row = 2u16;
     let col0 = 2u16;
     glow.tick(Some((row, col0)), t0, &c, g, &mut out);
-    // `(word, ms per key, thinking pause before the word)` — 60 keys,
-    // 8.6 s: 7 cps on average.
     let words: [(&str, u64, u64); 12] = [
         ("what ", 125, 0),
         ("more ", 125, 0),
@@ -252,8 +226,6 @@ fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
     );
 }
 
-/// An engaged v2 with nothing live is exactly zero (fingerprint 0, empty streams, no cadence, no
-/// deadline, inactive, status reports nothing drawn), so the loop parks.
 #[test]
 fn v2_idle_is_exactly_zero() {
     let g = geom();
@@ -289,8 +261,6 @@ fn v2_idle_is_exactly_zero() {
     assert!(glow.drain_sound_cues().next().is_none());
 }
 
-/// Only the rainbow kitty engages v2: a fresh engine draws v2 on its first
-/// drawing tick under `RainbowKitty`, and no other built-in style engages it.
 #[test]
 fn only_the_rainbow_kitty_engages_v2() {
     let g = geom();
@@ -304,9 +274,6 @@ fn only_the_rainbow_kitty_engages_v2() {
     }
 }
 
-/// `reset` and `curtain` clear `kill_retreat_pending`, `v2_caret`, `v2_beams`,
-/// and any buffered v2 sound cues so no stale licence, flare timestamp, beam
-/// plane or sound cue leaks across a coordinate-space boundary.
 #[test]
 fn reset_and_curtain_clear_kill_retreat_caret_seam_and_v2_sound_cues() {
     let g = geom();
@@ -316,9 +283,6 @@ fn reset_and_curtain_clear_kill_retreat_caret_seam_and_v2_sound_cues() {
         let t0 = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
-        // Trigger a meteor jump with no ribbon cohorts so `v2_caret.flare_at` is
-        // populated, then advance past the arrival edge (`T <= 120 ms`) so
-        // `draw_burst` populates `v2_beams`.
         let t2 = t0 + ms(16);
         glow.note_synthetic_move(t2);
         glow.tick(Some((2, 22)), t2, &c, g, &mut out);
@@ -332,7 +296,6 @@ fn reset_and_curtain_clear_kill_retreat_caret_seam_and_v2_sound_cues() {
             !glow.under_quads().is_empty() && !glow.halos().is_empty() && !glow.v2_beams.is_empty(),
             "fixture: landed meteor populates under_quads, halos, and v2_beams"
         );
-        // Arm a caret-moving kill right before the space seam.
         let t3 = t2b + ms(8);
         glow.note_word_kill(t3, true);
         if is_curtain {
@@ -353,8 +316,6 @@ fn reset_and_curtain_clear_kill_retreat_caret_seam_and_v2_sound_cues() {
             glow.drain_sound_cues().next().is_none(),
             "is_curtain={is_curtain}: sound ledger must drain v2 cues too"
         );
-        // After re-seeding in the new coordinate space, an unlicensed same-row
-        // retreat must NOT be licensed by the pre-seam `kill_retreat_pending`.
         let t4 = t3 + ms(16);
         glow.tick(Some((4, 15)), t4, &c, g, &mut out);
         let t5 = t4 + ms(16);
@@ -376,7 +337,6 @@ fn seated_caret_stop_and_licensed_row_follow_scroll_band_and_hand_lift() {
     let mut out = Vec::new();
     glow.tick(Some((5, 2)), t0, &c, g, &mut out);
 
-    // Type a short run so the caret settles at a non-zero field stop on (5, 7).
     let mut now = t0;
     for col in 3..=7u16 {
         now += ms(40);
@@ -387,27 +347,23 @@ fn seated_caret_stop_and_licensed_row_follow_scroll_band_and_hand_lift() {
     let seated_rgb = glow.rainbow_head_rgb(&c);
     assert!(seated_t > 0.05, "fixture: caret must settle past red");
 
-    // Let the ribbon cells expire under the parked caret: `v2_stop` holds the seated stop.
     now += Duration::from_secs(3);
     glow.tick(Some((5, 7)), now, &c, g, &mut out);
     assert_eq!(glow.v2.ribbon().live_cells(), 0, "fixture: ribbon expired");
     assert_eq!(glow.rainbow_field(), seated_t);
 
-    // Whole-screen scroll carries `v2_stop` with the parked caret from row 5 to row 3.
     glow.note_scroll(2);
     now += ms(16);
     glow.tick(Some((3, 7)), now, &c, g, &mut out);
     assert_eq!(glow.rainbow_field(), seated_t);
     assert_eq!(glow.rainbow_head_rgb(&c), seated_rgb);
 
-    // Row-band move carries `v2_stop` from row 3 to row 4.
     glow.note_band_move(2, 6, 1);
     now += ms(16);
     glow.tick(Some((4, 7)), now, &c, g, &mut out);
     assert_eq!(glow.rainbow_field(), seated_t);
     assert_eq!(glow.rainbow_head_rgb(&c), seated_rgb);
 
-    // `lift_hand_row` carries both `v2_stop` and `last_licensed_row` with the hand's line.
     glow.last_licensed_row = Some((4, now));
     glow.lift_hand_row(4, 3);
     assert_eq!(glow.last_licensed_row, Some((3, now)));

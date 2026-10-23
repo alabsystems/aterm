@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Incoming-row apron (CPU): during a sub-row up-glide the exposed bottom strip shows the
-//! top `frac` px of the row sliding in from below the viewport, raster-exact. The oracle is
-//! the engine: the apron at offset `d` is the bottom viewport row at offset `d - 1`.
-//!
-//! The bundled DejaVu face with runtime font discovery off keeps this machine-independent;
-//! the fixture text is ASCII caps and digits, which DejaVu covers.
+//! Incoming-row apron tests on the CPU renderer during sub-row up-glides.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Frame, Renderer, Theme, WindowCpu};
@@ -27,9 +22,6 @@ fn renderer() -> Renderer {
     r
 }
 
-/// Distinct, descender-free text per line (caps + digits only), so a row's
-/// ink never overshoots its own band and the per-row oracle is exact at the
-/// row seam. The cursor is hidden so no oracle row carries a caret.
 fn seeded_term() -> Terminal {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
@@ -40,8 +32,6 @@ fn seeded_term() -> Terminal {
     t
 }
 
-/// The partitioned input at the terminal's current offset: row 0 is a pinned
-/// (top) chrome row, the band reaches the frame's last row.
 fn partitioned(t: &mut Terminal, frac: i32) -> aterm_core::render::RenderInput {
     let mut input = t.cell_frame(ROWS, COLS);
     input.grid_top_row = 1;
@@ -67,7 +57,6 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
     let n = frac as usize;
     let d = 3;
 
-    // The glide frame at offset d.
     let mut t = seeded_term();
     t.scroll_display(d);
     let glide_in = partitioned(&mut t, frac);
@@ -77,9 +66,7 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
         "scrolled back: a row lies below the viewport"
     );
     let glide = r.render_input(&glide_in);
-    // The untranslated frame at offset d.
     let flat = r.render_input(&partitioned(&mut t, 0));
-    // The whole-row oracle at offset d - 1: its bottom grid row is the apron.
     let mut o = seeded_term();
     o.scroll_display(d - 1);
     let oracle = r.render_input(&partitioned(&mut o, 0));
@@ -93,19 +80,15 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
         strip, expected,
         "the exposed bottom strip must be the incoming row's top {n} px"
     );
-    // Control: the oracle strip differs from the bottom row's own bottom px.
     assert_ne!(
         expected,
         rows_of(&flat, y1 - n, n),
         "control: the incoming row's top px differ from the placeholder"
     );
-    // Non-vacuity: the strip carries real ink, not just background.
     assert!(
         strip.iter().any(|&p| (p & 0x00ff_ffff) != BG),
         "the incoming row's top half carries glyph ink"
     );
-    // The band's moved interior is the plain translate: row y (in-band, above
-    // the strip) shows untranslated row y + frac.
     for y in grid_top + ch..y1 - n {
         assert_eq!(
             &glide.pixels[y * w..y * w + w],
@@ -113,8 +96,6 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
             "interior row {y} is the up-translate"
         );
     }
-    // Chrome invariance with the apron painted: the pinned top chrome row and
-    // the pad bands are byte-identical to the frac-0 frame.
     for y in (0..grid_top + ch).chain(y1..glide.height) {
         assert_eq!(
             &glide.pixels[y * w..y * w + w],
@@ -124,9 +105,6 @@ fn up_glide_strip_shows_the_incoming_rows_top_pixels() {
     }
 }
 
-/// A frac-only frame over unchanged content is a damage-cache gate hit, and the strip is
-/// still painted from the apron on that re-present (the apron is a present step, not a
-/// damage step). Same oracle as above.
 #[test]
 fn cached_gate_hit_frame_still_paints_the_strip() {
     let mut r = renderer();
@@ -143,7 +121,6 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
     let mut t = seeded_term();
     t.scroll_display(d);
     let mut wc = WindowCpu::new();
-    // Prime the cache with the whole-row frame, then re-present with a residual.
     let _ = r.render_input_cached(&mut wc, &partitioned(&mut t, 0));
     let glide_in = partitioned(&mut t, frac);
     let view = r.render_input_cached(&mut wc, &glide_in);
@@ -154,8 +131,6 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         rows_of(&oracle, y1 - ch, n),
         "the gate-hit re-present paints the incoming row's top {n} px"
     );
-    // The presenter reads what the render handed back: re-borrowing the untranslated cache
-    // would drop the band shift and this strip.
     assert!(
         wc.last_translated(),
         "a sub-row frame is a translated frame"
@@ -170,7 +145,6 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
         wc.frame_pixels(),
         "control: the untranslated cache is a different frame"
     );
-    // Landing the row (frac 0) hands back the pristine cache.
     let landed = r.render_input_cached(&mut wc, &partitioned(&mut t, 0));
     let flat = r.render_input(&partitioned(&mut t, 0));
     assert_eq!(
@@ -185,10 +159,6 @@ fn cached_gate_hit_frame_still_paints_the_strip() {
     assert_eq!(wc.presented_pixels(), wc.frame_pixels());
 }
 
-/// Scrolling past the bottom of the live screen (`display_offset == 0`,
-/// `scroll_frac_px > 0`, `apron_row.present == false`) must paint a blank
-/// frame-background apron into the bottom `frac` scanlines rather than leaving
-/// the untranslated bottom row's glyphs duplicated at the bottom of the band.
 #[test]
 fn live_bottom_up_overscroll_paints_blank_apron_instead_of_duplicating_bottom_row() {
     let mut r = renderer();
@@ -230,9 +200,6 @@ fn a_reordered_bidi_incoming_row_keeps_the_scroll_placeholder() {
     let n = frac as usize;
     let d = 3;
     let mut t = seeded_term();
-    // At d=3, screen row ROWS-d is just below the viewport. Its Hebrew
-    // run has a nonidentity visual order, so the engine withholds its apron
-    // rather than exposing a strip rastered in logical order.
     let incoming_row = ROWS - d as usize;
     t.process(format!("\x1b[{};1H\x1b[2K", incoming_row + 1).as_bytes());
     t.process("\u{05d0}\u{05d1}\u{05d2}".as_bytes());

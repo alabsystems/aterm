@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Producer seam traits ([`Packer`], [`BundlePacker`], [`Indexer`]) and their request/outcome types.
+//! Producer seam traits ([`Packer`], [`BundlePacker`], [`Indexer`]) and request/outcome types.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ pub enum Signing {
     /// With the machine key (`Ctx::identity.key`).
     #[default]
     MachineKey,
-    /// Staged unsigned for a signing ceremony (`atpkg-publish sign`); never uploaded.
+    /// Staged unsigned for a signing ceremony (`atpkg-publish sign`).
     Unsigned,
 }
 
@@ -41,7 +41,7 @@ pub struct PackRequest {
     pub program: String,
     /// The source checkout, at the commit to pack.
     pub checkout: PathBuf,
-    /// The target. The build passes `--target` and the arch gate holds the bytes to it.
+    /// The target.
     pub triple: Triple,
     /// Build number (`None` uses `git rev-list --count HEAD` of the checkout).
     pub build: Option<Build>,
@@ -87,17 +87,13 @@ pub struct PackOutcome {
 /// Packs plain programs ([`crate::artifact::pack`]).
 pub trait Packer {
     /// Probes whether this machine can pack before a lane builds anything.
-    ///
     /// # Errors
-    ///
     /// What the machine lacks, worded for the lane's log.
     fn can_pack(&self) -> std::result::Result<(), String>;
 
     /// Build, gate, stage, sign and (maybe) upload one target of one build.
-    ///
     /// # Errors
-    ///
-    /// Any gate's refusal; nothing is signed or uploaded after one.
+    /// Any gate's refusal.
     fn pack(&self, ctx: &Ctx, request: &PackRequest) -> Result<PackOutcome>;
 }
 
@@ -106,7 +102,7 @@ pub trait Packer {
 pub struct HelloGate {
     /// Run the hello-world probe (disabled only for a local debugging pack).
     pub enabled: bool,
-    /// Trust sysroot the packed compiler was built from (`trust-mc`), used for admission and payload scan.
+    /// Trust sysroot the packed compiler was built from.
     pub sysroot: Option<PathBuf>,
 }
 
@@ -124,11 +120,11 @@ impl Default for HelloGate {
 pub struct BundleRequest {
     /// The program (a [`crate::programs::Shape::Bundle`] row).
     pub program: String,
-    /// The staged sysroot (bin/ + lib/): a sealed toolchain, or a copy of one.
+    /// The staged sysroot (bin/ + lib/).
     pub sysroot: PathBuf,
     /// The source checkout whose commit names the build (and whose cleanliness is gated).
     pub src_repo: PathBuf,
-    /// The build number; `None` is the source checkout's `rev-list --count HEAD`.
+    /// The build number.
     pub build: Option<Build>,
     /// The version; `None` derives it from what is packed.
     pub version: Option<String>,
@@ -159,10 +155,8 @@ pub struct BundleRequest {
 /// Packs sysroot bundles ([`crate::artifact::bundle`]).
 pub trait BundlePacker {
     /// Stage, prove, relocate, gate, sign and (maybe) upload one bundle.
-    ///
     /// # Errors
-    ///
-    /// Any gate's refusal; nothing is signed or uploaded after one.
+    /// Any gate's refusal.
     fn pack_bundle(&self, ctx: &Ctx, request: &BundleRequest) -> Result<PackOutcome>;
 }
 
@@ -186,7 +180,7 @@ pub struct TripleDrop {
     pub reason: String,
 }
 
-/// Channel changes for one publish, applied over the verified head while carrying all unmentioned state.
+/// Channel changes for one publish.
 #[derive(Clone, Debug, Default)]
 pub struct Delta {
     /// `pin` moves (or new programs, which must be rows of [`crate::programs::PROGRAMS`]).
@@ -203,11 +197,11 @@ pub struct Delta {
     pub lower_min_build: bool,
     /// Programs the head pins that this publish retires.
     pub retire: BTreeSet<String>,
-    /// Per-target overlays this publish drops: a whole target (`None`) or one program.
+    /// Per-target overlays this publish drops.
     pub retire_target: BTreeSet<(Triple, Option<String>)>,
     /// Apple targets a moved pin may drop.
     pub triple_drops: Vec<TripleDrop>,
-    /// A new freshness horizon (RFC3339 UTC); `None` carries the head's.
+    /// A new freshness horizon (RFC3339 UTC).
     pub valid_until: Option<String>,
 }
 
@@ -218,7 +212,7 @@ pub enum Baseline {
     ChannelHead,
     /// A verified quad on disk (must match the channel head when uploading).
     Dir(PathBuf),
-    /// A genuine first publish of a channel: no carry, no floors.
+    /// A genuine first publish of a channel.
     First {
         /// The channel name.
         channel: String,
@@ -256,9 +250,7 @@ pub struct Published {
 /// Publishes the channel index ([`crate::channel::index`]).
 pub trait Indexer {
     /// Plan the delta over the baseline, sign, self-verify and (maybe) publish.
-    ///
     /// # Errors
-    ///
     /// Any refusal (a downgrade, an omission, a triple drop, a lost compare-and-swap).
     fn publish(&self, ctx: &Ctx, request: &IndexRequest) -> Result<Published>;
 }

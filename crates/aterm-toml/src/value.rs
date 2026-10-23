@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The untyped value tree: what a TOML file means, with the formatting gone. For documents
-//! whose schema is not known at compile time; with `#[derive(Deserialize)]`,
-//! [`crate::from_str`] builds the target type straight off the parse tree instead.
+//! Untyped TOML value tree with formatting discarded.
 
 use core::fmt;
 use core::str::FromStr;
@@ -12,8 +10,7 @@ use std::collections::btree_map;
 
 use crate::Datetime;
 
-/// A TOML table: keys to values, ordered by key rather than by appearance. For the authored
-/// order, use [`crate::edit`].
+/// A TOML table mapping keys to values in key order (use [`crate::edit`] for authored order).
 pub type Table = Map<String, Value>;
 
 /// A sorted string-keyed map.
@@ -138,8 +135,7 @@ pub enum Value {
     Table(Table),
 }
 
-/// Something that can address into a [`Value`]: a key for tables, an index for
-/// arrays.
+/// An index into a [`Value`]: a key for tables or an index for arrays.
 pub trait Index: private::Sealed {
     /// Resolve against `value`, or `None` if the shapes do not match.
     fn index_into<'v>(&self, value: &'v Value) -> Option<&'v Value>;
@@ -334,15 +330,11 @@ impl FromStr for Value {
 impl FromStr for Table {
     type Err = crate::Error;
 
-    /// Parse a whole document, which is always a table.
     fn from_str(s: &str) -> crate::Result<Self> {
         crate::from_str(s)
     }
 }
 
-/// `value["key"]` and `value[0]`, panicking when the shape or the key is wrong: for code
-/// that has already decided the document is well-formed. [`Value::get`] is the fallible
-/// form.
 impl<I: Index> core::ops::Index<I> for Value {
     type Output = Value;
 
@@ -352,8 +344,6 @@ impl<I: Index> core::ops::Index<I> for Value {
 }
 
 impl fmt::Display for Value {
-    /// Prints the value as TOML: a table as a whole document, a scalar or array as the
-    /// value alone.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let item = crate::ser::value_to_item(self).map_err(|_| fmt::Error)?;
         fmt::Display::fmt(&item, f)

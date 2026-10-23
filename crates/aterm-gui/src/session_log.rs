@@ -390,6 +390,8 @@ pub(crate) struct SessionLog {
     marked_through: u64,
     burst_rows: u32,
     rollout: transcript::TapAnswers,
+    /// This log is the one a seamless update's predecessor wrote, carried and read ([`Self::adopt`]), not one that started over after a gap.
+    carried: bool,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
@@ -469,6 +471,7 @@ impl SessionLog {
             marked_through: 0,
             burst_rows: 0,
             rollout: transcript::TapAnswers::default(),
+            carried: false,
         }
     }
 }
@@ -619,6 +622,11 @@ impl SessionLog {
         self.log.row_head()
     }
 
+    /// Whether this log is the carried one a seamless update's predecessor wrote ([`aterm_gui_fabric::Timeline::log_carried`]).
+    pub(crate) fn log_carried(&self) -> bool {
+        self.carried
+    }
+
     /// The time now, on this log's clock.
     pub(crate) fn now(&self) -> Stamp {
         self.clock.now()
@@ -700,6 +708,7 @@ impl SessionLog {
             }
         }
         self.reset_producers();
+        self.carried = false;
         let next_seq = carry.seq.saturating_add(1);
         let log = match (keeper, carry.ids) {
             (true, _) => {

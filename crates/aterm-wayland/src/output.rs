@@ -179,6 +179,9 @@ impl OutputBook {
     }
 }
 
+/// # Safety
+/// `proxy` is a live output this crate bound, without a listener, released
+/// before the listener is freed.
 unsafe fn output_listener(
     proxy: Proxy,
     output_book: &Arc<Mutex<OutputBook>>,

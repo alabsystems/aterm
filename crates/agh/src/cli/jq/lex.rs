@@ -104,21 +104,17 @@ pub(super) fn lex(src: &str) -> Result<Vec<Spanned>> {
     lexer.tokens(false)
 }
 
-/// The lexer's state.
 struct Lexer<'a> {
     src: &'a [u8],
     text: &'a str,
     pos: usize,
-    /// How many interpolations deep the lexer is.
     nest: usize,
 }
 
-/// Whether `b` may start a name.
 const fn name_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-/// Whether `b` may continue a name.
 const fn name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -440,12 +436,10 @@ impl Lexer<'_> {
     }
 }
 
-/// `jq: unexpected {byte} at byte {offset}`, for an ASCII byte.
 fn unexpected(b: u8, at: usize) -> crate::error::Error {
     syntax(&format!("unexpected {}", char::from(b)), at)
 }
 
-/// `jq: unexpected {char} at byte {offset}`, for the character at `at`.
 fn unexpected_char(text: &str, at: usize) -> crate::error::Error {
     let c = text[at..].chars().next().unwrap_or('\u{fffd}');
     syntax(&format!("unexpected {c}"), at)

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// CPU==GPU parity for N:1 merged ligatures (`admit_collapsed`): a run whose
-// shaping collapses several cells into one wide glyph is sliced into per-cell
-// `mono_gid` tiles, and the GPU must place them as the CPU does. The face is
-// the checked-in Luckiest Guy, whose Latin `fi`/`fl` collapse N:1; it is handed
-// to both renderers as their family, so nothing writes the environment.
+// CPU==GPU parity for N:1 merged ligatures (`admit_collapsed`).
 
 use crate::common;
 use aterm_core::terminal::Terminal;
@@ -13,7 +9,6 @@ use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
 use crate::common::max_channel_delta_frame as max_channel_delta;
 
-/// The checked-in face whose `fi` collapses N:1 under `liga`.
 fn merged_ligature_font() -> &'static std::path::Path {
     std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -36,9 +31,6 @@ fn merged_ligature_gpu_matches_cpu() {
 
     let font = merged_ligature_font();
     let (mut cpu, mut gpu) = common::backends_with_font(font, px, theme);
-    // Negative control: a CPU renderer with the merge declined, settled like the
-    // kit's pair so a fallback chain landing between arms cannot fake or mask the
-    // difference.
     let family = font.to_str().expect("the fixture path is UTF-8");
     let mut cpu_off = Renderer::from_system_with_family(Some(family), px, theme)
         .expect("the fixture face builds a renderer");
@@ -49,8 +41,6 @@ fn merged_ligature_gpu_matches_cpu() {
 
     let (rows, cols) = (1usize, 24usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // A row of collapsing clusters interleaved with plain text so slices sit next
-    // to ordinary per-cell glyphs (exercising the run-break on both sides).
     term.process(b"\x1b[?25la fi b fl c ffi d");
 
     let mut win = aterm_gpu::WindowGpu::new();
@@ -64,13 +54,10 @@ fn merged_ligature_gpu_matches_cpu() {
         (cpu_frame.width, cpu_frame.height),
         "dimensions differ"
     );
-    // Non-vacuous: admitting the merge changed the ink vs the per-cell render.
     assert_ne!(
         cpu_frame.pixels, cpu_off_frame.pixels,
         "the merged ligatures did not slice — test would be vacuous (is this a merging font?)"
     );
-    // Both paths key and place the same per-cell slice tiles, so only blend
-    // rounding differs.
     let delta = max_channel_delta(&cpu_frame, &gpu_frame);
     eprintln!("merged-ligature GPU vs CPU max per-channel delta = {delta}");
     assert!(
@@ -79,9 +66,6 @@ fn merged_ligature_gpu_matches_cpu() {
     );
 }
 
-/// CPU==GPU parity with a block cursor on a merged-ligature cell: the cut-out
-/// re-colours only that cell's slice tile. Non-vacuous: the cursor frame
-/// differs from the hidden-cursor frame.
 #[test]
 fn merged_ligature_cursor_gpu_matches_cpu() {
     let theme = Theme::default();
@@ -95,12 +79,10 @@ fn merged_ligature_cursor_gpu_matches_cpu() {
     let (rows, cols) = (1usize, 8usize);
     let mut win = aterm_gpu::WindowGpu::new();
 
-    // Cursor-hidden CPU baseline for the non-vacuity check.
     let mut hidden = Terminal::new(rows as u16, cols as u16);
     hidden.process(b"\x1b[?25lfi");
     let cpu_hidden = cpu.render_input(&hidden.cell_frame(rows, cols));
 
-    // Block cursor on cell 1 (the second half of the merged `fi`).
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[2 qfi\x1b[1;2H");
     let input = term.cell_frame(rows, cols);

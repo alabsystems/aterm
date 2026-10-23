@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PUBLISHED FRAME.
+//! Memoized screen text and styled frame snapshots.
 
 use std::sync::{Arc, Mutex};
 
@@ -240,7 +240,6 @@ impl Drop for Look<'_> {
     }
 }
 
-/// Whether the slot still holds the build a look saw.
 fn same<T>(now: &Option<Arc<T>>, seen: &Option<Arc<T>>) -> bool {
     match (now, seen) {
         (Some(now), Some(seen)) => Arc::ptr_eq(now, seen),
@@ -273,9 +272,6 @@ mod tests {
 
     use super::{FrameSlot, ScreenText};
 
-    /// The text's slices are the rows `text` serves, and its fence hash is the
-    /// row-by-row `rows_hash` over every span, the empty and out-of-grid ones
-    /// included: wide glyphs, a combining mark, trailing spaces and blank rows.
     #[test]
     fn screen_text_slices_are_the_rows_and_the_fence_hash() {
         let mut t = Terminal::new(5, 16);
@@ -307,12 +303,6 @@ mod tests {
         );
     }
 
-    /// A RE-ENTERED ALTERNATE SCREEN AT THE SAME SEQ IS NOT SERVED THE OLD
-    /// TEXT. Box A is drawn on the alternate screen and its text published;
-    /// the program leaves and re-enters it and draws box B, which reads the
-    /// same `content_seq` (the premise). The slot serves box B. NEGATIVE
-    /// CONTROL: a memo keyed on `content_seq` alone serves box A's text for
-    /// box B, the press-into-the-wrong-box case the `if-fp=` fence exists for.
     #[test]
     fn a_re_entered_alt_screen_at_the_same_seq_is_not_served_the_old_text() {
         let slot = FrameSlot::default();

@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, same-handle reads for atpkg's private metadata files.
-//!
-//! A path under the package prefix may be a planted FIFO (parks an ordinary open), a device
-//! (streams forever) or a link (retargets outside the prefix). This seam opens once,
-//! non-blocking and no-follow where the OS allows, proves the handle regular, and reads at most
-//! the caller's limit plus one sentinel byte.
+//! Bounded, same-handle reads for private package metadata files.
 
 use std::io::{self, Read as _};
 use std::path::Path;
@@ -25,8 +20,7 @@ fn not_regular() -> io::Error {
     )
 }
 
-/// Open an existing regular metadata file without following its final link.
-/// The store-lock release probe reuses this admission without reading bytes.
+/// Opens an existing regular metadata file without following its final link.
 #[cfg(unix)]
 pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -125,8 +119,7 @@ pub(crate) fn read_bounded_regular(path: &Path, limit: usize) -> io::Result<Vec<
     Ok(bytes)
 }
 
-/// The first `limit` bytes (fewer when the file is shorter) of one regular, non-link file,
-/// through the same no-follow, non-blocking open — for sniffing a file's kind by magic.
+/// Reads at most `limit` leading bytes of a regular, non-link file.
 pub(crate) fn read_head(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let file = open_regular(path)?;
     let mut head = Vec::with_capacity(limit);
@@ -145,11 +138,7 @@ pub(crate) fn read_bounded_regular_utf8(path: &Path, limit: usize) -> io::Result
     })
 }
 
-/// Resolve a bounded chain of final-component symlinks, then read the resolved spelling with
-/// the no-follow same-handle reader.
-///
-/// A symlinked `aterm.toml` is supported (dotfile managers use one); opening the resolved
-/// target directly leaves no window for a retarget between the check and the read.
+/// Resolves a bounded chain of final-component symlinks and reads the target as bounded UTF-8.
 pub(crate) fn read_bounded_regular_utf8_follow_final_links(
     path: &Path,
     limit: usize,

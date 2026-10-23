@@ -8,16 +8,7 @@
 // plain values: no serde or zvariant derives (the publisher builds its wire
 // values in `wire`).
 
-//! AT-SPI's view of a window's tree, without a bus: what each node is to an
-//! assistive technology, how it answers each AT-SPI method, and which events
-//! a tree update sends (docs/AUDIT-third-party-2026-10-15.md, unit a11y,
-//! A11Y.5). The publisher (`super::publisher`, `super::serve`) puts this on
-//! the bus; `super::oracle` holds it to what accesskit_atspi_common answered.
-//!
-//! * `adapter`: a window's tree and the events its updates cause;
-//! * `node`: one node's (and the application root's) answers;
-//! * `context`: the state a window's tree shares with its nodes;
-//! * `util`: window coordinates and text offsets.
+//! AT-SPI tree semantics without a bus (`adapter`, `node`, `context`, and `util`).
 
 mod adapter;
 mod context;
@@ -96,7 +87,6 @@ impl Rect {
 }
 
 impl From<crate::model::Rect> for Rect {
-    /// Truncated toward zero, as `as` does (and saturated at `i32`'s ends).
     fn from(value: crate::model::Rect) -> Rect {
         Rect {
             x: value.x0 as i32,

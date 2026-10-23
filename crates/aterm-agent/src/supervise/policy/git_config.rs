@@ -149,7 +149,7 @@ pub(crate) fn git_reads(
             out.log_like = true;
         }
         let contacts_remote = sub == "ls-remote"
-            || (sub == "remote" && args.first().map(String::as_str) == Some("show") && !has("-n"));
+            || (sub == "remote" && crate::supervise::classify::git_remote_show_contacts(args));
         if contacts_remote && out.remote.is_none() {
             out.remote = Some(format!(
                 "git {sub} contacts a remote (credential helpers, ssh and the remote's \
@@ -501,8 +501,8 @@ pub(crate) fn claude_dir_at(
 
 /// Whether a variable changes which git runs or what a git read loads: `PATH`,
 /// `HOME` and `XDG_CONFIG_HOME` (where the global config is), and git's own
-/// `GIT_*` — but for `GIT_PAGER` (a pager is exempt, the module doc) and
-/// `GIT_EDITOR` (a read opens no editor).
+/// `GIT_*` — but for `GIT_PAGER` (a pager is exempt: Claude Code's Bash tool
+/// gives git no terminal) and `GIT_EDITOR` (a read opens no editor).
 fn git_relevant(key: &str) -> bool {
     matches!(key, "PATH" | "HOME" | "XDG_CONFIG_HOME")
         || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
@@ -600,7 +600,6 @@ impl Probe<'_> {
         for path in self.gitlinks(&top)? {
             let sub = normalise(&top.join(&path));
             if !sub.starts_with(&top) || !sub.join(".git").exists() {
-                // not populated: a read does not recurse into it
                 continue; // not populated: a read does not recurse into it
             }
             *count += 1;

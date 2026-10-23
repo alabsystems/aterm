@@ -1,24 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Metal resource creation behind a device handle that stamps every texture
-//! with its loss domain.
-//!
-//! The encoder's write verbs (`render_pass`, the copies) refuse a
-//! [`SealedTexture`] whose `Arc<LossLatch>` stamp is not their session's (by
-//! `Arc::ptr_eq`), and `Frame::present` refuses a session whose latch is not
-//! the swapchain's, so a texture cannot be rendered on one session and
-//! presented on another. Alias views inherit the parent's stamp. Buffers and
-//! samplers are plain [`Obj`]s: they are never presented or rendered to.
+//! Metal resource creation behind a device handle that stamps every texture with its loss domain.
 
 use std::sync::Arc;
 
 use super::ffi::{self, Device, MtlRegion, Obj, PixelFormat, SamplerDesc};
 use super::loss::LossLatch;
 
-/// The handle Metal resource creation goes through. Holds the retained device
-/// and the loss-domain latch it stamps into every texture. Mints may share a
-/// latch; queue exclusivity lives on [`super::encoder::EncodeSession`].
+/// The handle Metal resource creation goes through: the device and the loss latch it stamps into
+/// every texture.
 #[derive(Debug)]
 pub(crate) struct MetalResourceDevice {
     dev: Device,
@@ -26,8 +17,7 @@ pub(crate) struct MetalResourceDevice {
 }
 
 impl MetalResourceDevice {
-    /// A mint for `latch`'s loss domain on `dev` (retained, not copied — the
-    /// same `MTLDevice`).
+    /// A mint for `latch`'s loss domain on `dev` (retained, not copied — the same `MTLDevice`).
     #[inline]
     pub(crate) fn new(dev: &Device, latch: Arc<LossLatch>) -> Self {
         Self {
@@ -60,7 +50,7 @@ impl MetalResourceDevice {
         })
     }
 
-    /// A shared-storage buffer. Unsealed on purpose — see the module header.
+    /// A shared-storage buffer.
     #[inline]
     pub(crate) fn buffer(&self, len: usize) -> Result<Obj, String> {
         self.dev
@@ -68,7 +58,7 @@ impl MetalResourceDevice {
             .ok_or_else(|| format!("MTLBuffer allocation failed ({len} bytes)"))
     }
 
-    /// A sampler state. Unsealed on purpose — see the module header.
+    /// A sampler state.
     #[inline]
     pub(crate) fn sampler(&self, desc: SamplerDesc) -> Result<Obj, String> {
         self.dev
@@ -77,25 +67,18 @@ impl MetalResourceDevice {
     }
 }
 
-// Threading: `MTLResource`s and objc_retain/release are documented thread-safe
-// (wgpu-hal relies on the same contract). `GpuRenderer` holds these types and
-// crosses a thread at gui startup, hence Send/Sync; encoding stays on the
-// session's thread.
-
-// SAFETY: `MTLTexture` is an `MTLResource` (thread-safe per Metal's threading
-// model); `Arc<LossLatch>` is Send+Sync. See the threading note above.
+// SAFETY: `MTLTexture` is an `MTLResource` and objc retain/release are thread-safe (Metal's
+// threading model, which wgpu-hal relies on too); `Arc<LossLatch>` is Send+Sync. Encoding stays
+// on the session's thread.
 unsafe impl Send for SealedTexture {}
-// SAFETY: as for `Send` — the wrapped object is documented thread-safe and
-// this type adds only the immutable stamp.
+// SAFETY: as for `Send`; this type adds only the immutable stamp.
 unsafe impl Sync for SealedTexture {}
 
-/// A shared-storage `MTLBuffer` from [`MetalResourceDevice::buffer`], wrapped so
-/// it can cross threads. Coherent access to its contents relies on the writer
-/// waiting for the GPU before rewriting.
+/// A shared-storage `MTLBuffer` from [`MetalResourceDevice::buffer`].
 #[derive(Debug)]
 pub(crate) struct SharedBuffer(Obj);
 
-// SAFETY: `MTLBuffer` is an `MTLResource`; see the threading note above.
+// SAFETY: `MTLBuffer` is an `MTLResource`, thread-safe as for `SealedTexture` above.
 unsafe impl Send for SharedBuffer {}
 // SAFETY: as for `Send`.
 unsafe impl Sync for SharedBuffer {}
@@ -113,21 +96,14 @@ impl SharedBuffer {
         &self.0
     }
 
-    /// The raw buffer, by value, for a one-shot buffer used and dropped on this
-    /// thread.
+    /// The raw buffer, by value, for a one-shot buffer used and dropped on this thread.
     #[inline]
     pub(crate) fn into_obj(self) -> Obj {
         self.0
     }
 }
 
-/// A Metal texture (or a format-alias view of one) carrying the
-/// `Arc<LossLatch>` of the loss domain it was minted in, which the encoder's
-/// write verbs and `Frame::present` cross-check.
-///
-/// Constructed only inside the metal module: via [`MetalResourceDevice`], the
-/// swapchain's drawable stamp, or view inheritance, so a forged stamp is not
-/// expressible.
+/// A Metal texture ([`MetalResourceDevice`]).
 #[derive(Debug)]
 pub(crate) struct SealedTexture {
     obj: Obj,
@@ -135,15 +111,13 @@ pub(crate) struct SealedTexture {
 }
 
 impl SealedTexture {
-    /// Stamp an existing texture into `latch`'s domain: the swapchain's
-    /// drawable, vended by CoreAnimation but in the swapchain's loss domain.
+    /// Stamp an existing texture into `latch`'s domain.
     #[inline]
     pub(super) const fn from_parts(obj: Obj, latch: Arc<LossLatch>) -> Self {
         Self { obj, latch }
     }
 
-    /// The raw texture for read-only FFI (binding, property getters). Write
-    /// verbs take `&SealedTexture` and check the stamp.
+    /// The raw texture for read-only FFI (binding, property getters).
     #[inline]
     pub(crate) const fn obj(&self) -> &Obj {
         &self.obj
@@ -155,8 +129,7 @@ impl SealedTexture {
         &self.latch
     }
 
-    /// A second +1 handle to the same texture with the same stamp
-    /// ([`Obj::clone_retained`]).
+    /// A second +1 handle to the same texture with the same stamp ([`Obj::clone_retained`]).
     #[inline]
     pub(crate) fn clone_handle(&self) -> Self {
         Self {
@@ -165,8 +138,7 @@ impl SealedTexture {
         }
     }
 
-    /// `newTextureViewWithPixelFormat:` inheriting this texture's stamp: the
-    /// Unorm/sRGB alias pair is one storage, one loss domain.
+    /// `newTextureViewWithPixelFormat:` inheriting this texture's stamp.
     #[inline]
     pub(crate) fn alias_view(&self, format: PixelFormat) -> Option<SealedTexture> {
         ffi::texture_view(&self.obj, format).map(|obj| SealedTexture {
@@ -175,9 +147,7 @@ impl SealedTexture {
         })
     }
 
-    /// Upload CPU bytes into level 0 via [`ffi::texture_upload`]. Uploads are
-    /// CPU-synchronous `replaceRegion:` with no queue, so no stamp check.
-    ///
+    /// Upload CPU bytes into level 0 via [`ffi::texture_upload`].
     /// # Safety
     /// As [`ffi::texture_upload`]: the texture's storage is not `Private`, its
     /// dimensions cover `region`, and `bytes` holds at least

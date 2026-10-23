@@ -35,14 +35,25 @@ pub fn set_application_should_terminate_handler(handler: fn() -> bool) {
 }
 
 /// Printable ASCII character produced only via an Option chord on `key` under the active keyboard layout.
+///
+/// LOCAL PATCH (aterm): added; reads the layout with `UCKeyTranslate`, on the main thread.
 #[inline]
 pub fn option_only_character(key: crate::keyboard::PhysicalKey, shift: bool) -> Option<char> {
     crate::platform_impl::option_only_character(key, shift)
 }
 
 /// Additional methods on [`Window`] that are specific to macOS.
+///
+/// LOCAL PATCH (aterm): the methods aterm calls. Upstream's simple fullscreen, shadow, tabbing,
+/// document-edited and borderless-game controls are gone, with `WindowAttributesExtMacOS` (its
+/// settings stand at their defaults), `ActiveEventLoopExtMacOS`,
+/// `EventLoopBuilderExtMacOS::with_default_menu` (the default menu is always built) and
+/// `MonitorHandleExtMacOS::ns_screen`.
 pub trait WindowExtMacOS {
     /// Modifier state last derived from an event for this window.
+    ///
+    /// LOCAL PATCH (aterm): winit's own cache, written before the matching `ModifiersChanged` is
+    /// queued, for re-syncing after a contained NSException; never a WindowServer probe.
     fn cached_modifiers(&self) -> ModifiersState;
 
     /// Configure which Option keys are treated as Alt for this window's key events.
@@ -70,6 +81,8 @@ impl WindowExtMacOS for Window {
 }
 
 /// Which Option keys a window treats as Alt ([`WindowExtMacOS::set_option_as_alt`]).
+///
+/// LOCAL PATCH (aterm): upstream's type, kept with the setter.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OptionAsAlt {
     /// The left Option key is Alt; the right one composes.
@@ -83,7 +96,11 @@ pub enum OptionAsAlt {
     None,
 }
 
-// SAFETY: the content view is installed at window creation and retained by `NSWindow` for the life of `self`.
+// LOCAL PATCH (aterm): the content view through first-party `aterm_objc::HasNsView`, so the Metal
+// presenter and aterm-gui's chrome reach it without `raw-window-handle` (`rwh_06` is opt-in and
+// wraps this view).
+// SAFETY: the content view is installed at window creation and never replaced; the `NSWindow`
+// retains it and this `Window` retains the `NSWindow` until it drops, so the view outlives `self`.
 unsafe impl aterm_objc::HasNsView for Window {
     #[inline]
     fn ns_view(&self) -> aterm_objc::Id {

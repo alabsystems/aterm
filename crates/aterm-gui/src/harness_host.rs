@@ -4194,6 +4194,7 @@ impl IdleHost for WorkerIdle {
             Ok(accounts::strike(state, label, &self.sid, &why, now))
         });
         if done.is_ok() {
+            (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
             with_kept_of(&self.kept, |k| {
                 if let (Some(moved), Some(tab)) = (k.account.moved.as_mut(), k.snapshot.as_ref())
                     && (moved.pid, moved.start.as_str()) == (tab.pid, tab.start.as_str())
@@ -4367,6 +4368,7 @@ impl IdleHost for WorkerIdle {
             Ok(Vec::new())
         });
         let word = if done.is_ok() {
+            (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
             "recorded"
         } else {
             "not recorded"
@@ -4522,13 +4524,22 @@ impl WorkerIdle {
             ..reading.tap_read(beside, key)
         };
         let mut held_back = false;
+        let mut low_or_limited = false;
         let noted = self.account_transact(&seat, |state, now| {
             let (events, held) = accounts::note_reading_held(state, &label, &read, now);
             held_back = held;
+            low_or_limited = !events.is_empty()
+                && state
+                    .accounts
+                    .get(&label)
+                    .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
             Ok(events)
         });
         match noted {
             Ok(events) => {
+                if low_or_limited {
+                    (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
+                }
                 if !held_back {
                     self.tap
                         .lock()
@@ -4965,6 +4976,7 @@ impl WorkerIdle {
         match done {
             Ok(events) if events.iter().any(|e| e.kind == accounts::Kind::LoginEnded) => {
                 aterm_log::info!("harness @{}: account {label}: its login ended", self.sid);
+                (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
             }
             Ok(_) => {}
             Err(_) => {
@@ -5292,6 +5304,14 @@ impl WorkerIdle {
                 Instant::now() + (self.hooks.pause)(WALL_AGAIN_AFTER),
             );
         }
+        if at_wall
+            && !matches!(
+                decided,
+                Some(AccountAdvice::Move { .. } | AccountAdvice::Resume { .. })
+            )
+        {
+            (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
+        }
         advised
     }
 
@@ -5441,16 +5461,28 @@ impl WorkerIdle {
         if !same {
             return "sample dropped: not the process it was claimed for";
         }
+        let mut low_or_limited = false;
         let noted = self.account_transact(&seat, |state, now| {
             let sample = accounts::Sample {
                 at: now,
                 ..sample.clone()
             };
-            Ok(accounts::note_sample(state, &probing.label, sample, now))
+            let events = accounts::note_sample(state, &probing.label, sample, now);
+            low_or_limited = !events.is_empty()
+                && state
+                    .accounts
+                    .get(&probing.label)
+                    .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
+            Ok(events)
         });
         match noted {
             Ok(events) if events.is_empty() => "sample dropped: no figure, or none newer",
-            Ok(_) => "sampled",
+            Ok(_) => {
+                if low_or_limited {
+                    (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
+                }
+                "sampled"
+            }
             Err(why) if why == accounts::LOCK_HELD => "sample dropped: lock-held",
             Err(_) => "sample dropped: not recorded",
         }
@@ -17484,6 +17516,29 @@ fn activation_wake(host: &HostHandle) -> ActivationWake {
             harness_state().map(|state| accounts::Store::at(&state).wake_path()),
             Box::new(move || news.note_accounts()),
         );
+    for secret_mark in [
+        aterm_types::dirs::aterm_config_dir().map(|d| d.join("secrets/state.toml")),
+        home.as_ref().map(|h| {
+            h.join(".secrets")
+                .join(aterm_agent::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE)
+        }),
+        home.as_ref().map(|h| {
+            h.join(".secrets")
+                .join(aterm_agent::harness::headless_oauth::MAILBOX_TOML_FILE)
+        }),
+        aterm_types::dirs::aterm_config_dir()
+            .map(|d| d.join(aterm_agent::harness::headless_oauth::MAILBOX_TOML_FILE)),
+    ] {
+        let h = host.clone();
+        wake = wake.with_side(
+            secret_mark,
+            Box::new(move || {
+                if let Some(trigger) = h.shared.wake.get() {
+                    trigger.pull();
+                }
+            }),
+        );
+    }
     for agent in own_marker_agents() {
         wake = wake.with_agent(agent.name(), agent_landing_told(host.clone(), agent));
     }

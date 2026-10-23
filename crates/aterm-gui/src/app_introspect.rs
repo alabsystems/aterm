@@ -5687,7 +5687,8 @@ impl App {
                     (!window.is_null()).then_some(window)
                 });
 
-            // SAFETY: side-effect-free AppKit toolbar accessors on live main-thread receivers.
+            // SAFETY: side-effect-free AppKit toolbar accessors on live main-thread receivers; each
+            // answer is +0, borrowed for the pool above.
             unsafe {
                 let toolbar = ns_window
                     .map(|w| appkit::send_id(w, sel!(toolbar)))
@@ -6211,7 +6212,9 @@ impl App {
         if !macos_rect_is_finite(bounds) || bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return Err("window capture found invalid AppKit chrome bounds".to_string());
         }
-        // SAFETY: side-effect-free geometry conversions on live main-thread receivers.
+        // SAFETY: `-convertRect:toView:` is `-(NSRect)(NSRect, NSView *)` and
+        // `-convertRectToBacking:` `-(NSRect)(NSRect)`, side-effect-free on live main-thread
+        // receivers; `Id::NIL` is the documented "window base coordinates" argument.
         let window_rect = unsafe {
             appkit::send_rect_rect_id(chrome_root, sel!(convertRect:toView:), bounds, Id::NIL)
         };
@@ -6242,7 +6245,9 @@ impl App {
                 bitmap,
             );
         }
-        // SAFETY: process-lifetime `sRGBColorSpace` and color-space conversion on a live bitmap rep.
+        // SAFETY: `+[NSColorSpace sRGBColorSpace]` is +0 and process-lifetime;
+        // `-bitmapImageRepByConvertingToColorSpace:renderingIntent:` takes the intent as an
+        // NSInteger, on a live bitmap rep.
         let srgb = unsafe { appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace)) };
         if srgb.is_null() {
             return Err("window capture could not reach the sRGB color space".to_string());
@@ -6747,7 +6752,8 @@ fn macos_view_is_ancestor_of(
     if ancestor == descendant {
         return Ok(true);
     }
-    // SAFETY: side-effect-free `superview` reads on live main-thread `NSView`s.
+    // SAFETY: side-effect-free `superview` reads on live main-thread `NSView`s; each +0 answer is
+    // only compared, never kept.
     let mut current = unsafe { crate::appkit::send_id(descendant, sel!(superview)) };
     for _ in 0..64 {
         if current.is_null() {
@@ -6785,7 +6791,8 @@ fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), Str
     if image.is_null() {
         return Err("window capture could not read the AppKit chrome bitmap".to_string());
     }
-    // SAFETY: side-effect-free accessors on the live `CGImage`.
+    // SAFETY: side-effect-free accessors on the live `CGImage`; its colour space is +0, owned by
+    // the image.
     let desc = unsafe {
         let space = CGImageGetColorSpace(image);
         BitmapDesc {
@@ -6864,7 +6871,8 @@ fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
     let png_len = unsafe { appkit::send_usize(png, sel!(length)) };
     let mut png_bytes = vec![0_u8; png_len];
     if png_len != 0 {
-        // SAFETY: `-getBytes:length:` writes at most `png_len` bytes into the pre-sized `Vec`.
+        // SAFETY: `-getBytes:length:` writes `png_len` bytes, the receiver's own length, into the
+        // `Vec` sized to it.
         unsafe {
             appkit::send_v_ptr_usize(
                 png,

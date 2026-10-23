@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ReplyFidelity` (`aterm_models_effects::reply_fidelity_model`):
-//! once a forwarded verb has reached the host, no later failure may be
-//! reported to the client as `ERR forward`, and a failure before that must be.
-//!
-//! Drives the shipping `connect_hop` and `deliver_then_relay` (all of
-//! `relay_hop` but its relay stage) against a real host socket, and projects:
-//!
-//! * `delivered` — the host actually read the forwarded line (observed on the
-//!   host's side; the line after the connect probe);
-//! * `reported_err` — either returned `Err`, which is exactly when
-//!   `try_proxy_forward` leaves the client an error: `ERR no such session`
-//!   from the local dispatch for [`ForwardError::NotAHop`], `ERR forward` for
-//!   anything else.
-//!
-//! Five runs: the real relay (delivered, no error), a relay stage that fails
-//! after delivery (injected at the seam; a worker thread the system refuses to
-//! start cannot be staged in a shared test process), a dial with no listener, a
-//! host that never accepts, and a host with no token beside its socket (the
-//! last three reported, never delivered).
-//!
-//! Negative control: from the real delivered state, reporting the relay
-//! failure is rejected by the committed model and admitted by `Buggy = 1`.
+//! Tier-1 conformance test for `ReplyFidelity` (`aterm_models_effects::reply_fidelity_model`).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -36,10 +15,6 @@ use crate::test_socket::{hang_up, join_after_hang_up};
 
 type State = BTreeMap<&'static str, i64>;
 
-/// The connect-probe bound for runs whose host answers at once, and how long a run
-/// waits for the host's read: hang detectors for what must happen, never latency
-/// budgets, so a loaded machine cannot turn a delivered verb into `delivered = 0`.
-/// The unanswered-probe run passes its own short bound.
 const PATIENCE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 fn state(delivered: bool, reported_err: bool) -> State {
@@ -62,9 +37,6 @@ fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
     )
 }
 
-/// A throwaway host listener with its token beside the socket: it answers the
-/// connect probe, reports the next request line it reads (the forwarded line),
-/// then answers and hangs up.
 struct Host {
     sock: String,
     read: mpsc::Receiver<String>,
@@ -99,24 +71,15 @@ fn host() -> Host {
     }
 }
 
-/// What the forward sends once the host serves: the caller's line as it came.
 const LINE: &str = "@s-1 screen";
-/// What the host reads first: the handshake with the connect probe, presenting
-/// the token beside its socket.
 const PROBE: &str = "TOKEN abcd version\n";
 
-/// Whether the host read exactly the forwarded line. Bounded by [`PATIENCE`],
-/// so an undelivered line projects as `false` rather than hanging; any line
-/// read (EOF included) is reported at once.
 fn host_read(h: &Host) -> bool {
     h.read
         .recv_timeout(PATIENCE)
         .is_ok_and(|line| line.strip_suffix('\n') == Some(LINE))
 }
 
-/// The forward to `sock` up to its relay stage: `connect_hop`, then
-/// `deliver_then_relay` with `relay`. Whether it reported an error, and the
-/// connect's own when it was that.
 fn forward(
     sock: &str,
     client: &CtlStream,
@@ -136,7 +99,6 @@ fn forward(
 fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     let init = reply_fidelity_model().init_state();
 
-    // 1. The real relay: delivered, and nothing reported.
     let h = host();
     let (client_app, client_relay) = CtlStream::pair().expect("pair");
     let sock = h.sock.clone();
@@ -144,7 +106,6 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
         Ok(hop) => relay_hop(hop, LINE, &client_relay, &[]).is_err(),
         Err(_) => true,
     });
-    // The answer must cross: the read is a hang detector, not a latency budget.
     client_app
         .set_read_timeout(Some(PATIENCE))
         .expect("bound the reply read");
@@ -153,9 +114,6 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
         .read_line(&mut reply)
         .unwrap();
     assert_eq!(reply, "OK\n", "the host's answer crossed the real relay");
-    // Hang the client up for the whole socket, so the relay's client-to-host
-    // pump reads EOF even while a sibling's fork holds a copy of the client
-    // end; closing this test's descriptor is not that.
     hang_up(client_app);
     let reported = join_after_hang_up(forward_thread, "the forward to end on its client's hang-up");
     let delivered = host_read(&h);
@@ -167,9 +125,6 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     );
     join_after_hang_up(h.thread, "the stand-in host to finish serving");
 
-    // 2. A relay stage that fails after delivery. The failing stage observes
-    //    the delivery from the host's side first, so the run is split into its
-    //    two real steps.
     let h = host();
     let (_client_app, client_relay) = CtlStream::pair().expect("pair");
     let mut at_relay = None;
@@ -191,8 +146,6 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     );
     join_after_hang_up(h.thread, "the stand-in host to finish serving");
 
-    // 3. No listener: the connect finds no hop, nothing is delivered, and the
-    //    local dispatch reports it.
     let dir = crate::test_scratch::short_dir("the control socket");
     let absent = dir.path().join("absent.sock");
     let (_client_app, client_relay) = CtlStream::pair().expect("pair");
@@ -213,8 +166,6 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
         "dial failure: {init:?} -> {after:?} is not DialFail\n{why}"
     );
 
-    // 4. A host that never accepts: the connect probe goes unanswered,
-    //    nothing is delivered, and the failure is reported.
     let dir = crate::test_scratch::short_dir("the control socket");
     let wedged = dir.path().join("wedged.sock");
     std::fs::write(dir.path().join("wedged.sock.token"), "abcd\n").expect("token");
@@ -233,15 +184,11 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
         "an unaccepted forward: {init:?} -> {after:?} is not DialFail\n{why}"
     );
 
-    // 5. A host with no token beside its socket once the connection exists:
-    //    no hop, the forward sends nothing, and the failure is reported.
     let dir = crate::test_scratch::short_dir("the control socket");
     let tokenless = dir.path().join("aterm-77031.sock");
     let listener = aterm_uds::CtlListener::bind(&tokenless).expect("bind the host");
     let heard = std::thread::spawn(move || {
         let (conn, _) = listener.accept().expect("accept");
-        // In read slices, never one read parked on the end-of-file
-        // ([`crate::test_socket::read_to_end_of_file`]).
         crate::test_socket::read_to_end_of_file(&conn, |read| {
             format!("the forward's end ({} bytes read)", read.len())
         })
@@ -257,13 +204,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
         matches!(error, Some(ForwardError::NotAHop)),
         "no token is no hop: {error:?}"
     );
-    // The host's `accept` returns either way: the forward's dropped
-    // connection is first in its backlog, otherwise this closed connection
-    // is, so the run is judged rather than hung.
     drop(CtlStream::connect(&tokenless));
-    // Its read ends at the last close of the forward's end, which a
-    // sibling's fork may hold until its exec: a delay, joined with a hang
-    // detector.
     let heard = join_after_hang_up(heard, "the host to read the forward to its end");
     let delivered = String::from_utf8_lossy(&heard).lines().any(|l| l == LINE);
     let after = state(delivered, reported);
@@ -276,7 +217,6 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     );
 }
 
-/// The defect from a real delivered state: the relay failure reported as ERR.
 #[test]
 fn an_error_reported_after_delivery_is_the_buggy_step() {
     let model = reply_fidelity_model();

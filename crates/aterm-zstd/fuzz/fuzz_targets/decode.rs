@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Zstandard decoder fuzz target (docs/AUDIT-third-party-2026-10-15.md ZC.4).
+//!
+//! STOCK EXCEPTION (Trust ships no cargo-fuzz and no ASan runtime): run on a stock nightly,
+//! `cargo +nightly fuzz run decode` from `crates/aterm-zstd`.
 
 #![no_main]
 

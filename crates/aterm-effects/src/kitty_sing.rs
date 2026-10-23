@@ -906,27 +906,34 @@ const NOTE_A: f32 = 0.88;
 #[must_use]
 pub fn bake_note(w: u16, h: u16, kind: NoteKind) -> Tile {
     let mut tile = Tile::new(u32::from(w), u32::from(h));
+    paint_note(&mut tile, kind);
+    tile
+}
+
+/// Paint one note glyph onto a cleared `tile` at its current dimensions, white
+/// (tinted per sprite).
+pub fn paint_note(tile: &mut Tile, kind: NoteKind) {
+    let (w, h) = (tile.width(), tile.height());
     if w == 0 || h == 0 {
-        return tile;
+        return;
     }
     let white = (1.0, 1.0, 1.0);
-    let fit = PathTransform::fit(u32::from(w), u32::from(h));
-    let (wf, hf) = (f32::from(w), f32::from(h));
+    let fit = PathTransform::fit(w, h);
+    let (wf, hf) = (w as f32, h as f32);
     match kind {
         NoteKind::Eighth => {
-            fill_path(&mut tile, &[&EIGHTH_STEM], white, NOTE_A, fit);
-            fill_path(&mut tile, &[&EIGHTH_FLAG], white, NOTE_A, fit);
+            fill_path(tile, &[&EIGHTH_STEM], white, NOTE_A, fit);
+            fill_path(tile, &[&EIGHTH_FLAG], white, NOTE_A, fit);
             tile.disc(0.40 * wf, 0.82 * hf, (0.16 * hf).max(1.2), white, NOTE_A);
         }
         NoteKind::Beamed => {
-            fill_path(&mut tile, &[&BEAM_BAR], white, NOTE_A, fit);
-            fill_path(&mut tile, &[&BEAM_STEM_L], white, NOTE_A, fit);
-            fill_path(&mut tile, &[&BEAM_STEM_R], white, NOTE_A, fit);
+            fill_path(tile, &[&BEAM_BAR], white, NOTE_A, fit);
+            fill_path(tile, &[&BEAM_STEM_L], white, NOTE_A, fit);
+            fill_path(tile, &[&BEAM_STEM_R], white, NOTE_A, fit);
             tile.disc(0.24 * wf, 0.84 * hf, (0.14 * hf).max(1.2), white, NOTE_A);
             tile.disc(0.76 * wf, 0.84 * hf, (0.14 * hf).max(1.2), white, NOTE_A);
         }
     }
-    tile
 }
 
 #[cfg(test)]

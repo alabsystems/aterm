@@ -369,7 +369,7 @@ pub fn seed(run: &Run, agent: Agent, l: &Launch) -> Result<(), Fail> {
 /// Seed the scratch home and launch `agent` in the lab's first tab.
 ///
 /// # Errors
-/// Returns a [`Fail`] if the binary or witness is missing, arguments are refused, or the TUI fails to draw.
+/// No such agent, no witness, a refused argument, or the launch line could not be typed.
 pub fn launch(run: &Run, agent: Agent, l: &Launch) -> Result<String, Fail> {
     need(run, agent)?;
     crate::procs::need_witness(run)?;

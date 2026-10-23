@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The input shapes aterm-serde-derive's parser (crates/aterm-macro-support)
-//! has to read, each held to the tokens it writes and reads back
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.5): generics with bounds,
-//! defaults and where clauses; lifetimes; raw identifiers and raw strings; doc
-//! attributes; visibilities, including `pub (A, B)` in a tuple; the
-//! None-delimited groups `macro_rules!` fragments arrive in; nested generics
-//! and `->` inside a field type; associated-type fields; `Self` in a field
-//! type; discriminants, shifts and comparisons in them included; and a packed
-//! struct.
-//!
-//! `proc_macro` runs only inside the compiler, so the parser is tested here,
-//! through the derive, and not by unit tests.
+//! Input shapes for `aterm-serde-derive`'s parser (`crates/aterm-macro-support`).
 
 #![expect(
     clippy::type_complexity,
@@ -229,8 +218,6 @@ fn doc_attributes_and_visibilities() {
     );
 }
 
-// `$vis`, `$ty` and `$key` arrive wrapped in None-delimited groups; `$name`
-// and `$field` arrive bare.
 macro_rules! model {
     ($vis:vis struct $name:ident { $($fvis:vis $field:ident : $ty:ty = $key:literal),* $(,)? }) => {
         #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -257,11 +244,8 @@ macro_rules! newtype {
     };
 }
 
-// The field's `$ty` None-group starts the tuple field: a type, not a `$vis`.
 newtype!(Wrapped(Vec<u8>));
 
-// This is an opaque type macro, rather than a `$ty` fragment. `Self` is
-// its input syntax; replacing it with the enclosing type changes the macro.
 macro_rules! wire_ty {
     (Self) => {
         u8
@@ -378,9 +362,6 @@ fn nested_generics_and_an_associated_type_are_bounded() {
     );
 }
 
-// A `->` inside a field's type closes no angle bracket, and the field after it
-// still splits at its comma. The skipped closure type gets no `Serialize`
-// bound, so a function pointer serves.
 #[derive(Serialize)]
 #[expect(dead_code, reason = "`f` and `g` exist to be parsed and skipped")]
 struct Arrow<T, F>
@@ -503,18 +484,12 @@ impl Bit<u8, u16> for u8 {
     const BIT: u16 = 32;
 }
 
-// 64 for `pick::<u8, u16>()`.
 const fn pick<A, B>() -> u16 {
     (size_of::<A>() * 32 + size_of::<B>() * 16) as u16
 }
 
 const SHIFT: u32 = 2;
 
-// A discriminant is an expression: its `<` compares and `<<` shifts unless it
-// opens generic arguments (a turbofish, a qualified path, a cast's type), and
-// only a comma outside those ends it. Deserialize alone, because a variant
-// swallowed into the one before it still compiles there and is then refused
-// as an unknown name.
 #[derive(Debug, PartialEq, Deserialize)]
 #[repr(u16)]
 enum Shifts {

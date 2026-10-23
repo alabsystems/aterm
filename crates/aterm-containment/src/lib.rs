@@ -3,6 +3,19 @@
 // Author: Andrew Yates
 
 //! Three-mode containment policy (`User`, `Safety`, `Containment`) and spawn-seam actuator.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use aterm_containment::{ContainmentMode, ContainmentPolicy, init_mode};
+//!
+//! // At startup (called once by launcher):
+//! init_mode(ContainmentMode::User).expect("mode already set");
+//!
+//! // Anywhere in aterm:
+//! let mode = aterm_containment::mode_or_containment();
+//! let caps = ContainmentPolicy::capabilities(mode);
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
@@ -125,7 +138,7 @@ pub fn mode_or_containment() -> ContainmentMode {
 ///
 /// # Errors
 ///
-/// Returns an error if `flag` is not a valid mode or the mode was already initialized.
+/// The value is not a mode (the caller fails closed), or the mode was already set.
 pub fn init_mode_from_flag(
     flag: Option<&str>,
     default: ContainmentMode,

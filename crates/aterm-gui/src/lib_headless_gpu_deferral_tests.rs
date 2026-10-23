@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-/// The deferral needs both halves: a windowed GPU launch still builds at boot,
-/// and a headless `--cpu` launch has nothing to defer (so `ensure_pixel_backend`
-/// never resurrects a GPU the user refused).
 #[test]
 fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
     assert!(super::defer_gpu_build(true, true), "headless GPU launch");
@@ -28,8 +25,6 @@ fn a_headless_boot_claims_no_first_frame_warm() {
     );
 }
 
-/// A pixel demand with no deferred intent builds nothing, however often it repeats: the no-op
-/// is the absent intent, not a once-only latch.
 #[test]
 fn a_pixel_demand_without_a_deferred_intent_builds_nothing() {
     let mut app = super::App::headless_for_test();
@@ -42,9 +37,6 @@ fn a_pixel_demand_without_a_deferred_intent_builds_nothing() {
     }
 }
 
-/// The capability read follows the intent, not the live renderer: an unredeemed
-/// intent reads as GPU-capable (`ViewMotionCx::backend_gpu`) and a spent one as
-/// CPU again, the same answer `backend_kind_undecided` gives.
 #[test]
 fn the_settings_capability_read_follows_the_intent_the_app_holds() {
     let mut app = super::App::headless_for_test();
@@ -72,16 +64,11 @@ fn the_settings_capability_read_follows_the_intent_the_app_holds() {
     );
 }
 
-/// A failed redemption stays on CPU, so the render config is re-pinned and the CPU-only
-/// warnings are no longer withheld. An unsealed font generation, which
-/// `cpu_renderer_from_admitted` refuses, fails it without touching a device.
 #[test]
 fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
     let _lane = crate::message_inbox::lane_test_guard();
     let mut app = super::App::headless_for_test();
     let _ = crate::message_inbox::take_queued();
-    // A launch that asked for translucent glass, on a boot that has not yet
-    // decided whether it has a GPU to composite it with.
     app.render_knobs.background_opacity = 0.5;
     app.set_deferred_gpu(true);
     app.pin_backend_render_config_core();
@@ -91,9 +78,7 @@ fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
         backend_background_opacity(&app),
     );
 
-    // Pin writes are idempotent: move the knob unpinned, so only a second pin carries it.
     app.render_knobs.background_opacity = 0.25;
-    // A generation the redemption cannot fork => the first `Err` arm.
     app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
         super::Renderer::from_system(super::FONT_PX, app.theme)
             .expect("system font for an unsealed generation"),
@@ -104,7 +89,6 @@ fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
         app.backend.is_gpu(),
         backend_background_opacity(&app),
     );
-    // Leave no message for the inbox-drain tests, whatever the process-wide `Once` did.
     let _ = crate::message_inbox::take_queued();
 
     assert_eq!(
@@ -123,8 +107,6 @@ fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
     );
 }
 
-/// The background opacity the CPU renderer is carrying — separates "the failure
-/// path re-pinned" from "the failure path returned".
 fn backend_background_opacity(app: &super::App) -> f32 {
     match &app.backend {
         super::BackendSlot::Ready(super::Backend::Cpu(renderer)) => renderer.background_opacity(),

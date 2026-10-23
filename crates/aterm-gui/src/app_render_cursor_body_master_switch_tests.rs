@@ -5,13 +5,8 @@ use super::CursorFxInputs;
 use crate::{App, WindowId};
 use std::time::Instant;
 
-/// Every trail style that owns a block-cursor body engine, as a user spells
-/// it in `cursor_trail_style`. `rainbow kitty pet` is the default.
 const BODY_STYLES: [&str; 4] = ["rainbow kitty pet", "water", "comet", "phaser"];
 
-/// Drive one focused block-cursor frame. Returns the additive glow quads in `glow_scratch` (they
-/// become `RenderInput::cursor_glow_add` and demand-build `EffectPipeline::GlowAdd`) and whether
-/// a body effect claimed the caret's fill.
 fn one_focused_block_frame(trail_on: bool, style: &str) -> (usize, bool) {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
@@ -34,12 +29,9 @@ fn one_focused_block_frame(trail_on: bool, style: &str) -> (usize, bool) {
     )
 }
 
-/// `cursor_trail = false` masters the whole cursor-effect family: no block-body engine publishes
-/// an idle halo into `glow_scratch` or a `cursor_fill_override`, so nothing builds `glow_add`.
 #[test]
 fn the_cursor_trail_master_silences_every_block_cursor_body() {
     for style in BODY_STYLES {
-        // Control, master on: the style really drives the caret.
         let (on_quads, on_body) = one_focused_block_frame(true, style);
         assert!(
             on_quads > 0 && on_body,
@@ -60,8 +52,6 @@ fn the_cursor_trail_master_silences_every_block_cursor_body() {
     }
 }
 
-/// The master is read every frame: flipping `cursor_trail` at runtime (hot reload, Settings)
-/// lights the body on the next frame of the same window.
 #[test]
 fn switching_the_master_on_at_runtime_lights_the_body_on_the_next_frame() {
     let mut app = App::headless_for_test();
@@ -91,7 +81,6 @@ fn switching_the_master_on_at_runtime_lights_the_body_on_the_next_frame() {
         "precondition: the master is off, so this frame draws no body"
     );
 
-    // The hot-reload seam: the only thing that changes is the config.
     app.config.cursor_trail = Some(true);
 
     let mut lit = CursorFxInputs::sample_for_test(t0 + std::time::Duration::from_millis(16));
@@ -108,8 +97,6 @@ fn switching_the_master_on_at_runtime_lights_the_body_on_the_next_frame() {
     );
 }
 
-/// The master also darkens the momentum glow, which every style (`off` included) otherwise lights
-/// on fast typing. The master-on arm is the control.
 #[test]
 fn a_master_off_window_typed_into_fast_lights_no_momentum_glow() {
     for master in [true, false] {
@@ -149,9 +136,6 @@ fn a_master_off_window_typed_into_fast_lights_no_momentum_glow() {
     }
 }
 
-/// `fx_under_frames` counts ticks whose `glow_under` stream (the rainbow ribbon body) was
-/// non-empty. The counters are process-global, so the positive arm reads a delta and the zero
-/// arm the window's own stream. Control: the `off` style composes `glow_add` and no `glow_under`.
 #[test]
 fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
     let t0 = Instant::now();
@@ -179,8 +163,6 @@ fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
     );
 }
 
-/// Type three licensed keys into a focused window of `style` through the real tick path, each
-/// fed to the engines the printable-key arm feeds.
 fn ribbon_witness_take(style: &str, t0: Instant) -> (App, WindowId, Instant) {
     let mut app = App::headless_for_test();
     app.config.motion = Some("full".into());
@@ -204,7 +186,6 @@ fn ribbon_witness_take(style: &str, t0: Instant) -> (App, WindowId, Instant) {
             ws.last_key_at = Some(typed);
             ws.fx.cursor_mut().cadence.on_keystroke(typed);
             ws.fx.cursor_mut().glow.note_typed(typed);
-            // The printable-key arm's feed, as `app_input` makes it.
             ws.fx
                 .cursor_mut()
                 .momentum

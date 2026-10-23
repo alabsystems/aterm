@@ -293,7 +293,9 @@ fn refuse_enrolled(sys: &dyn System, layout: &Layout, admin: &User) -> Result<()
 /// Perform the agent installation for the resolved `admin`.
 ///
 /// # Errors
-/// One line naming why installation failed.
+/// One line naming why installation failed; whatever was done before it stays (re-running
+/// install finishes it, because `allowed_signers`, which makes the Mac enrolled, is written
+/// last).
 pub fn install(
     sys: &dyn System,
     layout: &Layout,

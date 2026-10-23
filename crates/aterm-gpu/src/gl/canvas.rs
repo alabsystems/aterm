@@ -91,7 +91,9 @@ impl GlCanvasSurface {
         let fbo = standin.fbo(&cur)?;
         let gl = cur.gl();
         let (w, h) = (tw as i32, th as i32);
-        // SAFETY: context is current and stand-in FBO is complete for RGBA8 nearest blit.
+        // SAFETY: the context is current; the stand-in's framebuffer is complete; the blit is
+        // colour-only and NEAREST between equal-sized rects of two RGBA8 buffers (the drawing
+        // buffer is the canvas's).
         unsafe {
             (gl.disable)(ffi::GL_SCISSOR_TEST);
             (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);

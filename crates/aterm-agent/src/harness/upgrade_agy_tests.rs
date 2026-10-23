@@ -12,15 +12,7 @@ const C1: &str = "eaeec4fb-4e43-47da-b46f-8a10c0fee186";
 const STORE: &str =
     "/Users//u/Library/Application Support/aterm/pkg/store/agy/1000001000004000000/bin/agy";
 
-/// The relaunch carries what this run chose and the conversation does not
-/// keep (`--effort`, `--model`, `--mode`, the hidden config flags, the
-/// permission posture and the sandbox), drops what the conversation keeps or
-/// a resume ignores (`--agent`, `--add-dir`, `--project`, `--new-project`),
-/// the launch's own `--conversation` and `-c`, and an `-i` prompt, and
-/// resumes the witnessed conversation as `--conversation=<uuid>` — Go's
-/// single-dash, double-dash, `=` and space forms read alike and kept as typed.
-/// NEGATIVE CONTROLS: a dropped flag's value never stands as a word of its
-/// own, and the launch's conversation is never the one typed.
+/// Relaunch carries run-level flags, drops conversation-kept flags, and resumes the witnessed conversation.
 #[test]
 fn a_relaunch_carries_the_runs_choices_and_drops_what_the_conversation_keeps() {
     let launch = argv(&[
@@ -72,11 +64,9 @@ fn a_relaunch_carries_the_runs_choices_and_drops_what_the_conversation_keeps() {
         Some("11111111-2222-4333-8444-555555555555"),
         "the launch's own, which the witness may have moved past"
     );
-    // With no conversation, the carried flags alone: a fresh start.
     let plain = argv(&[STORE, "--effort", "low"]);
     assert_eq!(rewrite_argv(&plain, None), Ok(argv(&["--effort", "low"])));
     assert_eq!(resumed_conversation(&plain), None);
-    // A switch never takes the next token: `--sandbox --model x`.
     let switch = argv(&[STORE, "--sandbox", "--model", "x"]);
     assert_eq!(
         rewrite_argv(&switch, Some(C1)),
@@ -87,17 +77,13 @@ fn a_relaunch_carries_the_runs_choices_and_drops_what_the_conversation_keeps() {
             &format!("--conversation={C1}")
         ]))
     );
-    // `--` alone ends nothing to carry.
     assert_eq!(
         rewrite_argv(&argv(&[STORE, "--effort=low", "--"]), None),
         Ok(argv(&["--effort=low"]))
     );
 }
 
-/// A launch no relaunch brings back is refused with its word, and a flag the
-/// table does not know refuses (nothing guesses its arity). NEGATIVE
-/// CONTROLS: a conversation that is no UUIDv4 is never typed, nor one in
-/// capitals.
+/// Non-resumable launches, unknown flags, and non-UUIDv4 conversation ids are refused.
 #[test]
 fn a_launch_no_resume_carries_is_refused() {
     for (words, why) in [
@@ -146,11 +132,7 @@ fn a_launch_no_resume_carries_is_refused() {
     }
 }
 
-/// The TUI is a plain launch, flags and all; one-shots, the subcommands and
-/// a positional (agy refuses one, exit 2) are not. A flag that refuses, or
-/// one the table does not know, leaves it a TUI (its relaunch is refused at
-/// the exit, with its word). NEGATIVE CONTROL: `--conversation` is no
-/// subcommand nor prompt.
+/// Only interactive TUI launches are snapshotted; one-shots, subcommands, and positionals are not.
 #[test]
 fn only_the_interactive_tui_is_snapshotted() {
     for words in [
@@ -182,22 +164,13 @@ fn only_the_interactive_tui_is_snapshotted() {
     }
 }
 
-/// Ctrl-Z's status: `128` plus this platform's SIGTSTP (`146` on macOS,
-/// measured; `148` on Linux).
+/// Ctrl-Z's status (`128 + SIGTSTP`).
 #[cfg(unix)]
 fn ctrl_z() -> i64 {
     128 + i64::from(libc::SIGTSTP)
 }
 
-/// agy's measured exit table: `0` every graceful way out, Ctrl-Z's status
-/// ([`ctrl_z`]: stopped, alive) and every other stop signal's, any other
-/// status a crash only with the dead pid's crash file left, else `2` a
-/// refused start and any other an end no witness tells. NEGATIVE CONTROLS:
-/// the status alone (a crash for every nonzero, as a signals-only table
-/// reads it) would read Ctrl-Z, a refusal and an unwitnessed end as crashes;
-/// the crash file alone would read Ctrl-Z (which keeps it) as one; a status
-/// beside a stop signal's is no stop. The stop signals are this platform's
-/// (libc's), so the stop rows are Unix's: no other platform names them.
+/// Exit status and crash-file presence classify clean exits, stops, crashes, and refusals.
 #[test]
 fn the_exit_table_is_agys_own() {
     let status_alone = |status: i64| status != 0;
@@ -243,11 +216,6 @@ fn the_exit_table_is_agys_own() {
         assert!(status_alone(status));
         assert_ne!(exit_kind(status, crash_left), ExitKind::Crashed, "{status}");
     }
-    // The relaunch line's own block: a program the shell could not run, a
-    // `cd` it could not make, is a refusal of the line; every other status
-    // reads as agy's own. NEGATIVE CONTROL: agy's own table reads 127 and 1
-    // as ends no witness tells, and a line whose process left its crash file
-    // crashed whatever its status.
     for (status, crash_left, kind) in [
         (126, false, ExitKind::Refused),
         (127, false, ExitKind::Refused),
@@ -263,11 +231,7 @@ fn the_exit_table_is_agys_own() {
     assert_eq!(exit_kind(127, false), ExitKind::Unwitnessed);
 }
 
-/// The config is `$HOME/.gemini/antigravity-cli`, moved only by the hidden
-/// flags (an absolute `--gemini_dir`, a relative `--app_data_dir`), any
-/// spelling, the last one winning. NEGATIVE CONTROLS: a relative
-/// `--gemini_dir` is ignored as agy ignores it; an absolute or climbing
-/// `--app_data_dir` names none (unmeasured); a relative `HOME` falls back.
+/// Config directory resolves from `$HOME` and `--gemini_dir` / `--app_data_dir`.
 #[test]
 fn the_config_is_where_home_and_the_hidden_flags_put_it() {
     let fb = Path::new("/fallback");
@@ -329,9 +293,7 @@ fn the_config_is_where_home_and_the_hidden_flags_put_it() {
     );
 }
 
-/// Only a presence lock names a conversation, and only a crash file of the
-/// very pid names its crash. NEGATIVE CONTROLS: another directory, another
-/// pid, a conversation that is no UUIDv4, another root.
+/// Presence locks name their conversation UUIDv4 and crash files match their pid.
 #[test]
 fn the_lock_names_the_conversation_and_the_crash_file_its_pid() {
     let config = Path::new("/h/.gemini/antigravity-cli");
@@ -374,13 +336,7 @@ fn the_lock_names_the_conversation_and_the_crash_file_its_pid() {
     );
 }
 
-/// AN AGY THAT HAS A CONVERSATION OPEN WITHOUT ITS LOCK is told by what it
-/// holds open, as 1.4.2 lays it out (measured): the conversation's database
-/// under its config, and no presence lock. NEGATIVE CONTROLS: the lock's
-/// holder holds the database and its lock; an agy a `/clear` moved on holds
-/// the old database and its new conversation's lock; a fresh agy holds the
-/// `presence` directory alone, which is no lock; a lock under another config
-/// is none of this one's.
+/// An agy with an open conversation database and no presence lock under its config holds no lock.
 #[test]
 fn an_agy_without_a_lock_is_told_by_what_it_holds() {
     const C2: &str = "c688fa56-6a00-49a5-a1d1-5386b0df8b4d";
@@ -413,10 +369,7 @@ fn an_agy_without_a_lock_is_told_by_what_it_holds() {
     assert!(holds_no_lock(config, &[db, presence_lock(elsewhere, C1)]));
 }
 
-/// The relaunch carries the `HOME` the process ran under where that is
-/// another than the user's, and a record keeps it. NEGATIVE CONTROLS: the
-/// user's own `HOME`, however written, a relative one, and every other
-/// variable (none moves agy's config) are never carried or read back.
+/// Relaunch environment carries only a non-default absolute `HOME`.
 #[test]
 fn the_relaunch_carries_another_home_alone() {
     let user = Path::new("/h");
@@ -447,8 +400,7 @@ fn the_relaunch_carries_another_home_alone() {
     );
 }
 
-/// A store build is what the twin execs, never typed. NEGATIVE CONTROLS: the
-/// twin itself, another program, another store's agent.
+/// A store build path is distinguished from the agent twin and other binaries.
 #[test]
 fn a_store_build_is_told_from_the_twin() {
     assert!(store_build(Path::new(STORE)));
@@ -459,9 +411,7 @@ fn a_store_build_is_told_from_the_twin() {
     assert!(!store_build(Path::new("/p/store/muse/1/bin/agy")));
 }
 
-/// The told line is agy's own hint, after the flags that moved its config
-/// and behind another `HOME`. NEGATIVE CONTROLS: an id that is no UUIDv4 and
-/// a control character tell none; flags that move nothing are not told.
+/// The resume hint includes `HOME` and config-moving flags before `--conversation=<id>`.
 #[test]
 fn the_told_line_is_agys_own_resume_hint() {
     assert_eq!(
@@ -480,8 +430,7 @@ fn the_told_line_is_agys_own_resume_hint() {
     );
 }
 
-/// agy's own ids are UUIDv4, lowercase. NEGATIVE CONTROLS: a v7 id (Muse
-/// Code's), a name, a longer word, capitals, a wrong variant.
+/// Conversation ids must be lowercase UUIDv4.
 #[test]
 fn a_conversation_id_is_a_uuid_v4() {
     assert!(is_conversation_uuid(C1));

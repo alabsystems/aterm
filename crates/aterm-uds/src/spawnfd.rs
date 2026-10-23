@@ -31,6 +31,8 @@ const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
 /// The composing executable's startup admission of the bridge's two inherited lanes, [`BRIDGE_VERB_FD`] then [`BRIDGE_PUSH_FD`], each by [`adopt_inherited_socket`].
 /// # Safety
 /// Each eligible lane at [`BRIDGE_VERB_FD`] and [`BRIDGE_PUSH_FD`] must have been transferred exclusively to this call: no Rust or foreign owner may retain it.
+/// No thread or callback may close or replace either lane during adoption. The call consumes
+/// each eligible lane, including on a later failure.
 pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
     static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -39,7 +41,11 @@ pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
             "the bridge's inherited lanes were already taken by this process",
         ));
     }
-    // SAFETY: on the GUI route these are the launcher's unclaimed lanes; a hand-started process may have neither, which is a checked refusal.
+    // SAFETY: on the GUI route these are the launcher's unclaimed lanes;
+    // a hand-started process may have neither, which is a checked refusal.
+    // This startup route takes each eligible descriptor once (`TAKEN`) before
+    // bridge threads; neither has another Rust owner or concurrent
+    // close/replacement.
     let verb = unsafe { adopt_inherited_socket(BRIDGE_VERB_FD) }?;
     // SAFETY: the same startup ownership admission for the distinct push lane.
     let push = unsafe { adopt_inherited_socket(BRIDGE_PUSH_FD) }?;
@@ -49,6 +55,8 @@ pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Adopt an inherited socket as a close-on-exec copy, closing the original number after duplication.
 /// # Safety
 /// The descriptor number must not be closed or replaced by another thread or callback during this call.
+/// If it names a socket eligible for adoption, no other owner may hold it: its ownership must
+/// have been given up to this call. Once taken, it is closed even if duplication fails.
 pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
     use std::os::unix::fs::FileTypeExt as _;
     let meta = descriptor_metadata(fd).map_err(|e| {
@@ -83,7 +91,9 @@ pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
             ),
         ));
     }
-    // SAFETY: the caller admitted exclusive, stable ownership; the checks above only diagnose type/flags.
+    // SAFETY: the caller admitted exclusive, stable ownership; the checks
+    // above only diagnose type/flags. This is the number's one owner, dropped
+    // immediately after its close-on-exec copy is made.
     let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
     inherited.try_clone()
 }
@@ -94,7 +104,9 @@ pub fn descriptor_metadata(fd: RawFd) -> io::Result<std::fs::Metadata> {
     if unsafe { fcntl(fd, F_GETFD) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `fd` is open (just answered), and the `File` is never dropped (`ManuallyDrop`): it names the number for one `fstat`, which changes nothing.
+    // SAFETY: `fd` is open (just answered), and the `File` is never dropped
+    // (`ManuallyDrop`): it names the number for one `fstat`, which changes nothing.
+    // Closed by another thread in between, the `fstat` answers `EBADF`.
     let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
     file.metadata()
 }
@@ -687,7 +699,10 @@ mod platform {
         if place.suspended {
             flags |= POSIX_SPAWN_START_SUSPENDED;
         }
-        // SAFETY: each call takes an object `Objects::new` initialised and a live local or C string; none retains a pointer past the call.
+        // SAFETY: each call takes an object `Objects::new` initialised and a
+        // live local or C string; none retains a pointer past the call. The
+        // disclaim setter is the SPI `disclaimer` resolved, called with its
+        // own prototype on that same attribute object.
         unsafe {
             check(posix_spawnattr_setflags(&mut objects.attr, flags))?;
             if !place.inherit_all {
@@ -979,6 +994,9 @@ mod platform {
         script: &'a [*const c_char],
     }
 
+    /// # Safety
+    /// Only between `fork` and `exec`, with `sources[..placed]` at 5 or above
+    /// (or `INHERIT`), `null` and `report` open, and `exec`'s pointers live.
     unsafe fn child(
         strip: Option<InheritStrip>,
         sources: &[RawFd; 5],
@@ -987,6 +1005,7 @@ mod platform {
         report: RawFd,
         exec: &Exec<'_>,
     ) -> ! {
+        // SAFETY (whole body): the function's contract.
         unsafe {
             let transparent = strip.is_none();
             if let Some(strip) = strip {
@@ -1023,6 +1042,8 @@ mod platform {
         }
     }
 
+    /// # Safety
+    /// Only in the forked child.
     unsafe fn fail(report: RawFd) -> ! {
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
         let word = errno.to_be_bytes();
@@ -1105,7 +1126,9 @@ impl InheritNothing for StdCommand {
     fn inherit_nothing(&mut self) -> &mut Self {
         use std::os::unix::process::CommandExt as _;
         let strip = InheritStrip::prepare();
-        // SAFETY: the hook runs between fork and exec (or right before an exec of this process) and calls only `InheritStrip::apply`: raw syscalls over integers, no allocation, no lock.
+        // SAFETY: the hook runs between fork and exec (or right before an exec of this
+        // process) and calls only `InheritStrip::apply`: raw syscalls over integers, no
+        // allocation, no lock. `strip` is a plain integer copied into the closure.
         unsafe {
             self.pre_exec(move || {
                 strip.apply();

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared grammar for native tab-app control and semantic inspection.
-//!
-//! No GUI or terminal types live here, so the control dispatcher can parse an app request
-//! before resolving a PTY session (native-only windows, an empty session pool). The protocol
-//! version is [`APP_INSPECTION_V1`]; unknown versions fail closed.
+//! Shared grammar for native tab-app control and semantic inspection (`app/v1`); unknown versions fail closed.
 
 use std::fmt;
 
@@ -18,8 +14,7 @@ const MAX_ACTION_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 16 * 1024;
 const MAX_URI_BYTES: usize = 16 * 1024;
 
-/// An opaque, stable view identifier as represented on the control wire. The host owns the
-/// concrete ID type, so the wire form is not tied to a process-local integer.
+/// Opaque, stable view identifier on the control wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WireViewId<'a>(&'a str);
 
@@ -77,9 +72,7 @@ pub enum InspectionSubject<'a> {
     },
 }
 
-/// Metadata that prefixes every successful `app/v1` semantic response, counted as the first
-/// line of the response's `Lines` framing. The monotone `revision` lets a driver detect that
-/// topology or app state changed between reads.
+/// First-line header metadata for a successful `app/v1` semantic response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InspectionEnvelope<'a> {
     /// Monotone host inspection revision.
@@ -129,8 +122,7 @@ pub struct ActRequest<'a> {
     pub ui_key: &'a str,
     /// Controller action token.
     pub action: &'a str,
-    /// Optional action value. The remainder is preserved verbatim except for
-    /// surrounding ASCII whitespace, so text values may contain spaces.
+    /// Optional action value, with surrounding whitespace trimmed.
     pub value: Option<&'a str>,
 }
 
@@ -165,8 +157,7 @@ pub enum ParseError {
     Usage(&'static str),
     /// The caller requested a protocol version this build does not implement.
     UnsupportedVersion,
-    /// An opaque identity/key/action token was empty, oversized, or contained
-    /// whitespace/control bytes.
+    /// An opaque identity, key, or action token was empty, oversized, or contained whitespace or control bytes.
     InvalidToken(&'static str),
     /// The requested semantic projection is not part of `app/v1`.
     UnknownProjection,
@@ -194,10 +185,7 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parse the arguments following the `inspect` verb.
-///
-/// Accepted forms are `app/v1 tabs` and
-/// `app/v1 view <view-id> <text|controls|tree|audit>`.
+/// Parse `inspect` arguments (`app/v1 tabs` or `app/v1 view <view-id> <text|controls|tree|audit>`).
 pub fn parse_inspect(rest: &str) -> Result<InspectRequest<'_>, ParseError> {
     reject_line_break(rest, "inspect payload")?;
     let mut input = rest;
@@ -234,9 +222,7 @@ pub fn parse_inspect(rest: &str) -> Result<InspectRequest<'_>, ParseError> {
     }
 }
 
-/// Parse the arguments following the `act` verb.
-///
-/// Accepted form: `app/v1 view <view-id> <ui-key> <action> [value]`.
+/// Parse `act` arguments (`app/v1 view <view-id> <ui-key> <action> [value]`).
 pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
     reject_line_break(rest, "action payload")?;
     let mut input = rest;
@@ -281,9 +267,7 @@ pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
     })
 }
 
-/// Parse the arguments following the `open` verb when its first token is `app`:
-/// `app system-state`, `app settings [route]`, `app markdown <uri>`, or `app editor <uri>`. Parsing grants no file
-/// authority: the host must still canonicalize and authorize the URI.
+/// Parse `open app` arguments (`system-state`, `settings [route]`, `markdown <uri>`, or `editor <uri>`).
 pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     reject_line_break(rest, "open payload")?;
     let mut input = rest;

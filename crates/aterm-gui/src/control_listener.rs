@@ -499,10 +499,15 @@ fn close_listening(fd: RawFd) -> bool {
         );
         return false;
     };
-    // SAFETY: `fd` is an open listening socket owned by the serving generation.
+    // SAFETY: `fd` is an open listening socket owned by the serving generation,
+    // for the reason the `dup2` below states, and `shutdown` reads and writes no
+    // memory.
     let _ = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
     loop {
-        // SAFETY: `null` and `fd` are open descriptors for the duration of `dup2`.
+        // SAFETY: both descriptors are open for the whole call: `null` is
+        // borrowed across it, and `fd` is the serving generation's listener,
+        // which its accept thread closes only once retired — never while
+        // `EndpointState::serving` names it, under the lock the caller holds.
         let duplicated = unsafe { libc::dup2(null.as_raw_fd(), fd) };
         if duplicated == fd {
             break;
@@ -554,7 +559,8 @@ fn shutdown_if_accepted_at(fd: RawFd, names: &[PathBuf]) -> bool {
         // Descriptor reused for a non-socket; leak the duplicate above `STDERR_FILENO`.
         return false;
     }
-    // SAFETY: `copy` is a freshly duplicated socket fd owned solely here.
+    // SAFETY: `copy` was just created by this call, nothing else owns it, and
+    // it names a socket, so closing it releases no lock.
     let copy = CtlStream::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) });
     copy.local_addr()
         .ok()
@@ -567,7 +573,9 @@ fn shutdown_if_accepted_at(fd: RawFd, names: &[PathBuf]) -> bool {
 #[cfg(unix)]
 fn is_socket(fd: RawFd) -> bool {
     let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `info` is a valid `MaybeUninit<libc::stat>` pointer.
+    // SAFETY: `info` is a valid `MaybeUninit<libc::stat>` pointer; `fstat`
+    // writes exactly one `struct stat` through the pointer and reads nothing
+    // else; the descriptor is inspected, never consumed.
     if unsafe { libc::fstat(fd, info.as_mut_ptr()) } != 0 {
         return false;
     }
@@ -928,7 +936,8 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Duration) -> std::io::Result<boo
         revents: 0,
     };
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    // SAFETY: `pfd` is a valid single-element `pollfd` array.
+    // SAFETY: `pfd` is a valid single-element `pollfd` array for a descriptor
+    // the caller keeps open for the whole call.
     match unsafe { libc::poll(&mut pfd, 1, ms) } {
         n if n > 0 => Ok(pfd.revents != 0),
         0 => Ok(false),
@@ -1001,7 +1010,8 @@ pub(crate) fn queue_pending(listener: &CtlListener) -> Option<u32> {
     #[repr(C, align(8))]
     struct SocketFdInfo([u8; SOCKET_FDINFO_SIZE]);
     let mut info = SocketFdInfo([0; SOCKET_FDINFO_SIZE]);
-    // SAFETY: `info` is an 8-aligned writable buffer sized to `size_of_val(&info)`.
+    // SAFETY: `info` is a writable, 8-aligned buffer of exactly the size passed,
+    // which is the size the kernel requires for this flavor.
     let got = unsafe {
         proc_pidfdinfo(
             libc::getpid(),

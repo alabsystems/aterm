@@ -199,7 +199,8 @@ pub(crate) fn is_webkit(user_agent: &str) -> bool {
         && !user_agent.contains("Firefox/")
 }
 
-/// The session's product: `WebKit`, with Safari's `Version/<v>` where `user_agent` has one.
+/// The session's product: `WebKit`, with Safari's `Version/<v>` where `user_agent` has one;
+/// another browser's user agent as it is.
 pub(crate) fn product(user_agent: &str) -> String {
     if !is_webkit(user_agent) {
         return user_agent.to_string();

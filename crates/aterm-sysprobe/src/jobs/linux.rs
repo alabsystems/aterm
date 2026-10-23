@@ -47,6 +47,8 @@ pub struct StatLine {
     pub tty_nr: u32,
     /// The terminal's foreground group, `-1` (here 0) for none.
     pub tpgid: u32,
+    /// The kernel's flags for it (`PF_*`).
+    pub flags: u64,
     /// Major faults.
     pub majflt: u64,
     /// User time, ticks.
@@ -61,6 +63,14 @@ pub struct StatLine {
     pub threads: u64,
     /// Start time, ticks since boot.
     pub start: u64,
+}
+
+impl StatLine {
+    /// Whether it is a kernel thread (`PF_KTHREAD`): it maps no user memory.
+    #[must_use]
+    pub const fn kernel_thread(&self) -> bool {
+        self.flags & 0x0020_0000 != 0
+    }
 }
 
 /// Parse a `/proc/<pid>/stat` line; `None` when it is malformed.
@@ -87,6 +97,7 @@ pub fn parse_stat(text: &str) -> Option<StatLine> {
             .ok()
             .map_or(0, |t| u32::try_from(t).unwrap_or(0)),
         tpgid: u32::try_from(tpgid).unwrap_or(0),
+        flags: num(6)?,
         majflt: num(9)?,
         utime: num(11)?,
         stime: num(12)?,

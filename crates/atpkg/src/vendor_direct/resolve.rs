@@ -12,23 +12,14 @@ use crate::flow::{Fetcher, FlowError, VendorFetchError, VendorGet};
 use crate::manifest::{Artifact, Cost, DigestAlg};
 use crate::openpgp::PinnedRsaKey;
 
-/// The claude head.
 const CLAUDE_HEAD_CAP: u64 = 64;
-/// The codex head is the release JSON.
 const CODEX_HEAD_CAP: u64 = 1024 * 1024;
-/// agy's two manifests and muse's channel.
 const SMALL_JSON_CAP: u64 = 4 * 1024;
-/// `<v>/manifest.json`, muse's release manifest.
 const MANIFEST_CAP: u64 = 64 * 1024;
-/// `codex-package_SHA256SUMS`.
 const SUMS_CAP: u64 = 64 * 1024;
-/// A gzip'd package unpacks to at most this many times its size.
 const ARCHIVE_UNPACK_RATIO: u64 = 4;
-/// Where every codex payload and `SHA256SUMS` is fetched.
 const CODEX_DOWNLOADS: &str = "https://github.com/openai/codex/releases/download/";
-/// Where every agy payload and its per-version `manifest.json` live.
 const AGY_BUCKET: &str = "https://storage.googleapis.com/antigravity-public/antigravity-cli/";
-/// Where muse's release manifest and payloads are fetched.
 const MUSE_DOWNLOAD: &str = "https://lookaside.facebook.com/lookaside/muse/download/";
 
 /// What the head said.
@@ -43,7 +34,8 @@ pub(crate) enum Head {
     Unreachable(String),
     /// The host answered, but not with the head.
     Unserved(String),
-    /// The head could not be read as a canonical version in its program's grammar.
+    /// The head could not be read as a canonical version in its program's grammar, or landed
+    /// off its pin.
     Refused(String),
     /// The head names `version`.
     Named {
@@ -92,7 +84,7 @@ pub(crate) struct Candidate {
 pub(crate) enum Resolution {
     /// A vendor host was not reached.
     Unreachable,
-    /// A vendor host answered.
+    /// A vendor host answered, but not with the document.
     Unserved(String),
     /// A document was refused (never a payload: nothing was downloaded).
     Refused {
@@ -171,7 +163,6 @@ pub(crate) fn read_head_via(
     }
 }
 
-/// The version `spec`'s head document names, or why it names none.
 fn head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     let canonical = || String::from("the release channel's head names no canonical version");
     match spec.anchor {
@@ -225,8 +216,8 @@ pub(crate) fn serves(anchor: Anchor, triple: &str) -> bool {
     }
 }
 
-/// Admit a synthetic row before any byte moves: its shape is exactly what [`verify`] builds for its
-/// program ([`Anchor::digest_alg`]).
+/// Admits a synthetic row before any byte moves.
+///
 /// # Errors
 /// [`FlowError::VendorRefused`] naming the first field that does not fit.
 pub(crate) fn admit(row: &SyntheticArtifact) -> Result<(), FlowError> {
@@ -278,7 +269,6 @@ pub(crate) fn staging_asset(spec: &VendorSpec, version: Version, triple: &str) -
     )
 }
 
-/// The payload lane `anchor`'s program stages on `triple`: claude's and muse's raw binary.
 fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
     let windows = triple.contains("-windows-");
     match anchor {
@@ -290,7 +280,6 @@ fn payload_of(anchor: Anchor, triple: &str) -> &'static str {
     }
 }
 
-/// `<program>-<version>-<triple>[.ext]`.
 fn asset_name(program: &str, version: Version, triple: &str, payload: &str) -> String {
     let ext = match payload {
         "tar-gz" | "tar-gz-binary" => ".tar.gz",
@@ -301,14 +290,12 @@ fn asset_name(program: &str, version: Version, triple: &str, payload: &str) -> S
     format!("{program}-{version}-{triple}{ext}")
 }
 
-/// Why a verification stopped.
 enum Fault {
     Unreachable,
     Unserved(String),
     Refused(String),
 }
 
-/// A fetch the transport refused is the host not serving the document, never a verdict on it.
 impl From<VendorFetchError> for Fault {
     fn from(e: VendorFetchError) -> Self {
         match e {
@@ -322,7 +309,6 @@ fn refused<T>(why: impl Into<String>) -> Result<T, Fault> {
     Err(Fault::Refused(why.into()))
 }
 
-/// GET one digest document.
 fn digest_doc(
     spec: &VendorSpec,
     fetcher: &dyn Fetcher,
@@ -349,13 +335,11 @@ fn off_pin(requested: &str, effective: &str) -> String {
     format!("{requested} was answered from {effective}, off its pinned host")
 }
 
-/// `x.y.z` and at most one trailing newline, canonical.
 fn claude_head_version(body: &[u8]) -> Option<Version> {
     let text = std::str::from_utf8(body).ok()?;
     Version::parse(text.strip_suffix('\n').unwrap_or(text))
 }
 
-/// Anthropic's `manifest.json` platform key for the client's own triple.
 fn claude_platform(triple: &str) -> Option<&'static str> {
     Some(match triple {
         "aarch64-apple-darwin" => "darwin-arm64",
@@ -370,7 +354,6 @@ fn claude_platform(triple: &str) -> Option<&'static str> {
     })
 }
 
-/// The base every claude document hangs under: the head URL without its `latest`.
 fn claude_base(spec: &VendorSpec) -> &'static str {
     let head = spec.head_url;
     head.rfind('/').map_or(head, |i| &head[..=i])
@@ -549,7 +532,6 @@ struct AgyManifest {
     sha512: String,
 }
 
-/// `{"version", "url", "sha512"}`, strictly.
 fn agy_manifest(body: &[u8]) -> Option<AgyManifest> {
     let doc = strict_json(body).ok()?;
     let field = |key: &str| doc.get(key)?.as_str().map(str::to_string);
@@ -560,8 +542,6 @@ fn agy_manifest(body: &[u8]) -> Option<AgyManifest> {
     })
 }
 
-/// The bucket directory `url` names when it is exactly `<bucket><version>-<1..20
-/// digits>/<dir>/<file>` for `version` and `triple`'s compiled `(dir, file)`.
 fn agy_release_dir<'u>(url: &'u str, version: Version, triple: &str) -> Option<&'u str> {
     let (_, dir, file) = agy_platform(triple)?;
     let rest = url.strip_prefix(AGY_BUCKET)?;
@@ -631,7 +611,6 @@ pub(super) fn muse_url(version: Version, file: &str) -> String {
     format!("{MUSE_DOWNLOAD}?channel=muse&version={version}&file={file}")
 }
 
-/// The version muse's channel names.
 fn muse_head_version(spec: &VendorSpec, body: &[u8]) -> Result<Version, String> {
     let doc = strict_json(body).map_err(|()| String::from("muse's channel is not strict JSON"))?;
     let field = |key: &str| doc.get(key).and_then(aterm_json::Value::as_str);
@@ -711,8 +690,6 @@ fn verify_muse(
     Ok(vouched(spec, version, triple, &url, digest, size, payload))
 }
 
-/// The candidate `spec`'s anchor vouched for: `size` bytes of `payload` at `url` under `digest`
-/// ([`admit`], [`ARCHIVE_UNPACK_RATIO`]).
 fn vouched(
     spec: &'static VendorSpec,
     version: Version,
@@ -769,7 +746,6 @@ fn vouched(
     }
 }
 
-/// The version a codex release JSON's `tag_name` (`rust-v<x.y.z>`) names.
 fn codex_tag_version(doc: &aterm_json::Value) -> Result<Version, ()> {
     doc.get("tag_name")
         .and_then(aterm_json::Value::as_str)
@@ -778,7 +754,6 @@ fn codex_tag_version(doc: &aterm_json::Value) -> Result<Version, ()> {
         .ok_or(())
 }
 
-/// The publisher's asset rule for `triple`, in preference order: the tarball everywhere.
 fn codex_candidates(triple: &str) -> Vec<String> {
     let package = |t: &str, ext: &str| format!("codex-package-{t}{ext}");
     if triple.contains("-windows-") {
@@ -796,7 +771,6 @@ fn codex_candidates(triple: &str) -> Vec<String> {
     }
 }
 
-/// `SHA256SUMS`, strictly: every non-empty line is 64 hex digits, one or two spaces.
 fn parse_sums(text: &[u8]) -> Option<BTreeMap<String, String>> {
     let text = std::str::from_utf8(text).ok()?;
     let mut out = BTreeMap::new();
@@ -823,7 +797,6 @@ fn parse_sums(text: &[u8]) -> Option<BTreeMap<String, String>> {
     Some(out)
 }
 
-/// The `sha256:<hex>` digest of the release JSON's one asset named `name`.
 fn json_asset_digest(release: &aterm_json::Value, name: &str) -> Result<String, String> {
     let assets = release
         .get("assets")
@@ -846,14 +819,12 @@ fn json_asset_digest(release: &aterm_json::Value, name: &str) -> Result<String, 
         .ok_or_else(|| format!("the release JSON carries no sha256 digest for {name}"))
 }
 
-/// JSON with every object's keys distinct.
 fn strict_json(bytes: &[u8]) -> Result<aterm_json::Value, ()> {
     aterm_json::from_slice::<Strict>(bytes)
         .map(|s| s.0)
         .map_err(|_| ())
 }
 
-/// A [`aterm_json::Value`] built by a visitor that refuses a repeated key.
 struct Strict(aterm_json::Value);
 
 impl<'de> serde::Deserialize<'de> for Strict {
@@ -930,16 +901,13 @@ mod tests {
     const REAL_SIG: &[u8] = include_bytes!("fixtures/claude-2.1.280-manifest.json.sig");
     const REAL_RELEASE: &[u8] = include_bytes!("fixtures/codex-0.156.0-release.json");
     const REAL_SUMS: &[u8] = include_bytes!("fixtures/codex-0.156.0-SHA256SUMS");
-    /// agy 1.3.6's Run manifests.
     const AGY_DARWIN_ARM: &[u8] = include_bytes!("fixtures/agy-1.3.6-darwin_arm64.json");
     const AGY_BESIDE_DARWIN_ARM: &[u8] =
         include_bytes!("fixtures/agy-1.3.6-darwin-arm-manifest.json");
     const AGY_LINUX_X64: &[u8] = include_bytes!("fixtures/agy-1.3.6-linux_amd64.json");
     const AGY_WINDOWS_X64: &[u8] = include_bytes!("fixtures/agy-1.3.6-windows_amd64.json");
-    /// muse's `muse-stable` channel and the 1.4.9-R6297.1 release manifest it names.
     const MUSE_CHANNEL: &[u8] = include_bytes!("fixtures/muse-stable-channel.json");
     const MUSE_MANIFEST: &[u8] = include_bytes!("fixtures/muse-1.4.9-R6297.1-manifest.json");
-    /// 2026-09-22T00:00:00Z, after both real releases were signed.
     const NOW: i64 = 1_790_035_200;
 
     fn v(text: &str) -> Version {
@@ -1292,7 +1260,6 @@ mod tests {
         assert!(admit(&other).is_err(), "a claude row is not codex's");
     }
 
-    /// The refusal reason of a verification that must not produce a candidate.
     fn refusal(r: Resolution) -> String {
         match r {
             Resolution::Refused { reason, .. } => reason,
@@ -1300,14 +1267,12 @@ mod tests {
         }
     }
 
-    /// `doc` with `from` replaced by `to` once.
     fn edit(doc: &[u8], from: &str, to: &str) -> Vec<u8> {
         let text = std::str::from_utf8(doc).unwrap();
         assert!(text.contains(from), "{from}");
         text.replacen(from, to, 1).into_bytes()
     }
 
-    /// The bucket URL of agy 1.3.6's release, as Google published it.
     const AGY_RELEASE: &str =
         "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.3.6-5068262057312256/";
 

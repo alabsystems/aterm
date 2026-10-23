@@ -29,8 +29,7 @@ fn underline_rects(
     out
 }
 
-/// Adversarial lattice for the resolver inputs: every combination must yield
-/// bands with `1 <= t <= cell_h` and `y + t <= cell_h`.
+/// Adversarial lattice for the resolver inputs keeps every band inside the cell.
 #[test]
 fn resolved_bands_always_inside_the_cell() {
     let positions = [-4.0f32, -0.5, -0.104, 0.0, 0.05, 0.5, 4.0];
@@ -141,8 +140,7 @@ fn resolved_bands_always_inside_the_cell() {
     }
 }
 
-/// Non-vacuity for the resolver: a synthetic post/OS2 entry moves the band off the
-/// heuristic position.
+/// Synthetic post/OS2 entries move the band off the heuristic position.
 #[test]
 fn font_tables_actually_drive_the_bands() {
     let tables = Some(DecoTables {
@@ -160,8 +158,6 @@ fn font_tables_actually_drive_the_bands() {
     );
 }
 
-/// One settled band of the `DecoBandContainment` lattice through the shipping resolver:
-/// `(y, t)` for a `cell_h`-tall cell asked for a raw `(raw_top, raw_t)` band.
 fn real_bands(cell_h: i64, raw_t: i64, raw_top: i64) -> [Option<(i64, i64)>; 2] {
     let tables = (raw_t >= 1).then_some(DecoTables {
         underline: None,
@@ -181,8 +177,7 @@ fn real_bands(cell_h: i64, raw_t: i64, raw_top: i64) -> [Option<(i64, i64)>; 2] 
     ]
 }
 
-/// Tier-1 conformance for `DecoBandContainment`
-/// (`aterm_models_render::deco_band_containment_model`).
+/// Tier-1 conformance for `DecoBandContainment`.
 #[test]
 fn resolved_bands_conform_to_the_deco_band_containment_model() {
     let model = aterm_models_render::deco_band_containment_model();
@@ -245,7 +240,6 @@ fn resolved_bands_conform_to_the_deco_band_containment_model() {
     );
 }
 
-/// Paint the rects of one underline emission into a coverage grid.
 fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
     for &[x, y, w, h] in rects {
         for row in grid.iter_mut().skip(y).take(h) {
@@ -254,8 +248,7 @@ fn paint(grid: &mut [Vec<bool>], rects: &[[usize; 4]]) {
     }
 }
 
-/// For every style, lattice geometry and cell partition of a run, per-cell emission covers
-/// the same pixels as whole-run emission: a cell seam cannot reset the pattern phase.
+/// Per-cell emission covers the same pixels as whole-run emission across styles and sizes.
 #[test]
 fn pattern_rects_are_partition_invariant() {
     let styles = [
@@ -312,8 +305,7 @@ fn pattern_rects_are_partition_invariant() {
     );
 }
 
-/// The tile sampler is periodic in the cell advance and independent of the
-/// cell index — the wave cannot reset or jump at a seam, by integer `%`.
+/// The tile sampler is periodic in the cell advance and independent of the cell index.
 #[test]
 fn undercurl_sampling_is_periodic_and_seam_independent() {
     for pad in [0usize, 3] {
@@ -335,11 +327,7 @@ fn undercurl_sampling_is_periodic_and_seam_independent() {
     }
 }
 
-/// Every nonzero coverage byte of the undercurl tile lies within
-/// [`undercurl_band`] — the amplitude derivation keeps the whole AA fringe
-/// inside the band (and therefore inside the cell) — and that band is the one
-/// the ink-skip probe reads ([`underline_band`]) and never starts below the
-/// underline.
+/// Every nonzero coverage byte of the undercurl tile lies within [`undercurl_band`].
 #[test]
 fn undercurl_stays_inside_its_band() {
     let mut waved = 0usize;
@@ -402,8 +390,7 @@ fn undercurl_stays_inside_its_band() {
     );
 }
 
-/// A curly underline WAVES however close to the cell bottom the font puts its
-/// underline.
+/// A curly underline waves however close to the cell bottom the font puts its underline.
 #[test]
 fn undercurl_waves_however_low_the_font_puts_its_underline() {
     let ubuntu_mono = DecoTables {
@@ -440,9 +427,7 @@ fn undercurl_waves_however_low_the_font_puts_its_underline() {
     }
 }
 
-/// Exhaustive over every ink mask up to 12 columns: the kept spans are exactly
-/// the columns with no ink within 1px — a pure erase (never adds), identity
-/// when inkless.
+/// Kept spans are the columns with no ink within 1px across all 12-column masks.
 #[test]
 fn ink_skip_spans_exhaustive() {
     for w in 0..=12usize {
@@ -473,8 +458,7 @@ fn ink_skip_spans_exhaustive() {
     }
 }
 
-/// `intersect_rect_spans` output coverage == rect ∩ spans (exhaustive small
-/// lattice) — the rect subtraction can only erase.
+/// `intersect_rect_spans` output coverage equals rect intersected with spans.
 #[test]
 fn intersect_rect_spans_is_exact() {
     for rx in 0..6usize {
@@ -506,7 +490,6 @@ fn intersect_rect_spans_is_exact() {
     }
 }
 
-/// The tracked fixture face at 18px; a missing file or failed build fails the test.
 fn fixture_renderer() -> Renderer {
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -524,8 +507,7 @@ fn render(r: &mut Renderer, bytes: &[u8]) -> aterm_render::Frame {
     r.render_input(&input)
 }
 
-/// Pixel-level coverage monotonicity: with underline+skip (B), underline without skip (A)
-/// and no underline (C), every pixel of B equals A or C.
+/// Every pixel with underline and ink-skip matches either unskipped underline or plain text.
 #[test]
 fn ink_skip_is_coverage_monotone_end_to_end() {
     let mut r = fixture_renderer();
@@ -570,8 +552,7 @@ fn ink_skip_is_coverage_monotone_end_to_end() {
     );
 }
 
-/// Baseline bottoms are not descenders: at 12px the underline band starts within 1px of
-/// the baseline, so the ink probe is clamped strictly below the baseline row.
+/// Baseline bottoms are not descenders when the 12px underline band starts near the baseline.
 #[test]
 fn baseline_bottoms_keep_the_underline_at_12px() {
     let bytes = embedded_font_bytes();
@@ -597,15 +578,11 @@ fn baseline_bottoms_keep_the_underline_at_12px() {
     );
 }
 
-/// The embedded DejaVu Sans Mono, from the checked-in asset whatever features
-/// the build turned on.
 fn embedded_font_bytes() -> Vec<u8> {
     include_bytes!("../assets/DejaVuSansMono.ttf").to_vec()
 }
 
-/// The undercurl band derivation agrees with the resolved metrics for every
-/// style, and `Curly` emits NO rects on mask-supported sizes (the tile draws
-/// instead) but real square-wave rects when the mask is unsupported.
+/// `Curly` emits no rects on mask-supported sizes and square-wave rects when unsupported.
 #[test]
 fn curly_gates_on_the_shared_mask_predicate() {
     let dm = DecoMetrics {
@@ -660,8 +637,7 @@ fn curly_gates_on_the_shared_mask_predicate() {
     );
 }
 
-/// Exhaustive over styles × cell geometry × run placement × adversarial metrics: every
-/// emitted rect is contained in its run band on both axes.
+/// Every emitted rect is contained in its run band on both axes across styles and metrics.
 #[test]
 fn decoration_writes_stay_within_the_run_band() {
     let styles = [
@@ -776,7 +752,6 @@ fn decoration_writes_stay_within_the_run_band() {
     assert!(checked > 10_000, "lattice must be dense ({checked})");
 }
 
-/// Dense index for an `UnderlineStyle`, which derives neither `Ord` nor `Hash`.
 fn style_idx(s: UnderlineStyle) -> usize {
     match s {
         UnderlineStyle::None => 0,
@@ -788,7 +763,6 @@ fn style_idx(s: UnderlineStyle) -> usize {
     }
 }
 
-/// A rect `[rx, ry, rw, rh]` must lie inside `[x0, x0+w) × [y0, y0+cell_h)`.
 fn assert_contained(
     r: [usize; 4],
     x0: usize,
@@ -813,8 +787,6 @@ fn assert_contained(
     );
 }
 
-/// Render `text` as an IME preedit at column 2 of row 0, as
-/// `RenderInput::overlay_ime_preedit` paints a live composition.
 fn preedit_frame(r: &mut Renderer, text: &str) -> aterm_render::Frame {
     let mut term = Terminal::new(2, 12);
     term.process(b"$ ");

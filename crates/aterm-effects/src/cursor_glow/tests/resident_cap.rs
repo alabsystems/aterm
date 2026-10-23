@@ -5,11 +5,6 @@
 
 use super::*;
 
-/// Bounded resident-work model for the post-`spawn` state. Tier 0 keeps the
-/// caps deliberately tiny so the complete reachable space is cheap to
-/// exhaust. Tier 1 below rebinds the same constants to the shipping limits
-/// and projects the real engine onto these exact saturating transitions.
-/// `Buggy=1` models omitting both oldest-first clamps.
 fn cursor_resident_cap_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {
@@ -39,19 +34,12 @@ fn cursor_resident_cap_model() -> aterm_spec::derive::Model {
     }
 }
 
-/// Tier 0: the healthy saturating transition proves both resident bounds over
-/// the full bounded state space, while the unclamped `Buggy=1` twin must yield
-/// a counterexample. The latter prevents a vacuous green proof.
 #[test]
 fn cursor_resident_cap_derived_model_proves_and_catches_missing_clamp() {
     let model = cursor_resident_cap_model();
     aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
 }
 
-/// Tier 1: drive the shipping Water spawn path at full heat, where every move
-/// adds exactly one path sample and the maximum seven-particle burst. Every
-/// real post-spawn count must equal the derived model's state through both
-/// saturation points and beyond them.
 #[test]
 fn cursor_resident_cap_real_spawn_conforms_to_model() {
     let spark_cap = i64::try_from(CursorGlow::MAX_SPARKS).expect("spark cap fits i64");
@@ -70,9 +58,6 @@ fn cursor_resident_cap_real_spawn_conforms_to_model() {
     };
     let now = Instant::now();
 
-    // Warm to full momentum, then clear only resident work. Keeping the
-    // cadence state makes every measured spawn request Water's maximum
-    // seven-particle burst, the hostile path the cap exists to bound.
     for step in 0usize..8 {
         let (from, to) = if step.is_multiple_of(2) {
             (1, 2)
@@ -112,8 +97,6 @@ fn cursor_resident_cap_real_spawn_conforms_to_model() {
         assert!(model.check_invariant("SparksBounded", &state));
         assert!(model.check_invariant("ParticlesBounded", &state));
         if step == CursorGlow::MAX_SPARKS {
-            // The first post-cap spawn appends and evicts back to each limit,
-            // so the projected shipping transition is a saturated self-loop.
             saturated_transition = Some((previous, state.clone()));
         }
     }
@@ -131,8 +114,6 @@ fn cursor_resident_cap_real_spawn_conforms_to_model() {
     );
     assert!(admitted, "real saturation transition rejected: {why}");
 
-    // Tier-1 negative control: the same saturated source with one excess
-    // spark is exactly the missing-clamp defect; no healthy action admits it.
     let mut overflow = saturated;
     overflow.insert("sparks", spark_cap + 1);
     let (admitted, _) = aterm_spec::verify::validate_transition_tiered(

@@ -51,7 +51,7 @@ const MAX_UNSETTLED_WAITS: u32 = 3;
 
 const QUESTION_STANDIN_QUIET: Duration = Duration::from_secs(10);
 
-/// What the loop remembers of the question dialog it is answering (module docs, "A question dialog").
+/// What the loop remembers of the question dialog it is answering.
 #[derive(Debug, Default)]
 pub(super) struct QuestionMemory {
     pub(super) keyed: Option<String>,
@@ -583,7 +583,6 @@ fn shown_subject(subject: &str, command: &str) -> String {
 }
 
 fn told_by_role(act: &Act, p: &aterm_phase::PromptV2, what: &str) -> Option<(String, bool)> {
-    // Muse Code's review sends answers already told (the note's Enter).
     if aterm_phase::muse::is_review(p) {
         return None;
     }
@@ -1472,7 +1471,6 @@ impl<C: Ctl> Session<'_, C> {
                 let now = self.fx.mono();
                 let cap = deny.checked_sub(DENY_MARGIN).unwrap_or(now);
                 if now >= cap {
-                    // Said once a countdown ([`Countdown::ended_said`]).
                     if let Some(c) = self.countdown.as_mut().filter(|c| !c.ended_said) {
                         c.ended_said = true;
                         review.note(&format!(
@@ -2052,7 +2050,6 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(Step::Again { settle: false });
             }
             Pressing::Lost { why } => {
-                // and the dialog is decided again after the reconnect.
                 if reset && self.focus_key_tried {
                     self.reset_row_lost(&what, seq);
                 }
@@ -2295,7 +2292,8 @@ impl LimitRetry {
     }
 }
 
-/// Gemini CLI usage-limit dialog answered `Stop` or relaunched while the loop waited on it ([`Session::limit_stopped`]).
+/// Gemini CLI usage-limit dialog answered `Stop`, or its agent relaunched, while the loop waited on
+/// it ([`Session::limit_stopped`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StoppedLimit {
     pub(super) wall: aterm_phase::Wall,
@@ -3139,7 +3137,6 @@ impl<C: Ctl> Session<'_, C> {
             }
             Some(_) => {}
             None => {
-                // The last key took effect: its box's back-off is over.
                 if let Some(p) = self.question.pending.take()
                     && self
                         .press_retry
@@ -3367,7 +3364,7 @@ mod act_tests {
         ),
         ("decline@v1", Outcome::Declined, "rm -rf /"),
         (RULE_LOGIN, Outcome::Typed, "/login"),
-        ("read-only@classify-v6", Outcome::Skipped, "ls"),
+        ("read-only@classify-v7", Outcome::Skipped, "ls"),
         ("-", Outcome::Escalated, ""),
         ("wall-wait@v1", Outcome::Waiting, ""),
     ];

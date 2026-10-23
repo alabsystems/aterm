@@ -4,14 +4,9 @@
 use super::*;
 use crate::pane_chrome::{SplitChrome, with_split_chrome};
 
-/// The four glyphs [`active_pane_edge_cell`] can put in a divider gap. No
-/// terminal in these fixtures ever prints one, so a cell carrying one is the
-/// mark and nothing else.
 const MARK_GLYPHS: [char; 4] = ['▁', '▔', '▐', '▌'];
 
-/// The composed frame's ring: every cell outside header chrome carrying a mark glyph, as
-/// `(row, col, glyph)`. Each is asserted to stand on a divider cell, so the mark never
-/// reaches a cell a pane owns.
+/// Collect `(row, col, glyph)` for every non-header mark cell.
 fn ring(app: &App, wid: WindowId) -> Vec<(usize, usize, char)> {
     let seam = divider_cell(app.theme);
     let input = &app.windows[&wid].input_scratch;
@@ -64,9 +59,7 @@ fn expected_visible_ring(
         .collect()
 }
 
-/// The ring a pane rectangle should produce, from the layout alone: the divider run on each
-/// side that exists, inked on the side facing the pane, the horizontal runs reaching the
-/// corners.
+/// Expected mark cells around a pane rectangle.
 fn expected_ring(
     rows: usize,
     cols: usize,
@@ -96,7 +89,6 @@ fn window_dims(app: &App, wid: WindowId) -> (usize, usize) {
     (usize::from(window.rows), usize::from(window.cols))
 }
 
-/// The canonical content rectangle of the pane that takes keyboard input.
 fn focused_pane_rect(app: &App, wid: WindowId) -> (usize, usize, usize, usize) {
     let plan = app
         .active_visible_leaf_plan(wid)
@@ -116,8 +108,6 @@ fn compose_pure(app: &mut App, wid: WindowId, now: Instant) -> bool {
         .is_some()
 }
 
-/// A two-pane pure-terminal split, side by side, with the window holding the
-/// keyboard. `split_active_stub_tab` leaves the new (right) pane focused.
 fn pure_split() -> (App, WindowId, u64, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -133,8 +123,6 @@ fn pure_split() -> (App, WindowId, u64, u64) {
     (app, wid, left, right)
 }
 
-/// A typed wake into an unfocused window keeps its cursor companion, but Sparkle Words are not
-/// presentable.
 #[test]
 fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
     let (mut app, wid, _, _) = pure_split();
@@ -142,7 +130,6 @@ fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
     app.recompute_sparkle();
     assert!(app.sparkle.is_some(), "fixture: Sparkle Words resolve ON");
     let now = Instant::now();
-    // Control: a focused window's words present.
     assert!(compose_pure(&mut app, wid, now));
     assert!(app.windows[&wid].fx.decos().presentable());
 
@@ -174,12 +161,8 @@ fn focus_pure_pane(app: &mut App, wid: WindowId, session: u64) {
     app.sync_window(wid);
 }
 
-/// A split's ring surrounds the pane taking keystrokes and follows pane focus. The expected
-/// ring comes from the layout, so the mark lands only in the divider gaps touching that pane.
 #[test]
 fn a_pure_split_rings_the_pane_that_takes_keystrokes_and_follows_the_focus() {
-    // The Classic half-block ring (macOS, Linux); the Fluent ring is
-    // `pane_chrome`'s hairline.
     with_split_chrome(SplitChrome::Classic, || {
         let (mut app, wid, left, right) = pure_split();
         let t0 = Instant::now();
@@ -232,13 +215,8 @@ fn a_pure_split_rings_the_pane_that_takes_keystrokes_and_follows_the_focus() {
     });
 }
 
-/// A mixed terminal/native split marks a native leaf like a terminal one: the ring is made of
-/// the leaf's layout rectangle and `leaf.focused`, never its content (a native leaf's pixels
-/// are a tray blitted over the composite).
 #[test]
 fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
-    // The Classic half-block ring (macOS, Linux); the Fluent ring is
-    // `pane_chrome`'s hairline.
     with_split_chrome(SplitChrome::Classic, || {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -284,7 +262,6 @@ fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
             app.sync_window(wid);
         };
 
-        // The split left the terminal leaf focused.
         assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
         let terminal_ring = ring(&app, wid);
         assert_eq!(
@@ -314,13 +291,8 @@ fn a_mixed_split_rings_the_native_leaf_when_the_native_leaf_takes_keys() {
     });
 }
 
-/// An unfocused window and the setting off each silence the ring (the first compose is the
-/// negative control): of two windows showing a split, only the one with the keyboard claims
-/// a pane.
 #[test]
 fn an_unfocused_window_and_the_setting_off_each_compose_a_plain_seam_grid() {
-    // The Classic half-block ring (macOS, Linux); the Fluent ring is
-    // `pane_chrome`'s hairline.
     with_split_chrome(SplitChrome::Classic, || {
         let t0 = Instant::now();
 
@@ -348,12 +320,8 @@ fn an_unfocused_window_and_the_setting_off_each_compose_a_plain_seam_grid() {
     });
 }
 
-/// The mark lives in the divider gap, so composing with it on or off leaves every cell
-/// outside the ring byte-identical.
 #[test]
 fn the_mark_leaves_every_cell_of_every_pane_byte_identical() {
-    // The Classic half-block ring (macOS, Linux); the Fluent ring is
-    // `pane_chrome`'s hairline.
     with_split_chrome(SplitChrome::Classic, || {
         let t0 = Instant::now();
         let compose = |enabled| {

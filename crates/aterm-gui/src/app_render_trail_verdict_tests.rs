@@ -31,7 +31,6 @@ fn external_celebration_wakes_initial_green_then_only_bars_outro_and_settle() {
         start,
         0,
     ));
-    // Real policy gates win even when an external run has an event due.
     assert_eq!(
         ws.plan_terminal_effect_lane_with_recording(start, false, false, true, false, 10.0, false),
         None
@@ -53,8 +52,6 @@ fn external_celebration_wakes_initial_green_then_only_bars_outro_and_settle() {
         Some(now),
         "on=green owns an initial followup at the existing frame cap"
     );
-    // A synchronized-output hold can consume the scheduler slot while
-    // deferring the song pass. Its still-due event must rearm in the future.
     assert!(ws.service_due_terminal_effect_tick(now));
     assert_eq!(
         ws.fx
@@ -200,8 +197,6 @@ fn fx_celebration_completion_guard_conforms_to_real_detector() {
                 actual, expected,
                 "the real detector fires only on the licensed success"
             );
-            // Negative control: a run forced live with no keyed success (what an unguarded
-            // detector would do) breaks the invariant.
             if !credit && !failed {
                 actual.insert("live", 1);
                 assert!(!model.check_invariant("ARunNeedsItsOwnKeyedSuccess", &actual));
@@ -219,7 +214,6 @@ fn fx_celebration_green_requires_one_fresh_successful_keyed_completion() {
     sing.arm_external(now, sid, song_signature('C'), 2, CelebrateOn::Green)
         .expect("the explicit arm is admitted");
     let mut spent = None;
-    // Unkeyed marks and another pane's completion leave this arm intact.
     assert!(!keyed_celebration_completion(
         &mut sing, &mut spent, sid, None, now, 0
     ));
@@ -233,8 +227,6 @@ fn fx_celebration_green_requires_one_fresh_successful_keyed_completion() {
     ));
     assert!(!sing.external_live());
     assert!(sing.armed_external().is_some());
-    // A failed command spends its Enter. A second, successful mark for
-    // that same Enter must not retroactively celebrate the failure.
     assert!(keyed_celebration_completion(
         &mut sing,
         &mut spent,
@@ -283,9 +275,6 @@ fn fx_celebration_green_requires_one_fresh_successful_keyed_completion() {
     );
 }
 
-/// A `D` mark speaks only when armed by an accepted plain-Enter turn
-/// boundary, and the first `D` after it spends the arm; program output alone
-/// never arms it.
 #[test]
 fn a_command_that_speaks_was_run_by_a_keystroke() {
     let t = Instant::now();
@@ -297,36 +286,28 @@ fn a_command_that_speaks_was_run_by_a_keystroke() {
     );
     assert_eq!(spent, None, "…and it spends nothing either");
 
-    // You press Enter; the command runs; the `D` comes back.
     let enter = t;
     assert!(
         verdict_armed(&mut spent, 7, Some(enter)),
         "a D behind a keyed Enter speaks"
     );
 
-    // The shell repeats its marks — a redraw, a resumed session, a second
-    // `D` for the one command. One Enter, one verdict.
     assert!(
         !verdict_armed(&mut spent, 7, Some(enter)),
         "the same Enter cannot buy a second verdict"
     );
 
-    // Another window's session, same instant: the arm is per session, so
-    // a tab switch re-baselines instead of replaying.
     assert!(
         verdict_armed(&mut spent, 9, Some(enter)),
         "another session's Enter is another session's verdict"
     );
 
-    // …and the next real Enter arms again.
     assert!(
         verdict_armed(&mut spent, 9, Some(enter + Duration::from_secs(1))),
         "a new Enter is a new verdict"
     );
 }
 
-/// Under two seconds a successful command is silent; a failure always
-/// speaks, and a success past half a minute rings the ice bell.
 #[test]
 fn a_quick_command_is_silent() {
     assert_eq!(

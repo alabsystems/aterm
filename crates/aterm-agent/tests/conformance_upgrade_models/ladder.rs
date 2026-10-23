@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelLadder, Tier-1: `upgrade_models::model_moves_now` (when the live upgrade
-//! takes a due model move) agrees with the model's guards at every reachable readable
-//! state: `VisitMoves` exactly where it answers a move, `VisitWaits` exactly where it
-//! waits. Negative controls: forged successors, and a cold-cache-only rule the bind
-//! must catch.
+//! Conformance tests for [`harness_model_ladder_model`].
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -15,10 +11,8 @@ use aterm_spec::derive::Model;
 
 use super::{Vars, assert_forged_rejected, assert_transition};
 
-/// The model's `Warm`: readable visits of being due before the bound.
 const WARM: i64 = 3;
 
-/// Every state the model can reach, breadth first.
 fn reachable(model: &Model) -> Vec<Vars> {
     let mut seen: BTreeSet<Vars> = BTreeSet::new();
     let mut out = Vec::new();
@@ -37,14 +31,11 @@ fn reachable(model: &Model) -> Vec<Vars> {
     out
 }
 
-/// The model's clock (readable visits due) as the real code's seconds due:
-/// `Warm` visits is exactly `MODEL_WARM_MAX_S`.
 fn due_for_s(clock: i64) -> u64 {
     u64::try_from(clock).expect("clock >= 0") * MODEL_WARM_MAX_S
         / u64::try_from(WARM).expect("warm")
 }
 
-/// The real decision at a model state.
 fn real_moves(s: &Vars) -> bool {
     model_moves_now(s["cold"] == 1, s["restart"] == 1, due_for_s(s["clock"])).is_some()
 }
@@ -57,8 +48,6 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
     let (mut moves, mut waits) = (0usize, 0usize);
     for s in &states {
         if s["moved"] == 1 || s["unknown"] == 1 {
-            // Nothing to decide: moved already, or this visit cannot read the
-            // live model — and the model offers no visit either way.
             assert!(model.successors("VisitMoves", s).is_empty(), "{s:?}");
             assert!(model.successors("VisitWaits", s).is_empty(), "{s:?}");
             continue;
@@ -80,7 +69,6 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
             let mut after = s.clone();
             after.insert("moved", 1);
             assert_transition(&model, s, &after, "VisitMoves", "model_moves_now (move)");
-            // Forged: a "move" that also advanced the wait.
             assert_forged_rejected(
                 &model,
                 s,
@@ -103,7 +91,6 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
             let mut after = s.clone();
             after.insert("clock", s["clock"] + 1);
             assert_transition(&model, s, &after, "VisitWaits", "model_moves_now (wait)");
-            // Forged: a wait that silently moved the model too.
             assert_forged_rejected(
                 &model,
                 s,
@@ -114,7 +101,6 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
             );
         }
     }
-    // Non-vacuity: the bind saw both answers, and at every rung.
     assert!(
         moves > 0 && waits > 0,
         "one-sided bind: {moves} moves, {waits} waits"
@@ -132,8 +118,6 @@ fn the_real_ladder_is_the_models_ladder_at_every_reachable_state() {
     assert!(decided > 0);
 }
 
-/// Negative control: a due move taken only on a cold cache disagrees with the model
-/// at a reachable state, including the case it misses (warm, a build restart in hand).
 #[test]
 fn the_incidents_cold_only_rule_is_caught_by_the_bind() {
     let model = harness_model_ladder_model();
@@ -151,7 +135,6 @@ fn the_incidents_cold_only_rule_is_caught_by_the_bind() {
         caught.iter().any(|s| s["cold"] == 0 && s["restart"] == 1),
         "the incident (warm, a build restart in hand) is not among the catches: {caught:?}"
     );
-    // And the real ladder is not caught there.
     for s in &caught {
         assert_eq!(
             real_moves(s),

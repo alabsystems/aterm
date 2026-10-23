@@ -762,7 +762,6 @@ pub(crate) fn every_intent() -> Vec<Intent> {
             pane: "full-disk-access".into(),
         },
         Intent::OpenLink {
-            // chatgpt.com/security/setup?from=codex%3Aa#top".into(),
             url: "https://chatgpt.com/security/setup?from=codex%3Aa#top".into(),
         },
         Intent::ApplyUpdate { build: 1234 },
@@ -1962,7 +1961,6 @@ mod tests {
         assert_eq!(Intent::decode("open-link:"), None);
         assert_eq!(Intent::decode("open-link"), None);
         let link = Intent::OpenLink {
-            // chatgpt.com/".into(),
             url: "https://chatgpt.com/".into(),
         };
         assert_eq!((link.label(), link.short()), ("Open in browser", "Open"));

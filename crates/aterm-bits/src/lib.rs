@@ -27,13 +27,26 @@ pub unsafe trait Zeroable: Sized {
 /// Plain-old-data.
 ///
 /// # Safety
-/// Implementors must satisfy *every* bullet.
+/// Implementors must satisfy *every* bullet:
+///
+/// 1. The type is `Copy`.
+/// 2. The type is `'static` — no lifetimes.
+/// 3. The type contains no references, raw pointers, function pointers,
+///    `NonZero*`, or any niche-optimized discriminants.
+/// 4. The type has a well-defined layout (`#[repr(C)]`, `#[repr(transparent)]`,
+///    or a primitive).
+/// 5. There are **no padding bytes** with indeterminate contents: the declared
+///    fields cover every byte (explicit `_padding: [u8; N]` fields).
+/// 6. Every field of the type is itself `Pod`.
 pub unsafe trait Pod: Zeroable + Copy + 'static {}
 
 macro_rules! impl_pod_zeroable_primitive {
     ($($t:ty),* $(,)?) => {
         $(
-            // SAFETY: `$t` is a built-in primitive integer/float.
+            // SAFETY: `$t` is a built-in primitive integer/float. All bit
+            // patterns of the appropriate size are valid values of the type,
+            // and the all-zero bit pattern corresponds to the value `0` /
+            // `0.0` which is always valid.
 
             unsafe impl Zeroable for $t {}
             // SAFETY: see above — `$t` is `Copy + 'static`, has a canonical layout, and every bit pattern is a valid value.
@@ -47,14 +60,17 @@ impl_pod_zeroable_primitive!(u8, u16, u32, u64, u128, usize);
 impl_pod_zeroable_primitive!(i8, i16, i32, i64, i128, isize);
 impl_pod_zeroable_primitive!(f32, f64);
 
-// SAFETY: `()` is a ZST.
+// SAFETY: `()` is a ZST; there are no bytes, so trivially every bit pattern (i.e. the empty one) is
+// valid and all-zero is sound.
 
 unsafe impl Zeroable for () {}
 // SAFETY: see above.
 
 unsafe impl Pod for () {}
 
-// SAFETY: `[T; N]` has layout `T` repeated `N` times with no extra padding (stable guarantee).
+// SAFETY: `[T; N]` has layout `T` repeated `N` times with no extra padding
+// (stable guarantee). If every `T` byte pattern is valid, so is every
+// `[T; N]` byte pattern. Same argument for `Zeroable`.
 
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 // SAFETY: see above; additionally `[T; N]: Copy` when `T: Copy`, and `[T; N]` is `'static` when `T: 'static`.
@@ -160,7 +176,15 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
         // of `is_null()`: the latter is an unlowerable call boundary.)
         return Ok(&[]);
     }
-    // SAFETY: the checks above (all on this path) verified.
+    // SAFETY: the checks above (all on this path) verified:
+    //   * `ptr_b` is non-null and aligned to `align_of::<B>()`.
+    //   * `out_len * size_of::<B>() <= byte_len == size_of_val(src)` bytes of
+    //     initialized memory are reachable from `ptr_b` (it is `src`'s own
+    //     data pointer).
+    //   * Both `A` and `B` are `Pod`, so every bit pattern of
+    //     `size_of::<B>() * out_len` bytes is a valid `[B; out_len]`.
+    //   * The returned lifetime is tied to `&[A]`, so `B` cannot outlive it.
+    // Therefore `from_raw_parts` produces a sound `&[B]`.
     Ok(unsafe { slice::from_raw_parts(ptr_b, out_len) })
 }
 
@@ -175,7 +199,11 @@ pub const fn bytes_of<T: Pod>(value: &T) -> &[u8] {
         // the pointer cast; behavior is unchanged.
         return &[];
     }
-    // SAFETY: `ptr` is non-null (guarded above), trivially aligned for `u8`, and points at `value`, so exactly `size_of::<T>()` bytes are reachable.
+    // SAFETY: `ptr` is non-null (guarded above), trivially aligned for `u8`,
+    // and points at `value`, so exactly `size_of::<T>()` bytes are reachable;
+    // `T: Pod` guarantees those bytes are fully initialized (no padding)
+    // with a well-defined layout. The returned slice borrows from `value`,
+    // so its lifetime is bounded correctly.
     unsafe { slice::from_raw_parts(ptr, size_of::<T>()) }
 }
 

@@ -2,11 +2,9 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Damage tracking: only cells changed since the last frame are re-rendered.
+//! Damage tracking for re-rendering only cells changed since the last frame.
 //!
-//! Damaged rows are bitsets (O(1) marking, iteration skipping clean rows via
-//! `trailing_zeros()`) with per-row column bounds. Resize uses full damage; a
-//! scroll smaller than the screen marks only the rows it exposes.
+//! # Examples
 //!
 //! ```
 //! use aterm_grid::damage::{Damage, DamageTracker};
@@ -22,7 +20,6 @@
 //! damage.mark_full();
 //! assert!(damage.is_full());
 //! ```
-//! use aterm_grid::damage::{Damage, DamageTracker};
 
 mod display_offset;
 mod iter;
@@ -156,8 +153,7 @@ impl Damage {
         }
     }
 
-    /// Iterate over damaged rows: all rows for `Full`, bitset scan for
-    /// `Partial`.
+    /// Iterate over damaged rows (`Full` visits all rows; `Partial` scans the bitset).
     #[inline]
     pub fn damaged_rows(&self, rows: u16) -> DamagedRowIterator<'_> {
         match self {
@@ -171,8 +167,7 @@ impl Damage {
         }
     }
 
-    /// Iterate over damaged rows with their column range [left, right) (the
-    /// primary renderer API).
+    /// Iterate over damaged rows with their `[left, right)` column bounds.
     #[inline]
     pub fn iter_bounds(&self, rows: u16, cols: u16) -> DamageBoundsIterator<'_> {
         DamageBoundsIterator::new(self, self.damaged_rows(rows), cols)

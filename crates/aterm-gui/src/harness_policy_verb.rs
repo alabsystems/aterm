@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `@<sid> harness policy` (the native harness contract §3): aterm's `[harness]` policy for ONE session, as one reader of aterm.toml answers it, so an agent that supervises itself (codex-alab) never parses the file.
+//! `@<sid> harness policy` control verb for one session's `[harness]` policy.
 
 use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
 use aterm_agent::supervise::policy::turn_end::{
@@ -40,7 +40,7 @@ pub(crate) struct Posture {
     pub(crate) autopilot_word: Option<Autopilot>,
 }
 
-/// `effective=`/`why=` (module doc), first refusal first.
+/// `effective=`/`why=`, first refusal first.
 #[must_use]
 pub(crate) fn effective(cfg: &SupervisorConfig, p: Posture) -> (bool, &'static str) {
     let why = if !p.hosted {
@@ -73,7 +73,7 @@ pub(crate) fn questions(cfg: &SupervisorConfig, session: Option<&str>) -> String
     }
 }
 
-/// The additive text keys after `questions=` (module doc), in their wire order.
+/// The additive text keys after `questions=`, in their wire order.
 pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
     "done_check_text",
     "land_text",
@@ -83,7 +83,9 @@ pub(crate) const ACT_TEXT_KEYS: [&str; 6] = [
     "needs_ack_text",
 ];
 
-/// Autopilot Cruise / Land's fixed words as aterm's own loop types them for a session whose standing rules read `rules` (module doc), keyed by [`ACT_TEXT_KEYS`]: the four whole acts through the turn-end policy's own composers (the rules after the words), the two suffixes bare.
+/// Autopilot Cruise / Land's fixed words as aterm's own loop types them for a session whose
+/// standing rules read `rules`, keyed by [`ACT_TEXT_KEYS`]: the four whole acts through the
+/// turn-end policy's own composers (the rules after the words), the two suffixes bare.
 #[must_use]
 pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
     let [done_check, land, nudge, answer, hint, ack] = ACT_TEXT_KEYS;
@@ -97,7 +99,8 @@ pub(crate) fn act_texts(rules: Option<&str>) -> [(&'static str, String); 6] {
     ]
 }
 
-/// The reply line (module doc), newline-terminated.
+/// The reply line, newline-terminated: `OK effective=<on|off>` alone for an edge token, the whole
+/// policy for the owner.
 #[must_use]
 pub(crate) fn reply(facts: &PolicyFacts, rules: Option<&str>, owner: bool) -> String {
     let (on, why) = facts.effective;
@@ -353,10 +356,6 @@ mod tests {
         );
     }
 
-    /// The owner's reply carries every key in the config's own spelling and
-    /// order, then `questions=`, then the six additive texts, each `[harness]`
-    /// key read back by the config's own setter to the policy it was printed
-    /// from (the one reader: nothing is respelled here).
     #[test]
     fn the_owners_reply_is_every_key_in_its_own_spelling_and_reads_back() {
         let mut cfg = SupervisorConfig::default();
@@ -405,8 +404,6 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL beside it: the reply's text is the composed one, so
-    /// the bare `continue_text` with rules standing is not what it says.
     #[test]
     fn continue_text_carries_the_standing_rules_as_the_loops_continuation_does() {
         let cfg = SupervisorConfig::default();
@@ -417,7 +414,6 @@ mod tests {
         assert!(text.ends_with("never force-push)"), "{text}");
     }
 
-    /// The decoded value of every additive text key in `line`, in wire order.
     fn act_texts_of(line: &str) -> Vec<(&'static str, String)> {
         ACT_TEXT_KEYS
             .iter()
@@ -429,14 +425,6 @@ mod tests {
             .collect()
     }
 
-    /// THE SIX ADDITIVE TEXTS ARE aterm's OWN WORDS, AS ITS LOOP TYPES THEM
-    /// (the codex-alab contract's §3, Autopilot Cruise / Land): after
-    /// `questions=`, `done_check_text`, `land_text`, `land_nudge_text` and
-    /// `land_answer_text` are the turn-end policy's own acts — its constants
-    /// with no rules standing, and with rules standing composed exactly as
-    /// the loop composes them (the act's own suffix-free words, then the
-    /// rules once) — and `needs_hint_text` and `needs_ack_text` are the two
-    /// suffixes, bare.
     #[test]
     fn the_six_texts_are_the_loops_own_words_composed_as_it_composes_them() {
         use aterm_agent::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_ANSWER, LAND_NUDGE};
@@ -517,10 +505,6 @@ mod tests {
         );
     }
 
-    /// THE REAL ADOPTION of a watcher's post moves the generation `harness
-    /// policy` answers and records `harness-policy gen=<n>` on the session's
-    /// timeline, which the `events` digest pushes; the facts are the real
-    /// App's (a test App has no host: `unhosted`).
     #[test]
     fn the_policys_move_is_announced_on_every_sessions_stream() {
         let mut app = crate::App::headless_for_test();

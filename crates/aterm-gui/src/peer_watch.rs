@@ -270,7 +270,11 @@ fn poll_loop(inbox: &Inbox, listen: &UnixStream, entries: &mut Vec<Entry>) -> Op
         let Ok(count) = libc::nfds_t::try_from(fds.len()) else {
             return Some(format!("{} descriptors are too many to poll", fds.len()));
         };
-        // SAFETY: `fds` is an initialized, exclusively borrowed array of `count` pollfds.
+        // SAFETY: `fds` is an initialized, exclusively borrowed array of
+        // `count` pollfds. Its descriptors are `listen`'s, alive across the
+        // call, and each entry's, whose stream its guard borrows until this
+        // thread has taken the entry out (below, after the call returns). -1
+        // waits until a descriptor is ready or a signal interrupts.
         let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
         if ready < 0 {
             let error = std::io::Error::last_os_error();

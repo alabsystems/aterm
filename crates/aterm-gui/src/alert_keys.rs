@@ -67,6 +67,8 @@ mod macos {
     impl Drop for ConfirmKeyWatch {
         fn drop(&mut self) {
             // SAFETY: `+[NSEvent removeMonitor:]` is `-(void)(id)` called once with the owned monitor token.
+            // Main thread: the monitor is installed from a main-thread path and this value holds an
+            // `Obj`, which is `!Send`.
             unsafe {
                 appkit::send_v_id(
                     aterm_objc::class(c"NSEvent").as_id(),
@@ -86,7 +88,11 @@ mod macos {
     /// Whether `event` belongs to the confirmation `panel` and that confirmation is still on
     /// screen.
     fn confirmation_owns_event(event: Id, panel: Id, parent: Option<Id>, _mtm: MainThread) -> bool {
-        // SAFETY: plain property reads on a live event and live retained windows, on the main thread (`_mtm` proves it).
+        // SAFETY: plain property reads on a live event and live retained windows, on
+        // the main thread (`_mtm` proves it). `-[NSEvent window]` and
+        // `-[NSWindow attachedSheet]` are `-(NSWindow *)` (`send_id`, +0 — borrowed
+        // for this frame, which is all these identity tests need) and
+        // `-[NSWindow isVisible]` is `-(BOOL)` (`send_bool`).
         unsafe {
             let target = appkit::send_id(event, sel!(window));
             if target.is_null() {
@@ -109,7 +115,10 @@ mod macos {
     /// answer travels the alert's normal action path (ending the sheet or the modal session)
     /// with no response-code plumbing of our own.
     fn click(button: Id) {
-        // SAFETY: `-performClick:` is `-(void)(id)` on an `NSButton` this watch retains.
+        // SAFETY: `-performClick:` is `-(void)(id)` on an `NSButton` this watch
+        // retains — one of the two buttons added to the alert that is currently on
+        // screen (liveness checked by `confirmation_owns_event` before we get here) —
+        // on the main thread. `Id::NIL` is the conventional nil sender.
         unsafe { appkit::send_v_id(button, sel!(performClick:), Id::NIL) };
     }
 
@@ -125,6 +134,10 @@ mod macos {
     ) -> Id {
         let attached = confirmation_owns_event(event, panel.id(), parent.map(Obj::id), mtm);
         // SAFETY: plain accessor reads on the live event, main thread.
+        // `-charactersIgnoringModifiers` is `-(NSString *)` and may be nil (a dead-key/IME
+        // state); nil stays `None` because `confirm_key` falls back to the key code on absent
+        // characters. `-modifierFlags` is an `NSUInteger`, `-keyCode` an `unsigned short`; all
+        // three are valid on a keyDown, the only kind the mask admits.
         let (chars, modifier_flags, key_code) = unsafe {
             let chars = appkit::send_id(event, sel!(charactersIgnoringModifiers));
             (
@@ -168,9 +181,17 @@ mod macos {
                 Err(_) => pass_through,
             }
         };
-        // SAFETY: `+addLocalMonitorForEventsMatchingMask:handler:` calls the block as `NSEvent *(^)(NSEvent *)`.
+        // SAFETY: `+addLocalMonitorForEventsMatchingMask:handler:` calls the block
+        // as `NSEvent *(^)(NSEvent *)` — the event to carry on with, or nil to
+        // swallow it — which is exactly the `(id) -> id` prototype `new1` builds
+        // here (`Id` is `Encode`-`"@"` on both sides); nothing unwinds out of its
+        // `invoke`.
         let handler = unsafe { RcBlock::new1(handler) }?;
         // SAFETY: `+[NSEvent addLocalMonitorForEventsMatchingMask:handler:]` is `@@:Q@?` taking a 64-bit mask and a `BlockPtr`.
+        // AppKit copies the block, so `handler` may drop at the end of this frame; the copy
+        // lives until `removeMonitor:` releases the token. The result is +0 (autoreleased: the
+        // selector is not `new`/`alloc`/`copy`), so it is retained into `Obj`, not adopted;
+        // adopting would over-release when the pool pops.
         let monitor = unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
                 aterm_objc::checked_msg();
@@ -192,7 +213,8 @@ mod macos {
         field: &Obj,
         input: std::sync::Arc<crate::askpass::PasswordInput>,
     ) -> Option<ConfirmKeyWatch> {
-        // SAFETY: these are retained live native objects borrowed on the main thread.
+        // SAFETY: these are retained live native objects borrowed on the main
+        // thread; the block needs independent owners for its full lifetime.
         let (panel, parent, field) = unsafe {
             (
                 Obj::retain(panel.id())?,
@@ -209,7 +231,8 @@ mod macos {
             }
             match aterm_objc::contain("password input monitor", || {
                 let owns = confirmation_owns_event(event, panel.id(), Some(parent.id()), mtm);
-                // SAFETY: NSEvent accessors run in a native local monitor on the main thread.
+                // SAFETY: NSEvent accessors run in a native local monitor on
+                // the main thread; the mask admits only mouseDown/keyDown.
                 unsafe {
                     let kind = appkit::send_usize(event, sel!(type));
                     if owns && kind == 1 && appkit::send_id(event, sel!(window)) == panel.id() {
@@ -250,7 +273,8 @@ mod macos {
                 Err(_) => Id::NIL,
             }
         };
-        // SAFETY: the local monitor's block is NSEvent *(^)(NSEvent *), matching this guarded (Id)->Id closure.
+        // SAFETY: the local monitor's block is NSEvent *(^)(NSEvent *), matching
+        // this guarded (Id)->Id closure; AppKit copies it and returns +0 token.
         let handler = unsafe { RcBlock::new1(handler) }?;
         let monitor = unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
@@ -305,7 +329,9 @@ mod macos {
 
         /// Whether this sheet is still on screen, per AppKit.
         pub(crate) fn is_attached(&self) -> bool {
-            // SAFETY: `-attachedSheet` is `-(NSWindow *)`, a plain property read on a retained window, borrowed only for the comparison.
+            // SAFETY: `-attachedSheet` is `-(NSWindow *)`, a plain property read on a
+            // retained window, borrowed only for the comparison; `PasteConfirm` lives
+            // on the main thread with `App` (it holds `Obj`s, which are `!Send`).
             let sheet = unsafe { appkit::send_id(self.parent.id(), sel!(attachedSheet)) };
             same_window(sheet, self.panel.id())
         }

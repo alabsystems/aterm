@@ -5,6 +5,10 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! XKB keymap compilation and keycode/keysym translation.
+//!
+//! LOCAL PATCH (aterm): libxkbcommon's entry points and keysyms are aterm-xkb's, and a Wayland
+//! keymap is compiled from the text aterm-wayland's seat read, where upstream used xkbcommon-dl,
+//! xkeysym and memmap2.
 
 use std::ffi::CStr;
 use std::ops::Deref;
@@ -467,7 +471,8 @@ impl XkbKeymap {
         if text.is_empty() {
             return None;
         }
-        // SAFETY: A live context, and `text.len()` readable bytes.
+        // SAFETY: a live context, and `text.len()` readable bytes; the length is passed, so
+        // the text needs no terminating NUL.
         let keymap = unsafe {
             let keymap = (xkbh().keymap_new_from_buffer)(
                 (*context).as_ptr(),

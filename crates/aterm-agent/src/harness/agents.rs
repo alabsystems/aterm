@@ -11,7 +11,7 @@ use super::flight::{Flight, ToolName};
 
 /// Quiet this long and a running dot turns [`DotState::Quiet`].
 pub const QUIET_MS: u64 = 20_000;
-/// Quiet this long and it turns [`DotState::Stuck`] (module docs).
+/// Quiet this long and it turns [`DotState::Stuck`]: Bash's default two-minute timeout plus 30 s.
 pub const STUCK_MS: u64 = 150_000;
 /// A clock still for `2 × resolution` plus this is [`DotState::Halted`].
 pub const HALT_SLACK_MS: u64 = 1_000;
@@ -47,7 +47,7 @@ pub enum Tint {
     Marked,
 }
 
-/// A dot's state (module docs).
+/// A dot's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DotState {
     /// Evidence of work under [`QUIET_MS`] ago.
@@ -81,7 +81,7 @@ pub struct Dot {
     pub bullet: Span,
     pub kind: RowKind,
     pub state: DotState,
-    /// How much work, `0..=1` (module docs).
+    /// How much work, `0..=1`: [`level()`] of [`Dot::rate`].
     pub level: f32,
     /// How sure the dot is that the work goes on, `0..=1`.
     pub sat: f32,
@@ -494,7 +494,7 @@ pub fn level(rate: f32) -> f32 {
     ((1.0 + rate.max(0.0) / 2.0).ln() / 501.0f32.ln()).clamp(0.0, 1.0)
 }
 
-/// A dot's saturation at `quiet_ms` without evidence (module docs).
+/// A dot's saturation at `quiet_ms` without evidence.
 #[must_use]
 pub fn sat(state: DotState, quiet_ms: u64) -> f32 {
     if state == DotState::Stuck {

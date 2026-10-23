@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Windows Explorer "Open aterm here" context-menu verb: right-clicking a folder, a folder's
-//! background or a drive launches `aterm-gui -d <that path>`. Registered per user under
-//! `HKCU\Software\Classes` (no admin, no MSIX identity); `--uninstall-context-menu` removes it.
+//! Windows Explorer "Open aterm here" context-menu verb registration under `HKCU\Software\Classes`.
 #![cfg(windows)]
 
 use core::ptr;
@@ -18,8 +16,6 @@ unsafe extern "system" {
     fn RegDeleteTreeW(hkey: Hkey, subkey: *const u16) -> i32;
 }
 
-/// The three verb roots (base subkey, path-argument token). `%V` is the folder for a
-/// background click; `%1` is the selected folder/drive.
 const VERBS: [(&str, &str); 3] = [
     (r"Software\Classes\Directory\Background\shell\aterm", "%V"),
     (r"Software\Classes\Directory\shell\aterm", "%1"),
@@ -49,7 +45,6 @@ fn create_key(subkey: &str) -> io::Result<Hkey> {
     Ok(hk)
 }
 
-/// Set a `REG_SZ`; `name = None` sets the key's default value.
 fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
     let data = wide(value);
     let name_w = name.map(wide);
@@ -66,24 +61,13 @@ fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
 
 /// Build the verb's registry command line: `"<exe>" -d "<token>."`.
 ///
-/// The trailing dot is load-bearing. Explorer substitutes `%1`/`%V` textually, and a drive root
-/// is `C:\`, so `-d "%V"` would expand to `-d "C:\"`: under the MSVCRT argv rules the backslash
-/// escapes the closing quote, the operand parses as `C:"`, and the GUI exe exits silently. With
-/// the dot it is `C:\.`, which resolves to the root; `C:\src.` normalizes to `C:\src` (Win32
-/// strips trailing dots on a final component). Git for Windows does the same (`"--cd=%v."`).
-/// Dropping the quotes would break paths with spaces, and drive roots cannot be special-cased:
-/// Explorer substitutes into this one static template.
+/// The trailing dot prevents a drive root (`C:\`) from escaping the closing quote under MSVCRT
+/// argv rules.
 fn verb_command(exe: &str, token: &str) -> String {
     format!("\"{exe}\" -d \"{token}.\"")
 }
 
-/// Install the "Open aterm here" verb on directories, directory backgrounds and drives,
-/// pointing at this install's windowed image with `-d <path>`.
-///
-/// The windowed image, not `current_exe()`: `aterm --install-context-menu` runs in the console
-/// image, and a verb on that would open a console window instead of an aterm window.
-/// [`crate::win32::windowed_front_door_beside`] picks it, as for the console handoff and the
-/// jump list. No windowed image beside this one: refused, nothing written.
+/// Install the "Open aterm here" verb pointing at this install's windowed image (`aterm-gui.exe`).
 pub(crate) fn install() -> io::Result<()> {
     let current = std::env::current_exe()?;
     let Some(exe) = crate::win32::windowed_front_door_beside(&current) else {
@@ -96,7 +80,6 @@ pub(crate) fn install() -> io::Result<()> {
     for (base, arg) in VERBS {
         let hk = create_key(base)?;
         let r1 = set_string(hk, None, "Open aterm here");
-        // `Icon` gives the verb the aterm glyph (the exe's first embedded icon).
         let r2 = set_string(hk, Some("Icon"), &format!("\"{exe_s}\",0"));
         // SAFETY: `hk` was opened by create_key above.
         unsafe { RegCloseKey(hk) };
@@ -111,7 +94,7 @@ pub(crate) fn install() -> io::Result<()> {
     Ok(())
 }
 
-/// Remove the verb (recursively deletes each root). Missing keys are not an error.
+/// Remove the verb (recursively deletes each root).
 pub(crate) fn uninstall() -> io::Result<()> {
     for (base, _) in VERBS {
         let sub = wide(base);
@@ -125,7 +108,6 @@ pub(crate) fn uninstall() -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A drive root's expansion must not end in backslash-quote (see [`verb_command`]).
     #[test]
     fn drive_root_expansion_does_not_escape_the_closing_quote() {
         for (_, token) in VERBS {
@@ -134,7 +116,6 @@ mod tests {
                 !template.ends_with("\\\""),
                 "template ends in backslash-quote: {template}"
             );
-            // Explorer's textual substitution on a drive root, the one path ending in `\`.
             let expanded = template.replace(token, r"C:\");
             assert!(
                 !expanded.ends_with("\\\""),

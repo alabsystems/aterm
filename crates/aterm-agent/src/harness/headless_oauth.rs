@@ -359,6 +359,63 @@ impl MailboxConfig {
     }
 }
 
+/// Discover any configured mailbox source from on-disk configuration files and directories
+/// without reading process-global environment variables.
+#[must_use]
+pub fn discover_mailbox_config_files(
+    home: Option<&Path>,
+    store_dir: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Option<MailboxConfig> {
+    let mut cfg = MailboxConfig::default();
+    let mut toml_candidates = Vec::new();
+    if let Some(store) = store_dir {
+        toml_candidates.push(store.join(MAILBOX_TOML_FILE));
+    }
+    if let Some(h) = home {
+        toml_candidates.push(h.join(".secrets").join(SECRETS_MAILBOX_TOML_FILE));
+        toml_candidates.push(h.join(".secrets").join(MAILBOX_TOML_FILE));
+        toml_candidates.push(h.join(".config/aterm").join(MAILBOX_TOML_FILE));
+        toml_candidates.push(h.join(".config/aterm/aterm.toml"));
+    }
+    if let Some(cfg_file) = config_path {
+        if let Some(parent) = cfg_file.parent() {
+            toml_candidates.push(parent.join(MAILBOX_TOML_FILE));
+        }
+        toml_candidates.push(cfg_file.to_path_buf());
+    }
+    for path in toml_candidates {
+        if path.is_file()
+            && let Ok(text) = std::fs::read_to_string(&path)
+            && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
+        {
+            cfg.merge_from(parsed);
+        }
+    }
+    if cfg.dir.is_none() {
+        if let Some(store) = store_dir {
+            let store_mb = store.join(DEFAULT_MAILBOX_DIR);
+            if store_mb.is_dir() {
+                cfg.dir = Some(store_mb);
+            }
+        }
+        if cfg.dir.is_none()
+            && let Some(h) = home
+        {
+            let config_mb = h.join(".config/aterm").join(DEFAULT_MAILBOX_DIR);
+            if config_mb.is_dir() {
+                cfg.dir = Some(config_mb);
+            }
+        }
+    }
+    if cfg.seen_file.is_none() {
+        cfg.seen_file = store_dir
+            .map(|s| s.join("mailbox.seen"))
+            .or_else(|| cfg.dir.as_ref().map(|d| d.join(".mailbox.seen")));
+    }
+    cfg.is_configured().then_some(cfg)
+}
+
 /// Discover any configured mailbox source.
 #[must_use]
 pub fn discover_mailbox_config(
@@ -420,47 +477,11 @@ pub fn discover_mailbox_config(
         cfg.bearer_token = Some(tok);
     }
 
-    let mut toml_candidates = Vec::new();
-    if let Some(store) = store_dir {
-        toml_candidates.push(store.join(MAILBOX_TOML_FILE));
-    }
-    if let Some(h) = home {
-        toml_candidates.push(h.join(".secrets").join(SECRETS_MAILBOX_TOML_FILE));
-        toml_candidates.push(h.join(".secrets").join(MAILBOX_TOML_FILE));
-        toml_candidates.push(h.join(".config/aterm").join(MAILBOX_TOML_FILE));
-        toml_candidates.push(h.join(".config/aterm/aterm.toml"));
-    }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-    {
-        toml_candidates.push(xdg.join("aterm").join(MAILBOX_TOML_FILE));
-        toml_candidates.push(xdg.join("aterm/aterm.toml"));
-    }
-    for path in toml_candidates {
-        if path.is_file()
-            && let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
-        {
-            cfg.merge_from(parsed);
-        }
-    }
-
-    if cfg.dir.is_none() {
-        if let Some(store) = store_dir {
-            let store_mb = store.join(DEFAULT_MAILBOX_DIR);
-            if store_mb.is_dir() {
-                cfg.dir = Some(store_mb);
-            }
-        }
-        if cfg.dir.is_none()
-            && let Some(h) = home
-        {
-            let config_mb = h.join(".config/aterm").join(DEFAULT_MAILBOX_DIR);
-            if config_mb.is_dir() {
-                cfg.dir = Some(config_mb);
-            }
-        }
+        .map(|v| PathBuf::from(v).join("aterm/aterm.toml"));
+    if let Some(files_cfg) = discover_mailbox_config_files(home, store_dir, xdg_config.as_deref()) {
+        cfg.merge_from(files_cfg);
     }
 
     if cfg.seen_file.is_none() {
@@ -675,17 +696,94 @@ pub fn headless_launch_args(browser: &HeadlessBrowser, profile_dir: &Path) -> Ve
     args
 }
 
-fn strip_html_tags(input: &str) -> String {
+fn strip_tag_block(input: &str, tag: &str) -> String {
+    let open_pat = format!("<{tag}");
+    let close_pat = format!("</{tag}");
+    let lower = input.to_ascii_lowercase();
     let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let mut search_from = 0usize;
+    let is_html_space = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c');
+    while let Some(rel_start) = lower[search_from..].find(&open_pat) {
+        let start = search_from + rel_start;
+        let name_end = start + open_pat.len();
+        if !lower
+            .as_bytes()
+            .get(name_end)
+            .is_some_and(|&b| is_html_space(b) || matches!(b, b'>' | b'/'))
+        {
+            search_from = name_end;
+            continue;
+        }
+        out.push_str(&input[cursor..start]);
+        out.push('\n');
+        let close_end = lower[name_end..]
+            .match_indices(close_pat.as_str())
+            .find_map(|(offset, _)| {
+                let end = name_end + offset + close_pat.len();
+                let spaces = lower.as_bytes()[end..]
+                    .iter()
+                    .take_while(|&&b| is_html_space(b))
+                    .count();
+                (lower.as_bytes().get(end + spaces) == Some(&b'>')).then_some(end + spaces + 1)
+            });
+        if let Some(end) = close_end {
+            cursor = end;
+            search_from = end;
+        } else {
+            return out;
+        }
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let cleaned = strip_tag_block(&strip_tag_block(input, "style"), "script");
+    let mut out = String::with_capacity(cleaned.len());
     let mut in_tag = false;
-    for ch in input.chars() {
+    let mut tag_buf = String::new();
+    for ch in cleaned.chars() {
         if ch == '<' {
             in_tag = true;
+            tag_buf.clear();
             out.push(' ');
         } else if ch == '>' {
             in_tag = false;
-            out.push(' ');
-        } else if !in_tag {
+            let t = tag_buf
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(
+                t.as_str(),
+                "p" | "/p"
+                    | "div"
+                    | "/div"
+                    | "tr"
+                    | "/tr"
+                    | "td"
+                    | "/td"
+                    | "li"
+                    | "/li"
+                    | "br"
+                    | "br/"
+                    | "h1"
+                    | "/h1"
+                    | "h2"
+                    | "/h2"
+                    | "h3"
+                    | "/h3"
+            ) {
+                out.push('\n');
+            } else {
+                out.push(' ');
+            }
+        } else if in_tag {
+            if tag_buf.len() < 16 {
+                tag_buf.push(ch);
+            }
+        } else {
             out.push(ch);
         }
     }
@@ -756,15 +854,23 @@ pub fn extract_otp_from_email(raw_email: &str, target_email: Option<&str>) -> Op
     };
     let plain = strip_html_tags(&decode_html_amp(&combined));
     let mut fallback = None;
+    let mut context_lines_left = 0usize;
     for line in plain.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.is_empty() {
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
-        let has_context = lower.contains("code")
+        let line_has_context = lower.contains("code")
             || lower.contains("verify")
             || lower.contains("verification")
             || lower.contains("sign in")
             || lower.contains("login")
             || lower.contains("one-time");
-        let words: Vec<&str> = line.split_whitespace().collect();
+        if line_has_context {
+            context_lines_left = 3;
+        }
+        let has_context = context_lines_left > 0;
         if words.len() == 1
             && let Some(otp) = is_six_digit_otp(words[0])
         {
@@ -779,6 +885,9 @@ pub fn extract_otp_from_email(raw_email: &str, target_email: Option<&str>) -> Op
                     fallback = Some(otp);
                 }
             }
+        }
+        if !line_has_context {
+            context_lines_left = context_lines_left.saturating_sub(1);
         }
     }
     fallback
@@ -1147,10 +1256,11 @@ fn fetch_imap_credential(
         .or(cfg.user.as_deref())
         .or(target_email)
         .unwrap_or("user");
+    let cfg_pw = cfg.password_for(target_email);
     let password = parsed
         .password
         .as_deref()
-        .or(cfg.password.as_deref())
+        .or(cfg_pw.as_deref())
         .unwrap_or("");
     if parsed.tls {
         fetch_imaps_curl_credential(
@@ -1228,9 +1338,11 @@ fn fetch_http_mailbox_credential(
             "--max-time",
             "10",
         ]);
+        let cfg_pw = cfg.password_for(target_email);
         if let Some(token) = cfg.bearer_token.as_deref().filter(|t| !t.is_empty()) {
             cmd.args(["-H", &format!("Authorization: Bearer {token}")]);
-        } else if let (Some(u), Some(p)) = (cfg.user.as_deref(), cfg.password.as_deref()) {
+        } else if let (Some(u), Some(p)) = (cfg.user.as_deref().or(target_email), cfg_pw.as_deref())
+        {
             cmd.args(["-u", &format!("{u}:{p}")]);
         }
         cmd.arg(&url);
@@ -1332,6 +1444,26 @@ fn scan_maildir_once(
             }
             return Some(found);
         }
+    }
+    None
+}
+
+fn poll_non_webmail_once(
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    tried_files: &mut BTreeSet<(PathBuf, u64, std::time::SystemTime)>,
+    seen_digests: &mut BTreeSet<String>,
+) -> Option<MailboxCredential> {
+    if let Some(dir) = cfg.dir.as_deref()
+        && let Some(cred) = scan_maildir_once(dir, target_email, tried_files)
+    {
+        return Some(cred);
+    }
+    if let Some(cred) = fetch_imap_credential(cfg, target_email, seen_digests) {
+        return Some(cred);
+    }
+    if let Some(cred) = fetch_http_mailbox_credential(cfg, target_email, seen_digests) {
+        return Some(cred);
     }
     None
 }
@@ -1485,6 +1617,68 @@ impl CdpClient {
     }
 }
 
+/// Shared field admission for OAuth OTPs and webmail TOTPs. Full-code fields keep the whole code;
+/// split fields need one single-character control per digit, all owned by the same form.
+const CODE_INPUT_HELPERS_JS: &str = r#"
+  const usableCodeInputs = (inputs) => inputs.filter(input =>
+    !input.disabled && !input.readOnly && !input.hidden &&
+    !["hidden", "checkbox", "radio"].includes(input.type));
+  const codeInputsFor = (explicit, singleChar) => {
+    const selected = usableCodeInputs(explicit);
+    if (selected.length === 0) return usableCodeInputs(singleChar);
+    if (selected.some(input => input.maxLength !== 1)) return selected;
+    const form = selected[0].form;
+    if (!form) return selected;
+    const group = usableCodeInputs(singleChar).filter(input => input.form === form);
+    return group.includes(selected[0]) ? group : selected;
+  };
+  const fillCodeInputs = (inputs, value) => {
+    if (!value || inputs.length === 0) return null;
+    const full = inputs.find(input => input.maxLength !== 1 &&
+      (input.maxLength < 0 || input.maxLength >= value.length));
+    if (full) {
+      setNativeValue(full, value);
+      return full;
+    }
+    if (inputs.length !== value.length || !inputs.every(input => input.maxLength === 1)) {
+      return null;
+    }
+    const form = inputs[0].form;
+    if (!form || !inputs.every(input => input.form === form)) return null;
+    for (let i = 0; i < inputs.length; i++) {
+      setNativeValue(inputs[i], value.charAt(i));
+    }
+    return inputs[0];
+  };
+"#;
+
+/// An enabled control or native form submission must be attempted before latching a step.
+/// Missing actions leave input-event-driven pages to advance on their next DOM observation.
+const SUBMIT_INPUT_HELPERS_JS: &str = r#"
+  const submitInput = (input, buttons, labelPattern) => {
+    const enabled = control => !control.disabled && !control.hidden &&
+      !control.matches(":disabled") && control.getAttribute("aria-disabled") !== "true";
+    if (!enabled(input) || input.readOnly || input.type === "hidden") return false;
+    const form = input.form;
+    const owner = button => "form" in button ? button.form : button.closest("form");
+    const owned = buttons.filter(button => owner(button) === form);
+    const isSubmit = button => (button.tagName === "BUTTON" && button.type === "submit") ||
+      (button.tagName === "INPUT" && ["submit", "image"].includes(button.type));
+    const button = (form && owned.find(button => isSubmit(button) && enabled(button))) ||
+      owned.find(button => button.type !== "reset" && enabled(button) &&
+        labelPattern.test(String(button.innerText || button.value || "")));
+    if (button) {
+      button.click();
+      return true;
+    }
+    if (form && !owned.some(isSubmit) && typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+      return true;
+    }
+    return false;
+  };
+"#;
+
 /// Build the JavaScript expression evaluated inside the OAuth page to inspect and advance the flow.
 #[must_use]
 pub fn oauth_step_js(
@@ -1512,7 +1706,9 @@ pub fn oauth_step_js(
     el.dispatchEvent(new Event("input", {{ bubbles: true }}));
     el.dispatchEvent(new Event("change", {{ bubbles: true }}));
   }};
-  const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button'], a[href]"));
+{CODE_INPUT_HELPERS_JS}
+{SUBMIT_INPUT_HELPERS_JS}
+  const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='image'], [role='button'], a[href]"));
   for (const btn of buttons) {{
     if (btn.disabled) continue;
     const text = String(btn.innerText || btn.value || btn.getAttribute("aria-label") || "").trim().toLowerCase();
@@ -1544,19 +1740,17 @@ pub fn oauth_step_js(
     }}
     return {{ state: "clicked_consent", url: href }};
   }}
-  const otpInput = document.querySelector("input[autocomplete='one-time-code'], input[name*='code'], input[name*='otp'], input[inputmode='numeric']");
+  const explicitOtp = Array.from(document.querySelectorAll("input[autocomplete='one-time-code'], input[name*='code'], input[name*='otp'], input[inputmode='numeric'], input[data-testid*='otp']"));
+  const singleCharBoxes = Array.from(document.querySelectorAll("input[maxlength='1']"));
+  const otpInputs = codeInputsFor(explicitOtp, singleCharBoxes);
   const otpVal = {otp_json};
   const otpDone = {otp_submitted};
-  if (otpInput) {{
+  if (otpInputs.length > 0) {{
     if (otpVal && !otpDone) {{
-      setNativeValue(otpInput, otpVal);
-      const form = otpInput.closest("form");
-      const submitBtn = (form && form.querySelector("button[type='submit'], input[type='submit'], button:not([type='button'])"))
-        || buttons.find(b => /verify|continue|submit|sign in|log in/i.test(String(b.innerText || b.value || "")));
-      if (submitBtn) {{
-        submitBtn.click();
-      }} else if (form) {{
-        form.submit();
+      const filledInput = fillCodeInputs(otpInputs, otpVal);
+      if (!filledInput) return {{ state: "loading", url: href }};
+      if (!submitInput(filledInput, buttons, /verify|continue|submit|sign in|log in/i)) {{
+        return {{ state: "loading", url: href }};
       }}
       return {{ state: "submitted_otp", url: href }};
     }}
@@ -1567,19 +1761,26 @@ pub fn oauth_step_js(
   const emailDone = {email_submitted};
   if (emailInput && emailVal && !emailDone) {{
     setNativeValue(emailInput, emailVal);
-    const form = emailInput.closest("form");
-    const submitBtn = (form && form.querySelector("button[type='submit'], input[type='submit'], button:not([type='button'])"))
-      || buttons.find(b => /continue|sign in|log in|next|send/i.test(String(b.innerText || b.value || "")));
-    if (submitBtn) {{
-      submitBtn.click();
-    }} else if (form) {{
-      form.submit();
+    if (!submitInput(emailInput, buttons, /continue|sign in|log in|next|send/i)) {{
+      return {{ state: "loading", url: href }};
     }}
     return {{ state: "submitted_email", url: href }};
   }}
   const bodyText = String(document.body && document.body.innerText || "").toLowerCase();
   if (bodyText.includes("check your email") || bodyText.includes("magic link") || bodyText.includes("sent a link") || bodyText.includes("verification code")) {{
     return {{ state: "needs_mailbox", url: href }};
+  }}
+  for (const btn of buttons) {{
+    if (btn.disabled) continue;
+    const text = String(btn.innerText || btn.value || btn.getAttribute("aria-label") || "").trim().toLowerCase();
+    const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
+    if (!isCancel && (
+      text.startsWith("continue as ") ||
+      (href.includes("/oauth/") && (text === "continue" || text === "confirm" || text === "select"))
+    )) {{
+      btn.click();
+      return {{ state: "clicked_consent", url: href, target: text }};
+    }}
   }}
   return {{ state: "loading", url: href }};
 }})()"#
@@ -1746,17 +1947,11 @@ fn webmail_step_js(
     el.dispatchEvent(new Event("input", {{ bubbles: true }}));
     el.dispatchEvent(new Event("change", {{ bubbles: true }}));
   }};
-  const buttons = Array.from(document.querySelectorAll("button, input[type='submit']"));
-  const clickSubmit = (el) => {{
-    const form = el && el.closest("form");
-    const btn = (form && form.querySelector("button[type='submit'], input[type='submit'], button:not([type='button'])"))
-      || buttons.find(b => !b.disabled && /sign in|log in|authenticate|unlock|verify|continue|submit/i.test(String(b.innerText || b.value || "")));
-    if (btn) {{
-      btn.click();
-    }} else if (form) {{
-      form.submit();
-    }}
-  }};
+{CODE_INPUT_HELPERS_JS}
+{SUBMIT_INPUT_HELPERS_JS}
+  const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='image']"));
+  const clickSubmit = (input) => submitInput(input, buttons,
+    /sign in|log in|authenticate|unlock|verify|continue|submit/i);
 
   const userEl = document.querySelector("input#username, input[name='username'], input[autocomplete='username'], input[type='email']");
   const passEl = document.querySelector("input#password, input[name='password'], input[type='password']:not(#mailboxPassword)");
@@ -1770,15 +1965,18 @@ fn webmail_step_js(
       setNativeValue(userEl, emailVal);
     }}
     setNativeValue(passEl, pwVal);
-    clickSubmit(passEl);
+    if (!clickSubmit(passEl)) return {{ state: "loading", url: href }};
     return {{ state: "submitted_login", url: href }};
   }}
 
-  const totpEl = document.querySelector("input#twoFa, input[name='totp'], input[autocomplete='one-time-code'], input[id*='totp' i]");
+  const explicitTotp = Array.from(document.querySelectorAll("input#twoFa, input[name='totp'], input[autocomplete='one-time-code'], input[id*='totp' i], input[data-testid*='totp' i]"));
+  const splitTotp = Array.from(document.querySelectorAll("input[maxlength='1']"));
+  const totpInputs = codeInputsFor(explicitTotp, splitTotp);
   const totpVal = {totp_json};
-  if (totpEl && totpVal && !{totp_submitted}) {{
-    setNativeValue(totpEl, totpVal);
-    clickSubmit(totpEl);
+  if (totpInputs.length > 0 && totpVal && !{totp_submitted}) {{
+    const filledInput = fillCodeInputs(totpInputs, totpVal);
+    if (!filledInput) return {{ state: "loading", url: href }};
+    if (!clickSubmit(filledInput)) return {{ state: "loading", url: href }};
     return {{ state: "submitted_totp", url: href }};
   }}
 
@@ -1786,7 +1984,7 @@ fn webmail_step_js(
   const mpwVal = {mpw_json} || pwVal;
   if (mpwEl && mpwVal && !{mailbox_pw_submitted}) {{
     setNativeValue(mpwEl, mpwVal);
-    clickSubmit(mpwEl);
+    if (!clickSubmit(mpwEl)) return {{ state: "loading", url: href }};
     return {{ state: "submitted_mailbox_password", url: href }};
   }}
 
@@ -1885,10 +2083,16 @@ pub fn poll_webmail_via_cdp(
         )?;
 
         let mut login_submitted = false;
-        let mut totp_submitted = false;
+        let mut last_submitted_totp: Option<String> = None;
         let mut mailbox_pw_submitted = false;
+        let mut tried_files = BTreeSet::new();
 
         for _ in 0..80 {
+            if let Some(cred) =
+                poll_non_webmail_once(cfg, target_email, &mut tried_files, seen_digests)
+            {
+                return Ok(cred);
+            }
             if Instant::now() >= deadline {
                 return Err("timed out waiting for verification email in webmail inbox");
             }
@@ -1905,7 +2109,7 @@ pub fn poll_webmail_via_cdp(
                 mailbox_password.as_deref(),
                 totp_code.as_deref(),
                 login_submitted,
-                totp_submitted,
+                totp_code.is_some() && totp_code == last_submitted_totp,
                 mailbox_pw_submitted,
             );
             let eval = cdp.call(
@@ -1936,7 +2140,7 @@ pub fn poll_webmail_via_cdp(
                     login_submitted = true;
                 }
                 "submitted_totp" => {
-                    totp_submitted = true;
+                    last_submitted_totp = totp_code;
                 }
                 "submitted_mailbox_password" => {
                     mailbox_pw_submitted = true;
@@ -1987,32 +2191,59 @@ pub fn poll_mailbox_or_webmail_for_credential(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<MailboxCredential, &'static str> {
-    if cfg.is_webmail_only(target_email) {
+    let has_non_webmail = cfg.dir.is_some() || cfg.imap_url.is_some() || cfg.http_url.is_some();
+    if cfg.effective_webmail_url(target_email).is_some() {
+        let t0 = Instant::now();
         let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
-        return poll_webmail_via_cdp(
+        let mut tried_files = BTreeSet::new();
+        if has_non_webmail
+            && let Some(cred) =
+                poll_non_webmail_once(cfg, target_email, &mut tried_files, &mut seen_digests)
+        {
+            return Ok(cred);
+        }
+        let remaining = timeout.saturating_sub(t0.elapsed());
+        match poll_webmail_via_cdp(
             cdp,
             cfg,
             target_email,
-            timeout,
+            remaining,
             poll_interval,
             &mut seen_digests,
-        );
+        ) {
+            Ok(cred) => return Ok(cred),
+            Err(err) => {
+                if !has_non_webmail || t0.elapsed() >= timeout {
+                    return Err(err);
+                }
+                return poll_mailbox_config_for_credential(
+                    cfg,
+                    target_email,
+                    timeout.saturating_sub(t0.elapsed()),
+                );
+            }
+        }
     }
-    if cfg.dir.is_some() || cfg.imap_url.is_some() || cfg.http_url.is_some() {
+    if has_non_webmail {
         return poll_mailbox_config_for_credential(cfg, target_email, timeout);
     }
-    if cfg.effective_webmail_url(target_email).is_some() {
-        let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
-        return poll_webmail_via_cdp(
-            cdp,
-            cfg,
-            target_email,
-            timeout,
-            poll_interval,
-            &mut seen_digests,
-        );
-    }
     Err("headless browser requires sign-in, but no mailbox is configured")
+}
+
+/// Reuse the HTTP probe's consumed credential once, then resume the configured source.
+#[cfg(unix)]
+pub(super) fn poll_mailbox_or_pending_credential(
+    pending: &mut Option<MailboxCredential>,
+    cdp: &mut CdpClient,
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MailboxCredential, &'static str> {
+    if let Some(credential) = pending.take() {
+        return Ok(credential);
+    }
+    poll_mailbox_or_webmail_for_credential(cdp, cfg, target_email, timeout, poll_interval)
 }
 
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`.
@@ -2095,7 +2326,9 @@ pub fn drive_cdp_oauth_with_webmail(
     let mut email_submitted = false;
     let mut otp_code: Option<String> = None;
     let mut otp_submitted = false;
-    let mut mailbox_polled = false;
+    let mut mailbox_polls = 0usize;
+    let mut needs_mailbox_ticks = 0usize;
+    const MAX_MAILBOX_POLLS: usize = 3;
 
     let result = (|| {
         for _ in 0..120 {
@@ -2148,14 +2381,16 @@ pub fn drive_cdp_oauth_with_webmail(
 
             match state {
                 "clicked_consent" => {
+                    needs_mailbox_ticks = 0;
                     if !poll_interval.is_zero() {
                         std::thread::sleep(poll_interval);
                     }
                 }
                 "submitted_email" => {
                     email_submitted = true;
-                    if !mailbox_polled {
-                        mailbox_polled = true;
+                    needs_mailbox_ticks = 0;
+                    if mailbox_polls == 0 {
+                        mailbox_polls += 1;
                         match mailbox_credential(cdp, email.as_deref())? {
                             MailboxCredential::MagicLink(magic_url) => {
                                 if !flow.admits_provider_url(&magic_url) {
@@ -2170,13 +2405,17 @@ pub fn drive_cdp_oauth_with_webmail(
                             }
                             MailboxCredential::Otp(code) => {
                                 otp_code = Some(code);
+                                otp_submitted = false;
                             }
                         }
                     }
                 }
                 "needs_mailbox" => {
-                    if !mailbox_polled {
-                        mailbox_polled = true;
+                    let should_poll = mailbox_polls == 0
+                        || (needs_mailbox_ticks >= 2 && mailbox_polls < MAX_MAILBOX_POLLS);
+                    if should_poll {
+                        mailbox_polls += 1;
+                        needs_mailbox_ticks = 0;
                         match mailbox_credential(cdp, email.as_deref())? {
                             MailboxCredential::MagicLink(magic_url) => {
                                 if !flow.admits_provider_url(&magic_url) {
@@ -2191,14 +2430,19 @@ pub fn drive_cdp_oauth_with_webmail(
                             }
                             MailboxCredential::Otp(code) => {
                                 otp_code = Some(code);
+                                otp_submitted = false;
                             }
                         }
-                    } else if !poll_interval.is_zero() {
-                        std::thread::sleep(poll_interval);
+                    } else {
+                        needs_mailbox_ticks += 1;
+                        if !poll_interval.is_zero() {
+                            std::thread::sleep(poll_interval);
+                        }
                     }
                 }
                 "submitted_otp" => {
                     otp_submitted = true;
+                    needs_mailbox_ticks = 0;
                     if !poll_interval.is_zero() {
                         std::thread::sleep(poll_interval);
                     }
@@ -2224,13 +2468,32 @@ pub fn drive_cdp_oauth_with_webmail(
 }
 
 /// Complete OAuth authorization headlessly over CDP pipes using `mailbox_cfg` when needed.
-#[cfg(unix)]
 pub fn authorize_with_headless_browser_config(
     authorize_url: &str,
     store_dir: Option<&Path>,
     mailbox_cfg: Option<&MailboxConfig>,
     target_email: Option<&str>,
     timeout: Duration,
+) -> Result<(), &'static str> {
+    authorize_with_headless_browser_config_and_credential(
+        authorize_url,
+        store_dir,
+        mailbox_cfg,
+        target_email,
+        timeout,
+        None,
+    )
+}
+
+/// Continue an HTTP probe with its already-consumed credential before polling again.
+#[cfg(unix)]
+pub(super) fn authorize_with_headless_browser_config_and_credential(
+    authorize_url: &str,
+    store_dir: Option<&Path>,
+    mailbox_cfg: Option<&MailboxConfig>,
+    target_email: Option<&str>,
+    timeout: Duration,
+    mut pending_credential: Option<MailboxCredential>,
 ) -> Result<(), &'static str> {
     use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
     use std::os::fd::OwnedFd;
@@ -2289,7 +2552,8 @@ pub fn authorize_with_headless_browser_config(
             let mb = mailbox_cfg
                 .filter(|c| c.is_configured())
                 .ok_or("headless browser requires sign-in, but no mailbox is configured")?;
-            poll_mailbox_or_webmail_for_credential(
+            poll_mailbox_or_pending_credential(
+                &mut pending_credential,
                 cdp_inner,
                 mb,
                 em,
@@ -2305,14 +2569,15 @@ pub fn authorize_with_headless_browser_config(
     )
 }
 
-/// Non-Unix stub for [`authorize_with_headless_browser_config`].
+/// Non-Unix continuation stub for [`authorize_with_headless_browser_config`].
 #[cfg(not(unix))]
-pub fn authorize_with_headless_browser_config(
+pub(super) fn authorize_with_headless_browser_config_and_credential(
     _authorize_url: &str,
     _store_dir: Option<&Path>,
     _mailbox_cfg: Option<&MailboxConfig>,
     _target_email: Option<&str>,
     _timeout: Duration,
+    _pending_credential: Option<MailboxCredential>,
 ) -> Result<(), &'static str> {
     Err("headless browser OAuth is supported on Unix hosts only")
 }

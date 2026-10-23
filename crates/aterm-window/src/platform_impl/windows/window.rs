@@ -83,7 +83,8 @@ use crate::window::{
     WindowButtons, WindowLevel,
 };
 
-// SAFETY: an `HWND` names a process-global window.
+// SAFETY: an `HWND` names a process-global window, and calls that need its owner thread go
+// through `thread_executor`.
 unsafe impl Send for Window {}
 unsafe impl Sync for Window {}
 

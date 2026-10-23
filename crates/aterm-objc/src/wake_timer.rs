@@ -146,7 +146,9 @@ unsafe extern "C" {
 /// The callout ([`Cell`], [`WakeTimer`]).
 extern "C" fn wake_timer_fired(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     if !info.is_null() {
-        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag.
+        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag,
+        // which outlives the timer (see `Drop`); a `Cell` is written through a
+        // shared reference on the one thread the timer's run loop runs on.
         unsafe { (*info.cast::<Cell<bool>>()).set(true) };
     }
 }
@@ -173,7 +175,8 @@ impl WakeTimer {
     /// The event loop's waker: the main run loop, in every common mode.
     #[must_use]
     pub fn main(_mtm: MainThread) -> Self {
-        // SAFETY: Plain CoreFoundation getters.
+        // SAFETY: plain CoreFoundation getters; the common-modes constant is
+        // a static CFString CoreFoundation owns.
         unsafe { Self::on(CFRunLoopGetMain(), kCFRunLoopCommonModes) }
     }
 
@@ -197,7 +200,10 @@ impl WakeTimer {
             release: None,
             copy_description: None,
         };
-        // SAFETY: CoreFoundation copies `context`.
+        // SAFETY: CoreFoundation copies `context`; the flag it points at lives
+        // as long as `Self` (the timer is invalidated in `Drop` first). The
+        // first fire date is beyond CoreFoundation's limit, so the timer starts
+        // disarmed, matching `WakePlan::new`.
         let timer = unsafe {
             CFRunLoopTimerCreate(
                 std::ptr::null(),
@@ -264,7 +270,8 @@ impl WakeTimer {
             WakeArm::Disarm => f64::MAX,
         };
         self.armed_date = (arm != WakeArm::Disarm).then_some(date);
-        // SAFETY: `self.timer` is live until `Drop`.
+        // SAFETY: `self.timer` is live until `Drop`; a finite or MAX date is
+        // accepted (CoreFoundation clamps the latter to its own limit).
         unsafe { CFRunLoopTimerSetNextFireDate(self.timer, date) };
     }
 
@@ -293,7 +300,9 @@ impl WakeTimer {
 
 impl Drop for WakeTimer {
     fn drop(&mut self) {
-        // SAFETY: The timer is live.
+        // SAFETY: the timer is live; invalidating removes it from every run
+        // loop, so the callout can no longer reach `self.fired`, which drops
+        // after this body.
         unsafe {
             CFRunLoopTimerInvalidate(self.timer);
             CFRelease(self.timer.cast_const());

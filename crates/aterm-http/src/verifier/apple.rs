@@ -117,8 +117,8 @@ unsafe extern "C" {
     fn SecTrustSetOCSPResponse(trust: SecTrustRef, response_data: CFTypeRef) -> OSStatus;
     fn SecTrustSetAnchorCertificates(trust: SecTrustRef, anchors: CFArrayRef) -> OSStatus;
     fn SecTrustSetAnchorCertificatesOnly(trust: SecTrustRef, only: Boolean) -> OSStatus;
-    /// Returns C `_Bool`: `true` iff the chain is trusted. Not an `OSStatus`
-    /// (see the module docs).
+    /// Returns C `_Bool`: `true` iff the chain is trusted. Not an `OSStatus`: compared to
+    /// `errSecSuccess` (0), a rejection (`false`) would read as success.
     fn SecTrustEvaluateWithError(trust: SecTrustRef, error: *mut CFErrorRef) -> bool;
 }
 
@@ -136,7 +136,9 @@ impl Drop for CfOwned {
 
 /// Build a `CFString` from a Rust string; `None` when CF refuses the bytes.
 fn cf_string(s: &str) -> Option<CfOwned> {
-    // SAFETY: the pointer/length pair describes `s`, which outlives the call; `CFStringCreateWithBytes` copies.
+    // SAFETY: the pointer/length pair describes `s`, which outlives the call;
+    // `CFStringCreateWithBytes` copies. `is_external_representation` is false —
+    // these bytes carry no BOM. A `&str` longer than `isize::MAX` cannot exist.
     let r = unsafe {
         CFStringCreateWithBytes(
             ptr::null(),
@@ -178,7 +180,10 @@ fn cf_string_to_string(s: CFStringRef) -> Option<String> {
 /// A `CFArray` that owns (retains) the objects in `items`.
 fn cf_array(items: &[CfOwned]) -> Option<CfOwned> {
     let raw: Vec<CFTypeRef> = items.iter().map(|item| item.0).collect();
-    // SAFETY: `raw` is valid for `raw.len()` elements for the duration of the call, every element is a live CF object, and `kCFTypeArrayCallBacks` is a CF-owned immutable static whose address is all that is passed.
+    // SAFETY: `raw` is valid for `raw.len()` elements for the duration of the
+    // call, every element is a live CF object, and `kCFTypeArrayCallBacks` is a
+    // CF-owned immutable static whose address is all that is passed. A slice
+    // longer than `isize::MAX` cannot exist.
     let r = unsafe {
         CFArrayCreate(
             ptr::null(),
@@ -193,7 +198,8 @@ fn cf_array(items: &[CfOwned]) -> Option<CfOwned> {
 /// Wrap one DER certificate as a `SecCertificate`; `None` when the
 /// (attacker-controlled) bytes do not parse.
 fn sec_certificate(der: &[u8]) -> Option<CfOwned> {
-    // SAFETY: the pointer/length pair describes `der`, which outlives the call; `CFDataCreate` copies.
+    // SAFETY: the pointer/length pair describes `der`, which outlives the call;
+    // `CFDataCreate` copies. A slice longer than `isize::MAX` cannot exist.
     let data = unsafe { CFDataCreate(ptr::null(), der.as_ptr(), der.len() as CFIndex) };
     if data.is_null() {
         return None;
@@ -374,7 +380,8 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
     }
 
     if let Some(ocsp) = ocsp_response.as_deref() {
-        // SAFETY: pointer/length describe `ocsp`, which outlives the call; `CFDataCreate` copies.
+        // SAFETY: pointer/length describe `ocsp`, which outlives the call;
+        // `CFDataCreate` copies. A slice longer than `isize::MAX` cannot exist.
         let data = unsafe { CFDataCreate(ptr::null(), ocsp.as_ptr(), ocsp.len() as CFIndex) };
         if data.is_null() {
             return Err(invalid_certificate(
@@ -397,7 +404,9 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
     }
 
     let mut raw_error: CFErrorRef = ptr::null();
-    // SAFETY: `trust` is a live, fully configured SecTrust and `raw_error` is a valid place to write one `CFErrorRef`.
+    // SAFETY: `trust` is a live, fully configured SecTrust and `raw_error`
+    // is a valid place to write one `CFErrorRef`. The out-error is +1 when
+    // written, which is why it is wrapped below before any early return.
     let trusted = unsafe { SecTrustEvaluateWithError(trust.0, &mut raw_error) };
     let error = (!raw_error.is_null()).then(|| CfOwned(raw_error));
 

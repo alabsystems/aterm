@@ -13,7 +13,7 @@ use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr::{self, NonNull};
 
-/// Slot `n` of a vtable.
+/// Slot `n` of a vtable: its byte offset.
 #[cfg(target_pointer_width = "64")]
 const fn slot(n: usize) -> usize {
     n * 8
@@ -230,7 +230,8 @@ impl Drop for Foreign {
 fn another_bindings_reference_moves_without_its_drop() {
     let object = object(false);
     let foreign = Foreign(NonNull::new(raw(&object)).expect("non-null"));
-    // SAFETY: `Foreign` is one non-null interface pointer owning one reference.
+    // SAFETY: `Foreign` is one non-null interface pointer owning one
+    // reference, released by its drop and nothing else.
     let com = unsafe { Com::from_interface(foreign) };
     assert_eq!(com.as_raw(), raw(&object));
     drop(com);

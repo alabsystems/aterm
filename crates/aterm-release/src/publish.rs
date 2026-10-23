@@ -2710,8 +2710,9 @@ pub fn channel_signature_policy(
     let Some(document) = evidence.roster else {
         return Err(Error::new(
             "the signing profile names no `machine_roster`: add `machine_roster = \
-             \"<path>/aterm-machines.toml\"` (its .sig beside it), or move the profile aside \
-             and re-run `targo --unverified ship provision --id <id>`, which writes it",
+             \"<path>/aterm-machines.toml\"` (its .sig beside it; a leading `~/` is this Mac's \
+             home), or move the profile aside and re-run `targo --unverified ship provision \
+             --id <id>`, which writes it",
         ));
     };
     let who = machines::authorize_cut(

@@ -16,7 +16,7 @@ use aterm_uds::exitwatch::ExitWatch;
 
 use crate::core::{CompanionId, ConnId, Holders, KeeperCore, KeeperEnv, MarkerEvidence, Out, Rdev};
 use crate::frameio::{Incoming, read_frame, write_frame};
-use crate::identity::{CheckError, Identity};
+use crate::identity::{CheckError, Identity, PeerCheck};
 use crate::sys::{self, POLLERR, POLLHUP, POLLIN, PollFd};
 use crate::wire::{
     Birth, CAP_JOURNAL, CAP_SYNC, COMPANION_JOURNAL, Frame, JournalOffer, MarkerRef, MasterHeader,
@@ -49,6 +49,14 @@ pub struct ServeConfig {
     pub test_drop_custody: bool,
 }
 
+/// A dial accepted whose identity check has not answered: admitted when it passes, turned away
+/// when it is refused or still unanswered at `until`.
+struct Dialing {
+    stream: CtlStream,
+    check: PeerCheck,
+    until: Instant,
+}
+
 struct Conn {
     stream: CtlStream,
     pid: u32,
@@ -63,6 +71,13 @@ pub struct Server {
     socket: PathBuf,
     core: KeeperCore,
     conns: BTreeMap<ConnId, Conn>,
+    /// Dials whose identity checks are running, each on its own helper while the loop serves
+    /// every other connection.
+    dialing: Vec<Dialing>,
+    /// The most checks running at once; later dials wait in the listen backlog.
+    dial_checks_max: usize,
+    /// How long one dial's check may run before the dial is turned away as unanswered.
+    check_hang: Duration,
     custody: BTreeMap<Rdev, OwnedFd>,
     /// Every crash-restore companion held, by the number given at its arrival, with the master
     /// it rides beside.
@@ -96,6 +111,9 @@ pub struct Server {
     /// ([`Server::test_unchecked_ever`]).
     #[cfg(test)]
     test_unchecked_ever: Vec<String>,
+    /// A test seam: the check each dial gets in place of [`Identity::start_check_named`].
+    #[cfg(test)]
+    test_check: Option<Box<dyn Fn() -> PeerCheck + Send>>,
 }
 
 /// A per-connection receive/send budget: once a frame's header has arrived,
@@ -105,6 +123,10 @@ pub struct Server {
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// The loop's clock tick when nothing is readable.
 const TICK_MS: i32 = 250;
+/// The loop's clock tick while a dial's check runs: how soon its answer is taken up.
+const CHECK_TICK_MS: i32 = 5;
+/// The most dials whose identity checks run at once ([`Server::dial_checks_max`]).
+const DIAL_CHECKS_MAX: usize = 16;
 /// The most frames [`Server::drain_pid`] reads from one connection of a dead
 /// peer: more than a socket buffer of the smallest frame (8 KiB of 8-byte
 /// headers).
@@ -258,6 +280,9 @@ impl Server {
             socket: config.socket,
             core: KeeperCore::new(can_relaunch),
             conns: BTreeMap::new(),
+            dialing: Vec::new(),
+            dial_checks_max: DIAL_CHECKS_MAX,
+            check_hang: crate::identity::PEER_CHECK_HANG,
             custody: BTreeMap::new(),
             companions: BTreeMap::new(),
             next_companion: 1,
@@ -279,6 +304,8 @@ impl Server {
             test_fail_next_dup: false,
             #[cfg(test)]
             test_unchecked_ever: Vec::new(),
+            #[cfg(test)]
+            test_check: None,
         })
     }
 
@@ -313,9 +340,10 @@ impl Server {
     /// # Errors
     /// Returns an error if `poll` fails for a reason other than `EINTR`.
     pub fn step(&mut self, timeout_ms: i32) -> io::Result<()> {
+        let accepting = self.dialing.len() < self.dial_checks_max;
         let mut fds = vec![PollFd {
             fd: self.listener.as_raw_fd(),
-            events: POLLIN,
+            events: if accepting { POLLIN } else { 0 },
             revents: 0,
         }];
         let conn_ids: Vec<ConnId> = self.conns.keys().copied().collect();
@@ -334,15 +362,16 @@ impl Server {
                 revents: 0,
             });
         }
-        match sys::poll(&mut fds, timeout_ms) {
+        match sys::poll(&mut fds, self.poll_wait(timeout_ms)) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
         let ready = |pfd: &PollFd| pfd.revents & (POLLIN | POLLHUP | POLLERR) != 0;
-        if ready(&fds[0]) {
+        if accepting && ready(&fds[0]) {
             self.accept_all();
         }
+        self.admit_checked();
         for (i, id) in conn_ids.iter().enumerate() {
             if ready(&fds[1 + i]) {
                 self.read_conn(*id);
@@ -364,8 +393,20 @@ impl Server {
         Ok(())
     }
 
+    /// How long one turn asked to wait `timeout_ms` may wait in `poll`: no longer than
+    /// [`CHECK_TICK_MS`] while a dial's check runs, since its answer wakes no descriptor.
+    fn poll_wait(&self, timeout_ms: i32) -> i32 {
+        if self.dialing.is_empty() || (0..=CHECK_TICK_MS).contains(&timeout_ms) {
+            timeout_ms
+        } else {
+            CHECK_TICK_MS
+        }
+    }
+
+    /// Accept every queued dial while fewer than [`Self::dial_checks_max`] checks run, and start
+    /// each one's identity check without waiting for it ([`Self::admit_checked`] takes the answer).
     fn accept_all(&mut self) {
-        loop {
+        while self.dialing.len() < self.dial_checks_max {
             let stream = match self.listener.accept() {
                 Ok((s, _)) => s,
                 Err(_) => return,
@@ -373,51 +414,93 @@ impl Server {
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-            match self.identity.check(&stream, IO_TIMEOUT) {
-                Ok(()) => self.unchecked_said = None,
-                Err(CheckError::Refused(_)) => {
-                    self.refused_dials += 1;
-                    continue;
-                }
-                Err(CheckError::Unchecked(why) | CheckError::Unanswered(why)) => {
-                    self.refused_dials += 1;
-                    #[cfg(test)]
-                    self.test_unchecked_ever.push(why.clone());
-                    if self.unchecked_said.as_deref() != Some(why.as_str()) {
-                        eprintln!(
-                            "keeper: turned away a connection whose identity could not be \
-                             verified: {why}"
-                        );
-                        self.unchecked_said = Some(why);
-                    }
-                    continue;
-                }
-            }
-            let Ok(pid) = aterm_uds::fdpass::peer_pid(&stream) else {
-                self.refused_dials += 1;
-                continue;
-            };
-            let birth = born(pid);
-            let id = self.next_conn;
-            self.next_conn += 1;
-            if !self.core.accept(id, pid, birth) {
-                self.refused_dials += 1;
-                continue;
-            }
-            if !self.watches.contains_key(&pid)
-                && let Some(w) = ExitWatch::watch(pid)
-            {
-                self.watches.insert(pid, w);
-            }
-            self.conns.insert(
-                id,
-                Conn {
-                    stream,
-                    pid,
-                    unwritable: false,
-                },
-            );
+            let check = self.start_check(&stream);
+            let until = Instant::now() + self.check_hang;
+            self.dialing.push(Dialing {
+                stream,
+                check,
+                until,
+            });
         }
+    }
+
+    /// The identity check of the peer on `stream`, started.
+    fn start_check(&self, stream: &CtlStream) -> PeerCheck {
+        #[cfg(test)]
+        if let Some(start) = &self.test_check {
+            return start();
+        }
+        self.identity
+            .start_check_named(stream, aterm_uds::peer::peer_audit_token(stream))
+    }
+
+    /// Admit each dial whose check passed, and turn away each one refused or unanswered at its
+    /// own deadline; the rest keep running.
+    fn admit_checked(&mut self) {
+        let now = Instant::now();
+        for Dialing {
+            stream,
+            check,
+            until,
+        } in std::mem::take(&mut self.dialing)
+        {
+            match check.wait(Duration::ZERO) {
+                Ok(Ok(())) => self.admit(stream),
+                Ok(Err(e)) => self.turn_away(e),
+                Err(check) if now >= until => {
+                    self.turn_away(CheckError::Unanswered(check.unanswered()));
+                }
+                Err(check) => self.dialing.push(Dialing {
+                    stream,
+                    check,
+                    until,
+                }),
+            }
+        }
+    }
+
+    /// Count a dial whose check did not pass, and say once per reason why one went unchecked.
+    fn turn_away(&mut self, e: CheckError) {
+        self.refused_dials += 1;
+        if let CheckError::Unchecked(why) | CheckError::Unanswered(why) = e {
+            #[cfg(test)]
+            self.test_unchecked_ever.push(why.clone());
+            if self.unchecked_said.as_deref() != Some(why.as_str()) {
+                eprintln!(
+                    "keeper: turned away a connection whose identity could not be verified: {why}"
+                );
+                self.unchecked_said = Some(why);
+            }
+        }
+    }
+
+    /// Take a checked dial as a connection of the core's.
+    fn admit(&mut self, stream: CtlStream) {
+        self.unchecked_said = None;
+        let Ok(pid) = aterm_uds::fdpass::peer_pid(&stream) else {
+            self.refused_dials += 1;
+            return;
+        };
+        let birth = born(pid);
+        let id = self.next_conn;
+        self.next_conn += 1;
+        if !self.core.accept(id, pid, birth) {
+            self.refused_dials += 1;
+            return;
+        }
+        if !self.watches.contains_key(&pid)
+            && let Some(w) = ExitWatch::watch(pid)
+        {
+            self.watches.insert(pid, w);
+        }
+        self.conns.insert(
+            id,
+            Conn {
+                stream,
+                pid,
+                unwritable: false,
+            },
+        );
     }
 
     fn read_watch(&mut self, pid: u32) {
@@ -1246,7 +1329,8 @@ mod tests {
             clippy::disallowed_methods,
             reason = "a test playing the window makes the region the keeper is sent"
         )]
-        // SAFETY: `companion_fault` only inspects descriptor metadata without modifying the region.
+        // SAFETY: `companion_fault` only inspects descriptor metadata; this custody stays local,
+        // and neither it nor an alias modifies or resizes the object.
         let (_region, custody) = unsafe { Region::create(len) }.expect("a region");
         let ro = custody.as_fd();
         assert_eq!(
@@ -1260,7 +1344,8 @@ mod tests {
             reason = "a test playing the window makes the region the keeper is sent"
         )]
         let (_twin, writable) =
-            // SAFETY: `companion_fault` only inspects metadata and rejects writable custody.
+            // SAFETY: `companion_fault` only inspects metadata and rejects writable custody; this
+            // private descriptor is never written, resized or mapped.
             unsafe { testing::create_with_writable_custody(len) }.expect("a twin");
         let why = companion_fault(writable.as_fd(), JOURNAL, len as u64).expect("refused");
         assert!(why.contains("open for writing"), "{why}");
@@ -1371,6 +1456,291 @@ mod tests {
         );
         drop(client);
         drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How the dials of [`dials_whose_checks_need_each_other`] ended.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DialsEnded {
+        /// Dials whose HELLO a WELCOME answered.
+        welcomed: usize,
+        /// Dials the keeper closed unanswered.
+        closed: usize,
+        /// The keeper's count of dials turned away.
+        refused: u64,
+        /// Dials turned away because their check did not answer.
+        unanswered: usize,
+    }
+
+    /// `n` dials queued at once, each writing its HELLO, whose checks each answer only once all
+    /// `n` have started, served with at most `max` checks at a time, each under `hang`.
+    fn dials_whose_checks_need_each_other(n: usize, max: usize, hang: Duration) -> DialsEnded {
+        use std::sync::{Arc, Condvar, Mutex, PoisonError};
+        static SCRIPTED: aterm_uds::deadline::Gate =
+            aterm_uds::deadline::Gate::new("akk-unit-scripted-check");
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-dials-{max}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        server.dial_checks_max = max;
+        server.check_hang = hang;
+        let started = Arc::new((Mutex::new(0usize), Condvar::new()));
+        server.test_check = Some(Box::new({
+            let started = Arc::clone(&started);
+            move || {
+                let (count, moved) = &*started;
+                *count.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+                moved.notify_all();
+                let started = Arc::clone(&started);
+                PeerCheck::start_on(&SCRIPTED, HANG, move || {
+                    let (count, moved) = &*started;
+                    let count = count.lock().unwrap_or_else(PoisonError::into_inner);
+                    let (count, waited) = moved
+                        .wait_timeout_while(count, HANG, |running| *running < n)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    drop(count);
+                    if waited.timed_out() {
+                        Err(CheckError::Unchecked("the other checks never ran".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }));
+        let mut dials: Vec<Option<CtlStream>> = (0..n)
+            .map(|_| {
+                let dial = CtlStream::connect(server.socket()).expect("dial");
+                write_frame(&dial, &hello_app(), None).expect("hello");
+                dial.set_read_timeout(Some(HANG))
+                    .expect("the hang detector");
+                Some(dial)
+            })
+            .collect();
+        let (mut welcomed, mut closed) = (0, 0);
+        let began = Instant::now();
+        while dials.iter().any(Option::is_some) {
+            assert!(began.elapsed() < HANG, "a dial was never answered");
+            server.step(10).expect("turn");
+            for slot in &mut dials {
+                let Some(dial) = slot else { continue };
+                let mut pfd = [PollFd {
+                    fd: dial.as_raw_fd(),
+                    events: POLLIN,
+                    revents: 0,
+                }];
+                if !matches!(sys::poll(&mut pfd, 0), Ok(ready) if ready > 0) {
+                    continue;
+                }
+                match read_frame(dial) {
+                    Ok(Some(Incoming {
+                        frame: Frame::Welcome { .. },
+                        ..
+                    })) => welcomed += 1,
+                    Ok(None) | Err(_) => closed += 1,
+                    Ok(Some(other)) => panic!("a dial read {:?} first", other.frame),
+                }
+                *slot = None;
+            }
+        }
+        let unanswered = server
+            .test_unchecked_ever()
+            .iter()
+            .filter(|why| why.contains("trustd"))
+            .count();
+        let ended = DialsEnded {
+            welcomed,
+            closed,
+            refused: server.refused_dials,
+            unanswered,
+        };
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+        ended
+    }
+
+    /// A CONNECTION IS SERVED WHILE ANOTHER DIAL'S CHECK RUNS: a window's HELLO is answered
+    /// while a second dial's check waits for that answer, and each turn meanwhile waits no
+    /// longer than [`CHECK_TICK_MS`], since nothing readable marks a check's answer. Negative
+    /// control: the idle loop's turn waits as long as it was asked.
+    #[test]
+    fn a_connection_is_served_while_another_dials_check_runs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Mutex, PoisonError, mpsc};
+        static SCRIPTED: aterm_uds::deadline::Gate =
+            aterm_uds::deadline::Gate::new("akk-unit-scripted-serve");
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-serve", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        assert_eq!(server.poll_wait(TICK_MS), TICK_MS, "idle");
+        // Past the test's own hang detector: a loop that waits on the check cannot outlast it.
+        server.check_hang = 2 * HANG;
+        let (answer, held) = mpsc::channel::<()>();
+        let held = Mutex::new(Some(held));
+        let first = AtomicBool::new(true);
+        server.test_check = Some(Box::new(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                return PeerCheck::start_on(&SCRIPTED, HANG, || Ok(()));
+            }
+            let held = held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .expect("two dials");
+            PeerCheck::start_on(&SCRIPTED, 2 * HANG, move || {
+                held.recv_timeout(2 * HANG)
+                    .map_err(|e| CheckError::Unchecked(e.to_string()))
+            })
+        }));
+        let window = CtlStream::connect(server.socket()).expect("the window's dial");
+        let began = Instant::now();
+        while server.conns.is_empty() {
+            assert!(began.elapsed() < HANG, "the window was never admitted");
+            server.step(10).expect("turn");
+        }
+        let dial = CtlStream::connect(server.socket()).expect("the second dial");
+        server.step(0).expect("its accept");
+        assert_eq!(server.dialing.len(), 1, "its check runs");
+        for (asked, waits) in [
+            (TICK_MS, CHECK_TICK_MS),
+            (-1, CHECK_TICK_MS),
+            (0, 0),
+            (1, 1),
+        ] {
+            assert_eq!(server.poll_wait(asked), waits, "asked {asked} ms");
+        }
+        write_frame(&window, &hello_app(), None).expect("the window's HELLO");
+        let welcomed = std::thread::spawn(move || {
+            window
+                .set_read_timeout(Some(HANG))
+                .expect("the hang detector");
+            let heard = read_frame(&window).map(|i| i.map(|i| i.frame));
+            answer.send(()).expect("the second check waits");
+            (window, heard)
+        });
+        let began = Instant::now();
+        while server.conns.len() < 2 {
+            assert!(began.elapsed() < HANG, "the second dial was never admitted");
+            server.step(10).expect("turn");
+        }
+        let (window, heard) = welcomed.join().expect("the window's reader");
+        assert!(
+            matches!(heard, Ok(Some(Frame::Welcome { .. }))),
+            "the window's HELLO went unanswered while the check ran: {heard:?}"
+        );
+        assert_eq!(server.poll_wait(TICK_MS), TICK_MS, "no check runs");
+        drop((window, dial, server));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// QUEUED DIALS ARE CHECKED AT ONCE, EACH UNDER ITS OWN DEADLINE: three dials whose checks
+    /// each answer only once all three have started are all welcomed, none turned away. Negative
+    /// control: one check at a time, the order the keeper used to check in, leaves at least the
+    /// first two dials unanswered at their deadline (the last one's answer races its own 200 ms
+    /// deadline, so whether it is welcomed is not asserted).
+    #[test]
+    fn queued_dials_are_checked_at_once_each_under_its_own_deadline() {
+        assert_eq!(
+            dials_whose_checks_need_each_other(3, DIAL_CHECKS_MAX, HANG),
+            DialsEnded {
+                welcomed: 3,
+                closed: 0,
+                refused: 0,
+                unanswered: 0
+            }
+        );
+        let one_at_a_time = dials_whose_checks_need_each_other(3, 1, Duration::from_millis(200));
+        let DialsEnded {
+            welcomed,
+            closed,
+            refused,
+            unanswered,
+        } = one_at_a_time;
+        assert!(
+            unanswered >= 2
+                && closed == unanswered
+                && refused == closed as u64
+                && welcomed + closed == 3,
+            "one check at a time: {one_at_a_time:?}"
+        );
+    }
+
+    /// A PASSED DIAL IS ADMITTED BEHIND A DIAL WHOSE CHECK STILL RUNS: a dial whose check
+    /// answers at once is admitted while an earlier dial's check has not answered, and the
+    /// earlier one is admitted once its own check answers. Negative control: while the second
+    /// is admitted, the first is still being checked, not admitted ahead of its answer.
+    #[test]
+    fn a_passed_dial_is_admitted_behind_a_dial_whose_check_still_runs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Mutex, PoisonError, mpsc};
+        static SCRIPTED: aterm_uds::deadline::Gate =
+            aterm_uds::deadline::Gate::new("akk-unit-scripted-behind");
+        let dir = std::env::temp_dir().join(format!("akk-unit-{}-behind", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut server = Server::bind(ServeConfig {
+            socket: dir.join("k.sock"),
+            identity: Identity::same_uid(),
+            relaunch: Relauncher::Unavailable,
+            version: "test".into(),
+            test_drop_custody: false,
+        })
+        .expect("bind");
+        // Past the test's own hang detector: the slow check is never turned away mid-test.
+        server.check_hang = 2 * HANG;
+        let (release, held) = mpsc::channel::<()>();
+        let held = Mutex::new(Some(held));
+        let first = AtomicBool::new(true);
+        server.test_check = Some(Box::new(move || {
+            if !first.swap(false, Ordering::SeqCst) {
+                return PeerCheck::start_on(&SCRIPTED, HANG, || Ok(()));
+            }
+            let held = held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .expect("one slow dial");
+            PeerCheck::start_on(&SCRIPTED, 2 * HANG, move || {
+                held.recv_timeout(2 * HANG)
+                    .map_err(|e| CheckError::Unchecked(e.to_string()))
+            })
+        }));
+        let slow = CtlStream::connect(server.socket()).expect("the slow dial");
+        server.step(0).expect("its accept");
+        assert_eq!(server.dialing.len(), 1, "the slow check runs");
+        let fast = CtlStream::connect(server.socket()).expect("the fast dial");
+        let began = Instant::now();
+        while server.conns.is_empty() {
+            assert!(
+                began.elapsed() < HANG,
+                "the fast dial waited behind the slow one's check"
+            );
+            server.step(10).expect("turn");
+        }
+        assert_eq!(
+            (server.conns.len(), server.dialing.len()),
+            (1, 1),
+            "the slow dial is still being checked"
+        );
+        release.send(()).expect("the slow check waits");
+        let began = Instant::now();
+        while server.conns.len() < 2 {
+            assert!(began.elapsed() < HANG, "the slow dial was never admitted");
+            server.step(10).expect("turn");
+        }
+        assert_eq!(server.refused_dials, 0, "none turned away");
+        drop((slow, fast, server));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

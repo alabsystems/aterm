@@ -3569,7 +3569,8 @@ pub(crate) mod tests {
         );
         assert!(refusal(&ctx, "send", "y", false).is_some());
 
-        // SAFETY: `leader` is this test's live child and `SIGUSR1` is trapped by its script.
+        // SAFETY: `leader` is this test's live child (reaped only by `job`'s drop) and `SIGUSR1` is
+        // trapped by its script.
         assert_eq!(unsafe { libc::kill(leader, libc::SIGUSR1) }, 0);
         assert_eq!(sink.write_frame_nonparking(b"x").expect("the key"), 1);
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;

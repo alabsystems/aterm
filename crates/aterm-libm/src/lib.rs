@@ -1,32 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! First-party `libm` facade wired via `[patch.crates-io]`, forwarding the
-//! 68 `f32`/`f64` math functions used by `num-traits` (66 functions in
-//! `float_impl_libm!` / `FloatCore`) and `naga` (`asinh`, `rint`, `rintf`)
-//! to `std`.
-//!
-//! # Fidelity
-//!
-//! * **Exact IEEE operations**: `floor`, `ceil`, `round`, `trunc`, `fabs`,
-//!   `copysign`, `sqrt`, `fma`, `rint`, and `fdim`.
-//! * **Transcendentals**: forwarded to `std` (platform libm on native,
-//!   `compiler-builtins` musl libm on `wasm32-unknown-unknown`). `atanh` and
-//!   `atanhf` evaluate `std`'s `ln_1p` formula on `x.abs()` and restore the
-//!   sign to avoid cancellation near `-1`. Verified against recorded musl
-//!   outputs in `tests/recorded.rs`.
-//!
-//! Requires `std` (present on all aterm targets, including
-//! `wasm32-unknown-unknown`); upstream feature flags (`arch`,
-//! `force-soft-floats`, `unstable*`) are accepted as no-ops.
+//! First-party `libm` facade forwarding `f32`/`f64` math functions to `std`.
 
 #![warn(missing_docs)]
 
-/// Forward a libm function pair (`f64` name, `f32` name) to one std method.
-///
-/// The bodies call `f64::method(..)` by path, never a bare name: the crate
-/// root defines functions called `sin`, `floor` and so on, and a bare call
-/// would recurse into itself.
 macro_rules! forward {
     ($($what:literal: $f64:ident / $f32:ident ($($a:ident),+) => $std:ident;)*) => {$(
         #[doc = concat!($what, " (`f64`); forwards to `f64::", stringify!($std), "`.")]
@@ -80,15 +58,14 @@ forward! {
     "Inverse hyperbolic cosine": acosh / acoshf (x) => acosh;
 }
 
-/// Inverse hyperbolic tangent (`f64`), evaluated on the magnitude to avoid
-/// cancellation near `-1` in std's `ln_1p` formula, then given `x`'s sign.
+/// Inverse hyperbolic tangent (`f64`).
 #[inline]
 #[must_use]
 pub fn atanh(x: f64) -> f64 {
     f64::atanh(x.abs()).copysign(x)
 }
 
-/// Inverse hyperbolic tangent (`f32`); see [`atanh`].
+/// Inverse hyperbolic tangent (`f32`).
 #[inline]
 #[must_use]
 pub fn atanhf(x: f32) -> f32 {
@@ -96,9 +73,6 @@ pub fn atanhf(x: f32) -> f32 {
 }
 
 /// Positive difference: `x - y` when `x > y`, else `+0.0` (`f64`).
-///
-/// Upstream's `generic::fdim` body, so a NaN operand yields the NaN that
-/// `x - y` produces, as upstream's does.
 #[inline]
 #[must_use]
 pub fn fdim(x: f64, y: f64) -> f64 {
@@ -106,8 +80,6 @@ pub fn fdim(x: f64, y: f64) -> f64 {
 }
 
 /// Positive difference: `x - y` when `x > y`, else `+0.0` (`f32`).
-///
-/// Upstream's `generic::fdim` body; see [`fdim`].
 #[inline]
 #[must_use]
 pub fn fdimf(x: f32, y: f32) -> f32 {

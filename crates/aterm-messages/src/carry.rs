@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seamless-handoff carry: plain data the outgoing process ships and the
-//! successor re-seeds (`MessageCenter::carried` / `seed_carried`). The host
-//! serialises it with whatever the handoff already uses.
+//! Seamless-handoff carry data (`MessageCenter::carried` / `seed_carried`).
 
-/// One live message as carried: strings and numbers, each intent in its
-/// [`crate::model::Intent::encode`] form.
+/// One live message as carried across seamless handoff.
 #[allow(
     clippy::struct_excessive_bools,
     reason = "a plain wire record: each flag is an independent fact the handoff ships"
@@ -21,16 +18,13 @@ pub struct CarriedMessage {
     pub tag: String,
     /// The severity word; an unknown one drops the row on seed.
     pub severity: String,
-    /// The original posted severity when different from the current mark.
-    /// An older parent's carry has none; until the authoritative log is
-    /// reloaded, the seed uses the current severity as its fallback.
+    /// Original posted severity when different from the current mark.
     pub posted_severity: Option<String>,
     /// The glyph; outside the closed set it becomes the fallback.
     pub glyph: char,
     /// The title.
     pub title: String,
-    /// The title's short form for the band (`Message::short_title`); an
-    /// older parent's rows carry none, and elide their title.
+    /// Short title for the band (`Message::short_title`).
     pub short_title: Option<String>,
     /// The detail lines.
     pub detail: Vec<String>,
@@ -42,35 +36,25 @@ pub struct CarriedMessage {
     pub key: Option<String>,
     /// The meter fill, when metered.
     pub fill_permille: Option<u16>,
-    /// The meter's stats (volatile, but the successor's first frame shows
-    /// the parent's last).
+    /// Meter stats from the parent's last frame.
     pub stats: String,
-    /// The meter was busy ([`crate::model::Meter::busy`]); an older build's
-    /// carry reads as still.
+    /// Whether the meter was busy ([`crate::model::Meter::busy`]).
     pub busy: bool,
     /// Whether the row was on glass when the parent froze.
     pub on_glass: bool,
-    /// Whether the band painted `detail[0]` beside the title
-    /// (`Message::excerpt`); an older parent's rows carry `true`.
+    /// Whether the band painted `detail[0]` beside the title (`Message::excerpt`).
     pub excerpt: bool,
-    /// The words the row finishes with (`Message::finished`); an older
-    /// parent's rows carry none and derive them from the title.
+    /// Words the row finishes with (`Message::finished`).
     pub finished: Option<String>,
-    /// A record about a previous run (`Message::retrospective`), which keeps
-    /// its lower rank across the handoff; an older parent's rows carry `false`.
+    /// Whether the row is a record about a previous run (`Message::retrospective`).
     pub retrospective: bool,
-    /// The row is the wire's ([`crate::model::Origin::wire_owned`]): a keyless
-    /// `notice post` row has no `wire.` key to say so. An older parent's rows
-    /// carry `false`.
+    /// Whether the row is wire-owned ([`crate::model::Origin::wire_owned`]).
     pub wire: bool,
-    /// Duplicate posts folded into the row (`Live::repeats`, 1 = posted once);
-    /// an older parent's rows carry 1, and 0 reads as 1.
+    /// Duplicate posts folded into the row (`Live::repeats`, 1 = posted once).
     pub repeats: u32,
 }
 
-/// Everything the successor needs: the next id and the live rows in glass
-/// order (on-glass rows first). No log lines cross: the parent flushes its own
-/// record before it execs, and the successor's begins at Commit (design §3.7).
+/// Next message id and live rows in glass order (on-glass rows first).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Carry {
     /// The parent's next id.

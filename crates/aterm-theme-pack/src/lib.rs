@@ -439,8 +439,10 @@ impl PartialEq for PackInstall {
 /// Installs `theme` as `<id>.conf` into `dir`, replacing modified files only when `replace` is set.
 ///
 /// # Errors
-/// Returns [`InstallError`] if `dir` is missing, a case-variant or modified file blocks the write,
-/// `theme` names a built-in, or the file fails to parse or write.
+/// [`InstallError::Failed`] with no folder, a same-name file in another case, a pack copy that
+/// does not parse, or a failed write; [`InstallError::Refused`] for an invalid theme id or a
+/// built-in's name; [`InstallError::Exists`] when a different `<id>.conf` is there and `replace`
+/// is false.
 pub fn install(
     theme: &PackTheme,
     dir: Option<&Path>,

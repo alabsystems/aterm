@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The service units that run a lane, rendered from typed fields. Each names the snapshot
-//! binary (never a checkout) and carries its sha256, which `lane run` checks against
-//! itself ([`super::self_check`]).
+//! Service units that run a lane, rendered from typed fields.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +10,7 @@ use super::LaneKind;
 /// The Apple lane's launchd label.
 pub const LAUNCHD_LABEL: &str = "systems.alab.aterm-auto-alab";
 
-/// The retired claude/codex vendor lane's label: booted out wherever it is still loaded.
+/// The retired claude/codex vendor lane's label.
 pub const RETIRED_LABEL: &str = "systems.alab.aterm-auto-vendor";
 
 /// The Linux lane's service unit.
@@ -21,8 +19,7 @@ pub const SYSTEMD_SERVICE: &str = "aterm-auto-atpkg.service";
 /// The Linux lane's timer.
 pub const SYSTEMD_TIMER: &str = "aterm-auto-atpkg.timer";
 
-/// The Apple lane runs every 6 h: a run that finds work builds a program from source, and
-/// a signed source release lands a few times a week, not a few times a day.
+/// The Apple lane's 6-hour start interval in seconds.
 pub const START_INTERVAL_SECS: u64 = 21_600;
 
 /// What a unit is rendered from.
@@ -38,11 +35,9 @@ pub struct UnitSpec {
     pub home: PathBuf,
     /// The lanes' state root (`Ctx::state_dir`).
     pub state_dir: PathBuf,
-    /// `XDG_CONFIG_HOME` as the installer resolved it: the run reads the store prefix
-    /// (`[packages].prefix`) through it, which must be the store the unit's PATH names.
+    /// `XDG_CONFIG_HOME` as the installer resolved it.
     pub xdg_config_home: PathBuf,
-    /// The atpkg shim dir (`<prefix>/bin`), first on PATH: the Trust drivers a pack
-    /// resolves.
+    /// The atpkg shim dir (`<prefix>/bin`), first on PATH.
     pub shim_bin: PathBuf,
 }
 
@@ -149,9 +144,7 @@ impl Plist {
     }
 }
 
-/// The Apple lane's launchd user agent: the snapshot's `lane run alab --sha256 <hex>`,
-/// PATH led by the atpkg shim dir, every 6 h, in the background, launchd's own capture
-/// beside the lane's log.
+/// Render the Apple lane's launchd user agent.
 #[must_use]
 pub fn launchd(spec: &UnitSpec) -> Unit {
     let s = |v: &str| Plist::Str(v.to_string());
@@ -217,7 +210,6 @@ pub fn launchd(spec: &UnitSpec) -> Unit {
     }
 }
 
-/// One `ExecStart=` word: quoted, with systemd's specifier `%` and variable `$` escaped.
 fn exec_word(s: &str) -> String {
     format!(
         "\"{}\"",
@@ -228,7 +220,6 @@ fn exec_word(s: &str) -> String {
     )
 }
 
-/// One `Environment=` assignment, quoted, specifiers escaped.
 fn env_word(k: &str, v: &str) -> String {
     format!(
         "\"{k}={}\"",
@@ -238,8 +229,7 @@ fn env_word(k: &str, v: &str) -> String {
     )
 }
 
-/// The Linux lane's service: a oneshot of the snapshot's `lane run linux --sha256 <hex>`
-/// (several program builds back to back, so a 4 h limit), PATH led by the atpkg shim dir.
+/// Render the Linux lane's systemd service unit.
 #[must_use]
 pub fn systemd_service(spec: &UnitSpec) -> Unit {
     let exec = spec

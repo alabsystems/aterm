@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aterm_uds::process::{
     END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, Identity, Lineage, Markers,
-    ProcessBirth, ProcessPresence, at_program_check, boot_id, end_proven, group_members,
-    launchd_idversion, process_presence, read_lineage, read_process_birth, read_process_markers,
+    ProcessBirth, ProcessPresence, boot_id, end_proven, group_members, launchd_idversion,
+    process_presence, read_lineage, read_process_birth, read_process_markers, thread_ran,
 };
 
 use crate::Ctx;
@@ -38,7 +38,7 @@ pub trait Kernel {
     fn exe(&self, pid: i32) -> Option<PathBuf>;
     /// `pid`'s marker variables, or `None` when unreadable.
     fn markers(&self, pid: i32) -> Option<Markers>;
-    /// Whether `pid` shows the program-check signature; `None` when unreadable.
+    /// Whether macOS's program check may hold `pid`: `Some(false)` only once its one thread ran ([`thread_ran`]), so a lone unstarted thread at any age, arch or volume reads `Some(true)`: its environment is never read, and it is never signalled. `None` when unreadable.
     fn held(&self, pid: i32) -> Option<bool>;
     /// launchd's pid version; `None` when unreadable.
     fn launchd_version(&self) -> Option<i32>;
@@ -82,7 +82,7 @@ impl Kernel for LiveKernel {
         read_process_markers(pid)
     }
     fn held(&self, pid: i32) -> Option<bool> {
-        at_program_check(pid)
+        thread_ran(pid).map(|ran| !ran)
     }
     fn launchd_version(&self) -> Option<i32> {
         launchd_idversion()

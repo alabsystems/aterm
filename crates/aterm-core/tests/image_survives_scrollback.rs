@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Inline images survive the scrollback boundary: an inline image (OSC 1337 `File=`, and
-//! sixel through the same placement) is one `ImageRef` per covered cell in the grid's
-//! `CellExtras` side table, and a footprint row that scrolls off the top carries its refs
-//! into history, so the render snapshot (`cell_frame(..).images`) shows the picture again.
+
+//! Inline images survive the scrollback boundary and appear in `cell_frame(..).images`.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -16,7 +13,6 @@ fn place_card(term: &mut Terminal, args: &str) {
     term.process(&osc_1337_file(args, &payload));
 }
 
-/// Every image placement in the rendered frame as `(row, col, tile_row, tile_col)`.
 fn frame_image_cells(frame: &RenderInput) -> Vec<(usize, usize, u16, u16)> {
     let mut v = Vec::new();
     for (r, row) in frame.images.iter().enumerate() {
@@ -27,9 +23,6 @@ fn frame_image_cells(frame: &RenderInput) -> Vec<(usize, usize, u16, u16)> {
     v
 }
 
-/// A 4x3 image pushed off the top by ordinary output is whole when scrolled back to,
-/// through either history tier (the extras-carrying ring or the `Line` store). The `Line`
-/// round trip itself is pinned in aterm-grid's `scrollback_images` tests.
 #[test]
 fn an_image_scrolled_off_the_top_is_still_there_when_you_scroll_back() {
     let mut term = Terminal::new(10, 20);
@@ -40,7 +33,6 @@ fn an_image_scrolled_off_the_top_is_still_there_when_you_scroll_back() {
     let live = frame_image_cells(&term.cell_frame(10, 20));
     assert_eq!(live.len(), 12, "4x3 footprint covers 12 cells while live");
 
-    // Push it well off the top with ordinary text.
     for i in 0..40 {
         term.process(format!("f{i}\r\n").as_bytes());
     }
@@ -56,8 +48,6 @@ fn an_image_scrolled_off_the_top_is_still_there_when_you_scroll_back() {
         12,
         "scrolling back to a 4x3 inline image must show all 12 tiles, not a hole"
     );
-    // Same tile geometry, same anchor column, and the three footprint rows are
-    // adjacent — i.e. the picture, not twelve scattered fragments.
     let tiles: Vec<(u16, u16)> = back.iter().map(|&(_, _, tr, tc)| (tr, tc)).collect();
     let expected: Vec<(u16, u16)> = (0..3u16)
         .flat_map(|r| (0..4u16).map(move |c| (r, c)))
@@ -71,9 +61,6 @@ fn an_image_scrolled_off_the_top_is_still_there_when_you_scroll_back() {
     assert_eq!(rows[4] + 1, rows[8], "footprint rows must stay adjacent");
 }
 
-/// The payload is shared, not copied per row: the scrolled-back tiles must point
-/// at one allocation, or a full-width image would cost its own megabytes per row
-/// of history.
 #[test]
 fn a_scrolled_back_image_shares_one_payload_across_its_rows() {
     let mut term = Terminal::new(10, 20);
@@ -96,11 +83,6 @@ fn a_scrolled_back_image_shares_one_payload_across_its_rows() {
     );
 }
 
-/// A partial scroll puts history above and live content below in one frame, and a live
-/// image lands where its text landed. The image cells sit in the side table at live
-/// coordinates while the viewport is drawn through `display_offset`; only a partial scroll
-/// can misplace them (at offset 0 the two coincide, and scrolled fully to the top no live
-/// row is on screen).
 #[test]
 fn a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back() {
     let mut term = Terminal::new(10, 20);
@@ -120,8 +102,6 @@ fn a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back() {
         "the footprint is on screen to begin with"
     );
 
-    // Scroll back by one line: every row on screen shifts down by exactly one,
-    // the image included, and nothing may be dropped.
     term.scroll_display(1);
     let scrolled: Vec<(usize, usize)> = frame_image_cells(&term.cell_frame(10, 20))
         .iter()
@@ -134,9 +114,6 @@ fn a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back() {
     );
 }
 
-/// A window made shorter and then taller again brings its top rows back from
-/// history with their pictures, and they still scroll off whole afterwards, even
-/// when the screen was erased while they were in history.
 #[test]
 fn an_image_a_taller_window_brings_back_keeps_its_tiles() {
     for erase in ["", "\x1b[2J\x1b[H"] {

@@ -300,7 +300,7 @@ mod os {
     pub(super) fn rusage() -> Option<Rusage> {
         let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
         let pid = libc::c_int::try_from(std::process::id()).ok()?;
-        // SAFETY: `info` is writable for one `rusage_info_v4`.
+        // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for.
         let rc = unsafe {
             libc::proc_pid_rusage(
                 pid,
@@ -324,7 +324,8 @@ mod os {
     pub(super) fn task_events() -> Option<TaskEvents> {
         let mut info = TaskEventsInfo::default();
         let mut count = TASK_EVENTS_INFO_COUNT;
-        // SAFETY: `info` is eight writable `integer_t`s and `mach_task_self_` is this task's port.
+        // SAFETY: `info` is eight writable `integer_t`s and `count` says so; `mach_task_self_` is
+        // this process's own task port, set before `main` runs and never written after.
         let kr = unsafe {
             task_info(
                 mach_task_self_,

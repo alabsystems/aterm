@@ -16,6 +16,10 @@ pub enum MaterializePolicy {
 }
 
 /// Set the calling thread's dataless-file policy.
+///
+/// # Errors
+///
+/// The kernel's errno when it refused the call; off macOS this is a no-op that succeeds.
 pub fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result<(), i32> {
     #[cfg(target_vendor = "apple")]
     {
@@ -32,6 +36,10 @@ pub fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result<(), i3
 }
 
 /// Run once on the GUI's main thread at startup so the event loop never waits on a download.
+///
+/// # Errors
+///
+/// The errno, for the caller to log; startup proceeds either way.
 #[inline]
 pub fn main_thread_never_materializes() -> Result<(), i32> {
     set_thread_materialize_policy(MaterializePolicy::Off)
@@ -69,12 +77,24 @@ pub struct PolicyOutcome {
     pub failed: Vec<(&'static str, i32)>,
 }
 
-/// Set the calling thread's walker I/O policy.
+/// How a walker thread's disk reads are scheduled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskIo {
+    /// `IOPOL_THROTTLE` at thread scope: the reads wait behind other I/O to
+    /// the same device, whatever the thread's QoS class.
+    Throttled,
+    /// No disk policy of the thread's own: its QoS class decides.
+    Inherited,
+}
+
+/// Set the calling thread's walker I/O policy: dataless files never
+/// downloaded, no access-time updates, and its disk reads as `disk` says.
 #[must_use]
-pub fn set_walker_thread_policy() -> PolicyOutcome {
+pub fn set_walker_thread_policy(disk: DiskIo) -> PolicyOutcome {
     #[cfg(target_vendor = "apple")]
     {
         let mut out = PolicyOutcome::default();
+        let throttle = ("disk-throttle", sys::IOPOL_TYPE_DISK, sys::IOPOL_THROTTLE);
         for (which, iotype, policy) in [
             (
                 "materialize-dataless-off",
@@ -86,8 +106,10 @@ pub fn set_walker_thread_policy() -> PolicyOutcome {
                 sys::IOPOL_TYPE_VFS_ATIME_UPDATES,
                 sys::IOPOL_ATIME_UPDATES_OFF,
             ),
-            ("disk-throttle", sys::IOPOL_TYPE_DISK, sys::IOPOL_THROTTLE),
-        ] {
+        ]
+        .into_iter()
+        .chain((disk == DiskIo::Throttled).then_some(throttle))
+        {
             if let Err(errno) = set_thread_policy_raw(iotype, policy) {
                 out.failed.push((which, errno));
             }
@@ -96,14 +118,32 @@ pub fn set_walker_thread_policy() -> PolicyOutcome {
     }
     #[cfg(not(target_vendor = "apple"))]
     {
+        let _ = disk;
         PolicyOutcome::default()
+    }
+}
+
+/// Whether the calling thread's own disk policy is `IOPOL_THROTTLE`;
+/// `None` off macOS or when the query fails.
+#[must_use]
+pub fn thread_disk_throttled() -> Option<bool> {
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: Plain FFI query with two integer arguments; see the declaration.
+        let raw = unsafe { sys::getiopolicy_np(sys::IOPOL_TYPE_DISK, sys::IOPOL_SCOPE_THREAD) };
+        (raw >= 0).then_some(raw == sys::IOPOL_THROTTLE)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
     }
 }
 
 /// One `setiopolicy_np` at thread scope.
 #[cfg(target_vendor = "apple")]
 fn set_thread_policy_raw(iotype: libc::c_int, policy: libc::c_int) -> Result<(), i32> {
-    // SAFETY: Integer-only FFI call that changes only the calling thread's policy.
+    // SAFETY: integer-only FFI call that changes only the calling thread's
+    // policy; signature per the declaration below.
     if unsafe { sys::setiopolicy_np(iotype, sys::IOPOL_SCOPE_THREAD, policy) } == 0 {
         Ok(())
     } else {

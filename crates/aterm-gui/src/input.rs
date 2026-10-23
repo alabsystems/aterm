@@ -1219,7 +1219,9 @@ mod tests {
             let name: Vec<u16> = format!("aterm-egress-capture-{}-{nth}\0", std::process::id())
                 .encode_utf16()
                 .collect();
-            // SAFETY: NULL attrs; manual-reset, initially unsignaled; NUL-terminated wide name.
+            // SAFETY: NULL attrs; manual-reset, initially unsignaled; NUL-terminated
+            // wide name. The second call opens the SAME object (documented
+            // `CreateEventW` behaviour for an existing name).
             let ours = unsafe { winapi::CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr()) };
             let theirs = unsafe { winapi::CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr()) };
             assert!(ours != 0 && theirs != 0, "CreateEventW for the capture");

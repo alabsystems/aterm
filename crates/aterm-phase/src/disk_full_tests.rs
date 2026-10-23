@@ -6,7 +6,8 @@
 use super::*;
 use crate::anchors::anchor_text;
 use crate::prompt::fixtures::{
-    TOOL_DISK_FULL_2_1_309, TRANSCRIPT_DEGRADED_EACCES_2_1_304, composer, ink_wrap, rows, screen,
+    TOOL_DISK_FULL_2_1_309, TOOL_ERROR_AUTO_MODE_2_1_309, TOOL_PRESTART_PRINTED_2_1_309,
+    TRANSCRIPT_DEGRADED_EACCES_2_1_304, composer, ink_wrap, rows, screen,
 };
 
 /// The measured words the vendor maps `EACCES` to, in the measured row.
@@ -549,4 +550,329 @@ fn a_goal_cleared_on_a_full_disk_reads_from_its_row() {
     let d = disk_full(&r).expect("the goal's row");
     assert_eq!(d.source, Source::GoalCleared);
     assert_eq!(disk_full(&busy(&[], &goal, "  ? for shortcuts")), None);
+}
+
+/// The measured Bash error result (2.1.309, an auto-mode refusal): its
+/// screen, the `⎿` row the result opens on, and how many rows its message
+/// takes.
+fn measured_error() -> (Vec<String>, usize, usize) {
+    let r = screen(TOOL_ERROR_AUTO_MODE_2_1_309);
+    let at = r
+        .iter()
+        .rposition(|row| result_row(row).is_some_and(|t| t.starts_with("Error: Auto mode")))
+        .expect("the measured error row");
+    let rows = 1 + r[at + 1..]
+        .iter()
+        .take_while(|row| message_row(row))
+        .count();
+    (r, at, rows)
+}
+
+/// The directory 2.1.309's notices name on the measured build (its
+/// temporary directory, `/private/tmp/claude-` and a three-digit uid).
+const MEASURED_DIR: &str = "/private/tmp/claude-502";
+
+/// The words of 2.1.309's pre-start notice, from the bundle's template:
+/// `said` naming `code`, the measured directory, and the advice.
+fn pre_start_words(said: &str, code: &str) -> String {
+    format!(
+        "{}{said}{code}){}{MEASURED_DIR}{}{} {}",
+        anchor_text("wall.disk_full.pre_start"),
+        anchor_text("wall.disk_full.pre_start_volume"),
+        anchor_text("wall.disk_full.tool_dir"),
+        anchor_text("wall.disk_full.pre_start_ran"),
+        anchor_text("wall.disk_full.free_space"),
+    )
+}
+
+/// The pre-start notice of a disk with no space left.
+fn full_words() -> String {
+    pre_start_words(anchor_text("wall.disk_full.pre_start_full"), "ENOSPC")
+}
+
+/// The measured error result's rows replaced by `text` behind `Error: `,
+/// wrapped as Claude Code wraps a result's message in a `cols`-column pane:
+/// the first row after the measured `⎿` and its white space, the rest five
+/// columns in.
+fn in_error_place(text: &str, cols: usize) -> Vec<String> {
+    let (mut r, at, rows) = measured_error();
+    let glyph = r[at][..r[at].find("Error: ").expect("the measured head")].to_string();
+    let wrapped = ink_wrap(&format!("Error: {text}"), cols - RESULT_BODY.len());
+    let drawn = std::iter::once(format!("{glyph}{}", wrapped[0]))
+        .chain(wrapped[1..].iter().map(|w| format!("{RESULT_BODY}{w}")));
+    r.splice(at..at + rows, drawn);
+    r
+}
+
+/// A CALL CLAUDE CODE DID NOT START (2.1.309): its pre-start notice is the
+/// call's error result, which Claude Code draws as it draws every Bash error
+/// result (MEASURED: an auto-mode refusal): on the vendor's `⎿` row after
+/// `Error: `, the rest wrapped exactly five columns in. The bundle's words,
+/// rewrapped as the measured message is, read there with their code (ENOSPC
+/// for the full form, EDQUOT for the quota form) at every width down to a
+/// 40-column pane, where the anchor's own row ends `started:`. CONTROL: the
+/// rewrap of the measured message is the
+/// vendor's, and the measured screen itself (the classifier's words) reads
+/// as no full disk.
+#[test]
+fn a_command_not_started_reads_in_the_place_of_its_error_result() {
+    let (r, at, rows) = measured_error();
+    assert!(
+        r[at].starts_with("  ⎿ \u{a0}Error: "),
+        "the vendor's `⎿`, a space and a no-break space: {:?}",
+        r[at]
+    );
+    assert_eq!(rows, 4, "wrapped onto four rows at 144 columns");
+    let measured: Vec<String> = std::iter::once(result_row(&r[at]).expect("a `⎿` row"))
+        .chain(r[at + 1..at + rows].iter().map(|row| row.trim()))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        ink_wrap(&measured.join(" "), 144 - RESULT_BODY.len()),
+        measured,
+        "the rewrap is the vendor's wrap"
+    );
+    assert_eq!(disk_full(&r), None, "the classifier's words");
+
+    let quota = pre_start_words(anchor_text("wall.disk_full.pre_start_quota"), "EDQUOT");
+    for cols in [144, 100, 80, 60, 40] {
+        for (words, code) in [(full_words(), Code::Enospc), (quota.clone(), Code::Edquot)] {
+            let d = disk_full(&in_error_place(&words, cols))
+                .unwrap_or_else(|| panic!("{code:?} at {cols}"));
+            assert_eq!(
+                (d.code, d.source, d.row),
+                (code, Source::ToolOutput, at),
+                "at {cols}"
+            );
+            assert!(
+                d.message
+                    .starts_with(anchor_text("wall.disk_full.pre_start").trim_end()),
+                "{:?}",
+                d.message
+            );
+        }
+    }
+}
+
+/// A PRINTED COPY READS ONLY WHERE ITS ROWS ARE A WORD WRAP'S: the bundle's
+/// words printed by a command, drawn in every pane from 40 to 220 columns,
+/// read as the notice exactly where each of their row breaks falls just
+/// after a space or inside the directory (rows a word wrap of the same
+/// words also draws, told apart only by the pane's wrap width) and nowhere
+/// else; the notice itself, word-wrapped into its error result's place,
+/// reads with its code at every one of those widths. CONTROL: the copy of
+/// the full form at 144 (the measured capture), 100, 120, 145, 165 and 200
+/// columns breaks a word or opens a row on a space, and does not read.
+#[test]
+fn a_printed_copy_reads_only_where_its_rows_are_a_word_wraps() {
+    let quota = pre_start_words(anchor_text("wall.disk_full.pre_start_quota"), "EDQUOT");
+    for (words, code) in [(full_words(), Code::Enospc), (quota, Code::Edquot)] {
+        let line = format!("Error: {words}");
+        let chars: Vec<char> = line.chars().collect();
+        let dir_at = line[..line.find(MEASURED_DIR).expect("the directory")]
+            .chars()
+            .count();
+        let inside_dir = dir_at + 1..dir_at + MEASURED_DIR.chars().count();
+        for cols in 40..=220 {
+            let real = disk_full(&in_error_place(&words, cols)).map(|d| (d.code, d.source));
+            assert_eq!(real, Some((code, Source::ToolOutput)), "{code:?} at {cols}");
+            let like_words = (cols - 10..chars.len())
+                .step_by(cols - 10)
+                .all(|b| chars[b - 1] == ' ' || inside_dir.contains(&b));
+            assert_eq!(
+                disk_full(&in_printed_place(&line, cols)).is_some(),
+                like_words,
+                "{code:?} printed at {cols}"
+            );
+        }
+    }
+    let line = format!("Error: {}", full_words());
+    for cols in [144, 100, 120, 145, 165, 200] {
+        assert_eq!(
+            disk_full(&in_printed_place(&line, cols)),
+            None,
+            "printed at {cols}"
+        );
+    }
+}
+
+/// The rows of a command's printed output `line` as Claude Code 2.1.309
+/// draws them in a `cols`-column pane, in the place of the measured printed
+/// capture's: wrapped by column at `cols - 10` (MEASURED: the capture's
+/// 447-character line breaks every 134 characters at 144 columns, `tel|l`
+/// included), the first row on the vendor's `⎿` row, the rest five columns
+/// in, so a row that opens on a space sits six in.
+fn in_printed_place(line: &str, cols: usize) -> Vec<String> {
+    let mut r = screen(TOOL_PRESTART_PRINTED_2_1_309);
+    let at = r
+        .iter()
+        .position(|row| result_row(row).is_some_and(|t| t.starts_with("Error: The command")))
+        .expect("the printed head");
+    let glyph = r[at][..r[at].find("Error: ").expect("the printed head")].to_string();
+    let rows = 1 + r[at + 1..]
+        .iter()
+        .take_while(|row| row.starts_with(RESULT_BODY))
+        .count();
+    let chars: Vec<char> = line.chars().collect();
+    let drawn: Vec<String> = chars
+        .chunks(cols - 10)
+        .enumerate()
+        .map(|(k, chunk)| {
+            let text: String = chunk.iter().collect();
+            let lead = if k == 0 { glyph.as_str() } else { RESULT_BODY };
+            format!("{lead}{}", text.trim_end())
+        })
+        .collect();
+    r.splice(at..at + rows, drawn);
+    r
+}
+
+/// NEGATIVE CONTROLS, each the pre-start notice moved, cut or changed: a
+/// command's printed output of the same words (MEASURED: wrapped by column,
+/// a row six columns in and a word broken across rows; the line it prints
+/// is the bundle's words, which read in the error result's place); a row
+/// of the message one column deeper; the rows under the composer; the
+/// words on the `⎿` row with no `Error: `; as a failed command's output
+/// under its exit line, with or without `Error: `; without the directory
+/// phrase, or with no directory named; with another volume phrase, another account of what failed, or
+/// other advice; the full words with EDQUOT, the quota words with ENOSPC,
+/// another code, a code with more words in its parenthesis; the `⎿` one
+/// column deeper; a `⏺` reply of the worker's; in an earlier turn (a
+/// person's message drawn since). CONTROL: the notice in the measured
+/// place reads.
+#[test]
+fn the_pre_start_words_anywhere_else_are_not_read() {
+    let words = full_words();
+    let placed = in_error_place(&words, 144);
+    let (_, at, _) = measured_error();
+    assert!(disk_full(&placed).is_some(), "the control");
+
+    let printed = screen(TOOL_PRESTART_PRINTED_2_1_309);
+    let head = printed
+        .iter()
+        .position(|row| result_row(row).is_some_and(|t| t.starts_with("Error: The command")))
+        .expect("the printed head");
+    let line: String = std::iter::once(result_row(&printed[head]).expect("a `⎿` row"))
+        .chain(
+            printed[head + 1..]
+                .iter()
+                .take_while(|row| row.starts_with(RESULT_BODY))
+                .map(|row| &row[RESULT_BODY.len()..]),
+        )
+        .collect();
+    assert_eq!(
+        line,
+        format!("Error: {words}"),
+        "the bundle's words, printed"
+    );
+    assert_eq!(in_printed_place(&line, 144), printed, "the column wrap");
+    assert!(
+        printed[head + 1].starts_with("      "),
+        "{:?}",
+        printed[head + 1]
+    );
+    assert_eq!(disk_full(&printed), None, "a command's printed output");
+
+    let message = placed[at + 1..]
+        .iter()
+        .take_while(|row| message_row(row))
+        .count();
+    assert!(message >= 2, "the message wraps at 144 columns");
+    let mut deeper = placed.clone();
+    deeper[at + 2] = format!(" {}", deeper[at + 2]);
+    assert_eq!(disk_full(&deeper), None, "a message row six columns in");
+
+    let mut under = placed.clone();
+    let notice: Vec<String> = under.drain(at..=at + message).collect();
+    under.extend(notice);
+    assert_eq!(disk_full(&under), None, "under the composer");
+
+    let mut bare = placed.clone();
+    bare[at] = bare[at].replacen("Error: ", "", 1);
+    assert_eq!(disk_full(&bare), None, "no `Error: `");
+
+    let wrapped = ink_wrap(&words, 144 - RESULT_BODY.len());
+    let output: Vec<&str> = wrapped.iter().map(String::as_str).collect();
+    assert_eq!(disk_full(&with_notice(&output)), None, "a command's output");
+    let errored = ink_wrap(&format!("Error: {words}"), 144 - RESULT_BODY.len());
+    let output: Vec<&str> = errored.iter().map(String::as_str).collect();
+    assert_eq!(
+        disk_full(&with_notice(&output)),
+        None,
+        "a command's output, `Error: ` and all"
+    );
+
+    let dir = anchor_text("wall.disk_full.tool_dir");
+    let undirected = words.replace(dir, "");
+    assert_ne!(undirected, words);
+    assert_eq!(
+        disk_full(&in_error_place(&undirected, 144)),
+        None,
+        "no directory phrase"
+    );
+    let nameless = words.replace(MEASURED_DIR, "");
+    assert_ne!(nameless, words);
+    assert_eq!(
+        disk_full(&in_error_place(&nameless, 144)),
+        None,
+        "no directory named"
+    );
+    for (part, other) in [
+        ("wall.disk_full.pre_start_volume", " on the disk holding "),
+        (
+            "wall.disk_full.pre_start_ran",
+            ", so its output could not be saved.",
+        ),
+        (
+            "wall.disk_full.free_space",
+            "Delete files there that are no longer needed, then retry.",
+        ),
+    ] {
+        let changed = words.replace(anchor_text(part), other);
+        assert_ne!(changed, words);
+        assert_eq!(
+            disk_full(&in_error_place(&changed, 144)),
+            None,
+            "{part} as {other:?}"
+        );
+    }
+    for (said, code) in [
+        ("wall.disk_full.pre_start_full", "EDQUOT"),
+        ("wall.disk_full.pre_start_quota", "ENOSPC"),
+        ("wall.disk_full.pre_start_full", "EROFS"),
+        (
+            "wall.disk_full.pre_start_full",
+            "ENOSPC: no space left on device",
+        ),
+    ] {
+        let other = pre_start_words(anchor_text(said), code);
+        assert_eq!(
+            disk_full(&in_error_place(&other, 144)),
+            None,
+            "{said} with {code}"
+        );
+    }
+
+    let mut glyph_deeper = placed.clone();
+    glyph_deeper[at] = format!(" {}", glyph_deeper[at]);
+    assert_eq!(disk_full(&glyph_deeper), None, "the `⎿` one column deeper");
+    let mut reply = placed.clone();
+    reply[at] = format!("⏺ {words}");
+    assert_eq!(disk_full(&reply), None, "the worker's reply");
+
+    let rows = 1 + placed[at + 1..]
+        .iter()
+        .take_while(|row| message_row(row))
+        .count();
+    let mut earlier = placed.clone();
+    earlier.splice(
+        at + rows..at + rows,
+        [
+            String::new(),
+            "❯ carry on".to_string(),
+            String::new(),
+            "⏺ Done.".to_string(),
+        ],
+    );
+    assert_eq!(disk_full(&earlier), None, "an earlier turn");
 }

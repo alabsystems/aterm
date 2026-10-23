@@ -20,10 +20,6 @@ fn pairing_step(
     }
 }
 
-/// A key release whose press a GUI gate consumed is swallowed exactly once:
-/// `take_consumed_release` removes the tracked physical key and returns `true`,
-/// so `on_key` never reaches the encoder (no orphan Kitty release report). A
-/// second release, or any untracked key, still encodes.
 #[test]
 fn consumed_press_release_is_swallowed_exactly_once() {
     let mut app = App::headless_for_test();
@@ -32,23 +28,19 @@ fn consumed_press_release_is_swallowed_exactly_once() {
     let other = PhysicalKey::Code(KeyCode::KeyB);
     let model = aterm_models_misc::input_release_pairing_model();
     let mut state = model.init_state();
-    // No tracked press yet: a normal key's release is forwarded.
     assert!(
         !app.take_consumed_release(wid, key),
         "an untracked release is not swallowed"
     );
     assert!(model.successors("ReleaseConsumedPress", &state).is_empty());
     assert!(model.successors("ReleaseForwardedPress", &state).is_empty());
-    // A GUI gate consumed this physical key's press.
     app.note_consumed_press_key(wid, key, false);
     pairing_step(&model, &mut state, "ConsumePhysicalPress");
 
-    // Non-vacuity: emitting a release after a consumed press breaks byte silence.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut mutant = state.clone();
     assert!(buggy.fire("ReleaseConsumedPress", &mut mutant));
     assert!(!buggy.check_invariant("NoOrphanCsiUBytes", &mutant));
-    // The matching release is swallowed and its entry removed.
     assert!(
         app.take_consumed_release(wid, key),
         "the matching release is swallowed (no orphan release report)"
@@ -62,8 +54,6 @@ fn consumed_press_release_is_swallowed_exactly_once() {
             .is_empty(),
         "the entry is removed on the first release"
     );
-    // A second release of the same key is not swallowed, and an unrelated key
-    // is never affected.
     assert!(
         !app.take_consumed_release(wid, key),
         "no stale double-swallow"
@@ -74,8 +64,6 @@ fn consumed_press_release_is_swallowed_exactly_once() {
     );
 }
 
-/// A repeat presented to the consumed-note seam cannot rewrite a forwarded
-/// episode (shipping `on_key` routes repeats before every GUI gate anyway).
 #[test]
 fn repeat_does_not_note_and_release_is_not_swallowed() {
     let mut app = App::headless_for_test();
@@ -84,8 +72,6 @@ fn repeat_does_not_note_and_release_is_not_swallowed() {
     let model = aterm_models_misc::input_release_pairing_model();
     let mut state = model.init_state();
     pairing_step(&model, &mut state, "ForwardPress");
-    // The press fell through to the encoder; repeat notes are no-ops, so the
-    // app is still owed the matching release.
     app.note_consumed_press_key(wid, key, true);
     app.note_consumed_press_key(wid, key, true);
     assert!(
@@ -103,11 +89,6 @@ fn repeat_does_not_note_and_release_is_not_swallowed() {
     pairing_step(&model, &mut state, "ReleaseForwardedPress");
 }
 
-/// If the platform loses a key-up and later reports a fresh key-down for
-/// the same physical key, the new press proves the old episode ended: the
-/// old forwarded owner is retired through the exact-release path before the
-/// new disposition is installed, or REPORT_EVENT_TYPES applications would
-/// see a permanently held key.
 #[test]
 fn fresh_press_closes_stale_forwarded_episode_before_replacement() {
     use aterm_types::keyboard::{Key as TKey, Modifiers};
@@ -150,9 +131,6 @@ fn fresh_press_closes_stale_forwarded_episode_before_replacement() {
     assert!(app.take_consumed_release(replacement_window, physical));
 }
 
-/// A repeat pinned to a now-hidden session must update that terminal only;
-/// it cannot heat or animate the replacement tab that happens to occupy the
-/// press window. This is the presentation half of immutable routing.
 #[test]
 fn hidden_owned_repeat_does_not_arm_replacement_tab_effects() {
     use aterm_types::keyboard::{Key as TKey, Modifiers};

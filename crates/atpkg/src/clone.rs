@@ -1,39 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Copy-on-write clones of a build's files: the construction behind the rustup view
-//! ([`crate::seam`]) and the per-build exec roots ([`crate::compat`]).
+//! Copy-on-write clones of a build's files for the rustup view ([`crate::seam`])
+//! and per-build exec roots ([`crate::compat`]).
 //!
-//! Not hard links: a link or unlink writes the store inode's link count and ctime, which
-//! aborts every tippy running from the store (it pins its own executable's and its
-//! siblings'); a link from a provenance-tracked process tags the store file; and identity
-//! has to be proven by `(dev, ino)`. On APFS `std::fs::copy` is `fclonefileat(2)`: a new
-//! inode sharing the source's blocks, with its mode, length and mtime, costing only
-//! metadata.
-//!
-//! * A clone never silently becomes a copy of a toolchain: `std::fs::copy` byte-copies
-//!   across volumes, so [`clone_file`] refuses when the destination directory is on another
-//!   device.
-//! * On Linux the call is `copy_file_range(2)`: a reflink on btrfs or XFS, a real copy
-//!   otherwise. No Linux bundle needs an exec root ([`crate::compat::needs_root`]), so that
-//!   cost falls on the rustup view alone.
-//! * [`is_clone_of`] is the identity: a regular file with the source's length, permission
-//!   bits and modification time, and not the source's inode (so a hard-link view reads as a
-//!   mismatch and is rebuilt as clones).
-//! * Off Unix both arms fail closed: `st_dev`/`st_ino` are unreachable from stable Rust and
-//!   Windows' `std::fs::copy` byte-copies within one volume too. [`distinct_files`] and
-//!   [`one_volume`] take the platform's answer as an argument, so both decisions are
-//!   asserted on every target.
+//! Uses `std::fs::copy` within a single volume on Unix (`fclonefileat` on APFS,
+//! `copy_file_range` on Linux) and verifies clone identity by matching length,
+//! permissions, and mtime on a distinct inode.
 
 use std::io;
 use std::path::Path;
 
-/// The volume a path lives on, as the OS numbers it (`st_dev` on Unix).
+/// OS device identifier (`st_dev` on Unix).
 type VolumeId = u64;
 
-/// Clone the regular file `src` to `dst`, which must not exist: its data shared
-/// copy-on-write where the filesystem can, its permission bits and modification time
-/// kept.
+/// Clones regular file `src` to `dst` on the same volume, preserving permissions and mtime.
 ///
 /// # Errors
 /// `src` is not a regular file, `dst` exists, `dst`'s directory is on another device than
@@ -66,8 +47,6 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
             format!("cannot clone {} to {} ({e})", src.display(), dst.display()),
         )
     })?;
-    // `fclonefileat` keeps the time already; a reflink or a byte copy may not, and the
-    // identity reads it.
     let modified = meta.modified()?;
     let file = std::fs::OpenOptions::new().write(true).open(dst)?;
     file.set_modified(modified)?;
@@ -88,18 +67,14 @@ fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
     one_volume(src, parent, Some(s.dev()), Some(p.dev()))
 }
 
-/// Off Unix: always a refusal. Windows' `std::fs::copy` byte-copies on one volume and
-/// across two alike, and stable Rust exposes no `st_dev`, so nothing laid here would be a
-/// clone; a named refusal, not an `Ok(())` that would read as coverage.
+/// Always refuses off Unix where volume identity and copy-on-write cloning are unavailable.
 #[cfg(not(unix))]
 fn same_device(src: &Path, dst: &Path) -> io::Result<()> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     one_volume(src, parent, None, None)
 }
 
-/// The verdict `same_device` returns once the platform has said which volume each side is
-/// on: `Ok(())` only when both are known and equal. Taking the answers as arguments lets
-/// the `not(unix)` verdict be asserted from a Unix box.
+/// Returns `Ok(())` only when both volume IDs are known and equal.
 fn one_volume(
     src: &Path,
     parent: &Path,
@@ -131,14 +106,7 @@ fn one_volume(
     }
 }
 
-/// Whether `at` is a clone of the regular file `src`: by `lstat`, a regular file (never a
-/// symlink) with `src`'s length, permission bits and modification time, and a different
-/// inode, so a hard link to `src` is not a clone of it.
-///
-/// Attributes, not bytes, because this runs over every file of a view on every update
-/// pass. It cannot tell a clone from another file sharing all three (a bundle may ship a
-/// separately signed `bin/rustc` with `trustc`'s length, mode and time), so callers check
-/// those names with [`same_bytes`] too. Off Unix it answers `false` for every pair.
+/// Whether `at` is a regular file with `src`'s length, permissions, and mtime on a distinct inode.
 #[must_use]
 pub(crate) fn is_clone_of(src: &Path, at: &Path) -> bool {
     let (Ok(s), Ok(a)) = (
@@ -175,7 +143,6 @@ pub(crate) fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     loop {
         let n = fa.read(&mut ba)?;
         if n == 0 {
-            // `a` ended: equal exactly when `b` ends too.
             return Ok(fb.read(&mut bb[..1])? == 0);
         }
         fb.read_exact(&mut bb[..n])?;
@@ -185,8 +152,7 @@ pub(crate) fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
-/// The OS's identity for a file, which tells a hard link (the store's inode under a second
-/// name) from a clone (a new inode with the same attributes): `(dev, ino)` on Unix.
+/// File identity `(dev, ino)` used to distinguish a clone from a hard link.
 type FileId = (u64, u64);
 
 #[cfg(unix)]
@@ -195,24 +161,18 @@ fn file_identity(m: &std::fs::Metadata) -> Option<FileId> {
     Some((m.dev(), m.ino()))
 }
 
-/// Off Unix: `None`. Windows has a file id (`GetFileInformationByHandle`), but no stable std
-/// API reaches it and this crate has no `windows-sys` edge; NTFS has hard links, so
-/// [`distinct_files`] reads `None` as "not a clone".
+/// Returns `None` off Unix where stable Rust exposes no file identity.
 #[cfg(not(unix))]
 fn file_identity(_m: &std::fs::Metadata) -> Option<FileId> {
     None
 }
 
-/// Whether `a` and `b` are provably different files. An unreadable identity is not a
-/// difference, so [`is_clone_of`] answers "not a clone" and its callers re-lay rather than
-/// trust a file they cannot tell from a hard link into the store.
+/// Whether `a` and `b` are provably distinct files (`Some` and unequal).
 fn distinct_files(a: Option<FileId>, b: Option<FileId>) -> bool {
     matches!((a, b), (Some(x), Some(y)) if x != y)
 }
 
-/// The two platform decisions, asserted on every target without a filesystem: they feed
-/// [`distinct_files`] and [`one_volume`] each platform's answer (`Some(..)` on Unix, `None`
-/// off it), so a Unix box asserts the Windows decision and a Windows box the Unix.
+/// Platform-independent tests for [`distinct_files`] and [`one_volume`].
 #[cfg(test)]
 mod decisions {
     use super::*;
@@ -226,7 +186,6 @@ mod decisions {
             !distinct_files(Some(a), Some(a)),
             "one inode under two names is a HARD LINK, not a clone"
         );
-        // The three shapes off Unix, where `file_identity` answers `None`.
         assert!(
             !distinct_files(None, None),
             "a platform that cannot read a file's identity has not proven two files apart, \
@@ -248,14 +207,12 @@ mod decisions {
         let crossed = one_volume(src, parent, Some(66_306), Some(46)).unwrap_err();
         assert_eq!(crossed.kind(), io::ErrorKind::CrossesDevices);
 
-        // Off Unix both answers are `None` — the arm that must refuse rather than pass.
         let unknown = one_volume(src, parent, None, None).unwrap_err();
         assert_eq!(
             unknown.kind(),
             io::ErrorKind::Unsupported,
             "an unprovable volume is a refusal, not a pass"
         );
-        // A half-known pair is unprovable too.
         assert_eq!(
             one_volume(src, parent, Some(66_306), None)
                 .unwrap_err()
@@ -321,10 +278,6 @@ mod tests {
         let dir = scratch("not");
         let src = dir.join("tippy");
         std::fs::write(&src, b"tippy").unwrap();
-        // A store file's time is its build's, long past, so the rewrite below
-        // moves it. Stamped now, the source and a rewrite in the same scheduler
-        // tick shared one time to the nanosecond under Linux's coarse file
-        // clock, and the rewritten clone still read as one (the Linux lane).
         let built =
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         std::fs::OpenOptions::new()
@@ -360,7 +313,6 @@ mod tests {
         let rustc = dir.join("rustc");
         let mut image = vec![7u8; 200_000];
         std::fs::write(&trustc, &image).unwrap();
-        // The bundle's shape: the same length, one different byte deep inside.
         image[150_000] = 8;
         std::fs::write(&rustc, &image).unwrap();
         let t = std::fs::metadata(&trustc).unwrap().modified().unwrap();

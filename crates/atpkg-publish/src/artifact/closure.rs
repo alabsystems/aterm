@@ -1,19 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The trust bundle's frozen rustc-dev + rust-src closure, embedded in the staged copy
-//! before relocation and signing (the `Staged` phase of [`super::bundle`]).
-//!
-//! [`prepare`] checks the compiler identity (`-vV`: one commit, the packaged host) and
-//! that `lib/` holds exactly one `librustc_driver`; merges the sealed
-//! `rustc-private-sysroots/<private_sysroot>` named by PROVENANCE (bound to the compiler's
-//! commit and driver digest) into the target lib, collision-checked, or re-checks a
-//! repack's `.rustc-commit-hash` marker; hard-links the target-lib driver to `lib/`'s; and
-//! freezes rust-src with its `rustc-src/rust` alias as hard links. Links and special files
-//! are refused, every parent is a real directory, and the seal is never written.
-//!
-//! These are local consistency checks, not compiler proof or signing authority: the
-//! bundle's relocation, smoke, arch and signature gates still run after it.
+//! Freezes the rustc-dev and rust-src closure into the staged Trust bundle.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -141,8 +129,6 @@ fn directory(p: &Path) -> R<()> {
     }
 }
 
-/// `root/relative`, every parent checked to be a real directory, so a copied directory
-/// link cannot redirect a write.
 fn below(root: &Path, relative: &str) -> R<PathBuf> {
     directory(root)?;
     let mut p = root.to_path_buf();
@@ -158,8 +144,6 @@ fn digest(p: &Path) -> R<String> {
     atpkg::sha256_file(p).map_err(|e| io(p, &e))
 }
 
-/// Every regular file under `root`, sorted; a link or special file anywhere (a directory
-/// link included) is refused without being followed.
 fn files(root: &Path) -> R<Vec<PathBuf>> {
     directory(root)?;
     let mut out = Vec::new();
@@ -183,7 +167,6 @@ fn files(root: &Path) -> R<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// The four PROVENANCE fields the closure reads; a repeated one is refused.
 fn fields(path: &Path) -> R<BTreeMap<String, String>> {
     regular(path)?;
     let text = std::fs::read_to_string(path).map_err(|e| io(path, &e))?;
@@ -265,8 +248,6 @@ fn require_surface(target: &Path, driver: &Path) -> R<()> {
     }
 }
 
-/// Copy `source`'s tree into `target`, collision-checked: an existing member must be
-/// byte-identical, and every parent written through must be a real directory.
 fn merge_closure(source: &Path, target: &Path) -> R<()> {
     for entry in files(source)? {
         let rel = entry
@@ -304,12 +285,8 @@ fn digests(root: &Path) -> R<BTreeMap<PathBuf, String>> {
         .collect()
 }
 
-/// Freeze rust-src and lay its `rustc-src/rust` alias as hard links: both canonical source
-/// paths survive a moved root, no source byte ships twice, and no symlink reaches the
-/// client.
 fn freeze_source(stage: &Path) -> R<()> {
     let source = below(stage, "lib/rustlib/src/rust")?;
-    // The copy below covers the whole root, so root-level riders are checked too.
     let contents = files(&source)?;
     for component in ["library", "compiler"] {
         let tree = below(&source, component)?;
@@ -327,8 +304,6 @@ fn freeze_source(stage: &Path) -> R<()> {
     let alias = alias_parent.join("rust");
     match std::fs::symlink_metadata(&alias) {
         Ok(m) if m.file_type().is_symlink() => {
-            // Promotion emits exactly this confined alias; any other target (a live
-            // checkout link above all) is refused, never copied from the host.
             let target = std::fs::read_link(&alias).map_err(|e| io(&alias, &e))?;
             if target != Path::new("../src/rust") {
                 return Err(Refusal::AliasNotSealed(alias));
@@ -380,13 +355,9 @@ fn valid_private_name(n: &str) -> bool {
         && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
 }
 
-/// Freeze the sealed closure of the compiler at `source` into the staged copy `stage`,
-/// for `triple`. `probe` answers a compiler's `-vV`. Only the stage is written. Returns
-/// the compiler's commit.
-///
+/// Freezes the sealed closure of `source` into `stage` for `triple` and returns its commit hash.
 /// # Errors
-///
-/// The first [`Refusal`]; the stage is then not packed.
+/// Returns the first [`Refusal`] encountered without packing `stage`.
 pub fn prepare(
     source: &Path,
     stage: &Path,
@@ -422,8 +393,6 @@ pub fn prepare(
     let target = below(&stage, &format!("lib/rustlib/{triple}/lib"))?;
     let marker = target.join(".rustc-commit-hash");
     if std::fs::symlink_metadata(&marker).is_ok() {
-        // A complete bundle repacked without its sibling seal: the marker is local
-        // consistency data and waives no surface or byte check.
         regular(&marker)?;
         let named = std::fs::read_to_string(&marker).map_err(|e| io(&marker, &e))?;
         if named.trim() != commit {
@@ -461,8 +430,6 @@ pub fn prepare(
         if digest(&private_target.join(&driver_name))? != driver_hash {
             return Err(Refusal::PrivateDriver);
         }
-        // Std stays the selected main sysroot's: the private root's own lib/rustlib (a
-        // build stage's std, perhaps) is neither a prerequisite nor a donor.
         if !any_named(&target, "libstd-", ".rlib") {
             return Err(Refusal::MissingSurface(
                 "selected compiler std",
@@ -474,8 +441,6 @@ pub fn prepare(
         require_surface(&target, driver)?;
         std::fs::write(&marker, format!("{commit}\n")).map_err(|e| io(&marker, &e))?;
     }
-    // One inode: the relocator is hard-link aware, and two copies at different depths
-    // would take different rpaths and break the wrapper's byte-identity check.
     let target_driver = target.join(&driver_name);
     if !same_file(&target_driver, driver) {
         std::fs::remove_file(&target_driver).map_err(|e| io(&target_driver, &e))?;

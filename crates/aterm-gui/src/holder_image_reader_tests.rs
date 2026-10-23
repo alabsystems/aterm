@@ -241,7 +241,8 @@ impl Rig {
             app.session_factory.proc_watch = scripted_watch;
         }
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: A zeroed termios is a valid out-slot for tcgetattr, then cfmakeraw/tcsetattr.
+        // SAFETY: A zeroed termios is a valid out-slot for tcgetattr, then
+        // cfmakeraw/tcsetattr on the test-owned slave fd.
         unsafe {
             let mut tio: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(slave, &mut tio), 0, "tcgetattr");

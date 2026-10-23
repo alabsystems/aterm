@@ -219,7 +219,6 @@ impl Outline {
 }
 
 impl Outline {
-    /// Sets next and previous indices for each point.
     fn link_points(&mut self) {
         let points = self.points.as_mut_slice();
         for contour in &self.contours {
@@ -238,7 +237,6 @@ impl Outline {
         }
     }
 
-    /// Computes the near flag for each contour.
     fn mark_near_points(&mut self, near_limit: i32) {
         let points = self.points.as_mut_slice();
         for contour in &self.contours {
@@ -256,7 +254,6 @@ impl Outline {
         }
     }
 
-    /// Compute directions of in and out vectors.
     fn compute_directions(&mut self, near_limit: i32) {
         let near_limit2 = 2 * near_limit - 1;
         let points = self.points.as_mut_slice();
@@ -323,7 +320,6 @@ impl Outline {
         }
     }
 
-    /// Simplify so that we can identify local extrema more reliably.
     fn simplify_topology(&mut self) {
         let points = self.points.as_mut_slice();
         for i in 0..points.len() {
@@ -349,7 +345,6 @@ impl Outline {
         }
     }
 
-    /// Check for remaining weak points.
     fn check_remaining_weak_points(&mut self, is_corner_flat: impl Fn(i32, i32, i32, i32) -> bool) {
         let points = self.points.as_mut_slice();
         for i in 0..points.len() {
@@ -388,7 +383,6 @@ impl Outline {
         }
     }
 
-    /// Computes the overall winding order of the outline.
     fn compute_orientation(&mut self) {
         self.orientation = None;
         let points = self.points.as_slice();
@@ -418,7 +412,6 @@ impl Outline {
     }
 }
 
-/// FreeType's corner test (ftcalc.c `ft_corner_is_flat`).
 fn is_corner_flat(in_x: i32, in_y: i32, out_x: i32, out_y: i32) -> bool {
     let ax = in_x + out_x;
     let ay = in_y + out_y;

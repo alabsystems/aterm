@@ -2228,7 +2228,8 @@ mod tests {
             return;
         };
         let home = PathBuf::from(home);
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+        // process runs this one test (`--exact`), so no other create sees the mask.
         unsafe { libc::umask(0o002) };
         let mode = |rel: &str| {
             let meta = std::fs::symlink_metadata(home.join(rel)).unwrap();

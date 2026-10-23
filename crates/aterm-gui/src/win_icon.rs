@@ -1,25 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! aterm's icon on Windows, loaded at the size each place draws it.
-//!
-//! `assets/aterm.ico` (the exe's icon resource, ordinal 1) carries a
-//! hinted, anti-aliased frame for every size the shell asks for: the small icon
-//! (`SM_CXSMICON`: caption, the notification area) and the big one (`SM_CXICON`:
-//! taskbar button, Alt+Tab) at every scale from 100 % to 300 %, and the shell's
-//! own 30/60/64/72/80/96/128/256. So a window loads both icons at exactly its
-//! DPI's metric ([`window_icons`]) and loads them again when it moves to a
-//! display of another DPI ([`fit_to`], from `WindowEvent::ScaleFactorChanged`);
-//! a fixed 16 px small icon was resampled by the shell at any other scale. The
-//! notification area takes the same frames at the system DPI ([`OwnedIcon`]).
+//! Window and notification-area icons on Windows, loaded at each DPI's metric.
 
 /// The window DPI a winit scale factor stands for (Windows reports 96 × scale).
 pub(crate) fn dpi_for_scale(scale: f64) -> u32 {
     (scale * 96.0).round().max(1.0) as u32
 }
 
-/// `(small, big)` icon edge in px at `dpi`: Windows' `SM_CXSMICON` and
-/// `SM_CXICON` for that DPI, or, when the system does not answer, the 96-dpi
-/// 16 and 32 scaled the way Windows scales them.
+/// `(small, big)` icon edge in px at `dpi`.
 pub(crate) fn icon_px(dpi: u32) -> (u32, u32) {
     #[cfg(windows)]
     if let Some(sizes) = sys::system_icon_px(dpi) {
@@ -28,7 +16,6 @@ pub(crate) fn icon_px(dpi: u32) -> (u32, u32) {
     (scale_px(16, dpi), scale_px(32, dpi))
 }
 
-/// `base` px at 96 dpi scaled to `dpi`, rounded half up as `MulDiv` rounds.
 fn scale_px(base: u32, dpi: u32) -> u32 {
     (base * dpi + 48) / 96
 }
@@ -43,16 +30,12 @@ mod sys {
     use aterm_window::platform::windows::{IconExtWindows as _, WindowExtWindows as _};
     use aterm_window::window::{Icon, Window};
 
-    /// Ordinal of the `1 ICON` resource: crates/aterm/build.rs compiles it into
-    /// the shipped exe and `assets/aterm.rc` into the dev `aterm-gui.exe`.
     const ICON_RESOURCE: u16 = 1;
     const SM_CXICON: i32 = 11;
     const SM_CXSMICON: i32 = 49;
     const IMAGE_ICON: u32 = 1;
     const LR_DEFAULTCOLOR: u32 = 0;
 
-    // `GetSystemMetricsForDpi` and `GetDpiForSystem` are Windows 10 1607 APIs;
-    // aterm's floor is 1809 (ConPTY), so they are imported, not looked up.
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
@@ -85,8 +68,7 @@ mod sys {
         (small > 0 && big > 0).then_some((small as u32, big as u32))
     }
 
-    /// The system DPI: what a window on the primary display at sign-in has, and
-    /// the DPI the notification area draws at.
+    /// The system DPI.
     pub(crate) fn system_dpi() -> u32 {
         // SAFETY: no arguments; never fails.
         match unsafe { GetDpiForSystem() } {
@@ -95,9 +77,7 @@ mod sys {
         }
     }
 
-    /// The caption (small) and taskbar (big) icons for a window at `dpi`, each
-    /// the `.ico` frame of exactly that size. `None` for a binary built without
-    /// the resource (build.rs already said so).
+    /// The caption (small) and taskbar (big) icons for a window at `dpi`.
     pub(crate) fn window_icons(dpi: u32) -> (Option<Icon>, Option<Icon>) {
         let (small, big) = icon_px(dpi);
         let load =
@@ -105,7 +85,7 @@ mod sys {
         (load(small), load(big))
     }
 
-    /// Send `window` the icons for `scale` (the DPI it now has).
+    /// Sends `window` the icons for `scale`.
     pub(crate) fn fit_to(window: &Window, scale: f64) {
         let (small, big) = window_icons(dpi_for_scale(scale));
         if small.is_some() {
@@ -116,9 +96,7 @@ mod sys {
         }
     }
 
-    /// A new window carries icons for the system DPI (its attributes are built
-    /// before it has a monitor); one that opened on a display of another DPI
-    /// takes that display's.
+    /// Updates `window`'s icons when its display DPI differs from [`system_dpi`].
     pub(crate) fn fit_new_window(window: &Window) {
         let scale = window.scale_factor();
         if dpi_for_scale(scale) != system_dpi() {
@@ -126,12 +104,11 @@ mod sys {
         }
     }
 
-    /// An `HICON` this process loaded and destroys on drop, for the raw Win32
-    /// users (the notification area's icon and its notification's).
+    /// An `HICON` loaded by this process and destroyed on drop.
     pub(crate) struct OwnedIcon(isize);
 
     impl OwnedIcon {
-        /// The `.ico` frame `px` square from this exe; `None` without the resource.
+        /// Loads the `px`-square `.ico` frame from this executable.
         pub(crate) fn load(px: u32) -> Option<Self> {
             let px = px as i32;
             // SAFETY: a null module name is this process's exe; the resource is
@@ -146,7 +123,6 @@ mod sys {
                     LR_DEFAULTCOLOR,
                 )
             };
-            // Lazy: `then_some` would build `Self(0)` and destroy it on drop.
             (handle != 0).then(|| Self(handle))
         }
 
@@ -168,10 +144,8 @@ mod sys {
 mod tests {
     use super::{dpi_for_scale, icon_px};
 
-    /// The `.ico` the build embeds (ordinal 1 of the exe).
     const ICO: &[u8] = include_bytes!("../assets/aterm.ico");
 
-    /// One frame of the `.ico`: its edge and its RGBA pixels.
     fn frames() -> Vec<(u32, Vec<u8>)> {
         let u16_at = |o: usize| u16::from_le_bytes([ICO[o], ICO[o + 1]]);
         let u32_at = |o: usize| u32::from_le_bytes([ICO[o], ICO[o + 1], ICO[o + 2], ICO[o + 3]]);
@@ -194,7 +168,6 @@ mod tests {
                     );
                     return (edge, rgba);
                 }
-                // BITMAPINFOHEADER, 32 bpp BI_RGB, XOR rows bottom-up as BGRA.
                 let d32 =
                     |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
                 assert_eq!(
@@ -214,11 +187,6 @@ mod tests {
             .collect()
     }
 
-    /// Every icon a window or the notification area asks for, at every scale
-    /// Windows offers from 100 % to 300 %, is a frame of its own, and so are the
-    /// shell's other sizes. The audit's icon had 16/32/48/64/128/256 only, so at
-    /// 125 % and 150 % (and on the 24 px Windows 11 taskbar) the shell resampled
-    /// a neighbour.
     #[test]
     fn every_icon_size_windows_asks_for_is_a_frame() {
         let sizes: Vec<u32> = frames().iter().map(|(edge, _)| *edge).collect();
@@ -238,9 +206,6 @@ mod tests {
         }
     }
 
-    /// Every frame is anti-aliased: its tile's rounded edge has partly
-    /// transparent pixels. The audit's frames were all hard 0/255 alpha, which
-    /// is what drew jagged corners at every size.
     #[test]
     fn every_icon_frame_is_anti_aliased() {
         for (edge, rgba) in frames() {
@@ -255,9 +220,6 @@ mod tests {
         }
     }
 
-    /// The small and big icons at the common scales are the sizes Windows
-    /// documents (16/32 at 100 %, 20/40 at 125 %, 24/48 at 150 %, …), whether
-    /// the system answered or the fallback did.
     #[test]
     fn icon_sizes_follow_the_window_dpi() {
         for (scale, small, big) in [

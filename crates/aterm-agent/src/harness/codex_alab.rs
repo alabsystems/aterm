@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CODEX-ALAB, the pure half.
+//! `codex-alab` package metadata, build identification, and upgrade argv reconstruction.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -16,8 +16,7 @@ pub const PACKAGE_JSON: &str = "codex-package.json";
 /// The file an ALab build of Codex (codex-alab) carries in its package root.
 pub const ALAB_BUILD_JSON: &str = "alab-build.json";
 
-/// Optional package metadata is small. A malformed package must not park a
-/// sweep or rollout reader on a FIFO, or allocate an unbounded manifest.
+/// Optional package metadata is small.
 const MAX_PACKAGE_BYTES: u64 = 1024 * 1024;
 
 fn package_text(path: &Path) -> Option<String> {
@@ -71,7 +70,7 @@ pub fn package_version(exe: &Path) -> Option<Version> {
     })
 }
 
-/// One `codex-package.json`: its version and entrypoint (relative to the root).
+/// One `codex-package.json`.
 #[must_use]
 pub fn parse_package(text: &str) -> Option<(Version, PathBuf)> {
     let entry = package_entrypoint(text)?;
@@ -102,7 +101,7 @@ pub fn package_entrypoint(text: &str) -> Option<PathBuf> {
 pub(crate) enum Arity {
     /// A switch.
     None,
-    /// Exactly one value: the next token whatever it looks like, or attached (`--model=x`, `-mx`).
+    /// Exactly one value.
     One,
     /// `<FILE>...`: one value or more, up to the next token that starts with `-`.
     Many,
@@ -119,8 +118,7 @@ pub(crate) enum Fate {
     Refuse,
 }
 
-/// Codex's interactive options (`codex --help`, `codex resume --help`). A flag
-/// missing here refuses the rewrite; new flags are added once known safe.
+/// Codex's interactive options (`codex --help`, `codex resume --help`).
 const FLAGS: &[(&str, Arity, Fate)] = &[
     ("-a", Arity::One, Fate::Keep),
     ("--add-dir", Arity::One, Fate::Keep),
@@ -171,8 +169,7 @@ pub(crate) fn flag(name: &str) -> Option<(Arity, Fate)> {
         .map(|(_, a, f)| (*a, *f))
 }
 
-/// Codex's subcommands. Only none, `resume` and `fork` run the interactive TUI
-/// a relaunch resumes; the rest are refused ([`ArgvRefusal::NotResumable`]).
+/// Codex's subcommands; all but `resume` and `fork` are refused ([`ArgvRefusal::NotResumable`]).
 const SUBCOMMANDS: &[&str] = &[
     "agents",
     "exec",
@@ -205,8 +202,7 @@ const SUBCOMMANDS: &[&str] = &[
     "help",
 ];
 
-/// Whether clap reads `tok` as an option: a leading `-` and more after it (a
-/// lone `-` is a value).
+/// Whether clap reads `tok` as an option.
 fn maybe_option(tok: &str) -> bool {
     tok.len() > 1 && tok.starts_with('-')
 }
@@ -228,8 +224,6 @@ pub(crate) fn kept_flags(
             continue;
         }
         if positional_only || !maybe_option(tok) {
-            // The first positional is the subcommand when it names one, else
-            // the prompt (dropped, as is every positional after it).
             if subcommand.is_none() && !positional_only {
                 if SUBCOMMANDS.contains(&tok) {
                     if tok != "resume" && tok != "fork" {
@@ -256,7 +250,6 @@ pub(crate) fn kept_flags(
             return Err(ArgvRefusal::NotResumable(name));
         }
         if attached && arity == Arity::None {
-            // `--no-daemon=x`, `-hV`: a shape clap refuses; so does this.
             return Err(ArgvRefusal::UnknownFlag(tok.to_string()));
         }
         let start = i - 1;
@@ -286,8 +279,11 @@ pub(crate) fn kept_flags(
 }
 
 /// The argv rewrite for Codex.
+///
 /// # Errors
-/// An unknown flag or subcommand, or a session not resumable in place.
+/// An unknown flag, or a value attached to a flag that takes none
+/// ([`ArgvRefusal::UnknownFlag`]), or a session not resumable in place
+/// ([`ArgvRefusal::NotResumable`]: `exec`, `--remote`, `--worktree`, …).
 pub fn rewrite_argv(argv: &[String], thread: Option<&str>) -> Result<Vec<String>, ArgvRefusal> {
     Ok(resume_words(kept_flags(argv, |_| true)?, thread))
 }
@@ -312,8 +308,7 @@ pub fn line_env(home: Option<&str>) -> Vec<(&'static str, &str)> {
     home.map(|value| (HOME_ENV, value)).into_iter().collect()
 }
 
-/// Whether `argv` is an interactive Codex TUI's (no subcommand, `resume` or
-/// `fork`), not the daemon, its updater, `exec` or another face of the binary.
+/// Whether `argv` is an interactive Codex TUI's.
 #[must_use]
 pub fn is_tui_argv(argv: &[String]) -> bool {
     let mut i = 1;

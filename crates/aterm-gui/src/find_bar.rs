@@ -1614,6 +1614,9 @@ mod tests {
     }
 
     /// The clickable indicator spans line up EXACTLY with the painted `[Aa]` / `[.*]`
+    /// cells (brackets included — a click on the bracket is not a dead pixel), or on
+    /// Windows the padded ` Aa ` / ` .* ` chips, and the toolbar's buttons with their
+    /// padded `↑` / `↓` / `✕`.
     #[test]
     fn indicator_cols_match_painted_cells() {
         let cols = 90;

@@ -111,7 +111,8 @@ fn stepped_keeper_role() -> ! {
 fn pty_with_leader() -> (OwnedFd, Child) {
     use aterm_uds::spawnfd::InheritNothing as _;
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: `master` and `slave` are fresh descriptors from `open_pty_pair`.
+    // SAFETY: `master` and `slave` are two fresh descriptors from `open_pty_pair`; this
+    // function alone owns them.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let stdio = || Stdio::from(slave.try_clone().expect("dup the slave"));
     let mut cmd = Command::new("/bin/sleep");
@@ -120,7 +121,8 @@ fn pty_with_leader() -> (OwnedFd, Child) {
         .stdin(stdio())
         .stdout(stdio())
         .stderr(stdio());
-    // SAFETY: `pre_exec` runs only async-signal-safe `setsid`/`ioctl`/`close` calls.
+    // SAFETY: the hook makes only async-signal-safe calls between fork and exec: `setsid`, and
+    // `ioctl` on the child's own stdin, which is the slave by then.
     unsafe {
         use std::os::unix::process::CommandExt as _;
         cmd.pre_exec(|| {
@@ -447,7 +449,8 @@ fn outgoing_window_role() -> ! {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: `pre_exec` runs async-signal-safe `fcntl` on `raw`.
+    // SAFETY: `pre_exec` runs one async-signal-safe `fcntl` between fork and exec, on `raw`,
+    // a descriptor the child holds from the fork.
     unsafe {
         use std::os::unix::process::CommandExt as _;
         cmd.pre_exec(move || {
@@ -1442,7 +1445,9 @@ fn journal_window_role(journaled: Journaled) -> ! {
                 clippy::disallowed_methods,
                 reason = "a test playing the window makes the region the keeper is sent"
             )]
-            // SAFETY: test fixture verifying that the keeper refuses writable custody descriptors.
+            // SAFETY: this fixture keeper checks metadata and refuses the writable
+            // descriptor before any mapping; no writer uses it or its aliases. The local
+            // mapping remains inert until both local owners are dropped below.
             let (region, writable) =
                 unsafe { aterm_uds::shm::testing::create_with_writable_custody(len) }
                     .expect("a twin");
@@ -1461,7 +1466,8 @@ fn journal_window_role(journaled: Journaled) -> ! {
                 clippy::disallowed_methods,
                 reason = "a test playing the window makes the region the keeper is sent"
             )]
-            // SAFETY: single-writer `JournalWriter` in this test process; keeper holds read-only custody.
+            // SAFETY: the fixture keeper only holds/queries this custody; the local
+            // mapping is inert and dropped below. No participant writes or resizes aliases.
             let (proper, custody) =
                 unsafe { aterm_uds::shm::Region::create(len) }.expect("a region");
             client

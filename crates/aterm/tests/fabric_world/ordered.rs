@@ -97,7 +97,10 @@ fn agent_note(w: &World, from: &str, to: &str, text: &str) -> u64 {
 
 /// **WHAT A PERSON WOULD MISS IS FLUSHED IN FULL BEFORE IT IS SHOWN; AN
 /// AGENT'S NOTE IS NOT.** On an ordered broker with aterm's table and no
-/// horizon:
+/// horizon, an agent's note is shown before it is durable and costs no full
+/// flush, while a person's halt and its lift, an agent's ask onto the person's
+/// lane, and the read mark `aterm fabric inbox` reports are each durable by
+/// the time they are shown, at one full flush apiece.
 #[test]
 fn an_ordered_broker_flushes_a_persons_records_before_it_shows_them() {
     let Some(w) = ordered_world("ord") else {

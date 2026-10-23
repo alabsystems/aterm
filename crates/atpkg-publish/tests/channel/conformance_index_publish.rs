@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! TIER-1 CONFORMANCE, the WRITER half of the derived model `AtpkgIndexPublishWalk`
-//! (crates/aterm-models-atpkg/src/models_atpkg_index_publish.rs). The reader half — the
-//! client's tag walk — stays in atpkg (`src/net/index_publish_conformance.rs`).
-//!
-//! Every decision a publisher holding a baseline faces in the model is laid out on a fake
-//! channel, and the real indexer (`channel::index::publish_with`) must take the model's one
-//! enabled decision (`Create`, `Converge` or `Refuse`) and leave the tags as the model does.
-//!
-//! Negative controls: the `Buggy = 1` decisions (a baseline counted off a draft, a number past
-//! the baseline's successor, a converge onto another publisher's bytes) are driven too, and
-//! the indexer refuses each. The writer derives N+1, so the only way to name a number past the
-//! successor is a channel's first publish, which a live channel refuses.
+//! Conformance test for the writer half (`channel::index::publish_with`) of the `AtpkgIndexPublishWalk` model.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -32,7 +21,6 @@ use super::Rig;
 const OWN_VALID_UNTIL: &str = "2098-01-01T00:00:00Z";
 const FOREIGN_VALID_UNTIL: &str = "2098-01-02T00:00:00Z";
 
-/// Every state `model` reaches, breadth-first over its actions.
 fn reachable(model: &Model) -> Vec<State> {
     let key = |s: &State| s.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
     let init = model.init_state();
@@ -52,8 +40,6 @@ fn reachable(model: &Model) -> Vec<State> {
     out
 }
 
-/// The codes of atpkg-index-2..=4: 0 absent, 1/3 a draft, 2/4 published; 1/2 publisher
-/// A's bytes, 3/4 another publisher's.
 fn channel(state: &State) -> [i64; 3] {
     [state["t2"], state["t3"], state["t4"]]
 }
@@ -81,7 +67,6 @@ fn valid_until(v: &str) -> atpkg_publish::api::Delta {
 impl Fixture {
     fn new() -> Self {
         let rig = Rig::new("index-conformance");
-        // The genesis has no head to ship a roster beside: the machine's installed pair.
         let installed = &rig.ctx.identity.roster;
         std::fs::create_dir_all(installed.parent().expect("dir")).expect("mkdir");
         std::fs::write(installed, &rig.keys.roster_bytes).expect("roster");
@@ -135,7 +120,6 @@ impl Fixture {
         self.rig.ctx.index_slug()
     }
 
-    /// A fresh channel: atpkg-index-1 published, 2..=4 as `tags` codes.
     fn lay(&self, tags: [i64; 3]) -> Arc<FakeHost> {
         let host = Arc::new(FakeHost::new());
         for build in 1..=4u64 {
@@ -187,7 +171,6 @@ impl Fixture {
         }
     }
 
-    /// Publisher A, holding baseline `ba`, aims at `na` over the channel `tags`.
     fn publish(&self, ba: i64, na: i64, tags: [i64; 3]) -> (bool, [i64; 3], String) {
         let host = self.lay(tags);
         let mut ctx = self.rig.ctx.clone();
@@ -226,8 +209,6 @@ impl Fixture {
 fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
     let model = atpkg_index_publish_walk_model();
     let buggy = interp::with_buggy(&model, 1);
-    // Every decision publisher A faces while it holds a baseline, and whether the
-    // committed model reaches it (else only the mutant does).
     let mut cases: BTreeMap<(i64, i64, [i64; 3]), bool> = BTreeMap::new();
     for (m, committed) in [(&model, true), (&buggy, false)] {
         for s in reachable(m) {
@@ -285,7 +266,6 @@ fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
             );
             assert!(model.fire(decision, &mut state));
             if decision == "CreateA" {
-                // The fake's create publishes in one step: the model's Create, Finish.
                 assert!(model.fire("FinishA", &mut state));
             }
             assert_eq!(

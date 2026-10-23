@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! Settings ▸ Harness ▸ AI CLIs' page (`native_settings_ai.rs`), rendered
 //! through the Settings controller and read back from the compiled semantic
 //! tree — what `controls prefs` and a screen reader read.
@@ -12,7 +11,6 @@ use crate::native_settings::ai_page::{
 };
 use aterm_agent::ai::state::{Mark, State};
 
-/// One CLI as a look would judge it, wanted.
 fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
     let row = aterm_agent::ai::connector::connector(id).expect("a connection");
     AiCli {
@@ -84,8 +82,6 @@ pub(super) fn fixture() -> HarnessState {
     }
 }
 
-/// A Settings controller holding `state`, its view on Settings ▸ Harness ▸ AI
-/// CLIs; the route's arrival asks the host to look again.
 fn ai_route(
     state: HarnessState,
 ) -> (
@@ -111,7 +107,6 @@ fn ai_route(
     (runtime, instance, view)
 }
 
-/// Press `action` on the view; the effects it asks of the host.
 fn press(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -131,8 +126,6 @@ fn press(
         .effects
 }
 
-/// Every page of the route at `cx`, compiled: page 0, then each page to the
-/// bound the render recorded.
 fn every_page(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -163,7 +156,6 @@ fn every_page(
     }
 }
 
-/// The semantic node `key` on any of `pages`.
 fn node<'a>(
     pages: &'a [crate::native_ui::CompiledUi],
     key: &str,
@@ -174,20 +166,12 @@ fn node<'a>(
         .unwrap_or_else(|| panic!("{key} is on no page"))
 }
 
-/// Whether `key` is on any of `pages`.
 fn shown(pages: &[crate::native_ui::CompiledUi], key: &str) -> bool {
     pages
         .iter()
         .any(|page| page.semantic(&UiKey::new(key)).is_some())
 }
 
-/// THE ROUTE IS ITS SPECIAL PAGE (§10): Harness's sub-page, its own row
-/// listed and selected under Harness's while it shows; the heading; THIS MACHINE's two
-/// registry rows; the CLIS card's health line, one status row per CLI with a
-/// Sign in only on the one that needs a person, and each "Use on this
-/// machine" switch as its ordinary registry control; REVIEWS and FLEET
-/// DOCUMENT as facts with their Open aterm.toml; Refresh. Every page of it
-/// whole on a wide, a medium and a compact host, and at the lab's two sizes.
 #[test]
 fn the_ai_route_renders_its_cards_and_controls() {
     assert_eq!(
@@ -277,11 +261,6 @@ fn the_ai_route_renders_its_cards_and_controls() {
     }
 }
 
-/// THE PAGE'S PRESSES ARE TYPED HOST REQUESTS: a Sign in names its CLI, a
-/// press for one that needs nobody asks for nothing and says why; Refresh
-/// asks for a look; each Open aterm.toml is the Manual route's own act at the
-/// key its card shows, and the page stays. The Harness page's AI CLIs button
-/// is this route, and its SUPERVISION card draws none of this page's rows.
 #[test]
 fn the_ai_routes_presses_are_typed_host_requests() {
     let harness = |effects: &[AppEffect]| {
@@ -329,7 +308,6 @@ fn the_ai_routes_presses_are_typed_host_requests() {
             )),
             "{action}: {effects:?}"
         );
-        // The editor's completion lets the next Open through.
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
             unreachable!()
         };
@@ -340,7 +318,6 @@ fn the_ai_routes_presses_are_typed_host_requests() {
     };
     assert_eq!(state.route, SettingsRoute::Ai, "the page stays");
 
-    // The way in from Settings ▸ Harness, whose own rows are its own.
     let effects = press(
         &mut runtime,
         instance,
@@ -402,13 +379,6 @@ fn a_stale_sign_in_action_cannot_override_the_current_use_switch() {
     );
 }
 
-/// THE PAGE'S FACT CARDS KEEP THEIR LABELS WHOLE AT LARGE TYPE (the review
-/// of the post-landing check's page fixes): WHO REVIEWS and WHAT IS HELD
-/// each size their label column as Settings ▸ Harness's fact cards do
-/// (`fact_label_width`), so at 2× text on the lab's 504 pt page and a wide
-/// one `Permissions` and `Each review` are whole, and their values wrap
-/// whole. NEGATIVE CONTROL: About's column (capped at 1.2×) paints
-/// `Permissi…`.
 #[test]
 fn the_ai_fact_cards_keep_their_labels_whole_at_large_type() {
     at_each_text_scale(&[1.0, 2.0], "the AI page's fact cards", |scale| {
@@ -421,17 +391,6 @@ fn the_ai_fact_cards_keep_their_labels_whole_at_large_type() {
     });
 }
 
-/// A CLI ROW PAINTS ITS WHOLE NAME AND FACT AT EVERY WIDTH (the
-/// audit): a CLI not installed by aterm whose copy lives under
-/// `~/Library/Application Support/` — a path with a space, where aterm's
-/// own reroute copies live — and every other CLI paint their name and fact
-/// whole, wrapped to the text column (a path at its folders), on a compact
-/// page, beside the button on a medium and a wide one, and in a short wide
-/// window at 1×, 1.5× and 2× text: the painted lines, joined, are the
-/// row's accessible words, with no ellipsis. A one-line row cut its fact to
-/// one line: at 2× text in a 1564pt window it read "not installed by aterm
-/// (a… …/reroute/claude)". NEGATIVE CONTROL: the fact is longer than one
-/// line of the column at 2×, so a whole fact there is on lines.
 #[test]
 fn a_cli_row_paints_its_whole_name_and_fact_at_every_width() {
     let path = "/Users//someone/Library/Application Support/aterm/pkg/reroute/agy";
@@ -460,7 +419,6 @@ fn a_cli_row_paints_its_whole_name_and_fact_at_every_width() {
             for id in ["claude", "codex", "agy", "muse"] {
                 let key = format!("ai/cli/{id}");
                 let label = node(&pages, &key).label.clone();
-                // Each line once, from the first page that paints it.
                 let mut lines: Vec<(String, String)> = Vec::new();
                 for page in &pages {
                     for painted in &page.paint {

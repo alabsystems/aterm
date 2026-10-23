@@ -289,8 +289,8 @@ pub(super) struct PerchTrip {
 
 #[derive(Default)]
 pub(super) struct ConsoleLife {
-    world: Option<Box<PetWorld>>,
-    spare_world: Option<Box<PetWorld>>,
+    pub(super) world: Option<Box<PetWorld>>,
+    pub(super) spare_world: Option<Box<PetWorld>>,
     presentable: bool,
     seq: u64,
     input: Option<InputEpisode>,

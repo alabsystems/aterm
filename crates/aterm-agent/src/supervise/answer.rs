@@ -125,8 +125,8 @@ fn option_named<'a>(options: &'a [QuestionOption], word: &str) -> Option<&'a Que
         .find(|o| o.label.trim().eq_ignore_ascii_case(word))
 }
 
-/// Why `answer` is refused as the text priority `p` (module header): the
-/// window's policy, never an answer typed from here.
+/// Why `answer` is refused as the text priority `p`: the window's policy, never an answer
+/// typed from here.
 fn policy_refusal(answer: &str, who: &str, p: QuestionPriority) -> String {
     format!(
         "{answer:?} is a question policy, not an answer: `aterm ctl {who} meta set questions \
@@ -145,8 +145,8 @@ fn names_no_option(answer: &str, who: &str) -> String {
     }
 }
 
-/// Plan `answer` on the question on display (module header), for the worker
-/// `who`: a dialog read whole, else by its answers' roles ([`plan_by_role`]).
+/// Plan `answer` on the question on display, for the worker `who`: a dialog read whole, else
+/// by its answers' roles ([`plan_by_role`]).
 fn plan(
     prompt: &aterm_phase::PromptV2,
     rows: &[String],
@@ -403,7 +403,8 @@ fn next_of(reader: &dyn ScreenReader, rows: &[String]) -> String {
 /// `aterm drive answer`'s options.
 #[derive(Debug, Clone)]
 pub struct AnswerOpts {
-    /// The controller's answer (module header).
+    /// The controller's answer: an option's number or label (`,`-joined on a multi-select),
+    /// `submit`, `recommended` or `human`.
     pub answer: String,
     /// `--box`: the question's token the answer was decided on.
     pub box_token: Option<String>,
@@ -541,8 +542,8 @@ impl<C: Ctl> Session<'_, C> {
         )
     }
 
-    /// Press `digit` on the question read by its answers' roles on `screen`
-    /// (module header): the window's own key for it
+    /// Press `digit` on the question read by its answers' roles on `screen`:
+    /// the window's own key for it
     /// ([`Self::press_one_guarded`]), guarded on the question's title row and
     /// fenced on the screen generation and person count (never pressed
     /// without them), and only while a person has been quiet for `grace` by
@@ -623,7 +624,7 @@ const FOCUS_TRIES: u32 = 3;
 
 impl<C: Ctl> Session<'_, C> {
     /// Answer the question read by its answers' roles on `screen` that is
-    /// chosen by the cursor and Enter (Muse Code's, module header): the focus
+    /// chosen by the cursor and Enter (Muse Code's): the focus
     /// moved `focus.steps` options, each move fenced on the generation and
     /// guarded on the question's own row and seen landing, then Enter on the
     /// answer's own row once a fresh read shows the focus on it

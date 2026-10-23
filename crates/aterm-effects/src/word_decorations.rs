@@ -244,6 +244,7 @@ pub struct PetCursorFrame {
 }
 
 /// One resolved cursor-companion emission (grouped so the render call does not grow a positional argument list).
+#[derive(Clone, Copy, Debug)]
 pub struct KittyCursorFrame {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
@@ -990,8 +991,8 @@ impl DoneMarkLru {
     }
 
     #[inline]
-    fn remove(&mut self, key: &u64) -> bool {
-        let Some(idx) = self.index.remove(key) else {
+    fn remove(&mut self, key: u64) -> bool {
+        let Some(idx) = self.index.remove(&key) else {
             return false;
         };
         self.detach(idx);
@@ -1104,12 +1105,13 @@ struct KittyCustom {
     w: u16,
     h: u16,
     rgba: Arc<[u8]>,
-    cache: Option<(u16, u16, Vec<u8>)>,
+    cache_size: (u16, u16),
+    cache_rgba: Vec<u8>,
 }
 
 struct NotePaintCache {
     host: u64,
-    rgba: Vec<u8>,
+    tile: aterm_scene::Tile,
 }
 
 impl NotePaintCache {
@@ -1118,7 +1120,7 @@ impl NotePaintCache {
         baker: &mut CatBaker,
         host: u64,
         (w, h): (u16, u16),
-        paint: impl FnOnce() -> aterm_scene::Tile,
+        paint: impl FnOnce(&mut aterm_scene::Tile),
     ) -> Option<CatTile> {
         if let Some(tile) = baker.host_peek(host) {
             return Some(tile);
@@ -1128,12 +1130,19 @@ impl NotePaintCache {
         }
         let cache = match slot {
             Some(cache) if cache.host == host => cache,
-            _ => slot.insert(Self {
-                host,
-                rgba: paint().pixels().to_vec(),
-            }),
+            Some(cache) => {
+                cache.host = host;
+                cache.tile.reset(u32::from(w), u32::from(h));
+                paint(&mut cache.tile);
+                cache
+            }
+            None => {
+                let mut tile = aterm_scene::Tile::new(u32::from(w), u32::from(h));
+                paint(&mut tile);
+                slot.insert(Self { host, tile })
+            }
         };
-        baker.host_tile(host, w, h, &cache.rgba)
+        baker.host_tile(host, w, h, cache.tile.pixels())
     }
 }
 
@@ -1342,6 +1351,7 @@ pub struct WordDecorations {
     kitty_cursor_placement: KittyCursorPlacementState,
     note_cache: [Option<NotePaintCache>; 2],
     nuke_cache: [Option<NotePaintCache>; 3],
+    mote_scratch: Option<aterm_scene::Tile>,
     done_marks: DoneMarkLru,
     frozen_at: Option<Instant>,
     settle_until: Option<Instant>,
@@ -1693,20 +1703,16 @@ impl WordDecorations {
     }
 
     fn with_each_pane(&mut self, mut f: impl FnMut(&mut Self)) {
+        if !self.parked.is_empty() {
+            let mut parked = std::mem::take(&mut self.parked);
+            for slot in parked.values_mut() {
+                slot.swap(self);
+                f(self);
+                slot.swap(self);
+            }
+            self.parked = parked;
+        }
         f(self);
-        if self.parked.is_empty() {
-            return;
-        }
-        let keys: Vec<u64> = self.parked.keys().copied().collect();
-        for key in keys {
-            let Some(mut slot) = self.parked.remove(&key) else {
-                continue;
-            };
-            slot.swap(self);
-            f(self);
-            slot.swap(self);
-            self.parked.insert(key, slot);
-        }
     }
 
     /// Hard reset (v3 §1.1: master toggle, config reload / lexicon rebuild, web knob setters): clears episodes and `done_marks`, so everything replays.
@@ -2289,24 +2295,31 @@ impl WordDecorations {
 
         let (w, h) = (footprint.w, footprint.h);
         let (ax, ay, w, h) = if let Some(cust) = self.kitty_custom.as_mut() {
-            let (nw, nh) = (usize::from(cust.w).max(1), usize::from(cust.h).max(1));
-            if cust.cache.as_ref().map(|(cw, chh, _)| (*cw, *chh)) != Some((w, h)) {
-                let r = crate::kitty_cursor::resample_nearest(
-                    &cust.rgba,
-                    nw,
-                    nh,
-                    usize::from(w),
-                    usize::from(h),
-                );
-                cust.cache = Some((w, h, r));
-            }
             let host = crate::kitty_cursor::HOST_ID ^ self.kitty_gen;
-            let Some(tile) =
-                self.cat_baker
-                    .host_tile(host, w, h, &cust.cache.as_ref().expect("set above").2)
-            else {
-                // Distinct branch.
-                return None;
+            let tile = if let Some(tile) = self.cat_baker.host_peek(host) {
+                tile
+            } else {
+                if !self.cat_baker.can_bake() {
+                    return None;
+                }
+                let src: &[u8] = if (cust.w, cust.h) == (w, h) {
+                    &cust.rgba
+                } else {
+                    if cust.cache_size != (w, h) {
+                        let (nw, nh) = (usize::from(cust.w).max(1), usize::from(cust.h).max(1));
+                        crate::kitty_cursor::resample_nearest_into(
+                            &cust.rgba,
+                            nw,
+                            nh,
+                            usize::from(w),
+                            usize::from(h),
+                            &mut cust.cache_rgba,
+                        );
+                        cust.cache_size = (w, h);
+                    }
+                    &cust.cache_rgba
+                };
+                self.cat_baker.host_tile(host, w, h, src)?
             };
             (tile.ax, tile.ay, w, h)
         } else {
@@ -2393,7 +2406,7 @@ impl WordDecorations {
                     &mut self.cat_baker,
                     host,
                     (nw, nh),
-                    || crate::kitty_sing::bake_note(nw, nh, note.kind),
+                    |tile| crate::kitty_sing::paint_note(tile, note.kind),
                 ) else {
                     // Distinct branch.
                     continue;
@@ -2551,7 +2564,15 @@ impl WordDecorations {
                 if !self.cat_baker.can_bake() {
                     return None;
                 }
-                let paint = Self::bake_pet_mote(m.kind, bucket, side);
+                let side_u32 = u32::from(side);
+                let paint = match &mut self.mote_scratch {
+                    Some(tile) => {
+                        tile.reset(side_u32, side_u32);
+                        tile
+                    }
+                    slot @ None => slot.insert(aterm_scene::Tile::new(side_u32, side_u32)),
+                };
+                Self::paint_pet_mote(paint, m.kind, bucket, side);
                 self.cat_baker.host_tile(host, side, side, paint.pixels())
             }) else {
                 // Distinct branch.
@@ -2850,14 +2871,14 @@ impl WordDecorations {
         }
     }
 
-    fn bake_pet_mote(
+    fn paint_pet_mote(
+        tile: &mut aterm_scene::Tile,
         kind: crate::kitty_pet::PetMoteKind,
         bucket: u32,
         side: u16,
-    ) -> aterm_scene::Tile {
-        let mut tile = aterm_scene::Tile::new(u32::from(side), u32::from(side));
+    ) {
         if side == 0 {
-            return tile;
+            return;
         }
         let s = f32::from(side);
         let ang = bucket as f32 / Self::PET_MOTE_ROT_BUCKETS as f32 * std::f32::consts::TAU;
@@ -2895,7 +2916,7 @@ impl WordDecorations {
             }
             crate::kitty_pet::PetMoteKind::Zee | crate::kitty_pet::PetMoteKind::ZeePop => {
                 fill_poly(
-                    &mut tile,
+                    tile,
                     &[
                         (0.20, 0.16),
                         (0.80, 0.16),
@@ -2913,12 +2934,12 @@ impl WordDecorations {
             }
             crate::kitty_pet::PetMoteKind::Note => {
                 fill_poly(
-                    &mut tile,
+                    tile,
                     &[(0.46, 0.12), (0.58, 0.12), (0.58, 0.72), (0.46, 0.72)],
                     0.88,
                 );
                 fill_poly(
-                    &mut tile,
+                    tile,
                     &[(0.58, 0.12), (0.82, 0.24), (0.74, 0.44), (0.58, 0.28)],
                     0.88,
                 );
@@ -2926,14 +2947,13 @@ impl WordDecorations {
                 tile.disc(hx * s, hy * s, (0.15 * s).max(1.2), white, 0.88);
             }
             crate::kitty_pet::PetMoteKind::Heart => {
-                fill_poly(&mut tile, &[(0.18, 0.46), (0.82, 0.46), (0.50, 0.86)], 0.85);
+                fill_poly(tile, &[(0.18, 0.46), (0.82, 0.46), (0.50, 0.86)], 0.85);
                 for &(u, v) in &[(0.34f32, 0.38f32), (0.66, 0.38)] {
                     let (x, y) = rp(u, v);
                     tile.disc(x * s, y * s, (0.19 * s).max(1.2), white, 0.85);
                 }
             }
         }
-        tile
     }
 
     const DOG_TRAIL_NUM: i32 = 3;
@@ -3066,12 +3086,19 @@ impl WordDecorations {
                     self.kitty_gen = u64::MAX;
                     return;
                 }
+                let mut cache_rgba = self
+                    .kitty_custom
+                    .take()
+                    .map(|c| c.cache_rgba)
+                    .unwrap_or_default();
+                cache_rgba.clear();
                 self.kitty_custom = Some(KittyCustom {
                     source_fp,
                     w,
                     h,
                     rgba,
-                    cache: None,
+                    cache_size: (0, 0),
+                    cache_rgba,
                 });
                 self.kitty_disabled = false;
                 self.kitty_gen = source_fp;
@@ -4067,7 +4094,7 @@ impl WordDecorations {
                 .any(|&k| typed_here[k] && pending[k].live_caret_completion);
             let mut typed_keys = [0u64; MAX_OCCURRENCES];
             let mut typed_keys_len = 0usize;
-            for &k in group.iter() {
+            for &k in group {
                 if typed_here[k] && pending[k].at_live_cursor && typed_keys_len < MAX_OCCURRENCES {
                     let occ = &out[usize::from(pending[k].occ_idx)];
                     typed_keys[typed_keys_len] = occ.ident ^ pending[k].ctx_fp;
@@ -4104,7 +4131,7 @@ impl WordDecorations {
                                 && pending[k].live_caret_completion));
                     let born_done = if typed_reentry {
                         typed_witness_used = true;
-                        self.done_marks.remove(&key);
+                        self.done_marks.remove(key);
                         false
                     } else {
                         touch_done(&mut self.done_marks, key)
@@ -4169,7 +4196,7 @@ impl WordDecorations {
                         self.insert_persist_bounded(old_ident, ep, PersistAdmission::Grace);
                         continue;
                     }
-                    self.done_marks.remove(&old_key);
+                    self.done_marks.remove(old_key);
                     continue;
                 }
                 self.insert_persist_bounded(old_ident, ep, PersistAdmission::Grace);
@@ -4634,7 +4661,7 @@ impl WordDecorations {
                     &mut self.cat_baker,
                     host,
                     (nw, nh),
-                    || crate::nuke::bake_nuke(nw, nh, part),
+                    |tile| crate::nuke::paint_nuke(tile, part),
                 ) else {
                     // Distinct branch.
                     continue;
@@ -6425,7 +6452,7 @@ fn emit_ink(
                     col,
                     color: u32_to_rgb3(mix_rgb(fg, lit, glow * paper_glow_scale(fg, lit, bg, amp))),
                 };
-                *fp = fold_ink(*fp, &cell);
+                *fp = fold_ink(*fp, cell);
                 *fp ^= frame_term;
                 ink.push(cell);
             }
@@ -6516,7 +6543,7 @@ fn emit_ink(
             col,
             color: u32_to_rgb3(color),
         };
-        *fp = fold_ink(*fp, &cell);
+        *fp = fold_ink(*fp, cell);
         if fold_frame {
             *fp ^= frame_term;
         }
@@ -6627,7 +6654,7 @@ fn emit_rainbow_ink(
             col,
             color: u32_to_rgb3(color),
         };
-        *fp = fold_ink(*fp, &cell);
+        *fp = fold_ink(*fp, cell);
         if fold_frame {
             *fp ^= frame_term;
         }
@@ -6698,7 +6725,7 @@ fn emit_rainbow_sparkles(
 
 /// Fold an ink cell's visible fields into the frame fingerprint (FNV-1a chain, the `fold_deco` sibling).
 #[inline]
-pub(crate) const fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
+pub(crate) const fn fold_ink(mut h: u64, c: InkCell) -> u64 {
     h = fnv_mix_u64(h, c.row as u64);
     h = fnv_mix_u64(h, c.col as u64);
     h = fnv_mix_u64(h, c.color[0] as u64);
@@ -16472,15 +16499,43 @@ mod pet_handoff_emission_tests {
         assert!(wd.cat_baker.host_tile(0xAA02, 4, 4, &scratch).is_some());
         let mut painted = false;
         assert!(
-            NotePaintCache::tile(&mut slot, &mut wd.cat_baker, 0xAA03, (8, 8), || {
+            NotePaintCache::tile(&mut slot, &mut wd.cat_baker, 0xAA03, (8, 8), |_| {
                 painted = true;
-                aterm_scene::Tile::new(8, 8)
             })
             .is_none()
         );
         assert!(
             !painted && slot.is_none(),
             "NotePaintCache::tile must not run paint() when cat_baker budget is spent"
+        );
+        wd.begin_host_frame();
+        wd.begin_baker_frame(geom, true);
+        assert!(
+            NotePaintCache::tile(&mut slot, &mut wd.cat_baker, 0xAA03, (8, 8), |tile| {
+                tile.disc(4.0, 4.0, 2.0, (1.0, 1.0, 1.0), 1.0);
+            })
+            .is_some()
+        );
+        let ptr_8 = slot
+            .as_ref()
+            .expect("cached 8x8 tile")
+            .tile
+            .pixels()
+            .as_ptr();
+        assert!(
+            NotePaintCache::tile(&mut slot, &mut wd.cat_baker, 0xAA04, (6, 6), |tile| {
+                tile.disc(3.0, 3.0, 1.5, (1.0, 1.0, 1.0), 1.0);
+            })
+            .is_some()
+        );
+        assert_eq!(
+            slot.as_ref()
+                .expect("cached 6x6 tile")
+                .tile
+                .pixels()
+                .as_ptr(),
+            ptr_8,
+            "NotePaintCache::tile must reuse its Tile buffer when a new host fits existing capacity"
         );
 
         for (cols, rows, scale) in [(1, geom.rows, 1.0), (geom.cols, 1, 3.0)] {
@@ -17284,6 +17339,76 @@ mod trick_flash_hook_tests {
         wd.reset();
         assert_eq!(wd.pet_ink(), (&[][..], None));
         assert_eq!(wd.burst_hint, None);
+    }
+
+    #[test]
+    fn custom_kitty_sprite_skips_exact_size_resample_and_reuses_cache_across_reloads() {
+        let mut wd = WordDecorations::default();
+        let geom = EffectGeom {
+            cols: 80,
+            rows: 24,
+            cell_w: 10,
+            cell_h: 20,
+        };
+        let frame = KittyCursorFrame {
+            geom,
+            cursor: (2, 2),
+            look: KittyLook::default(),
+            colors: CatColorKey::default(),
+            bob: 0.0,
+            lift: 0.0,
+            alpha: 255,
+            pose: crate::kitty_cursor::CatPose::STILL,
+            sing: 0.0,
+            notes: [None; crate::kitty_sing::MAX_NOTES],
+        };
+        let mut free = Vec::new();
+
+        // Exact-size custom sprite (w=36, h=36 at cell_h=20 -> max_h=36, s=1.0 -> (36, 36))
+        // should blit directly from `cust.rgba` without allocating `cache_rgba`.
+        let exact_rgba: Arc<[u8]> = vec![200u8; 36 * 36 * 4].into();
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x1111,
+            w: 36,
+            h: 36,
+            rgba: exact_rgba,
+        });
+        wd.begin_host_frame();
+        assert!(wd.kitty_cursor(frame, &mut free).is_some());
+        assert_eq!(
+            wd.kitty_custom.as_ref().unwrap().cache_rgba.capacity(),
+            0,
+            "exact-size custom sprite must blit directly without allocating resample cache"
+        );
+
+        // Non-matching size (8x8 -> resampled to 36x36) allocates once and reuses across reloads.
+        let small_a: Arc<[u8]> = vec![120u8; 8 * 8 * 4].into();
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x2222,
+            w: 8,
+            h: 8,
+            rgba: small_a,
+        });
+        wd.begin_host_frame();
+        assert!(wd.kitty_cursor(frame, &mut free).is_some());
+        let cust = wd.kitty_custom.as_ref().unwrap();
+        assert_eq!(cust.cache_size, (36, 36));
+        let ptr_a = cust.cache_rgba.as_ptr();
+        let cap_a = cust.cache_rgba.capacity();
+        assert!(cap_a >= 36 * 36 * 4);
+
+        let small_b: Arc<[u8]> = vec![180u8; 8 * 8 * 4].into();
+        wd.set_kitty_sprite_source(KittySpriteSource::Custom {
+            source_fp: 0x3333,
+            w: 8,
+            h: 8,
+            rgba: small_b,
+        });
+        wd.begin_host_frame();
+        assert!(wd.kitty_cursor(frame, &mut free).is_some());
+        let cust_b = wd.kitty_custom.as_ref().unwrap();
+        assert_eq!(cust_b.cache_rgba.as_ptr(), ptr_a);
+        assert_eq!(cust_b.cache_rgba.capacity(), cap_a);
     }
 }
 

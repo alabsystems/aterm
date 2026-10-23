@@ -2,8 +2,11 @@
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Derived from read-fonts 0.43.2 src/tables/gvar.rs and src/tables/variations.rs,
-// modified by the aterm project in 2026.
+// Derived from read-fonts 0.43.2 src/tables/gvar.rs, src/tables/variations.rs and
+// generated/generated_gvar.rs, generated/generated_variations.rs, and modified by the aterm
+// project in 2026: the `gvar` glyph variation data as FreeType's 16.16 loader reads it (tuple
+// headers, shared and private packed point numbers, packed deltas, the fixed-point tuple
+// scalar), specialized to point deltas in 16.16, with every read checked.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! Fixed-point 16.16 `gvar` tuple variation reader for the autohinter.

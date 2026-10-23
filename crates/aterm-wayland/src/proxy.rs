@@ -77,7 +77,12 @@ impl Display {
     /// Wrap someone else's display.
     ///
     /// # Safety
-    /// `raw` remains a live `wl_display *` through every use and drop of this handle.
+    /// `raw` remains a live `wl_display *` through every use and drop of
+    /// this handle and every queue, proxy, wrapper and listener derived
+    /// from it. All queues must be destroyed before the display is closed.
+    /// For each private queue, dispatch must be serialized with the use
+    /// and destruction of its proxies and listeners; destroying a proxy
+    /// does not wait for a callback already running on another thread.
     #[inline]
     pub const unsafe fn from_ptr(raw: NonNull<c_void>) -> Display {
         Display(raw)
@@ -172,7 +177,12 @@ impl OwnedDisplay {
     /// Borrow the raw display as a copyable handle.
     ///
     /// # Safety
-    /// This owner must remain alive through every use and drop of the returned handle.
+    /// This owner must remain alive through every use and drop of the
+    /// returned handle and every queue, proxy, wrapper and listener derived
+    /// from it. All queues must be destroyed before this owner is dropped.
+    /// For each private queue, dispatch must be serialized with the use
+    /// and destruction of its proxies and listeners; destroying a proxy
+    /// does not wait for a callback already running on another thread.
     #[inline]
     pub const unsafe fn display(&self) -> Display {
         self.0
@@ -182,7 +192,7 @@ impl OwnedDisplay {
 impl Drop for OwnedDisplay {
     fn drop(&mut self) {
         if let Ok(c) = client() {
-            // SAFETY: A display this value connected, disconnected.
+            // SAFETY: A display this value connected, disconnected once.
             unsafe { (c.display_disconnect)(self.0.as_ptr()) }
         }
     }
@@ -194,7 +204,9 @@ pub struct Queue {
     raw: NonNull<c_void>,
 }
 
-// SAFETY: The queue moves with its owner.
+// SAFETY: The queue moves with its owner. The Display admission contract
+// requires serialized dispatch and proxy/listener destruction on this
+// queue; libwayland's display lock does not join callbacks already running.
 unsafe impl Send for Queue {}
 
 impl Queue {
@@ -281,7 +293,8 @@ impl ReadIntent<'_> {
         let display = self.display;
         let client = self.client;
         std::mem::forget(self);
-        // SAFETY: A live display with a read announced by this value, which is consumed here.
+        // SAFETY: A live display with a read announced by this value, which is consumed here,
+        // so it is read or cancelled exactly once.
         if unsafe { (client.display_read_events)(display.as_ptr()) } < 0 {
             return Err(display.error_or(Error::Display(-1)));
         }
@@ -299,7 +312,8 @@ impl Drop for ReadIntent<'_> {
 impl Drop for Queue {
     fn drop(&mut self) {
         if let Ok(c) = client() {
-            // SAFETY: A queue this value made.
+            // SAFETY: A queue this value made; every proxy on it is destroyed
+            // first (its owners' contract).
             unsafe { (c.event_queue_destroy)(self.raw.as_ptr()) }
         }
     }
@@ -319,7 +333,7 @@ impl Wrapper {
 impl Drop for Wrapper {
     fn drop(&mut self) {
         if let Ok(c) = client() {
-            // SAFETY: A wrapper this value made, destroyed.
+            // SAFETY: A wrapper this value made, destroyed once.
             unsafe { (c.proxy_wrapper_destroy)(self.0.as_ptr()) }
         }
     }
@@ -446,12 +460,13 @@ pub struct Listener(*mut Box<Handler>);
 
 // SAFETY: The closure is `Send`; the pointer is this value's alone.
 unsafe impl Send for Listener {}
-// SAFETY: A shared `&Listener` can do nothing (it has no `&self` methods), so it may be shared.
+// SAFETY: a shared `&Listener` can do nothing (it has no `&self` methods), so
+// it may be shared with any thread; only its owner's drop touches the closure.
 unsafe impl Sync for Listener {}
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        // SAFETY: Made by `Box::into_raw` in `Proxy::listen`, freed.
+        // SAFETY: Made by `Box::into_raw` in `Proxy::listen`, freed once.
         drop(unsafe { Box::from_raw(self.0) });
     }
 }
@@ -493,7 +508,7 @@ impl Proxy {
     /// The object's interface name.
     ///
     /// # Safety
-    /// The proxy is live.
+    /// The proxy is live; the name lives as long as its interface table.
     pub unsafe fn class(self) -> Option<&'static CStr> {
         let c = client().ok()?;
         // SAFETY: The caller's contract.
@@ -505,7 +520,8 @@ impl Proxy {
     /// Send request `opcode` with `args` (one per signature argument).
     ///
     /// # Safety
-    /// The proxy is live, `args` match the request's signature.
+    /// The proxy is live, `args` match the request's signature, and a
+    /// destroyed proxy is not used again.
     pub unsafe fn marshal(
         self,
         opcode: u32,
@@ -561,7 +577,9 @@ impl Proxy {
     /// Deliver the proxy's events to `handler`.
     ///
     /// # Safety
-    /// The proxy is live and was made by this crate (a foreign proxy has its owner's listener).
+    /// The proxy is live and was made by this crate (a foreign proxy has its
+    /// owner's listener), and the returned [`Listener`] outlives it (drop the
+    /// listener only after destroying the proxy).
     pub unsafe fn listen(
         self,
         handler: impl FnMut(Proxy, u32, &[EventArg<'_>]) + Send + 'static,

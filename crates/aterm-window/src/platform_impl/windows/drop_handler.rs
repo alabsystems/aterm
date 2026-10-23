@@ -5,7 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Preserve COM interface identity and release each acquired storage medium through OLE.
 
 use std::ffi::{c_void, OsString};
 use std::os::windows::ffi::OsStringExt;
@@ -33,12 +32,10 @@ use crate::platform_impl::platform::WindowId;
 use crate::event::Event;
 use crate::window::WindowId as RootWindowId;
 
-// Published COM interface IDs (unknwn.h and oleidl.h).
 const IID_UNKNOWN: GUID = GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
 const IID_DROP_TARGET: GUID = GUID::from_u128(0x00000122_0000_0000_c000_000000000046);
 
 /// A successful GetData transfers one medium, including its release owner.
-/// ReleaseStgMedium honors pUnkForRelease; DragFinish would free only the handle.
 struct StorageMedium(STGMEDIUM);
 
 impl Drop for StorageMedium {
@@ -77,7 +74,6 @@ impl FileDropHandler {
         FileDropHandler { data: Box::into_raw(data) }
     }
 
-    // Implement IUnknown
     pub unsafe extern "system" fn QueryInterface(
         this: *mut IUnknown,
         riid: *const GUID,
@@ -102,8 +98,8 @@ impl FileDropHandler {
         if !supported {
             return E_NOINTERFACE;
         }
-        // SAFETY: both interfaces start at the same repr(C) object's first field.
-        // Each successful query hands out one owned reference to that identity.
+        // SAFETY: both interfaces start at the same repr(C) object's first field; each successful
+        // query hands out one owned reference.
         unsafe {
             Self::AddRef(this);
             *ppvObject = this.cast();
@@ -121,7 +117,6 @@ impl FileDropHandler {
         let drop_handler = unsafe { Self::from_interface(this) };
         let count = drop_handler.refcount.fetch_sub(1, Ordering::Release) - 1;
         if count == 0 {
-            // Destroy the underlying data
             drop(unsafe { Box::from_raw(drop_handler as *mut FileDropHandlerData) });
         }
         count as u32
@@ -229,13 +224,9 @@ impl FileDropHandler {
             // SAFETY: the advertised medium type selects this union member.
             let hdrop: HDROP = unsafe { medium.0.u.hGlobal };
 
-            // The second parameter (0xFFFFFFFF) instructs the function to return the item count
             let item_count = unsafe { DragQueryFileW(hdrop, 0xffffffff, ptr::null_mut(), 0) };
 
             for i in 0..item_count {
-                // Get the length of the path string NOT including the terminating null character.
-                // Previously, this was using a fixed size array of MAX_PATH length, but the
-                // Windows API allows longer paths under certain circumstances.
                 let character_count =
                     unsafe { DragQueryFileW(hdrop, i, ptr::null_mut(), 0) as usize };
                 let str_len = character_count + 1;
@@ -254,8 +245,6 @@ impl FileDropHandler {
 
             true
         } else if get_data_result == DV_E_FORMATETC {
-            // If the dropped item is not a file this error will occur.
-            // In this case it is OK to return without taking further action.
             debug!("Error occurred while processing dropped/hovered item: item is not a file.");
             false
         } else {

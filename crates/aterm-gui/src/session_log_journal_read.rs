@@ -81,7 +81,7 @@ pub(crate) enum JournalRead {
     View(Box<View>),
     /// No line of it in a journal read whole (or no journal).
     Absent,
-    /// No line of it in the reached prefix of a truncated read ([`JOURNAL_CUT`]).
+    /// No line of it in what a truncated read reached ([`JOURNAL_CUT`]).
     Cut,
 }
 

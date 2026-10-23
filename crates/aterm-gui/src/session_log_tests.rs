@@ -4624,6 +4624,104 @@ fn an_agent_mid_turn_stays_in_its_turn_across_an_update() {
     }
 }
 
+/// A MAIL ITS BRIDGE OFFERS AGAIN AFTER A SEAMLESS UPDATE IS MARKED ONCE
+/// (6G-4's latch finding, found live by `lab seamless`). The predecessor
+/// marks a task mail's delivery. The update carries the log but not the
+/// inbox ring, so the successor's bridge offers the unread mail again as
+/// the ring's refill. The successor takes the row back, and its log holds
+/// one `mail dir=in` for it, whether the log was carried or started over.
+/// So the fold counts one mail in, one open and one waiting; `brief` says
+/// `mail in 1`; and the successor's next ctl turn links the mail.
+#[test]
+fn a_mail_its_bridge_offers_again_after_an_update_is_marked_once() {
+    for carry in [true, false] {
+        let (p, _, hand) = producer();
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(p.clone());
+        {
+            let mut g = p.ctx.timeline.lock().unwrap();
+            hand.set(10);
+            assert!(g.note_foreground_group(300));
+            assert!(g.set_program(300, Some("claude".into())));
+            swept(&mut g);
+            publish(&mut g, "idle", 1);
+        }
+        hand.set(100);
+        let mail = |sid: &str| format!("{sid} off=9 from=h-a kind=task trust=agent text=x");
+        let first = crate::fabric::cmd_deliver(&store, &mail(p.sid.as_str()));
+        assert!(first.starts_with("OK "), "{first}");
+        let manifest = SessionHandoff::from_store(&store.read().unwrap());
+        let rec = manifest
+            .sessions
+            .iter()
+            .find(|r| r.local_id == p.local_id)
+            .expect("the record")
+            .clone();
+        assert_eq!(rec.fabric.marked, [9], "the delivery's mark is carried");
+        let (s, next, hand2) = hand_over(&p, &store.read().unwrap(), 2_000, carry);
+        crate::spawn::seed_adopted_fabric(
+            &s.ctx.fabric,
+            &s.ctx.timeline,
+            &rec.topics,
+            &rec.hold_rows(),
+            &rec.fabric,
+        );
+        let next: crate::session_store::Store = Arc::new(std::sync::RwLock::new(next));
+        {
+            let mut g = s.ctx.timeline.lock().unwrap();
+            successors_first_sweep(&mut g, "claude");
+        }
+        hand2.set(100);
+        let refill = crate::fabric::cmd_deliver(&next, &mail(s.sid.as_str()));
+        assert!(refill.starts_with("OK "), "the refill is taken: {refill}");
+        assert!(
+            crate::fabric::cmd_inbox(&s.ctx, "--peek").contains(" off=9 "),
+            "carry {carry}: the successor's inbox holds the mail again"
+        );
+        let brief = crate::control::cmd_brief(&s.ctx, &next, "");
+        assert!(brief.contains("mail in 1 "), "carry {carry}:\n{brief}");
+        let mut g = s.ctx.timeline.lock().unwrap();
+        {
+            let log = g.slog().log();
+            let marks = log
+                .window()
+                .filter(|r| {
+                    r.k == Kind::Mail
+                        && r.f.get_word(Key::Dir) == Some("in")
+                        && r.f.get_u(Key::Off) == Some(9)
+                })
+                .count();
+            assert_eq!(marks, 1, "carry {carry}: {:?}", lines(log));
+            let st = log.state();
+            assert_eq!(
+                (
+                    st.totals.mail_in,
+                    st.mail_open,
+                    log.fold().mail_waiting().len()
+                ),
+                (1, 1, 1),
+                "carry {carry}: one mail in, open and waiting"
+            );
+        }
+        hand2.set(200);
+        let now = g.slog().now();
+        let _ = g.slog_mut().ctl_turn(Actor::Ctl, 1, None, now);
+        hand2.set(300);
+        publish(&mut g, "busy", 2);
+        let log = g.slog().log();
+        let turn = log
+            .window()
+            .rfind(|r| r.op == aterm_slog::Op::Open && r.k == Kind::Turn)
+            .map(|r| r.node)
+            .expect("the ctl turn");
+        assert_eq!(
+            log.fold().mail_link(turn).map(|l| l.off),
+            Some(9),
+            "carry {carry}: the turn links the one waiting mail"
+        );
+    }
+}
+
 #[test]
 fn a_command_running_across_an_update_closes_with_its_code_and_wall_duration() {
     for carry in [true, false] {

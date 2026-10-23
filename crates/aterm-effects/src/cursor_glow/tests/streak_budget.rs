@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The beam family's streak over text on light grounds: the under-ink bodies.
-//! (The dark ground's bed and over-ink account are `streak_bed`'s.)
+//! Light-ground cursor-glow streak and body legibility tests.
 
 use super::*;
 
-/// A full-height glyph at `(row, col)` for the light bodies: three 2 px stems
-/// from the ascender line to the descender line, and the counters beside
-/// them, split into the top edge band, the x-height and the bottom edge band.
 fn tall_glyph(g: Geom, row: u16, col: u16) -> [(Pixels, Pixels); 3] {
     let x0 = i32::from(g.origin_x) + i32::from(col) * g.cw as i32;
     let y0 = i32::from(g.origin_y) + i32::from(row) * g.ch as i32;
@@ -33,9 +29,6 @@ fn tall_glyph(g: Geom, row: u16, col: u16) -> [(Pixels, Pixels); 3] {
     })
 }
 
-/// A light frame composited in the renderer's order: the page, the under-ink
-/// stream `under`, full-height glyphs on the typed row and the rows above and
-/// below it (columns `cols`), then the over-ink quads `out` and the `halos`.
 fn light_frame(
     g: Geom,
     c: &GlowConfig,
@@ -59,8 +52,6 @@ fn light_frame(
     frame
 }
 
-/// The light-ground styles the body test judges: the beam family and Lumen,
-/// whose glow is its body.
 const LIGHT_BODY_STYLES: [GlowStyle; 6] = [
     GlowStyle::Comet,
     GlowStyle::Beam,
@@ -70,11 +61,6 @@ const LIGHT_BODY_STYLES: [GlowStyle; 6] = [
     GlowStyle::Lumen,
 ];
 
-/// One style's typed burst on one light theme (`fg` on `bg`): 20 keys at the
-/// gallery's cadence, judged at the 12th and 20th key and 120 ms later, then
-/// four backspaces and four keys retyped, judged at the last. Each judge
-/// point pushes what breaks the light law into `failures` and returns the
-/// worst stroke ratio; `drew` records that the body drew.
 fn light_body_burst(
     style: GlowStyle,
     (fg, bg): (u32, u32),
@@ -96,15 +82,12 @@ fn light_body_burst(
     let mut out = Vec::new();
     let mut worst = f32::INFINITY;
     let theme = format!("{style:?} on #{bg:06x}");
-    // The host probes the typed row every frame, so a grain keeps off it.
     let probe = |glow: &mut CursorGlow, caret: u16, at: Instant| {
         let mut chars = [' '; 48];
         chars[usize::from(start)..usize::from(caret)].fill('x');
         glow.observe_row(row, caret, &chars, at);
     };
     let mut judge = |glow: &mut CursorGlow, out: &[GlowQuad], at: Instant, caret: u16| {
-        // The full tick's streams: nothing additive, nothing under the ink
-        // past the body cap.
         let under = glow.under_quads().to_vec();
         let halos = glow.halos().to_vec();
         if let Some(q) = out.iter().chain(&under).find(|q| q.alpha == 0) {
@@ -126,7 +109,6 @@ fn light_body_burst(
                 "{theme}: an under-ink quad past the body cap: {q:?}"
             ));
         }
-        // The body alone (the streak, and Lumen's glow): inside the typed row.
         let (mut b_out, mut b_halos, mut b_under) = (Vec::new(), Vec::new(), Vec::new());
         let cur = Some((row, caret));
         glow.emit_comet(at, &c, g, cur, &mut b_out, &mut b_halos, &mut b_under);
@@ -150,7 +132,6 @@ fn light_body_burst(
                 }
             }
         }
-        // Legibility over the whole frame, crackles and grains included.
         let lit = light_frame(g, &c, rows, typed.clone(), (&under, out, &halos));
         for col in typed {
             for (band, (ink, counters)) in tall_glyph(g, row, col).iter().enumerate() {
@@ -179,8 +160,6 @@ fn light_body_burst(
     t += Duration::from_millis(120);
     glow.tick(Some((row, caret)), t, &c, g, &mut out);
     judge(&mut glow, &out, t, caret);
-    // A revisit: four backspaces and the four keys retyped over the same
-    // cells, whose bodies must not stack.
     for _ in 0..4 {
         t += Duration::from_millis(57);
         arm_exact_backspace(&mut glow, t, (row, caret), (row, caret - 1));
@@ -198,19 +177,6 @@ fn light_body_burst(
     worst
 }
 
-/// Light grounds: the beam family's body (and Lumen's glow) is ink under the
-/// letters, held inside the typed row. Over a typed burst and a
-/// backspace-and-retype pass, on GitHub Light (`#1f2328` on `#ffffff`) and
-/// Default Light (`#2b2d33` on `#f6f7f9`) at full intensity, a full tick lays
-/// no additive quad or halo and nothing under the ink past
-/// [`LIGHT_BODY_ALPHA_CAP`]; every stroke of the typed letters keeps
-/// [`BODY_CONTRAST_BAR`] against its counter with the frame composited in the
-/// renderer's order (page, the under-ink stream, the glyphs, the over-ink
-/// quads, the halos), Laser's crackles included; and the body alone leaves
-/// every pixel outside the typed row as the bare frame has it. Negative
-/// control: with the bodies laid in their unsolved vivid ink
-/// (`light_body_unsolved`), a stroke drops under the bar, so the probe sees
-/// the solve.
 #[test]
 fn light_bodies_stay_in_the_typed_row_and_keep_its_letters_legible() {
     let mut failures = Vec::new();

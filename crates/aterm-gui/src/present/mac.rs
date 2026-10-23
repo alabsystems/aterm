@@ -46,6 +46,12 @@ const BITS_PER_PIXEL: usize = 32;
 /// Bytes per pixel — one `u32` word.
 const BYTES_PER_PIXEL: usize = 4;
 
+// SAFETY (whole block): stable CoreGraphics C entry points with the signatures
+// in Apple's headers. At each call site every `Create` result is checked for
+// NULL and released once; the data given to `CGDataProviderCreateWithData` is a
+// leaked `Box<[u32]>` that comes back through `release_pixel_box` (by hand when
+// the provider is NULL); and the colour space, owned by the presenter, is
+// retained by every image built against it.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     /// The generic device RGB space, as `softbuffer`'s CG backend uses.
@@ -79,7 +85,9 @@ unsafe extern "C" {
     ) -> CGImageRef;
 }
 
-// SAFETY: A read of an immutable, stable QuartzCore-exported `CFStringRef` global.
+// SAFETY: a read of an immutable, stable QuartzCore-exported `CFStringRef`
+// global. Never freed, never mutated here. `platform::layer_colorspace`
+// declares the same symbol with the same type.
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
     /// Pins unrescaled contents to the minimum-Y left corner of a
@@ -91,13 +99,17 @@ unsafe extern "C" {
 /// CoreGraphics hands the presented buffer back here when the last image reference drops.
 ///
 /// # Safety
-/// Called only by CoreGraphics.
+///
+/// `data` is NULL, or `data` and `size` are the thin pointer and byte length of
+/// one leaked `Box<[u32]>` (as [`MacCpuFrame::commit`] gives
+/// `CGDataProviderCreateWithData`), and that pair is passed here only once.
 unsafe extern "C" fn release_pixel_box(_info: *mut c_void, data: *const c_void, size: usize) {
     if data.is_null() {
         return;
     }
     let len = size / size_of::<u32>();
-    // SAFETY: `data` and `size` are the pointer and byte length of one leaked `Box<[u32]>`.
+    // SAFETY: `data` and `size` are the pointer and byte length of one `Box<[u32]>` leaked in
+    // `commit`, the only producer, and delivered back once, so this frees it once.
     unsafe {
         drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
             data.cast::<u32>().cast_mut(),
@@ -114,7 +126,8 @@ impl Drop for OwnedColorSpace {
         if self.0.is_null() {
             return;
         }
-        // SAFETY: `self.0` came from `CGColorSpaceCreateDeviceRGB` (+1) and is released once here.
+        // SAFETY: `self.0` came from `CGColorSpaceCreateDeviceRGB` (+1) and is released once here;
+        // every `CGImage` built against it retained it.
         unsafe { CGColorSpaceRelease(self.0) };
     }
 }
@@ -188,7 +201,10 @@ impl MacCpuPresenter {
     /// # Safety
     /// `self.root_layer` and `self.layer` must be live `CALayer`s on the main thread.
     unsafe fn sync_layer_geometry(&mut self) {
-        // SAFETY: Both layers are live for the presenter's lifetime.
+        // SAFETY: both layers are live for the presenter's lifetime (`layer` is
+        // our +1, `root_layer` is owned by the `NSView` that `_window` keeps
+        // alive). `bounds` and `contentsScale` are side-effect-free reads;
+        // `setFrame:` and `setContentsScale:` are plain property writes.
         unsafe {
             let bounds = appkit::send_rect(self.root_layer, sel!(bounds));
             let scale: CGFloat = appkit::send_f64(self.root_layer, sel!(contentsScale));
@@ -216,7 +232,9 @@ impl MacCpuPresenter {
 
 impl Drop for MacCpuPresenter {
     fn drop(&mut self) {
-        // SAFETY: `self.layer` is our live +1 `CALayer`.
+        // SAFETY: `self.layer` is our live +1 `CALayer`, and
+        // `-removeFromSuperlayer` is `-(void)`. The presenter is not `Send` and
+        // was built on the main thread, so it drops there.
         unsafe {
             appkit::send_v(self.layer.id(), sel!(removeFromSuperlayer));
         }
@@ -241,7 +259,14 @@ impl CpuPresenter for MacCpuPresenter {
             return Err(MacPresentError::MissingClass("CALayer"));
         }
 
-        // SAFETY: `view` is this window's live `NSView`.
+        // SAFETY: `view` is this window's live `NSView` (winit owns it for the
+        // window's lifetime, which `window`, moved into `Self` below, holds open),
+        // and we are on the main thread (checked above). `setWantsLayer:` and
+        // `layer` are the AppKit layer-backing pair; `alloc`/`init` on `CALayer`
+        // yields a +1 that `Obj` owns before anything else can fail; the anchor,
+        // flip and gravity setters are plain property writes (the gravity string
+        // is a framework constant, retained by the setter); `addSublayer:`
+        // retains our layer, so our own +1 is still released.
         unsafe {
             appkit::send_v_bool(view, sel!(setWantsLayer:), true);
             let root_layer = appkit::send_id(view, sel!(layer));
@@ -326,7 +351,10 @@ impl MacCpuFrame<'_> {
         let byte_len = buffer.len() * size_of::<u32>();
         let raw: *mut [u32] = Box::into_raw(buffer.into_boxed_slice());
 
-        // SAFETY: `raw` is a live, uniquely-owned `Box<[u32]>` of `byte_len` bytes, leaked above.
+        // SAFETY: `raw` is a live, uniquely-owned `Box<[u32]>` of `byte_len`
+        // bytes, leaked above; `release_pixel_box` reconstitutes it. Ownership
+        // passes to the provider on success and is reclaimed by hand on the NULL
+        // path, so it is freed once either way.
         let provider = unsafe {
             CGDataProviderCreateWithData(
                 ptr::null_mut(),
@@ -341,7 +369,11 @@ impl MacCpuFrame<'_> {
             return Err(MacPresentError::DataProvider);
         }
 
-        // SAFETY: `provider` is a live +1 provider over `width * height` words.
+        // SAFETY: `provider` is a live +1 provider over `width * height` words;
+        // `color_space` is the presenter's live device-RGB space; the layout
+        // arguments describe that buffer (8 bits per component, 32 per pixel,
+        // `width * 4` bytes per row) and `BITMAP_INFO` names the `0x00RRGGBB`
+        // word. A NULL `decode` (the default decode array) is documented valid.
         let image = unsafe {
             CGImageCreate(
                 width,
@@ -364,7 +396,11 @@ impl MacCpuFrame<'_> {
         }
 
         let transaction = class(c"CATransaction");
-        // SAFETY: `CATransaction`'s begin/setDisableActions:/commit are balanced on every path.
+        // SAFETY: `CATransaction`'s begin/setDisableActions:/commit are balanced
+        // on every path (nothing between them returns early). `setContents:`
+        // takes an `id`; a `CGImageRef` is a valid contents value and the
+        // property retains it, so our create-reference is released after the
+        // commit. Main thread, as checked in `new`.
         unsafe {
             if !transaction.is_null() {
                 appkit::send_v(transaction.as_id(), sel!(begin));
@@ -449,13 +485,15 @@ mod tests {
     /// inert, and a real leaked box is reclaimed exactly once.
     #[test]
     fn release_callback_reclaims_the_box_and_ignores_null() {
-        // SAFETY: The documented degenerate input.
+        // SAFETY: the documented degenerate input — the callback must not touch
+        // a NULL data pointer.
         unsafe { release_pixel_box(std::ptr::null_mut(), std::ptr::null(), 64) };
 
         let pixels = vec![0x0011_2233_u32; 32];
         let byte_len = pixels.len() * std::mem::size_of::<u32>();
         let raw: *mut [u32] = Box::into_raw(pixels.into_boxed_slice());
-        // SAFETY: Exactly the pairing `commit` sets.
+        // SAFETY: exactly the pairing `commit` sets up — the thin pointer and
+        // byte length of one leaked `Box<[u32]>`, delivered once.
         unsafe { release_pixel_box(std::ptr::null_mut(), raw.cast(), byte_len) };
     }
 }

@@ -492,7 +492,7 @@ impl TrickFlash {
                     }
                 }
             };
-            *fp = fold_ink(*fp, &cell);
+            *fp = fold_ink(*fp, cell);
         }
         *fp = fnv_mix_u64(*fp, t);
         Some(loc.since + Duration::from_millis(window))

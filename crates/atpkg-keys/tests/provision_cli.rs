@@ -102,7 +102,10 @@ fn run(dir: &Path, stdin_path: Option<&str>, args: &[&str]) -> Output {
             cmd.stdin(Stdio::null());
         }
     }
-    // SAFETY: `setsid` is async-signal-safe and touches no state shared with the parent.
+    // SAFETY: `setsid` is async-signal-safe and touches no state shared with the parent; it
+    // runs post-fork, pre-exec. Its result is ignored: failing because the child already
+    // leads a session is harmless, and the assertions do not depend on how `/dev/tty` became
+    // unavailable.
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -194,7 +197,8 @@ fn phrase_on(terminal: &str) -> Option<String> {
     })
 }
 
-/// Like [`run_on_a_terminal`].
+/// Like [`run_on_a_terminal`], but types back the phrase on the terminal at `setup`'s retype
+/// prompt.
 fn run_on_a_terminal_retyping_phrase(dir: &Path, args: &[&str]) -> TtyRun {
     let mut pty = Pty::open();
     let mut child = pty.spawn(base_command(dir, args));

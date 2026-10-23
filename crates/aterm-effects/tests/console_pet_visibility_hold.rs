@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pet must not strobe while the user types.
-//!
-//! The pet's visibility is held rather than a per-frame boolean of screen
-//! content, so keystrokes (even the caret's own protection halo) cannot flip
-//! it at the key rate. These tests measure a real `Terminal` snapshot stream:
-//! blackout frames, on->off cuts, and the largest single-frame opacity drop
-//! (which separates a fade from a cut). The guard that remains (a protected
-//! surface still takes the pet to zero; ordinary ink moves the resident behind
-//! the glyphs) is pinned in `console_hidden_cursor_coverage.rs` and
-//! `console_life_geometry.rs`.
+//! Tests that typing, cursor navigation, and output bursts do not strobe the console pet.
 
 use std::time::{Duration, Instant};
 
@@ -23,9 +14,6 @@ const COLS: u16 = 80;
 const CELL_W: u16 = 8;
 const CELL_H: u16 = 16;
 
-/// The sprite rectangle the emitter projects for these feet: `PetBrain::console_body`'s
-/// arithmetic, restated so the oracle does not borrow the code under test. Unlike
-/// `PetFrame::body_px` it ignores `alpha`, so a blanked frame still has a footprint.
 fn body(col: f32, row: f32) -> PetRect {
     let cw = f32::from(CELL_W);
     let ch = f32::from(CELL_H);
@@ -50,8 +38,6 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let mut term = Terminal::new(ROWS, COLS);
-        // Match a presented host: an unresolved COLOR_UNSET default cannot
-        // certify a blank sprite footprint even on an empty terminal.
         term.process(b"\x1b]11;#000000\x07");
         Self {
             brain: PetBrain::default(),
@@ -61,7 +47,6 @@ impl Fixture {
         }
     }
 
-    /// Let the pet arrive and finish its fade before anything is measured.
     fn settle(&mut self) {
         for _ in 0..40 {
             self.tick(100);
@@ -92,9 +77,6 @@ impl Fixture {
         })
     }
 
-    /// Real glyph occupancy under the sprite (`ink_at`, independent of caret
-    /// and selection protection). `None` (unobserved) reads as inked, so this
-    /// oracle never accuses the veto unfairly.
     fn ink_under(&self, frame: &PetFrame) -> bool {
         let rect = body(frame.col, frame.row);
         let r1 = (rect.row + rect.rows).ceil() as usize;
@@ -136,8 +118,6 @@ impl Strobe {
     }
 }
 
-/// The pangram typed one key per 128 ms (eight frames), with the prompt already on screen so the
-/// pet starts from a settled station.
 #[test]
 fn typing_never_blanks_the_pet() {
     let mut f = Fixture::new();
@@ -160,8 +140,6 @@ fn typing_never_blanks_the_pet() {
     assert_eq!(strobe.cuts, 0, "typing cuts the pet: {strobe:?}");
 }
 
-/// The caret is not an obstruction to its own escort: the caret walks across
-/// a blank line with no ink near the sprite, so no frame may be blank.
 #[test]
 fn the_caret_alone_never_blanks_its_escort() {
     let mut f = Fixture::new();
@@ -185,9 +163,6 @@ fn the_caret_alone_never_blanks_its_escort() {
     );
 }
 
-/// A line of output every 112 ms for 1.44 s at 16 ms (90 frames). The pet's station is one cell
-/// right of the caret, where output lands, so a real obstruction is legitimate; reaching it by a
-/// cut, or blanking over blank cells, is not.
 #[test]
 fn an_output_burst_yields_by_fading_never_by_cutting() {
     let mut f = Fixture::new();
@@ -207,8 +182,6 @@ fn an_output_burst_yields_by_fading_never_by_cutting() {
         prev = frame.alpha;
     }
     println!("output burst: {strobe:?}");
-    // One fade step is ~21 (see `Strobe::worst_drop`) and the pet's own ramps can compound with
-    // it; anything past this is a cut.
     assert!(
         strobe.worst_drop <= 40,
         "the pet is cut, not faded: {strobe:?}"

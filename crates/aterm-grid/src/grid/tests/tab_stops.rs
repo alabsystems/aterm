@@ -125,8 +125,6 @@ fn grid_resize_preserves_tab_stops() {
         grid.storage.tab_stops[5],
         "Custom tab stop at column 5 should be preserved"
     );
-    // And the widen invents none: TBC 3 means no stop at any column, and a
-    // wider window is not a request for stops (xterm never re-seeds its bitmap).
     assert!(
         !grid.storage.tab_stops[48],
         "a widen must not resurrect a default stop the application cleared"
@@ -139,8 +137,6 @@ fn grid_resize_preserves_tab_stops() {
 
 #[test]
 fn grid_widen_still_seeds_defaults_when_no_one_cleared_them() {
-    // A grid whose default every-8 stops are intact gains them in the columns a
-    // widen adds, so a tab past the old width does not run to the right edge.
     let mut grid = Grid::new(24, 40);
     grid.resize(24, 80);
     assert!(grid.storage.tab_stops[48], "default stop at 48 after widen");
@@ -161,7 +157,6 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     assert!(model.fire("SetCustomFutureStop", &mut state));
     source.resize(6, 40);
     assert!(model.fire("ShrinkSourceNarrow", &mut state));
-    // The backing array outlives the shrink and still covers column 96.
     assert!(source.tab_stops().len() >= 120);
     assert!(source.tab_stops()[96]);
 
@@ -199,11 +194,6 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     );
     assert_eq!(oversize_rejected.get("rejected"), Some(&1));
 
-    // Negative control: a restore that admits a vector of any length and copies
-    // the overlapping prefix, replayed on a 40-column destination beside the
-    // shipping restore. Projected onto the admission fields (did it take the
-    // vector, did it keep its width), it is the model's `Buggy=1` admission,
-    // which the covering/bounded window rejects.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     for (stops, invalid, reject) in [
         (vec![false; 39], &undersize, "RejectUndersizeProjection"),
@@ -247,15 +237,6 @@ fn restore_preserves_bounded_stops_beyond_narrow_width_for_later_grow() {
     }
 }
 
-// CBT and the DECSLRM left margin: gated on origin mode, not on DECLRMM.
-//
-// VT510's CBT stops at column one; DECOM turns "column one" into "the left
-// margin". xterm's `TabToPrevStop` clamps to `ScrnLeftMargin` only under
-// ORIGIN, and Ghostty's `horizontalTabBack` likewise. `ScrnLeftMargin` is 0
-// unless DECLRMM is on, so both flags must be set for the margin to bind.
-
-/// A 3x40 grid with DECSLRM margins at columns 10..=30 and the default tab
-/// stops (every 8: 8, 16, 24, 32).
 fn grid_with_margins_at_10_30() -> Grid {
     let mut grid = Grid::new(3, 40);
     grid.set_horizontal_margins(10, 30);
@@ -264,8 +245,6 @@ fn grid_with_margins_at_10_30() -> Grid {
     grid
 }
 
-/// DECLRMM alone does not make the left margin bind: without origin mode the
-/// back tab runs past it to the real stop at column 8.
 #[test]
 fn cbt_ignores_the_left_margin_without_origin_mode() {
     let mut grid = grid_with_margins_at_10_30();
@@ -281,7 +260,6 @@ fn cbt_ignores_the_left_margin_without_origin_mode() {
     );
 }
 
-/// With origin mode set the margin binds, exactly as xterm and Ghostty do it.
 #[test]
 fn cbt_clamps_to_the_left_margin_under_origin_mode() {
     let mut grid = grid_with_margins_at_10_30();
@@ -297,9 +275,6 @@ fn cbt_clamps_to_the_left_margin_under_origin_mode() {
     );
 }
 
-/// A cursor already left of the left margin is not dragged onto it: CBT is
-/// backward motion, so the cursor stands still (as in Ghostty; xterm drags it
-/// forward).
 #[test]
 fn cbt_left_of_the_left_margin_never_moves_the_cursor() {
     let mut grid = grid_with_margins_at_10_30();
@@ -315,8 +290,6 @@ fn cbt_left_of_the_left_margin_never_moves_the_cursor() {
     );
 }
 
-/// With no margins armed at all, origin mode changes nothing: CBT is the plain
-/// back tab, floored at column 0.
 #[test]
 fn cbt_without_declrmm_is_the_plain_back_tab_in_either_mode() {
     for origin in [false, true] {
@@ -331,9 +304,6 @@ fn cbt_without_declrmm_is_the_plain_back_tab_in_either_mode() {
     }
 }
 
-/// CHT right of the right margin never moves backward. xterm's `TabToNextStop`
-/// clamps the destination down to `rgt_marg` (its `CursorForward` does not, nor
-/// do Ghostty and iTerm2); `tab_margin` uses the row edge outside the margins.
 #[test]
 fn cht_right_of_the_right_margin_never_moves_the_cursor_backward() {
     let mut grid = grid_with_margins_at_10_30();

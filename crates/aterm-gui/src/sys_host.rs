@@ -94,7 +94,8 @@ struct Kept {
 
 #[derive(Default)]
 struct State {
-    /// The newest whole snapshot (module docs).
+    /// The newest whole snapshot (machine counters and the process sweep); a machine-only one
+    /// only while none is held.
     held: Option<Held>,
     /// The newest snapshot seq published, a machine-only one's included: the
     /// cursor's head.
@@ -176,7 +177,8 @@ impl Shared {
         self.lock().panes = panes;
     }
 
-    /// The probe thread's newest snapshot: its events rung, the head moved, held when it is whole (module docs), every waiting worker woken.
+    /// The probe thread's newest snapshot: its events rung, the head moved, held unless it is
+    /// machine-only and one is held already, every waiting worker woken.
     pub(crate) fn publish(&self, snap: Arc<Snapshot>, machine: &Machine) {
         let mut g = self.lock();
         if g.machine != *machine {

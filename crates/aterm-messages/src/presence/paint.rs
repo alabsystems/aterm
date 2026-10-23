@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The border's colours: the presence tones ([`tones`]) and the same hues as
-//! text inks ([`inks`]) for the in-grid pill's words. Two alarm hues and no
-//! more: the stop tone for a stuck need, the wait tone for a decide need;
-//! the person's own hold wears the band's dim ink, no alarm hue at all.
+//! Presence border tones ([`tones`]) and in-grid pill text inks ([`inks`]).
 
 use crate::ink::{BandInks, ForcedPalette, bg_is_light, ensure_contrast, forced_ink};
 
-/// The presence tones: amber for a decide need, red for a stuck one, and
-/// the dim ink of the person's own hold. Each alarm hue has a light and a
-/// dark pair, contrast-floored against the band: [`tones`] at the 3:1
-/// non-text floor a border and a chip's mark share, [`inks`] at AA 4.5:1 for
-/// words painted in them.
+/// Presence tones for decide (`wait`), stuck (`stop`), and user-held (`yours`) states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresenceTones {
     /// A decide need: the wait tone (#B7811A light, #E0A83A dark).
@@ -23,10 +16,7 @@ pub struct PresenceTones {
     pub yours: [u8; 3],
 }
 
-/// The presence tones on the band `c` of a theme whose background is
-/// `theme_bg`, or under an OS-forced chrome palette (`forced`) the High
-/// Contrast colours: hue is no channel there, so every tone is the text ink
-/// and the pill's glyph and words say which.
+/// Compute presence tones at 3:1 contrast against `c.bar_bg`, or High Contrast inks when `forced` is set.
 #[must_use]
 pub fn tones(theme_bg: [u8; 3], c: &BandInks, forced: Option<ForcedPalette>) -> PresenceTones {
     if let Some(hc) = forced {
@@ -49,9 +39,7 @@ pub fn tones(theme_bg: [u8; 3], c: &BandInks, forced: Option<ForcedPalette>) -> 
     }
 }
 
-/// The presence hues as text inks on a band whose ground is `bar_bg`:
-/// [`tones`]' hues held to the AA 4.5:1 text floor, for the words the
-/// in-grid pill paints; the border keeps the 3:1 tones.
+/// Floor `tones` to AA 4.5:1 text contrast against `bar_bg`.
 #[must_use]
 pub fn inks(tones: PresenceTones, bar_bg: [u8; 3]) -> PresenceTones {
     const AA: f64 = 4.5;
@@ -62,7 +50,6 @@ pub fn inks(tones: PresenceTones, bar_bg: [u8; 3]) -> PresenceTones {
     }
 }
 
-/// A packed `0x00RRGGBB` colour as sRGB bytes.
 const fn rgb(c: u32) -> [u8; 3] {
     let [_, r, g, b] = c.to_be_bytes();
     [r, g, b]

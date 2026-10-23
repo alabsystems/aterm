@@ -119,6 +119,10 @@ impl Timeline for crate::session_timeline::SessionTimeline {
         crate::session_timeline::SessionTimeline::record(self, kind, payload);
         self.slog_take_wake()
     }
+
+    fn log_carried(&self) -> bool {
+        self.slog().log_carried()
+    }
 }
 
 /// [`aterm_gui_fabric::with_link_reset`], resetting the launcher's supervisor

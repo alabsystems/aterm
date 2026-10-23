@@ -1,33 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `#[export]`, the attribute that marks what an aterm wasm module shows JS.
-//! It replaces `#[wasm_bindgen]` on exports (docs/AUDIT-third-party-2026-10-15.md,
-//! wasm-platform WP.6); use it through `aterm_wasm_abi::export`.
-//!
-//! * On `pub struct Name`: a JS class. JS holds a handle; the class gets a
-//!   `free()` and a FinalizationRegistry entry.
-//! * On `impl Name { .. }`: each plain `pub fn` becomes a method (`&self`,
-//!   `&mut self`), a static method (no receiver), a getter
-//!   (`#[export(getter)]`) or the constructor (`#[export(constructor)]`).
-//!   Other items are left alone.
-//! * On a module-level `pub fn`: a JS function (`#[export(js_name = x)]` to
-//!   rename it).
-//!
-//! The source shape is wasm-bindgen's: a crate that exports only on wasm32
-//! writes `#[cfg_attr(target_arch = "wasm32", export)]` on the item and
-//! `#[cfg_attr(target_arch = "wasm32", export(getter))]` on a method. That
-//! works because the impl's macro puts a marker attribute on each `pub fn`;
-//! rustc expands a method's `cfg` and `cfg_attr` before it runs the marker,
-//! which therefore sees the configured method and its options.
-//!
-//! No proc-macro2, quote or syn: the input is read as a plain token tree
-//! (`tt.rs`), the expansion written as source (`expand.rs`). The item itself
-//! passes through as the compiler's own tokens, so its spans, and every
-//! diagnostic inside it, are where they were. String literals are read by
-//! aterm-macro-support (`lit`); its cursor and derive-input parser are not
-//! used: they read derive input, not impls and signatures, and run only
-//! inside a macro invocation, where this parser is unit-tested natively.
+//! Proc-macro implementation of `#[export]` for `aterm_wasm_abi`.
 
 use std::str::FromStr;
 
@@ -39,8 +13,7 @@ mod tt;
 
 use parse::{Error, Item, Receiver};
 
-/// Mark a struct, an inherent impl or a function as part of the module's JS
-/// interface. See the crate docs.
+/// Marks a struct, inherent impl, or function as part of the module's JS interface.
 #[proc_macro_attribute]
 pub fn export(args: TokenStream, item: TokenStream) -> TokenStream {
     match export_item(args, item.clone()) {
@@ -49,8 +22,7 @@ pub fn export(args: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// The per-method half of `#[export]` on an impl; the impl's expansion
-/// writes it, with the impl's type as its argument. Not for direct use.
+/// Internal per-method helper attribute emitted by `#[export]` on an `impl` block.
 #[doc(hidden)]
 #[proc_macro_attribute]
 pub fn __export_method(args: TokenStream, item: TokenStream) -> TokenStream {
@@ -60,8 +32,6 @@ pub fn __export_method(args: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// The item unchanged, then the error: the item still compiles, so the
-/// error is the only one reported.
 fn with_error(item: TokenStream, e: &Error) -> TokenStream {
     let mut out = item;
     out.extend(parse(&format!("::core::compile_error!({:?});", e.0)));
@@ -69,8 +39,6 @@ fn with_error(item: TokenStream, e: &Error) -> TokenStream {
 }
 
 fn parse(src: &str) -> TokenStream {
-    // The expansion is written by this crate; a lex failure is a bug here,
-    // reported as a compile error rather than a panic.
     TokenStream::from_str(src).unwrap_or_else(|e| {
         TokenStream::from_str(&format!(
             "::core::compile_error!({:?});",
@@ -127,8 +95,6 @@ fn export_item(args: TokenStream, item: TokenStream) -> Result<TokenStream, Erro
     }
 }
 
-/// The impl with `#[::aterm_wasm_abi::__export_method(Type)]` in front of
-/// each plain `pub fn`.
 fn mark_methods(item: TokenStream, self_ty: &[tt::Tt]) -> TokenStream {
     let marker = parse(&format!(
         "#[::aterm_wasm_abi::__export_method({})]",
@@ -211,8 +177,6 @@ fn export_method(args: TokenStream, item: TokenStream) -> Result<TokenStream, Er
         sig: &sig,
     })?;
 
-    // The method as written, less its `#[export(..)]` attributes, with the
-    // export's items at the top of its body.
     let mut out: Vec<TokenTree> = Vec::new();
     let tokens: Vec<TokenTree> = item.into_iter().collect();
     let last = tokens.len().saturating_sub(1);
@@ -223,7 +187,6 @@ fn export_method(args: TokenStream, item: TokenStream) -> Result<TokenStream, Er
         match t {
             TokenTree::Group(body) if i == last && body.delimiter() == Delimiter::Brace => {
                 let mut inner: Vec<TokenTree> = body.stream().into_iter().collect();
-                // Inner attributes (`#![..]`) stay first.
                 let mut keep = 0;
                 while matches!(inner.get(keep), Some(TokenTree::Punct(p)) if p.as_char() == '#')
                     && matches!(inner.get(keep + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')

@@ -1,34 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Absolute `http`/`https` URL parsing — the slice of RFC 3986 an HTTP client
-//! needs, and no more.
+//! Absolute `http`/`https` URL parsing for configured HTTP endpoints.
 //!
-//! This is deliberately NOT a general URI type. It accepts exactly what a
-//! configured endpoint may be (an absolute `http://` or `https://` URL with an
-//! optional port and path/query) and rejects everything else, so a
-//! malformed or hostile endpoint string fails at parse time rather than
-//! becoming a surprising connection. In particular:
-//!
-//! * userinfo (`user:pass@host`) is REJECTED, not stripped — an endpoint
-//!   policy that requires credential-free URLs needs the parser to refuse
-//!   them, and a parser that silently dropped credentials would make that
-//!   check vacuous;
-//! * a control character or space anywhere in the string is rejected, so a
-//!   header cannot be smuggled through the request line;
-//! * an empty host is rejected, as is a port that is not a `u16`.
-//!
-//! Percent-encoding is deliberately NOT decoded. The path and query are carried
-//! through to the request line VERBATIM — re-encoding is what turns one
-//! well-formed request into two (request smuggling), and a client that never
-//! rewrites the target cannot introduce that class of bug.
+//! Rejects userinfo (`user:pass@host`), control characters, whitespace, empty hosts,
+//! and invalid ports, and carries percent-encoded paths and queries through verbatim.
 
 /// The scheme of an absolute URL this client can speak.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scheme {
-    /// Plaintext HTTP.
     Http,
-    /// HTTP over TLS.
     Https,
 }
 
@@ -160,22 +141,15 @@ pub const fn decode_http_endpoint_le(bytes: [u8; 16]) -> (u64, u16, u16, u32) {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Uri {
     scheme: Scheme,
-    /// Host without brackets for an IPv6 literal (`::1`, not `[::1]`): the
-    /// form both `ServerName` and `SocketAddr` want.
     host: String,
     port: u16,
-    /// Origin-form request target: always begins with `/`.
     path_and_query: String,
-    /// True when the authority named a port explicitly.
     explicit_port: bool,
-    /// The authority exactly as written, brackets and all
-    /// ([`Uri::authority_as_written`]).
     authority_raw: String,
 }
 
 impl Uri {
-    /// Parse an absolute `http`/`https` URL. `None` on anything this client
-    /// will not speak — see the module docs for the exact rejections.
+    /// Parse an absolute `http` or `https` URL.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         // No control characters and no spaces: the string is about to become
@@ -190,12 +164,9 @@ impl Uri {
         let (scheme, rest) = strip_prefix_ascii_ci(text, "https://")
             .map(|rest| (Scheme::Https, rest))
             .or_else(|| strip_prefix_ascii_ci(text, "http://").map(|rest| (Scheme::Http, rest)))?;
-        // The authority ends at the first `/`, `?` or `#`. A fragment is not
-        // sent to the server, so it is split off and dropped here.
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(authority_end);
         if authority.is_empty() || authority.contains('@') {
-            // Empty authority, or userinfo — rejected, never stripped.
             return None;
         }
         let (host, port, explicit_port) = split_authority(authority, scheme)?;
@@ -262,18 +233,14 @@ impl Uri {
             .unwrap_or(&self.path_and_query)
     }
 
-    /// The authority exactly as written, for agreement checks against a naive
-    /// textual split of the same input: if they differ, the endpoint is
-    /// ambiguous.
+    /// The authority substring exactly as written in the input URL.
     #[inline]
     #[must_use]
     pub fn authority_as_written(&self) -> &str {
         &self.authority_raw
     }
 
-    /// The `Host` header value: the authority as the peer should see it, with
-    /// the port elided when it is the scheme default (RFC 9110 §7.2) and an
-    /// IPv6 literal re-bracketed.
+    /// The `Host` header value with default ports elided (RFC 9110 §7.2) and IPv6 literals bracketed.
     #[must_use]
     pub fn host_header(&self) -> String {
         let host = if self.host.contains(':') {
@@ -300,17 +267,14 @@ impl Uri {
     }
 }
 
-/// ASCII-case-insensitive `strip_prefix` (schemes are case-insensitive).
 #[inline]
 pub(crate) fn strip_prefix_ascii_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let (head, rest) = text.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
-/// Split `host[:port]`, handling the `[v6]:port` bracket form.
 fn split_authority(authority: &str, scheme: Scheme) -> Option<(String, u16, bool)> {
     if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal: the host runs to the closing bracket.
         let close = rest.find(']')?;
         let host = &rest[..close];
         if host.is_empty() || host.parse::<std::net::Ipv6Addr>().is_err() {
@@ -320,8 +284,6 @@ fn split_authority(authority: &str, scheme: Scheme) -> Option<(String, u16, bool
         let (port, explicit) = parse_port(after, scheme)?;
         return Some((host.to_owned(), port, explicit));
     }
-    // A bare `:` count above one is a malformed authority (an unbracketed IPv6
-    // literal), not a host with a port.
     let mut parts = authority.split(':');
     let host = parts.next()?;
     let port_text = parts.next();
@@ -338,7 +300,6 @@ fn split_authority(authority: &str, scheme: Scheme) -> Option<(String, u16, bool
     Some((host.to_owned(), port, explicit))
 }
 
-/// Parse the `":port"` (or empty) tail after an IPv6 literal's `]`.
 fn parse_port(after: &str, scheme: Scheme) -> Option<(u16, bool)> {
     if after.is_empty() {
         return Some((scheme.default_port(), false));
@@ -347,7 +308,6 @@ fn parse_port(after: &str, scheme: Scheme) -> Option<(u16, bool)> {
     Some((parse_port_digits(digits)?, true))
 }
 
-/// A port must be non-empty ASCII digits fitting a non-zero `u16`.
 fn parse_port_digits(text: &str) -> Option<u16> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -355,16 +315,12 @@ fn parse_port_digits(text: &str) -> Option<u16> {
     text.parse::<u16>().ok().filter(|&p| p != 0)
 }
 
-/// Reject a host containing a character that has no business in a `Host`
-/// header or an SNI name.
 #[inline]
 fn host_is_plausible(host: &str) -> bool {
     host.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%'))
 }
 
-/// Normalize the post-authority tail into an origin-form request target: a
-/// missing path becomes `/`, and a fragment is dropped (never sent).
 fn origin_form(tail: &str) -> String {
     let tail = tail.split('#').next().unwrap_or("");
     if tail.is_empty() {
@@ -392,7 +348,6 @@ mod tests {
         let u = Uri::parse("https://llm.example.test/v1/chat/completions").unwrap();
         assert_eq!(u.scheme(), Scheme::Https);
         assert_eq!(u.port(), 443);
-        // Default port is elided from the Host header.
         assert_eq!(u.host_header(), "llm.example.test");
         assert_eq!(u.path_and_query(), "/v1/chat/completions");
     }
@@ -419,7 +374,6 @@ mod tests {
 
     #[test]
     fn percent_encoding_is_carried_through_verbatim() {
-        // Re-encoding a target is how one request becomes two.
         let u = Uri::parse("http://h/a%2Fb%20c?q=%41").unwrap();
         assert_eq!(u.path_and_query(), "/a%2Fb%20c?q=%41");
     }
@@ -450,17 +404,14 @@ mod tests {
         ] {
             assert!(Uri::parse(bad).is_none(), "{bad} must not parse");
         }
-        // The scheme itself is case-insensitive.
         assert_eq!(Uri::parse("HtTpS://h/p").unwrap().scheme(), Scheme::Https);
     }
 
     #[test]
     fn ipv6_literals_round_trip_through_brackets() {
         let u = Uri::parse("http://[::1]:8080/p").unwrap();
-        // Host is stored unbracketed (what ServerName and SocketAddr want)...
         assert_eq!(u.host(), "::1");
         assert_eq!(u.port(), 8080);
-        // ...and re-bracketed for the Host header and the CONNECT target.
         assert_eq!(u.host_header(), "[::1]:8080");
         assert_eq!(u.authority(), "[::1]:8080");
 
@@ -493,11 +444,9 @@ mod tests {
 
         let u = Uri::parse("https://api.test/v1/x?a=1").unwrap();
         assert_eq!(u.authority_as_written(), "api.test");
-        // `path` drops the query; `path_and_query` keeps it.
         assert_eq!(u.path(), "/v1/x");
         assert_eq!(u.path_and_query(), "/v1/x?a=1");
 
-        // Brackets are kept: the caller compares against its own textual split.
         let u = Uri::parse("http://[::1]:8080/p").unwrap();
         assert_eq!(u.authority_as_written(), "[::1]:8080");
     }

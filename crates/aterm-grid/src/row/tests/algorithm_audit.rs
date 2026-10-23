@@ -1,17 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
-//
-// Boundary tests: insert/delete chars wide character invariants,
-// len tracking edge cases, selective_clear_range len recalculation,
-// and recalculate_len_up_to boundary conditions.
 
 use super::super::*;
 use super::make_row;
 
-// insert_chars / delete_chars wide character invariants
-
-/// ICH at a position that bisects a wide character pair.
 #[test]
 fn insert_chars_at_wide_continuation_clears_orphan() {
     use crate::{CellFlags, PackedColor};
@@ -29,7 +22,6 @@ fn insert_chars_at_wide_continuation_clears_orphan() {
     let cell2 = row.get(2).unwrap();
     let cell3 = row.get(3).unwrap();
 
-    // The continuation shifted to col 4, so col 2's orphaned head is cleared.
     assert_eq!(
         cell2.flags() & CellFlags::WIDE,
         CellFlags::empty(),
@@ -42,7 +34,6 @@ fn insert_chars_at_wide_continuation_clears_orphan() {
     );
 }
 
-/// DCH removing the WIDE cell clears the orphaned continuation.
 #[test]
 fn delete_chars_splits_wide_char_at_boundary() {
     use crate::{CellFlags, PackedColor};
@@ -62,7 +53,6 @@ fn delete_chars_splits_wide_char_at_boundary() {
 
     assert_eq!(cell0.char(), 'A', "col 0 should be unchanged");
 
-    // The continuation shifts to col 1 with no head before it and is cleared.
     assert_eq!(
         cell1.flags() & CellFlags::WIDE_CONTINUATION,
         CellFlags::empty(),
@@ -75,7 +65,6 @@ fn delete_chars_splits_wide_char_at_boundary() {
     );
 }
 
-/// delete_chars removing only the continuation clears the orphaned WIDE cell.
 #[test]
 fn delete_chars_removes_continuation_orphans_wide() {
     use crate::{CellFlags, PackedColor};
@@ -93,7 +82,6 @@ fn delete_chars_removes_continuation_orphans_wide() {
     let cell4 = row.get(4).unwrap();
     let cell5 = row.get(5).unwrap();
 
-    // Col 4 lost its continuation, so its WIDE head is cleared.
     assert_eq!(
         cell4.flags() & CellFlags::WIDE,
         CellFlags::empty(),
@@ -107,9 +95,6 @@ fn delete_chars_removes_continuation_orphans_wide() {
     );
 }
 
-// insert_chars len tracking edge cases
-
-/// insert_chars with count > remaining space should clamp correctly.
 #[test]
 fn insert_chars_count_exceeds_remaining_space() {
     let (_pages, mut row) = make_row(10);
@@ -132,10 +117,6 @@ fn insert_chars_count_exceeds_remaining_space() {
     }
 }
 
-// selective_clear_range len recalculation
-
-/// selective_clear_range should correctly update len when the last non-empty
-/// cell is protected and the cell at old_len-1 was erased.
 #[test]
 fn selective_clear_range_len_with_protected_at_end() {
     use crate::{CellFlags, PackedColor};
@@ -167,7 +148,6 @@ fn selective_clear_range_len_with_protected_at_end() {
     );
 }
 
-/// selective_clear on a row where all cells are protected should not change len.
 #[test]
 fn selective_clear_all_protected_preserves_len() {
     use crate::{CellFlags, PackedColor};
@@ -193,9 +173,6 @@ fn selective_clear_all_protected_preserves_len() {
     }
 }
 
-// recalculate_len_up_to boundary conditions
-
-/// clear_range in the middle of content should not change len.
 #[test]
 fn clear_range_middle_preserves_len() {
     let (_pages, mut row) = make_row(10);
@@ -214,7 +191,6 @@ fn clear_range_middle_preserves_len() {
     assert_eq!(row.get(9).unwrap().char(), 'J');
 }
 
-/// erase_chars in the middle of content should not change len.
 #[test]
 fn erase_chars_middle_preserves_len() {
     let (_pages, mut row) = make_row(10);
@@ -232,8 +208,6 @@ fn erase_chars_middle_preserves_len() {
     assert_eq!(row.get(5).unwrap().char(), 'F');
 }
 
-/// ECH of a WIDE head whose continuation is the row's last content cell leaves
-/// `Row::len` correct (the orphan cleared at `end` == old_len - 1 shrinks len).
 #[test]
 fn erase_chars_wide_head_at_tail_recalcs_len() {
     use crate::{CellFlags, PackedColor};
@@ -242,7 +216,6 @@ fn erase_chars_wide_head_at_tail_recalcs_len() {
     let fg = PackedColor::DEFAULT_FG;
     let bg = PackedColor::DEFAULT_BG;
 
-    // cells = A, B, WIDE, CONT; len = 4.
     row.write_char(0, 'A');
     row.write_char(1, 'B');
     row.write_wide_char(2, '\u{4E2D}', fg, bg, CellFlags::empty());
@@ -250,8 +223,6 @@ fn erase_chars_wide_head_at_tail_recalcs_len() {
     assert!(row.get(2).unwrap().is_wide());
     assert!(row.get(3).unwrap().is_wide_continuation());
 
-    // ECH at col 2, count 1: end=3. cells[2] (WIDE) erased and the orphan
-    // continuation at cells[3] cleared, leaving content only at cols 0-1.
     row.erase_chars(2, 1);
 
     assert_eq!(
@@ -264,15 +235,8 @@ fn erase_chars_wide_head_at_tail_recalcs_len() {
     assert!(row.get(3).unwrap().is_empty());
 }
 
-// Row::set boundary tests: `self.len = col + 1` cannot overflow, since rows
-// are at most PAGE_SIZE / size_of::<Cell>() columns wide. Writing the last
-// valid column yields len == cols.
-
-/// Row::set at the last column of an 8192-column row (the PAGE_SIZE limit)
-/// yields len == 8192.
 #[test]
 fn row_set_page_max_cols_last_valid() {
-    // 8192 cells × 8 bytes = 65536 = PAGE_SIZE exactly
     let (_pages, mut row) = make_row(8192);
     let cell = Cell::new('X');
 

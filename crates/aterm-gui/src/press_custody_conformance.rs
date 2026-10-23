@@ -253,6 +253,16 @@ fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
 }
 
 /// The in-place and unattributed takes:
+///
+/// (a) EL over the selected rows under a reader, with no line feed, so the view stays
+/// put: `OutputDamagesTheSelectedRowsInPlace`, `[1, 1, 0]`.
+///
+/// (b) The selected oldest row evicted at the history floor by output at live; no
+/// damage band names it, so `post_process` fails closed:
+/// `OutputTookTheSelectionUnattributed`, `[0, 0, 0]`.
+///
+/// (c) The same eviction under a reader parked at the top of a full two-line history;
+/// the re-pin saturates: `OutputTookTheSelectionUnattributedInPlace`, `[1, 2, 0]`.
 fn in_place_and_unattributed_takes(validated: &mut usize, ev: &mut StepEvidence) {
     let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
     {

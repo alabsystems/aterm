@@ -1454,7 +1454,7 @@ fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
         let debugger = debugger_facts();
         let instances = match withheld {
             Some(why) => Err(why.to_owned()),
-            None => aterm_ctl::census::window_census(),
+            None => aterm_ctl::census::window_census(&front_door_verb),
         };
         let recovery = recovery_facts();
         let exceptions = exceptions_facts();
@@ -2191,41 +2191,106 @@ fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
     (mark, lines.join("\n"))
 }
 
+/// What the front door does with `word` in argv[1] (`aterm <word>`), for the census: a windowing
+/// verb opens a window; any other verb, a diagnostic, `help` and the `hook` the front door hands
+/// to `aterm link` run as the program `aterm <word>`; another word is no verb.
+fn front_door_verb(word: &str) -> Option<aterm_ctl::census::Verb> {
+    use aterm_ctl::census::Verb as Census;
+    match Verb::from_operand(word) {
+        Some(verb) if verb.is_windowing() => Some(Census::Window),
+        Some(_) => Some(Census::Program),
+        None => (matches!(word, "help" | "hook")
+            || DIAG_COMMANDS.iter().any(|(name, _)| *name == word))
+        .then_some(Census::Program),
+    }
+}
+
+/// The most program names the `instances:` row lists before it cuts the list.
+const PROGRAM_GROUPS: usize = 6;
+
 /// The `instances:` row, pure over [`aterm_ctl::census`]: aterm windows and
 /// headless instances of this user that no published control socket reaches
-/// (invisible to `aterm ctl ls`).
+/// (invisible to `aterm ctl ls`), then the other aterm programs, each one whose
+/// launcher exited named. Only an unreached instance makes it a note: an adopted
+/// program may be a pass aterm detached on purpose.
 fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, String) {
     let census = match census {
         Ok(census) => census,
         Err(why) => return (Mark::Note, format!("not measured ({why})")),
     };
     let (n, dir) = (census.instances, &census.dir);
-    if census.unreached.is_empty() {
-        let line = match n {
+    let mut detail = if census.unreached.is_empty() {
+        match n {
             0 => "no aterm window or headless instance is running as you".to_string(),
             1 => format!("1 aterm window or headless instance, published in {dir}"),
             n => format!("{n} aterm windows and headless instances, each published in {dir}"),
-        };
-        return (Mark::Ok, line);
-    }
-    let k = census.unreached.len();
-    let noun = if n == 1 { "instance" } else { "instances" };
-    let (verb, pronoun) = if k == 1 {
-        ("is", "it")
+        }
     } else {
-        ("are", "them")
+        let k = census.unreached.len();
+        let noun = if n == 1 { "instance" } else { "instances" };
+        let (verb, pronoun) = if k == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        let mut detail = format!(
+            "{k} of {n} aterm {noun} {verb} reachable by no control socket in {dir} \
+             (`aterm ctl ls` cannot see {pronoun})"
+        );
+        for u in &census.unreached {
+            detail.push_str(&format!("\npid {} (up {}): {}", u.pid, u.age, u.command));
+            if u.socketless {
+                detail.push_str(" — started with its control socket off");
+            }
+        }
+        detail
     };
-    let mut detail = format!(
-        "{k} of {n} aterm {noun} {verb} reachable by no control socket in {dir} \
-         (`aterm ctl ls` cannot see {pronoun})"
-    );
-    for u in &census.unreached {
-        detail.push_str(&format!("\npid {} (up {}): {}", u.pid, u.age, u.command));
-        if u.socketless {
-            detail.push_str(" — started with its control socket off");
+    if !census.programs.is_empty() {
+        let mut groups: Vec<(&str, usize)> = Vec::new();
+        for p in &census.programs {
+            match groups.iter_mut().find(|(name, _)| *name == p.name) {
+                Some((_, k)) => *k += 1,
+                None => groups.push((&p.name, 1)),
+            }
+        }
+        groups.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let mut named: Vec<String> = groups
+            .iter()
+            .take(PROGRAM_GROUPS)
+            .map(|(name, k)| format!("{name} ×{k}"))
+            .collect();
+        if groups.len() > PROGRAM_GROUPS {
+            named.push("…".to_string());
+        }
+        let m = census.programs.len();
+        let (noun, verb) = if m == 1 {
+            ("program", "runs")
+        } else {
+            ("programs", "run")
+        };
+        detail.push_str(&format!(
+            "\n{m} other aterm {noun} {verb} as you: {}",
+            named.join(", ")
+        ));
+    }
+    for p in census.programs.iter().filter(|p| p.adopted) {
+        detail.push_str(&format!(
+            "\npid {} `{}` (up {}): its launcher exited and launchd adopted it",
+            p.pid, p.name, p.age
+        ));
+        if p.build {
+            detail.push_str("; from a build directory");
+        }
+        if p.deleted {
+            detail.push_str("; running a deleted binary");
         }
     }
-    (Mark::Note, detail)
+    let mark = if census.unreached.is_empty() {
+        Mark::Ok
+    } else {
+        Mark::Note
+    };
+    (mark, detail)
 }
 
 /// Pure core of `doctor` without a `shell_origin` label.
@@ -2850,6 +2915,13 @@ const HOOK_AGENTS_ENV: &str = "ATPKG_AGENTS";
 const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 
 /// Resolve the managed `agents/` directory for a TTY session:
+///
+/// 1. `handed` (`$ATERM_AGENTS_DIR` from the front door) when it is an absolute
+///    existing real directory;
+/// 2. `<prefix>/agents` alongside `reroute_dir` (`$ATERM_REROUTE_DIR`), ensured
+///    via [`ensure_agents_dir`];
+/// 3. `enclosing_agents` (`$ATPKG_AGENTS` from an enclosing hook-sourced shell)
+///    when it is an absolute existing directory.
 fn managed_agents_dir(
     handed: Option<&str>,
     reroute_dir: Option<&str>,
@@ -3125,8 +3197,8 @@ mod tests {
         ExceptionsFacts, FdaState, HOOK_AGENTS_ENV, MachineFacts, Mark, PASSTHROUGH_ENV,
         PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, RecoveryFacts, SelfHardening, ShellCheck, Verb,
         agents_dir_mode, config_conpty_from_text, decide_args, diag_report, doctor_checks,
-        doctor_checks_with_origin, exceptions_report_at, explain_config_report, help_text,
-        is_tool_candidate, list_fonts_report, list_themes_alias, managed_agents_dir,
+        doctor_checks_with_origin, exceptions_report_at, explain_config_report, front_door_verb,
+        help_text, is_tool_candidate, list_fonts_report, list_themes_alias, managed_agents_dir,
         parse_zone_offset, prepend_path, read_exceptions_log, reroute_dir_from_values,
         session_limits, session_path_env, show_face_report, version_text,
     };
@@ -3180,6 +3252,7 @@ mod tests {
             dir: "/run/aterm".to_string(),
             instances: 0,
             unreached: Vec::new(),
+            programs: Vec::new(),
         })
     }
 
@@ -4807,10 +4880,11 @@ mod tests {
     }
 
     /// The `instances:` row in every state: a note that names each unreached
-    /// instance and never moves the exit code.
+    /// instance, counts the other aterm programs and names each one launchd
+    /// adopted, and never moves the exit code.
     #[test]
     fn the_instances_row_names_what_nothing_reaches_and_never_fails() {
-        use aterm_ctl::census::{Census, Unreached};
+        use aterm_ctl::census::{Census, Program, Unreached};
         let check = |census: Result<Census, String>| {
             doctor_checks(
                 "/bin/sh",
@@ -4827,6 +4901,7 @@ mod tests {
                 dir: "/run/aterm".to_string(),
                 instances,
                 unreached,
+                programs: Vec::new(),
             })
         };
 
@@ -4867,6 +4942,94 @@ mod tests {
             "note",
             "a census that was not taken never reads as none\n{r}"
         );
+
+        let program = |pid: u32, name: &str, adopted: bool| Program {
+            pid,
+            name: name.to_string(),
+            age: "3h 05m".to_string(),
+            adopted,
+            build: adopted,
+            deleted: false,
+        };
+        let with_programs = |programs: Vec<Program>| {
+            Ok(Census {
+                dir: "/run/aterm".to_string(),
+                instances: 1,
+                unreached: Vec::new(),
+                programs,
+            })
+        };
+        let (r, code) = check(with_programs(vec![
+            program(71100, "aterm link serve", false),
+            program(71101, "aterm link serve", false),
+        ]));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "instances:"), "ok", "{r}");
+        assert!(
+            r.contains("2 other aterm programs run as you: aterm link serve ×2"),
+            "{r}"
+        );
+        assert!(
+            !r.contains("pid 71100"),
+            "a program whose launcher lives is counted, not named: {r}"
+        );
+
+        let (r, code) = check(with_programs(vec![
+            program(71100, "aterm link serve", false),
+            program(71102, "aterm link broker", true),
+            Program {
+                build: false,
+                ..program(71103, "aterm pkg update", true)
+            },
+        ]));
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(
+            mark_of(&r, "instances:"),
+            "ok",
+            "an adopted program is a fact, not a leftover: aterm detaches passes of its own\n{r}"
+        );
+        assert!(r.contains("pid 71102 `aterm link broker`"), "{r}");
+        assert!(r.contains("pid 71103 `aterm pkg update`"), "{r}");
+        assert!(
+            r.contains("its launcher exited and launchd adopted it"),
+            "{r}"
+        );
+        assert!(!r.contains("nothing supervises"), "{r}");
+        assert!(r.contains("from a build directory"), "{r}");
+        assert!(
+            r.contains(
+                "3 other aterm programs run as you: aterm link broker ×1, aterm link serve ×1, \
+                 aterm pkg update ×1"
+            ),
+            "{r}"
+        );
+
+        let many: Vec<Program> = (0..8)
+            .map(|i| program(72000 + i, &format!("aterm v{i}"), false))
+            .collect();
+        let (r, _) = check(with_programs(many));
+        assert!(
+            r.contains("aterm v5 ×1, …"),
+            "at most six names, then a cut: {r}"
+        );
+        assert!(!r.contains("aterm v6"), "{r}");
+    }
+
+    /// The census names a program by the front door's own words: its verbs, its
+    /// diagnostics, `help` and `hook`, never a flag or an unknown word; a windowing verb
+    /// opens a window.
+    #[test]
+    fn the_front_door_verbs_name_a_program() {
+        use aterm_ctl::census::Verb as Census;
+        for word in ["link", "ctl", "doctor", "help", "hook"] {
+            assert_eq!(front_door_verb(word), Some(Census::Program), "{word}");
+        }
+        for word in ["new-tab", "new-window", "split-pane"] {
+            assert_eq!(front_door_verb(word), Some(Census::Window), "{word}");
+        }
+        for word in ["frobnicate", "--headless", ""] {
+            assert_eq!(front_door_verb(word), None, "{word}");
+        }
     }
 
     /// Running `doctor_report` from a test binary outside an `.app` bundle must

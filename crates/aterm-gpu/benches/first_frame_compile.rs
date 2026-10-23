@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FIRST-FRAME COMPILE MEASUREMENT: how long the first window's main
-//! thread spends in its Metal compiles (`cell.metal`, the first-frame rows, the
-//! present blit), with the launch's warm begun on a worker or without one. A
-//! measurement, not a gate; it prints one `BENCH` line.
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-gpu --bench first_frame_compile
-//! FIRST_FRAME_BENCH=warm FIRST_FRAME_BENCH_PROLOGUE_MS=120 \
-//!   targo --unverified bench -p aterm-gpu --bench first_frame_compile
-//! ```
-//!
-//! `FIRST_FRAME_BENCH=warm` begins the warm at t0 on another thread (default:
-//! `inline`, none); `FIRST_FRAME_BENCH_PROLOGUE_MS` is when the main thread
-//! arrives after t0; `FIRST_FRAME_BENCH_AURORA=0` warms the text frame and the
-//! blit alone (the warm before 2026-10-17). Each run's libraries are cache
-//! misses (a nonce comment). The main thread then builds what the first
-//! prompt's aurora binds (`aurora_ms`).
+//! Measures main-thread Metal shader and pipeline compilation time for the first frame.
 
 #[cfg(target_os = "macos")]
 fn main() -> std::process::ExitCode {

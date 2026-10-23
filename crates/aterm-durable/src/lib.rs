@@ -325,7 +325,8 @@ pub mod primitive {
     #[cfg(unix)]
     pub fn fsync(file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer.
+        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer;
+        // for a descriptor that is not open it fails with `EBADF`.
         unsafe extern "C" {
             safe fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
         }

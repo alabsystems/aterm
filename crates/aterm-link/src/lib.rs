@@ -47,8 +47,7 @@ pub mod enable;
 pub mod fabric;
 pub mod fabric_brief;
 /// The bridge's doors: its clocks, park, broker dials and readers, verb lane,
-/// jitter and state-dir writes, in one place a simulation can stand in for —
-/// see [`fx`]'s module doc.
+/// jitter and state-dir writes, in one place a simulation can stand in for.
 mod fx;
 pub mod glance;
 pub mod mailbox;
@@ -63,7 +62,7 @@ pub mod presence;
 pub mod presence_view;
 pub mod render;
 /// The deterministic fabric simulation (test builds): one real bridge, its
-/// doors answered by a seeded world — see its module doc.
+/// doors answered by a seeded world.
 #[cfg(test)]
 mod sim;
 pub mod state;

@@ -3204,7 +3204,12 @@ mod macos {
             },
         )?;
         let handle = autoreleasepool(|_| -> Option<StatusItemHandle> {
-            // SAFETY: `+systemStatusBar` is a `-(id)` singleton accessor and `-statusItemWithLength:` is `-(id)(CGFloat)`; both are main-thread AppKit calls (proved by `main`).
+            // SAFETY: `+systemStatusBar` is a `-(id)` singleton accessor and
+            // `-statusItemWithLength:` is `-(id)(CGFloat)`; both are main-thread
+            // AppKit calls (proved by `main`). The item comes back AUTORELEASED
+            // (+0), so it is retained into the handle here — releasing an
+            // `NSStatusItem` removes it from the menu bar, which is why the
+            // handle owns one.
             let item = unsafe {
                 let bar = appkit::send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
                 if bar.is_null() {
@@ -3220,7 +3225,11 @@ mod macos {
             let menu = new_menu()?;
             let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0));
             paint_menu(menu.id(), &target, super::compose_status_menu(glance, now));
-            // SAFETY: `-setDelegate:` and `-setMenu:` are `-(void)(id)` on live receivers, on the main thread.
+            // SAFETY: `-setDelegate:` and `-setMenu:` are `-(void)(id)` on live
+            // receivers, on the main thread. The delegate is the retained
+            // target, which outlives the menu because the handle owns it; the
+            // item retains the menu, so `menu` may drop at the end of this
+            // scope, inside the pool.
             unsafe {
                 appkit::send_v_id(menu.id(), sel!(setDelegate:), target.as_id());
                 appkit::send_v_id(item.id(), sel!(setMenu:), menu.id());
@@ -3294,7 +3303,13 @@ mod macos {
 
     fn red_title(title: &str, font: Id) -> Option<Obj> {
         let text = appkit::nsstring(title)?;
-        // SAFETY: `+systemRedColor` is `-(NSColor *)`, an autoreleased shared colour; `+menuBarFontOfSize:` is `-(NSFont *)(CGFloat)`, 0 meaning the menu bar's own size; `+dictionaryWithObjects:forKeys:count:` is `-(id)(const id *, const id *, NSUInteger)`, which copies the two arrays (live on this frame) and retains their elements; `-initWithString:attributes:` is NSAttributedString's `-(id)(NSString *, NSDictionary *)` initializer, consuming the +1 `+alloc`.
+        // SAFETY: `+systemRedColor` is `-(NSColor *)`, an autoreleased shared colour;
+        // `+menuBarFontOfSize:` is `-(NSFont *)(CGFloat)`, 0 meaning the menu bar's own size;
+        // `+dictionaryWithObjects:forKeys:count:` is `-(id)(const id *, const id *, NSUInteger)`,
+        // which copies the two arrays (live on this frame) and retains their elements;
+        // `-initWithString:attributes:` is NSAttributedString's `-(id)(NSString *, NSDictionary *)`
+        // initializer, consuming the +1 `+alloc`. Every argument is live for the call, inside the
+        // caller's pool.
         unsafe {
             let red = appkit::send_id(class(c"NSColor").as_id(), sel!(systemRedColor));
             let font = if font.is_null() {
@@ -3333,7 +3348,11 @@ mod macos {
 
     fn show_face(handle: &StatusItemHandle, face: (String, bool)) {
         let set = autoreleasepool(|_| {
-            // SAFETY: plain AppKit sends on live receivers, on the main thread (both callers checked `MainThread::new()`).
+            // SAFETY: plain AppKit sends on live receivers, on the main thread
+            // (both callers checked `MainThread::new()`). `-button` is `-(id)`
+            // and returns the bar button for an item created with a variable
+            // length; `-setTitle:` and `-setAttributedTitle:` are
+            // `-(void)(id)`, the plain title replacing any attributed one.
             unsafe {
                 let button = appkit::send_id(handle.item.id(), sel!(button));
                 if button.is_null() {
@@ -3422,7 +3441,11 @@ mod macos {
     fn new_item(title: &str, action: Sel) -> Option<Obj> {
         let title = appkit::nsstring(title)?;
         let empty = appkit::nsstring("")?;
-        // SAFETY: `initWithTitle:action:keyEquivalent:` is NSMenuItem's designated initializer, `-(id)(NSString *, SEL, NSString *)`, and a nil SEL is its documented "no action" value.
+        // SAFETY: `initWithTitle:action:keyEquivalent:` is NSMenuItem's
+        // designated initializer, `-(id)(NSString *, SEL, NSString *)`, and a
+        // nil SEL is its documented "no action" value. `+alloc` is +1 and the
+        // initializer consumes it, so `Obj::from_owned` adopts one +1. Both
+        // strings are live +1 NSStrings the initializer copies.
         unsafe {
             let raw = appkit::send_id_id_sel_id(
                 appkit::alloc(class(c"NSMenuItem")),

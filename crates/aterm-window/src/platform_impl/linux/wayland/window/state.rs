@@ -5,6 +5,14 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Wayland window state shared with the event loop.
+//!
+//! LOCAL PATCH (aterm): no client-side frame. Upstream drew sctk-adwaita's or sctk's fallback frame
+//! around the surface under client-side decorations; here the application draws its own header
+//! inside the surface and drives its gestures through `drag_window`, `drag_resize_window` and
+//! `show_window_menu`, and only sctk-adwaita's shadow margin ([`super::frame::ShadowFrame`]) is
+//! drawn outside it. The window's objects are first-party `aterm-wayland` proxies and the configure
+//! is the backend's own [`WindowConfigure`], where upstream used smithay-client-toolkit; custom
+//! cursors, cursor grabs, `set_cursor_position` and KWin blur are gone.
 
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -320,6 +328,7 @@ impl WindowState {
 
         let stateless = Self::is_stateless(&configure);
 
+        // LOCAL PATCH (aterm): no frame borders to subtract; the configure's size is the surface's.
         let (mut new_size, constrain) = match configure.new_size {
             (Some(width), Some(height)) => ((width.get(), height.get()).into(), false),
             _ if stateless => (self.stateless_size, true),
@@ -359,6 +368,9 @@ impl WindowState {
         let new_state = configure.state;
         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
 
+        // LOCAL PATCH (aterm): a change of decoration mode or compositor capabilities counts too,
+        // so the application hears it (a `Resized`, perhaps of the same size) and re-reads
+        // `client_decorations`.
         let decorations_moved = self.last_configure.as_ref().is_some_and(|last| {
             last.decoration_mode != configure.decoration_mode
                 || last.capabilities != configure.capabilities
@@ -456,6 +468,9 @@ impl WindowState {
     }
 
     /// Returns whether the compositor provides server-side decorations.
+    ///
+    /// LOCAL PATCH (aterm): `false` under client-side decorations, where upstream answered `true`
+    /// while its own frame showed.
     #[inline]
     pub fn is_decorated(&self) -> bool {
         match self.last_configure.as_ref() {

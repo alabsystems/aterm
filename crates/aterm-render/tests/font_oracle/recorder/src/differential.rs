@@ -113,7 +113,8 @@ impl Pools {
         }
     }
 
-    /// One run of 2 to 10 characters from the domain the module doc states.
+    /// One run of 2 to 10 characters from these pools; after each, by chance, a haraka (after
+    /// an Arabic letter only), a variation selector and a default ignorable.
     fn run(&self, rng: &mut Rng) -> String {
         let len = 2 + rng.below(9);
         let kind = rng.below(10);

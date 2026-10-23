@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A torn read of a frame that also erases is still not a cleared line.
-//!
-//! A Backspace's repaint can arrive in two reads with a present between. The
-//! walk releases `boundary..end` as one part, which contains the cell of the
-//! glyph the key erased; on the complete present the standing text is back but
-//! that column stays blank. The part is lifted anyway: a column still blank
-//! when lifted is text that really went, and the walk on that sample names it
-//! on its own. Otherwise every standing letter right of the boundary would
-//! retract and the next keys land past a dark stretch.
-//!
-//! The seam is `review_real_bytes.rs`'s: a real `aterm_core` [`Terminal`],
-//! sampled as `app_render.rs`'s frame hold does (the caret's row probe, then
-//! every ribbon row, whatever the caret's visibility), the content-scroll
-//! clock read as `sync_cursor_effect_scroll` does, [`CursorGlow`] ticked on a
-//! 16 ms train. A hole is a dark column strictly between two lit ones in a
-//! row's planned coverage.
-//!
-//! Not pinned here (none is a gap under a typing hand): a torn ⌃K leaves the
-//! killed suffix lit over blank cells for up to 1.6 s (the kill's own
-//! retract); a mid-line Backspace run blinks one cell at the edit column; a
-//! Claude Code Enter's exit fade can carry a one-cell hole for a frame after a
-//! torn spinner present.
+//! Tests that torn edit and erase repaints leave no interior holes in cursor-glow coverage.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, holes_of, is_arrow, is_key, note_blink,
@@ -60,11 +39,7 @@ const SPIN: [char; 4] = ['✻', '✶', '✳', '✢'];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Split {
     Whole,
-    /// One present right after text index `j` of the composer was written
-    /// (the rest of its row blank from `CSI 2K`, later rows not yet
-    /// rewritten), the caret hidden.
     TextCol(usize),
-    /// A present after every 1024-byte chunk of the frame.
     Chunks,
 }
 
@@ -78,7 +53,6 @@ fn sgr_pad(n: usize) -> String {
     s
 }
 
-/// A frame with a hole: frame index, ms, label, row, holes.
 type HoleAt = (usize, u64, String, u16, Vec<(usize, usize)>);
 
 #[derive(Clone, Debug)]
@@ -93,11 +67,8 @@ struct Frame {
     ms: u64,
     label: String,
     rows: Vec<RowC>,
-    /// `(row, col)` of cells carrying a retire stamp.
     retiring: Vec<(u16, u16)>,
-    /// `(row, col)` of cells carrying a release stamp.
     released: Vec<(u16, u16)>,
-    /// `(row, col)` of live (not leaving) cells.
     live: Vec<(u16, u16)>,
     fp: u64,
     text: Vec<(u16, String)>,
@@ -311,7 +282,6 @@ impl Host {
         by_len.max(by_caret).max(self.min_rows).max(1)
     }
 
-    /// The first text row's screen row (0-based) for the current layout.
     fn text_row0(&self) -> u16 {
         (self.top - 1 + self.transcript_shown() + 3) as u16
     }
@@ -320,8 +290,6 @@ impl Host {
         FILLER.len()
     }
 
-    /// Claude Code's frame. Returns bytes, byte offsets of each text row's
-    /// first text char, and the region's top (1-based).
     fn frame_bytes(&self) -> (Vec<u8>, Vec<usize>, usize) {
         let cols = self.cols;
         let clip = |s: &str| -> String { s.chars().take(cols - 1).collect() };
@@ -465,7 +433,6 @@ impl Host {
         self.repaint(Split::Whole);
     }
 
-    /// Ctrl-K: kill from the caret to the end of the line.
     fn kill_to_end(&mut self, ms: u64, split: Split) {
         self.schedule(ms);
         self.label = "ctrl-k".into();
@@ -474,7 +441,6 @@ impl Host {
         self.repaint(split);
     }
 
-    /// Frames whose watched rows carry an interior hole.
     fn holes_on(&self, rows: &[u16]) -> Vec<HoleAt> {
         let mut v = Vec::new();
         for (i, f) in self.frames.iter().enumerate() {
@@ -549,8 +515,6 @@ impl Host {
         s
     }
 
-    /// Idle long past every swoosh, then T6: nothing on glass, no cadence,
-    /// no deadline, on every one of the last frames.
     fn assert_idle_to_zero(&mut self, what: &str) {
         self.idle((SWOOSH_TOTAL_S * 1000.0) as u64 + 1500);
         for _ in 0..10 {
@@ -621,9 +585,6 @@ fn assert_no_melt(h: &Host, rows: &[u16], what: &str) {
     }
 }
 
-/// Run every take, collecting failures instead of stopping at the first. Each
-/// take builds its own host on its own clock, so the takes run in parallel
-/// ([`crate::common::par_map`]); failures are listed in the takes' order.
 fn run_takes<T: Copy + Sync>(takes: Vec<(String, T)>, f: impl Fn(&str, T) + Sync) {
     let n = takes.len();
     let failed: Vec<String> = crate::common::par_map(&takes, |(what, t)| {
@@ -647,8 +608,6 @@ fn run_takes<T: Copy + Sync>(takes: Vec<(String, T)>, f: impl Fn(&str, T) + Sync
         failed.join("\n  ")
     );
 }
-
-// (1) Codex particle replay, torn.
 
 mod codex {
     use super::*;
@@ -707,8 +666,6 @@ mod codex {
             }
         }
 
-        /// The host's SYNC-1 hold with its cap: a present through an open
-        /// `?2026` bracket only once it has been open 150 ms.
         fn present_ok(&mut self) -> bool {
             if !self.term.sync_open_dirty() {
                 self.sync_since = None;
@@ -803,8 +760,6 @@ mod codex {
 
 #[test]
 fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_sync_hold() {
-    // Each replay is caught in its pool thread, so the torn replay's panic is raised only
-    // after the whole replay's laws are asserted.
     let pairs = [(false, true), (true, true)];
     let replays = crate::common::par_map(&pairs, |&(torn, honor)| {
         std::panic::catch_unwind(|| codex::replay(torn, honor))
@@ -825,11 +780,6 @@ fn codex_particle_replay_stays_one_run_whole_and_torn_in_half_under_the_capped_s
     }
 }
 
-// (2) A torn read inside a wrapped two-row composer.
-
-/// A fixed two-row box (70 columns, 64-cell text rows): the owner's line
-/// wraps at text index 64, typed in Claude Code's 1024-byte reads with and
-/// without the spinner, a read boundary pinned around the wrap.
 #[test]
 fn claude_code_1024_byte_reads_with_the_boundary_at_the_wrap_keep_both_rows_whole() {
     let cols = 70;
@@ -859,8 +809,6 @@ fn claude_code_1024_byte_reads_with_the_boundary_at_the_wrap_keep_both_rows_whol
     });
 }
 
-/// A composer that grows at the wrap (the box grows upward by a scroll, as
-/// Ink's bottom-pinned region does), every key torn around the wrap column.
 #[test]
 fn a_growing_composer_torn_at_its_wrap_keeps_the_band_whole() {
     let cols = 70;
@@ -882,15 +830,10 @@ fn a_growing_composer_torn_at_its_wrap_keeps_the_band_whole() {
     });
 }
 
-// (3) A torn read on every key for 3 s at 12 cps, the boundary fixed.
-
-/// The lit count on the row at frame `i`.
 fn lit_count(h: &Host, i: usize, row: u16) -> usize {
     h.lit_of(i, row).chars().filter(|&c| c == '#').count()
 }
 
-/// Every key typed in 1024-byte reads for 3 s at 12 cps, a read boundary
-/// fixed inside the line, with and without the spinner.
 #[test]
 fn every_key_in_1024_byte_reads_for_three_seconds_at_one_fixed_boundary_keeps_the_band_whole() {
     let typed = &LINE[..36];
@@ -925,8 +868,6 @@ fn every_key_in_1024_byte_reads_for_three_seconds_at_one_fixed_boundary_keeps_th
     });
 }
 
-/// A Backspace run at the end of the line while the agent's spinner tears
-/// every frame: the erased glyphs leave, the rest stands whole.
 #[test]
 fn a_backspace_run_under_torn_reads_keeps_the_band_whole() {
     let typed = &LINE[..60];
@@ -978,11 +919,6 @@ fn a_backspace_run_under_torn_reads_keeps_the_band_whole() {
     });
 }
 
-/// A torn Backspace frame: one Backspace at the end of a typed line whose
-/// repaint arrives in two reads, a present after text index `j`. The released
-/// part `j..end` includes the erased glyph's cell, which never comes back;
-/// the standing text right of the boundary must stay lit and keys typed on
-/// must join it.
 #[test]
 fn a_torn_backspace_frame_keeps_the_standing_text_lit() {
     let typed = &LINE[..60];
@@ -1049,8 +985,6 @@ fn a_torn_backspace_frame_keeps_the_standing_text_lit() {
     });
 }
 
-/// A word kill (Ctrl-W / Option-Backspace) at the end of the line whose
-/// repaint is torn inside the standing text.
 #[test]
 fn a_torn_word_kill_frame_keeps_the_standing_text_lit() {
     let typed = &LINE[..60];
@@ -1106,10 +1040,6 @@ fn a_torn_word_kill_frame_keeps_the_standing_text_lit() {
     });
 }
 
-// (4) Ctrl-K mid-line.
-
-/// The owner's line typed, three hops left, then Ctrl-K; the host, the row
-/// and the caret.
 fn kill_take(split: Split) -> (Host, u16, usize) {
     let mut h = Host::new(140, 1, false, 0);
     let row = h.text_row0();
@@ -1124,9 +1054,6 @@ fn kill_take(split: Split) -> (Host, u16, usize) {
     (h, row, caret)
 }
 
-/// Ctrl-K, then the hand types on at the caret: the new text joins the
-/// standing prefix with no hole, the kill torn or not, and again with EVERY
-/// key torn at the kill's boundary inside the standing prefix.
 #[test]
 fn ctrl_k_then_typing_on_keeps_one_run() {
     let mut takes: Vec<(String, (Split, Split))> = [

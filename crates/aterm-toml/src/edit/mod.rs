@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The comment-preserving document model (replaces `toml_edit`).
-//!
-//! [`crate::from_str`] keeps only what a file means. This model keeps what it says: the
-//! original text of every token and of the whitespace and comments between tokens, plus byte
-//! spans. The Preferences window uses it to rewrite only the keys a user changed, the config
-//! editor to underline a diagnostic's token. Rendering is concatenation, so parse then print
-//! is the identity by construction.
-//!
-//! Every node carries a [`Decor`]: the raw text immediately before it (`prefix`) and after it
-//! (`suffix`), so every source byte belongs to some node. Unlike `toml_edit`, the line
-//! terminator belongs to the suffix, so a file whose last line has no newline round-trips
-//! too. A `None` side means the node was built, not parsed: the encoder uses the canonical
-//! spacing for its position (`key = value`, not `key=value`).
+//! Comment- and formatting-preserving TOML document model.
 
 mod document;
 mod encode;
@@ -30,8 +18,7 @@ pub use value::{Array, InlineTable, Value};
 
 pub(crate) use parse::{ParseLimits, parse_document};
 
-/// Raw, unparsed source text: a run of whitespace, newlines, and comments, or
-/// the verbatim spelling of a scalar.
+/// Raw, unparsed source text.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawString(String);
 
@@ -68,10 +55,7 @@ impl fmt::Display for RawString {
     }
 }
 
-/// The raw text on either side of a node.
-///
-/// `None` on either side means "unset": the encoder substitutes the canonical
-/// spacing for the position the node sits in (see the module docs).
+/// The raw text on either side of a node (`None` substitutes canonical spacing).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decor {
     prefix: Option<RawString>,
@@ -134,8 +118,7 @@ impl Decor {
     }
 }
 
-/// The verbatim spelling of a scalar, kept so `0x1F`, `1_000_000`, `+3.0e2` and
-/// `'''literal'''` all survive a round-trip as themselves.
+/// The verbatim spelling of a scalar.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Repr {
     raw: RawString,
@@ -252,10 +235,7 @@ impl ValueRepr for crate::Datetime {
     }
 }
 
-/// One segment of a key: what it means, and how it was spelled.
-///
-/// Equality, ordering, and hashing use the decoded text only, so `"font-px"`, `'font-px'`,
-/// and `font-px` are the same key, as the spec and duplicate detection require.
+/// One segment of a key, compared and hashed by its decoded text.
 #[derive(Debug, Clone)]
 pub struct Key {
     key: String,
@@ -281,8 +261,7 @@ pub(crate) struct PathRepr {
 }
 
 impl Key {
-    /// A key from its decoded text; the encoder picks the narrowest legal
-    /// spelling (bare when the characters allow it, quoted otherwise).
+    /// A key from its decoded text, encoded in the narrowest legal spelling.
     #[must_use]
     pub fn new(key: impl Into<String>) -> Self {
         Self {
@@ -306,8 +285,7 @@ impl Key {
         }
     }
 
-    /// Split a dotted key (`a.b."c.d"`) into its segments, each with its authored spelling; a
-    /// dot inside a quoted segment is part of the name.
+    /// Split a dotted key (`a.b."c.d"`) into its segments, each with its authored spelling.
     ///
     /// # Errors
     /// If `repr` is not a syntactically valid TOML key.

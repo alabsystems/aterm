@@ -113,7 +113,8 @@ struct Posted {
     at: Instant,
 }
 
-/// THE JOBS BOARD ([module docs](self)): one leaf-locked slot.
+/// THE JOBS BOARD: the view the loop last adopted, with its tabs' session ids, read by the
+/// harness workers' stall canary ([`JobsBoard::evidence`]); one leaf-locked slot.
 pub(crate) struct JobsBoard {
     slot: Mutex<Option<Posted>>,
 }

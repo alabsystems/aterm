@@ -6,8 +6,15 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long the whole probe may take ([`probe`]): every call shares it.
-pub const PROBE_LIMIT: Duration = Duration::from_secs(10);
+/// How long the whole probe may take ([`probe`]): every call shares it. A
+/// one-minute hang detector, never a latency budget: Land judges a defense
+/// by the probe, and a probe cut short reads as less work than the
+/// repository holds, so a defense landed over the rest. With ten seconds,
+/// under a CPU clamp beside 56 busy loops, the probes after two defenses ran
+/// out (the next exchange came 10.5 and 11.3 s after the screen was read)
+/// and both tasks landed, over an unpushed commit and over a changed file
+/// (docs/measured/typing-under-load-2026-10-22.md).
+pub const PROBE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The most paths a finding names ([`RepoWork::paths`]).
 pub const NAMED_PATHS: usize = 3;
@@ -964,6 +971,10 @@ struct Reads<'a> {
 /// global configuration not shut out.
 fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<String> {
     let deadline = reads.deadline;
+    #[cfg(test)]
+    let deadline = deadline
+        .checked_sub(read_stall::spent())
+        .unwrap_or_else(Instant::now);
     if Instant::now() >= deadline {
         return None;
     }
@@ -997,6 +1008,38 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+/// A starved `git` for this thread's probes (tests), on the probe's clock:
+/// the time a starved read loses is taken as gone from the probe's deadline,
+/// with no sleep, so a test of the deadline spends no time of its own.
+#[cfg(test)]
+mod read_stall {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    std::thread_local! {
+        static NEXT: Cell<u64> = const { Cell::new(0) };
+        static SPENT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// The next read this thread starts is starved `ms` (0: none), and the
+    /// time starved so far starts again from nothing.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn set(ms: u64) {
+        NEXT.with(|n| n.set(ms));
+        SPENT.with(|s| s.set(0));
+    }
+
+    /// The time this thread's reads have lost so far, the read starting now
+    /// included.
+    pub(super) fn spent() -> Duration {
+        let next = NEXT.with(|n| n.replace(0));
+        SPENT.with(|s| {
+            s.set(s.get().saturating_add(next));
+            Duration::from_millis(s.get())
+        })
+    }
 }
 
 #[cfg(test)]

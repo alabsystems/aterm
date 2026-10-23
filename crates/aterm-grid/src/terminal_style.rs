@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal rendition state (the current style and the DECSC saved-cursor state) shared by
-//! the grid cell model and checkpoint serialization.
+//! Terminal rendition state ([`CurrentStyle`], [`SavedCursorState`]).
 
 use crate::cell::{CellFlags, PackedColor};
 use crate::cell_colors::PackedColors;
@@ -19,19 +18,14 @@ pub struct CurrentStyle {
     pub bg: PackedColor,
     /// Cell flags (bold, italic, etc.).
     pub flags: CellFlags,
-    /// Whether characters are protected from selective erase (DECSCA): when
-    /// true, DECSED/DECSEL skip them.
+    /// Whether characters are protected from selective erase (DECSCA).
     pub protected: bool,
     /// Cached packed colors, so a character write skips `convert_colors`.
     cached_colors: PackedColors,
-    /// `flags.has_extended_flags() || fg.is_rgb() || bg.is_rgb()`: the style
-    /// alone requires CellExtras overflow.
+    /// `flags.has_extended_flags() || fg.is_rgb() || bg.is_rgb()`.
     cached_has_style_extras: bool,
     /// The style is completely default, so `write_ascii_blast` may be used.
     cached_is_default: bool,
-    // Only the caches the cell writers read are kept (`cached_colors` in
-    // `write_char_core`, `has_style_extras` in the extras gate, `is_default` in
-    // the ASCII-blast gate). Cells store `PackedColors` inline.
 }
 
 impl Default for CurrentStyle {
@@ -95,8 +89,7 @@ impl CurrentStyle {
         self.cached_colors
     }
 
-    /// The background RGB for BCE when the background is truecolor, which
-    /// `set_cursor_template` callers carry through erase/fill/scroll operations.
+    /// The background RGB for BCE when the background is truecolor.
     #[must_use]
     #[inline]
     pub const fn bce_bg_rgb(&self) -> Option<[u8; 3]> {
@@ -115,8 +108,7 @@ impl CurrentStyle {
         self.cached_has_style_extras
     }
 
-    /// Whether the style is completely default (no colors, no flags, not protected), so the
-    /// `write_ascii_blast` path applies.
+    /// Whether the style is completely default.
     #[must_use]
     #[inline]
     pub const fn is_default(&self) -> bool {
@@ -124,8 +116,6 @@ impl CurrentStyle {
     }
 
     /// Recompute all cached state from current fg/bg/flags/protected.
-    ///
-    /// Must be called after any change to `fg`, `bg`, `flags`, or `protected`.
     #[inline]
     pub const fn update_cached_colors(&mut self) {
         self.cached_colors = crate::Cell::convert_colors(self.fg, self.bg);
@@ -137,8 +127,7 @@ impl CurrentStyle {
             && !self.protected;
     }
 
-    /// Recompute only the flag-derived caches after a flags-only SGR change (e.g. `\x1b[1m`),
-    /// which leaves `cached_colors` valid and skips `convert_colors`.
+    /// Recompute only the flag-derived caches after a flags-only SGR change.
     #[inline]
     pub const fn update_flags_cache(&mut self) {
         self.cached_has_style_extras =
@@ -150,29 +139,22 @@ impl CurrentStyle {
     }
 
     /// Reset to default style (full reset including DECSCA protection).
-    ///
-    /// Used by RIS (full terminal reset).
     #[inline]
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
-    /// Reset SGR attributes only (colors and flags). Per VT510, SGR 0 does not reset the
-    /// DECSCA protection attribute.
+    /// Reset SGR attributes only (colors and flags).
     #[inline]
     pub fn reset_sgr(&mut self) {
         let protected = self.protected;
         *self = Self::default();
         self.protected = protected;
-        // Recompute cached_is_default since protected may differ from default.
         self.cached_is_default = !protected;
     }
 }
 
 /// Saved cursor state for DECSC/DECRC.
-///
-/// Per VT510, DECSC saves the cursor position, SGR attributes, character sets (G0-G3, GL,
-/// single shift), DECAWM, DECOM and the DECSCA protection attribute.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SavedCursorState {
     /// Cursor position.
@@ -188,9 +170,6 @@ pub struct SavedCursorState {
     /// Pending wrap (wrap-next) flag at save time.
     pub pending_wrap: bool,
     /// Underline color at save time (SGR 58/59).
-    ///
-    /// Stored as packed u32 color (same encoding as `PackedColor`).
-    /// `None` means default underline color (foreground).
     pub underline_color: Option<u32>,
 }
 
@@ -211,8 +190,6 @@ mod tests {
 
     #[test]
     fn one_attribute_or_colour_leaves_the_default() {
-        // (label, flag, fg, bg, needs style extras).
-        // Style extras are needed for the extended flag bits (11-13) and RGB.
         let d_fg = PackedColor::DEFAULT_FG;
         let d_bg = PackedColor::DEFAULT_BG;
         let empty = CellFlags::empty();
@@ -269,8 +246,6 @@ mod tests {
         assert!(!style.flags.contains(CellFlags::BOLD));
         assert!(style.is_default(), "clearing bold should restore default");
     }
-
-    // Style reset clears everything
 
     #[test]
     fn test_reset_clears_all() {
@@ -331,8 +306,6 @@ mod tests {
             "sgr reset without protected should be default"
         );
     }
-
-    // CurrentStyle::new computes the caches
 
     #[test]
     fn test_new_with_all_fields() {

@@ -405,6 +405,13 @@ impl SpawnedShell {
     }
 }
 
+/// How long a session's start may take before it is judged hung: the
+/// one-minute hang detector, never a latency budget. A start that must happen
+/// is waited for, and a start that fails is told at once. The Unix spawn waits
+/// this long for its child's exec verdict, and a window holds keys typed into a
+/// tab still starting from it.
+pub const START_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Clamp a PTY window dimension (`cols` or `rows`) to at least `1` cell, using `fallback` when `cells == 0`.
 #[inline]
 #[must_use]
@@ -448,7 +455,7 @@ pub const fn decode_winsize_le(bytes: [u8; 8]) -> (u16, u16, u16, u16) {
 /// Promote the calling thread to `QOS_CLASS_USER_INTERACTIVE` on macOS (no-op elsewhere).
 pub fn declare_interactive_thread() {
     #[cfg(target_os = "macos")]
-    // SAFETY: sets this thread's own QoS class.
+    // SAFETY: sets this thread's own QoS class; takes no pointers and mutates no shared state.
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }

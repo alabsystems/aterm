@@ -1670,17 +1670,51 @@ fn push_exit_veil(
 
 /// Nearest-neighbour resample a straight-alpha RGBA8 image `src` (`sw×sh`) to `tw×th`.
 pub fn resample_nearest(src: &[u8], sw: usize, sh: usize, tw: usize, th: usize) -> Vec<u8> {
-    if tw == 0 || th == 0 {
-        return Vec::new();
+    let mut out = Vec::new();
+    resample_nearest_into(src, sw, sh, tw, th, &mut out);
+    out
+}
+
+/// Nearest-neighbour resample a straight-alpha RGBA8 image `src` (`sw×sh`) to `tw×th` into `out`, reusing its capacity.
+pub fn resample_nearest_into(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    tw: usize,
+    th: usize,
+    out: &mut Vec<u8>,
+) {
+    let Some(row_bytes) = tw.checked_mul(4) else {
+        out.clear();
+        return;
+    };
+    let Some(total_bytes) = row_bytes.checked_mul(th) else {
+        out.clear();
+        return;
+    };
+    if total_bytes == 0 {
+        out.clear();
+        return;
     }
-    let row_bytes = tw * 4;
-    let mut out = vec![0u8; row_bytes * th];
-    if sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
-        return out;
+    let Some(src_row_bytes) = sw.checked_mul(4) else {
+        out.clear();
+        out.resize(total_bytes, 0);
+        return;
+    };
+    let Some(src_total_bytes) = src_row_bytes.checked_mul(sh) else {
+        out.clear();
+        out.resize(total_bytes, 0);
+        return;
+    };
+    if sw == 0 || sh == 0 || src.len() < src_total_bytes {
+        out.clear();
+        out.resize(total_bytes, 0);
+        return;
     }
+    out.resize(total_bytes, 0);
     if sw == tw && sh == th {
-        out.copy_from_slice(&src[..row_bytes * th]);
-        return out;
+        out.copy_from_slice(&src[..total_bytes]);
+        return;
     }
     let mut prev_sy = usize::MAX;
     for ty in 0..th {
@@ -1692,18 +1726,17 @@ pub fn resample_nearest(src: &[u8], sw: usize, sh: usize, tw: usize, th: usize) 
             continue;
         }
         prev_sy = sy;
-        let row_s = sy * sw * 4;
+        let row_s = sy * src_row_bytes;
         if sw == tw {
             out[row_d..row_d + row_bytes].copy_from_slice(&src[row_s..row_s + row_bytes]);
             continue;
         }
-        let src_row = src[row_s..row_s + sw * 4].as_chunks::<4>().0;
+        let src_row = src[row_s..row_s + src_row_bytes].as_chunks::<4>().0;
         let dst_row = out[row_d..row_d + row_bytes].as_chunks_mut::<4>().0;
         for (tx, dst_px) in dst_row.iter_mut().enumerate() {
             *dst_px = src_row[tx * sw / tw];
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -3742,5 +3775,28 @@ mod tests {
         cat.on_collect(t0 + Duration::from_millis(96), KittyLook::for_app("claude"));
         assert_eq!(cat.stride_at, None);
         assert_eq!(cat.stride_shown, cat.stride);
+    }
+
+    #[test]
+    fn resample_nearest_into_reuses_capacity_and_matches_resample_nearest() {
+        let src: [u8; 16] = [
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let mut buf = Vec::with_capacity(256);
+        let ptr_before = buf.as_ptr();
+        let cap_before = buf.capacity();
+
+        resample_nearest_into(&src, 2, 2, 4, 3, &mut buf);
+        assert_eq!(buf, resample_nearest(&src, 2, 2, 4, 3));
+        assert_eq!(buf.as_ptr(), ptr_before);
+        assert_eq!(buf.capacity(), cap_before);
+
+        resample_nearest_into(&src, 2, 2, 2, 2, &mut buf);
+        assert_eq!(&buf[..], &src[..]);
+        assert_eq!(buf.as_ptr(), ptr_before);
+
+        resample_nearest_into(&src, 2, 2, 0, 3, &mut buf);
+        assert!(buf.is_empty());
+        assert_eq!(buf.capacity(), cap_before);
     }
 }

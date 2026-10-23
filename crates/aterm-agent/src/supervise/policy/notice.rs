@@ -97,7 +97,7 @@ const CONTINUES: &str = "The session continues by itself once you are signed in.
 
 /// What closes a sign-in aterm opened that nobody needs any more: Esc IN THE
 /// TAB the band's title names — never `this tab`, which on the window's band
-/// reads as whichever tab is in front (module docs).
+/// reads as whichever tab is in front.
 const ESC_SIGN_IN: &str = "Press Esc in the tab to close its sign-in.";
 
 /// What follows a renewal: the relaunch onto the login renewed for the

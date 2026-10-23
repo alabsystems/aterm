@@ -22,15 +22,43 @@ pub fn trust_service_silent() -> bool {
     })
 }
 
-/// End the calling test COULD NOT RUN when macOS's `trustd` does not answer ([`trust_service_silent`]): every code-signing and TLS check waits on it, so the silence is the machine's, not the code's.
+/// End the calling test COULD NOT RUN when macOS's `trustd` does not answer ([`trust_service_silent`]): every code-signing and TLS check waits on it, so the silence is the machine's, not the code's. The words count this user's programs macOS's program check holds now ([`crate::process::held_programs`]).
 #[track_caller]
 pub fn require_trust_service() {
     if trust_service_silent() {
-        could_not_run(
-            "macOS's trust service (trustd) did not answer, so no code-signing or TLS check \
-             ran here; rebooting the Mac clears a wedged trustd",
-        );
+        could_not_run(trust_silent_words(crate::process::held_programs()));
     }
+}
+
+/// [`require_trust_service`]'s words, with a second clause counting the programs `held` names when there are any: a fact beside the silence, never its cause, since nothing measured ties the two.
+fn trust_silent_words(held: Option<crate::process::HeldNow>) -> String {
+    let mut words = String::from(
+        "macOS's trust service (trustd) did not answer, so no code-signing or TLS check ran \
+         here; rebooting the Mac clears a wedged trustd",
+    );
+    if let Some(n) = held.filter(|n| n.count > 0) {
+        let (programs, wait) = if n.count == 1 {
+            ("program", "waits")
+        } else {
+            ("programs", "wait")
+        };
+        words.push_str(&format!(
+            "; {} {programs} of this user {wait} for macOS's program check now",
+            n.count
+        ));
+    }
+    words
+}
+
+/// The words a test's wait ends COULD NOT RUN with when its child `pid` is held at macOS's program check past `waited`, its hang detector: `held` is [`crate::process::at_program_check`]'s answer, asked before the child is killed. `None` unless it is held, so any other silence stays the test's own failure.
+#[must_use]
+pub fn held_words(pid: u32, waited: Duration, held: Option<bool>) -> Option<String> {
+    (held == Some(true)).then(|| {
+        format!(
+            "macOS's program check held this test's program (pid {pid}) past its {waited:?} \
+             hang detector; nothing was verified"
+        )
+    })
 }
 
 /// End the calling test COULD NOT RUN when `out` is an `hdiutil` run that failed with `Operation timed out` (a wedged disk-image service, after about 121 s).
@@ -147,11 +175,26 @@ impl Drop for KeptUntilRan {
 /// How long [`cat_echoes`] waits for the echo: the one-minute hang detector, never a budget.
 pub const ECHO_HANG: Duration = Duration::from_secs(60);
 
-/// The proof [`ad_hoc_copy`] asks for before a copied executable goes: `child`, spawned from the copy with piped stdout, writes the line `line` (lines before it are skipped) within `hang` ([`ECHO_HANG`] for a copy of a small Apple binary, [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) for a copy of the test binary), so its exec's assessment is done and it runs from its file.
+/// The proof [`ad_hoc_copy`] asks for before a copied executable goes: `child`, spawned from the copy with piped stdout, writes the line `line` (lines before it are skipped) within `hang` ([`ECHO_HANG`] for a copy of a small Apple binary, [`FIRST_EXEC_HANG`](super::FIRST_EXEC_HANG) for a copy of the test binary), so its exec's assessment is done and it runs from its file. A child macOS's program check still holds at `hang` ends the test COULD NOT RUN ([`held_words`]).
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]
 pub fn prints(child: &mut crate::spawnfd::Child, line: &str, hang: Duration) {
+    prints_judged(child, line, hang, &|pid| {
+        crate::process::at_program_check(i32::try_from(pid).unwrap_or(0))
+    });
+}
+
+/// [`prints`], with `held` asked whether the child is held at macOS's program check when `hang` runs out.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+#[track_caller]
+fn prints_judged(
+    child: &mut crate::spawnfd::Child,
+    line: &str,
+    hang: Duration,
+    held: &dyn Fn(u32) -> Option<bool>,
+) {
     use std::io::BufRead as _;
     use std::sync::mpsc::RecvTimeoutError;
     let Some(from) = child.stdout.take() else {
@@ -180,18 +223,30 @@ pub fn prints(child: &mut crate::spawnfd::Child, line: &str, hang: Duration) {
     match seen.recv_timeout(hang) {
         Ok(()) => {}
         Err(RecvTimeoutError::Disconnected) => refused(child, line, "its output ended first"),
-        Err(RecvTimeoutError::Timeout) => refused(child, line, &format!("not within {hang:?}")),
+        Err(RecvTimeoutError::Timeout) => match held_words(child.id(), hang, held(child.id())) {
+            Some(words) => {
+                end(child);
+                could_not_run(words)
+            }
+            None => refused(child, line, &format!("not within {hang:?}")),
+        },
     }
 }
 
-/// [`prints`]' and [`cat_echoes`]' end without their proof: `child` killed and reaped, its file
-/// left, the panic naming the line and why.
+/// `child` killed and reaped within the one-minute hang detector ([`super::kill_within`]), its file left.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+fn end(child: &mut crate::spawnfd::Child) {
+    super::kill_within(child, ECHO_HANG);
+}
+
+/// [`prints`]' and [`cat_echoes`]' end without their proof: `child` [`end`]ed, the panic naming
+/// the line and why.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]
 fn refused(child: &mut crate::spawnfd::Child, line: &str, why: &str) -> ! {
-    let _ = child.kill();
-    let _ = child.wait();
+    end(child);
     panic!(
         "the copied program (pid {}) never wrote {line:?}: {why}",
         child.id()
@@ -606,6 +661,82 @@ mod tests {
         let mut asked = 0;
         super::signed_stand_in(&cache, &binary, &mut |_| asked += 1);
         assert_eq!(asked, 1, "the next ask signs");
+    }
+
+    /// A child the program check holds past the hang detector ends the test COULD NOT RUN,
+    /// naming it, and is killed and reaped; one that is not held, or unread, is still the
+    /// test's own failure. (`sleep` writes nothing, so the 100 ms runs out by construction.)
+    /// The reader is asked about the child itself while it still runs: the fake answers only
+    /// for the child's pid while the program check's own reader still reads it, which on
+    /// macOS a killed and reaped child no longer does.
+    #[test]
+    fn a_child_held_at_the_program_check_ends_could_not_run_and_others_still_hang() {
+        use crate::spawnfd::{Stdio, command};
+        let ends = |held: Option<bool>| {
+            let mut child = command("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn");
+            let pid = child.id();
+            let runs = |asked: u32| {
+                crate::process::at_program_check(i32::try_from(asked).unwrap_or(0)).is_some()
+            };
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::prints_judged(
+                    &mut child,
+                    "ran",
+                    std::time::Duration::from_millis(100),
+                    &|asked| (asked == pid && runs(asked)).then_some(held).flatten(),
+                );
+            }))
+            .expect_err("a silent child ends the test");
+            let why = refused
+                .downcast_ref::<String>()
+                .expect("the wait panics with its words")
+                .clone();
+            assert!(
+                child.try_wait().expect("poll").is_some(),
+                "{held:?}: killed and reaped"
+            );
+            (pid, why)
+        };
+        let (pid, why) = ends(Some(true));
+        assert!(
+            why.starts_with(crate::host::COULD_NOT_RUN),
+            "expected COULD NOT RUN, got: {why}"
+        );
+        assert!(why.contains(&format!("(pid {pid})")), "{why}");
+        for held in [Some(false), None] {
+            let (pid, why) = ends(held);
+            assert!(
+                why.starts_with(&format!("the copied program (pid {pid}) never wrote")),
+                "{held:?}: {why}"
+            );
+        }
+    }
+
+    /// The trustd skip counts this user's held programs beside the silence when there are
+    /// any, and says nothing of them when there are none or they could not be counted.
+    #[test]
+    fn the_trust_skip_counts_the_wait_without_blaming_it() {
+        use crate::process::HeldNow;
+        let plain = super::trust_silent_words(None);
+        assert!(!plain.contains("program check"), "{plain}");
+        assert_eq!(super::trust_silent_words(Some(HeldNow::default())), plain);
+        let two = HeldNow {
+            count: 2,
+            oldest_ms: 35_940_000,
+        };
+        assert_eq!(
+            super::trust_silent_words(Some(two)),
+            format!("{plain}; 2 programs of this user wait for macOS's program check now")
+        );
+        assert_eq!(
+            super::trust_silent_words(Some(HeldNow { count: 1, ..two })),
+            format!("{plain}; 1 program of this user waits for macOS's program check now")
+        );
     }
 
     /// The silence ends the test COULD NOT RUN; an answer returns.

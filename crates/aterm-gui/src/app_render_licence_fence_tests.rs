@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The control socket's licence fence ([`crate::licence_fence`]) lands in the
-//! frame path: a fence recorded on a session before its write is applied by the
-//! cursor frame before that frame judges the output the write caused, end to end
-//! through `redraw_window`.
+//! Tests that control-socket licence fences apply in `redraw_window` before judging cursor output.
 
 use crate::scripted_redraw_fixture::{feed, scripted_app};
 use crate::{App, WindowId};
@@ -39,14 +36,11 @@ fn lit(mut app: App) -> App {
     app
 }
 
-/// Records a control fence on the front session, as the dispatch does before
-/// a driven write.
 fn fence_front(app: &App, keep_hand: bool) {
     let session = app.front_terminal(WID).expect("front terminal").session;
     fence_session(app, session, keep_hand);
 }
 
-/// Records a control fence on `session`, presented or not.
 fn fence_session(app: &App, session: u64, keep_hand: bool) {
     app.pool
         .get(session)
@@ -56,28 +50,18 @@ fn fence_session(app: &App, session: u64, keep_hand: bool) {
         .fence(keep_hand);
 }
 
-/// A typed press's stamps, armed as the input seam arms them.
 fn arm_typed_press(app: &mut App, now: Instant) {
     let ws = app.windows.get_mut(&WID).expect("window");
     ws.fx.cursor_mut().glow.note_typed_cells(now, 1);
     ws.fx.cursor_mut().trail.note_typed(now);
 }
 
-/// A navigation press's stamps (an arrow, a word motion), armed as the input
-/// seam arms them. Its licence is the stamp alone: a typed press's one-cell
-/// echo is also licensed by the press's own credit while it is in flight
-/// (`CursorHintLicense::InFlightPressEchoMintsLight`), which no boundary
-/// closes, so only a stamp-licensed move shows what a fence closes.
 fn arm_navigation_press(app: &mut App, now: Instant) {
     let ws = app.windows.get_mut(&WID).expect("window");
     ws.fx.cursor_mut().glow.note_navigation(now);
     ws.fx.cursor_mut().trail.note_navigation(now);
 }
 
-/// The glow's `(licensed, declined)` tallies around one move: the caret seeded
-/// and presented (the window's first look), a navigation press's stamp armed, a
-/// control fence recorded or not, then the move the driven write caused,
-/// presented.
 fn move_tallies(fenced: bool) -> ((u64, u64), (u64, u64)) {
     let mut app = lit_app();
     feed(&app, b"\x1b[2J\x1b[6;4H");
@@ -100,10 +84,6 @@ fn move_tallies(fenced: bool) -> ((u64, u64), (u64, u64)) {
     (before, tally(&app))
 }
 
-/// A fence recorded before the write lands before the frame judges the move
-/// the write caused: the stamp a person's press armed earlier licenses
-/// nothing, and the move is declined. Negative control: with no fence the same
-/// stamp licenses the same move.
 #[test]
 fn a_fence_lands_before_the_output_it_causes() {
     let (before, after) = move_tallies(false);
@@ -133,8 +113,6 @@ fn a_press_after_the_fence_keeps_its_licence_through_the_frame() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
     use aterm_window::keyboard::{KeyCode, KeyLocation, PhysicalKey};
 
-    // The glow's licence, read at the press's own instant after the frame: a
-    // stamp the frame left standing licenses it.
     let survives = |press: fn(&mut App)| {
         let (mut app, _pty) = lit_app_writing();
         feed(&app, b"\x1b[2J\x1b[6;4H");
@@ -177,13 +155,6 @@ fn a_press_after_the_fence_keeps_its_licence_through_the_frame() {
     );
 }
 
-/// A switch to another session closes the licence the window armed against
-/// the session it leaves (`App::sync_window`'s `fx.front_replaced` curtains
-/// the glow), so until the window's first look after the switch, which adopts
-/// the new session's counters, no stamp stands for a fence on either session
-/// to misjudge: a fence on the new session recorded in that interval, which
-/// the window never owes, finds the licence already closed. Negative control:
-/// with no switch the same stamp survives the frame.
 #[test]
 fn a_switch_closes_the_licence_armed_against_the_session_it_leaves() {
     let survives = |switch: bool| {
@@ -209,12 +180,6 @@ fn a_switch_closes_the_licence_armed_against_the_session_it_leaves() {
     );
 }
 
-/// The look binds to the licence model's swallow clear
-/// (`CursorHintLicense::SwallowedKeyClearsLicense`): the epoch store is the
-/// boundary, and the look applying it before the engine's read is the clear.
-/// The model's `hint` is read off the engine. Negative control: a look with
-/// no fence recorded leaves the stamp standing, which the model refuses as
-/// that transition.
 #[test]
 fn a_fence_and_its_look_are_the_licence_models_swallow_clear() {
     let model = aterm_models_effects::cursor_hint_license_model();

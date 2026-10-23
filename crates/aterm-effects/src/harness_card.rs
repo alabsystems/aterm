@@ -2,16 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Pure emitter for the Autopilot harness card decoration ([`CardPalette`]).
-//!
-//! Resolves a [`CardScene`] into two card-local fx contents ([`CardFrame::layers`]):
-//! - `under` (beneath glyph ink): the perimeter border and six-stripe rainbow trail.
-//! - `over` (above glyph ink): the animated kitty sprite, spectrum rim, and stars.
-//!
-//! [`HarnessCard::arm`] starts an intro episode of [`EPISODE_MS`] (with an initial
-//! [`RIDE_MS`] kitty ride-in), then transitions into continuous flow stepped on
-//! [`FLOW_STEP_MS`] and optionally phase-locked to Claude's wand ripple via
-//! [`HarnessCard::lock_glint`] and [`HarnessCard::lock_step`]. Dark grounds use
-//! additive light; light grounds use opaque print inks.
 
 use std::sync::Arc;
 
@@ -49,13 +39,13 @@ pub const EPISODE_MS: u64 = 6000;
 /// Intro frame cadence in milliseconds (~30 fps).
 pub const FRAME_MS: u64 = 33;
 
-/// Maximum duration (ms) past the last drawn frame that [`HarnessCard::deadline`] continues requesting wakes.
+/// Maximum duration (ms) past the last drawn frame that [`HarnessCard::deadline`] requests wakes.
 pub const SETTLE_GRACE_MS: u64 = 500;
 
-/// Maximum duration (ms) after [`HarnessCard::arm`] during which a held-back intro episode may still start.
+/// Maximum duration (ms) after [`HarnessCard::arm`] while a held-back intro episode may start.
 pub const OWED_MAX_MS: u64 = 45_000;
 
-/// Maximum number of peeled star piece layers ([`aterm_render::fx::PieceArt`]) stacked over one pixel.
+/// Maximum number of peeled star piece layers ([`aterm_render::fx::PieceArt`]) over one pixel.
 pub const STAR_DEPTH_MAX: usize = 4;
 
 const TONE_RECTS_MAX: usize = 3 * MAX_TRAIL_SEGMENTS as usize + 2;
@@ -101,7 +91,7 @@ const LOCK_GAIN: i64 = 4;
 
 const LOCK_SLEW_MS: i64 = FLOW_STEP_MS as i64;
 
-/// Slack window (ms) after a flow step's start before [`HarnessCard::deadline`] schedules its own wake.
+/// Slack window (ms) after a flow step's start before [`HarnessCard::deadline`] schedules a wake.
 pub const FLOW_SLACK_MS: u64 = 40;
 
 const FLOW_BLINK_PERIOD_MS: u64 = 2 * GLINT_PERIOD_MS;
@@ -733,7 +723,7 @@ thread_local! {
     static LINE_INK_SOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Test seam returning and resetting the count of per-letter light-ground ink solves on this thread.
+/// Test seam returning and resetting the count of light-ground ink solves on this thread.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn take_line_ink_solves() -> usize {
@@ -797,7 +787,7 @@ impl CardPalette {
         }
     }
 
-    /// Returns the card art color at normalized position `t` (`0.0..=1.0`) for `dark` or light ground.
+    /// Returns the card art color at normalized position `t` (`0.0..=1.0`) for `dark` ground.
     #[must_use]
     #[inline]
     pub fn art(self, t: f32, dark: bool) -> u32 {
@@ -1861,7 +1851,7 @@ fn field_spots(
     (spots, n)
 }
 
-/// Grid placement and hero-word span for the status line beneath the card ([`HarnessCard::line_ink_into`]).
+/// Grid placement and hero-word span for the status line beneath the card.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LineAt {
     /// Grid row of the line.
@@ -1877,7 +1867,7 @@ pub struct LineAt {
 }
 
 impl HarnessCard {
-    /// Arms an intro episode at `now` with star placement `seed`, preserving any active ripple clock.
+    /// Arms an intro episode at `now` with star `seed`, preserving any active ripple clock.
     #[inline]
     pub fn arm(&mut self, now: Instant, seed: u64) {
         self.episode = Episode::Armed(now);
@@ -1925,7 +1915,7 @@ impl HarnessCard {
             && self.running(now).is_none()
     }
 
-    /// Returns the [`FLOW_STEP_MS`] grid step index containing `now`, or `None` before the first arm.
+    /// Returns the [`FLOW_STEP_MS`] step index containing `now`, or `None` before the first arm.
     #[must_use]
     #[inline]
     pub fn flow_step(&self, now: Instant) -> Option<u64> {
@@ -1948,7 +1938,7 @@ impl HarnessCard {
         }
     }
 
-    /// Phase-locks the ripple cycle to an observed wand flare at `seen`, slewing by at most one step when visible.
+    /// Phase-locks the ripple cycle to an observed wand flare at `seen`.
     #[inline]
     pub fn lock_glint(&mut self, seen: Instant) {
         if self.glint0.is_none() {
@@ -2021,7 +2011,8 @@ impl HarnessCard {
         }
     }
 
-    /// Replays the cached settled [`CardFrame`] from `frames` if the card holds still and matches `scene`'s shape.
+    /// Replays the cached settled [`CardFrame`] from `frames` if the card holds still and matches
+    /// `scene`'s shape.
     pub fn replay(
         &mut self,
         scene: &CardScene,
@@ -2046,7 +2037,7 @@ impl HarnessCard {
         Some(kept.at(origin))
     }
 
-    /// Replays the cached flow [`CardFrame`] from `frames` when `now` falls in the same ripple step and shape.
+    /// Replays the cached flow [`CardFrame`] from `frames` when `now` falls in the same step.
     pub fn replay_step(
         &mut self,
         scene: &CardScene,
@@ -2086,7 +2077,7 @@ impl HarnessCard {
         (ms < EPISODE_MS).then_some(ms)
     }
 
-    /// Returns the next animation wake instant for a card ticked on the current frame, or `None` if at rest.
+    /// Returns the next animation wake instant for the current frame, or `None` if at rest.
     #[inline]
     #[must_use]
     pub fn deadline(&self, now: Instant) -> Option<Instant> {
@@ -2112,7 +2103,7 @@ impl HarnessCard {
         }
     }
 
-    /// Draws the current frame into `frames` for `scene` and motion verdict `animate` (`under` and `over` layers).
+    /// Draws the current frame (`under` and `over` layers) into `frames` for `scene` and `animate`.
     pub fn draw(
         &mut self,
         now: Instant,
@@ -2284,7 +2275,7 @@ impl HarnessCard {
         out
     }
 
-    /// Appends per-cell [`InkCell`] colors for the status line at `at` (including [`LineAt::hero`]) into `out`.
+    /// Appends per-cell [`InkCell`] colors for the status line at `at` into `out`.
     pub fn line_ink_into(
         &self,
         now: Option<Instant>,

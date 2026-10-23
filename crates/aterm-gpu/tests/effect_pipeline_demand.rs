@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Demand-driven effect pipelines on a real device: `encode_frame` consults
-// `frame_effect_pipelines` (unit-tested in `renderer.rs`), so a frame with no
-// effect stream compiles nothing, and the first frame carrying one builds only
-// what it needs. Prints the per-slot compile cost.
-//
-// No GPU or no font: COULD NOT RUN.
+// Demand-driven GPU effect pipeline compilation tests.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{GlowQuad, Theme};
 
 use crate::common::backends;
 
-/// The one glow quad a cursor effect publishes, in cell (1,1).
 fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
     GlowQuad {
         row: 1,
@@ -22,17 +16,12 @@ fn glow_quad(cw: usize, ch: usize) -> GlowQuad {
         w: cw as u16,
         h: ch as u16,
         color: 0x0020_2020,
-
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: 0x0020_2020,
         alpha2: 0,
     }
 }
 
-/// A frame with the shipped defaults (no cursor trail, glow, rain, sparkle
-/// words or sprites) leaves every effect pipeline unbuilt, and the first frame
-/// publishing one glow quad builds exactly `glow_add`.
 #[test]
 fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_add() {
     let theme = Theme::default();
@@ -42,7 +31,6 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
     let (cw, ch) = cpu.cell_size();
     let mut input = Terminal::new(rows as u16, cols as u16).cell_frame(rows, cols);
 
-    // Frame 1: the shipped default, a plain grid with an opaque cursor.
     let _ = gpu.render_input(&mut win, &input, None);
     let resident = gpu.effect_pipelines_resident();
     let (builds, build_ns) = gpu.effect_pipeline_build_cost();
@@ -62,7 +50,6 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
         "an effect-free frame must spend no time in the pipeline builder"
     );
 
-    // Frame 2: one glow quad, exactly what a live cursor effect publishes.
     input.cursor_glow_add.push(glow_quad(cw, ch));
     let _ = gpu.render_input(&mut win, &input, None);
     let resident = gpu.effect_pipelines_resident();
@@ -83,13 +70,11 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
         builds, 1,
         "the demand pass must build each slot exactly once"
     );
-    // What the first glow-carrying frame pays; an effects-off config never pays it.
     eprintln!(
         "MEASURED glow_add demand build = {:.2} ms",
         build_ns as f64 / 1.0e6
     );
 
-    // Frame 3, the same glow stream again: no second compile.
     let _ = gpu.render_input(&mut win, &input, None);
     assert_eq!(
         gpu.effect_pipeline_build_cost().0,
@@ -98,8 +83,6 @@ fn an_effect_free_frame_compiles_nothing_and_one_glow_quad_compiles_only_glow_ad
     );
 }
 
-/// `warm_effect_pipelines` builds every slot off the frame path (config apply relies on it);
-/// the assertion is on residency, not timing, and the cost is printed.
 #[test]
 fn the_warm_up_seam_builds_every_slot_off_the_frame_path() {
     let theme = Theme::default();
@@ -130,11 +113,6 @@ fn the_warm_up_seam_builds_every_slot_off_the_frame_path() {
     );
 }
 
-/// The fx rows are demanded like every other effect slot (design §4.5): the
-/// first frame drawing an Exact layer builds exactly `fx`, a Linear layer
-/// exactly `fx_linear`, and a `bloom` layer on a frame with no aurora also
-/// `glow_add`, the bloom extract's pipeline. The same layer without `bloom`
-/// does not demand `glow_add`: the control that the bloom is what does.
 #[test]
 fn an_fx_frame_demands_exactly_its_rows() {
     use std::sync::Arc;

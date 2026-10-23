@@ -135,7 +135,8 @@ fn scrollback_parity_rows() {
     }
 }
 
-/// SGR 58 underline-colour parity: first assert the live cell at `col` carries `expect_color`.
+/// SGR 58 underline-colour parity: assert the live cell at `col` carries `expect_color`, then
+/// that the row renders identically once scrolled into history.
 fn assert_scrollback_parity_underline(input: &[u8], find: char, col: usize, expect_color: [u8; 3]) {
     let mut t = Terminal::new(6, 80);
     t.process(input);

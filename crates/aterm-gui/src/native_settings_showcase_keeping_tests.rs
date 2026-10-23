@@ -8,10 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::*;
 
-/// A window's size, in points.
 type Size = (u16, u16);
 
-/// The windows the sweep draws, phone width to desktop.
 const WINDOWS: [Size; 11] = [
     (178, 348),
     (300, 160),
@@ -33,28 +31,19 @@ const DONE: &str = "settings/showcase/customize-done";
 const SIDE: &str = "settings/showcase/side/dark";
 const LIST: &str = "settings/showcase/list";
 const SHEET_LIST: &str = "settings/showcase/sheet-list";
-/// The reload warning and a status, each as long as a real one gets.
 const WARNING: &str = "aterm.toml reload rejected: repair the invalid authored value before \
                        automatic reload can resume.";
 const REFUSED: &str = "/Volumes/Shared Drive/Users//someone/dotfiles/config/aterm \
                        isn\u{2019}t writable \u{b7} check its permissions";
 
-/// What the keyboard is on when a walk's first frame is drawn, and how it got there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Keyboard {
-    /// Off the list: the list lands on the theme in use alone.
     Off,
-    /// The chooser's filter, put there before the page's first frame.
     Filter,
-    /// The Community disclosure, pressed open before the first frame.
     Pack,
-    /// The Customize sheet's Done, Customize pressed before the first frame.
     SheetFirst,
-    /// The sheet's Done, Customize pressed on the drawn page.
     SheetDrawn,
-    /// Customize, the sheet opened on the drawn page and closed with Done.
     SheetClosed,
-    /// The Dark | Light segment's Dark, pressed on the drawn page.
     Side,
 }
 
@@ -70,7 +59,6 @@ impl Keyboard {
         }
     }
 
-    /// Whether a press on the drawn page put the keyboard there.
     fn pressed_on_drawn(self) -> bool {
         matches!(self, Self::SheetDrawn | Self::SheetClosed | Self::Side)
     }
@@ -79,9 +67,7 @@ impl Keyboard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Scenario {
     keyboard: Keyboard,
-    /// aterm.toml's theme.
     theme: &'static str,
-    /// The theme in use.
     in_use: &'static str,
 }
 
@@ -91,45 +77,30 @@ impl std::fmt::Display for Scenario {
     }
 }
 
-/// Which walks a sweep takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walks {
-    /// Every walk from every start ([`walks_from`]), and random walks seeded with this.
     Every(u64),
-    /// SHARED WITH OFF ON NORD: only the walks whose frames the theme in use's row decides.
     Landing,
 }
 
-/// What comes between two frames.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Step {
-    /// Nothing: the frame drawn again.
     Again,
-    /// The window made that size.
     Window(Size),
-    /// The text size changed, 1× to 2× or back.
     Text,
-    /// The aterm.toml reload warning came, or went.
     Warning,
-    /// A status came, or went.
     Status,
-    /// The wheel that many lines down the list (up, negative).
     Wheel(i32),
-    /// The keyboard put on its control (off the list, on the theme in use's row).
     Focus,
-    /// The Messages tick every Settings view gets each minute.
     Tick,
-    /// A packages refresh's reply.
     Refresh,
 }
 
 impl Step {
-    /// Whether the person did it.
     fn persons(self) -> bool {
         matches!(self, Self::Wheel(_) | Self::Focus)
     }
 
-    /// The step that undoes this one, in a walk that started at `start`.
     fn back(self, start: Drawn) -> Self {
         match self {
             Self::Window(_) => Self::Window(start.window),
@@ -148,11 +119,9 @@ impl std::fmt::Display for Step {
     }
 }
 
-/// What a frame is drawn in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Drawn {
     window: Size,
-    /// The text size: 1× or 2×.
     scale: u8,
     warning: bool,
     status: bool,
@@ -202,7 +171,6 @@ impl Drawn {
     }
 }
 
-/// The rule a frame broke.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Rule {
     R1,
@@ -211,16 +179,13 @@ enum Rule {
     R4,
 }
 
-/// How much of a control a screen shows.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kept {
     Whole,
-    /// That many points of it, cut (none: not drawn).
     Part(f32),
 }
 
 impl Kept {
-    /// Whether a screen that shows this much shows what `owed` asks.
     fn covers(self, owed: Self) -> bool {
         match (self, owed) {
             (Self::Whole, _) => true,
@@ -239,18 +204,13 @@ impl std::fmt::Display for Kept {
     }
 }
 
-/// A frame, as the rules read it.
 struct Frame {
     drawn: Drawn,
     screen: crate::native_ui::CompiledUi,
-    /// The list's plan.
     plan: Option<scroll::ScrollPlan>,
     top: Option<usize>,
-    /// Whether the screen draws a list.
     list: bool,
-    /// Whether the list paints any of its stops in its room.
     paints: bool,
-    /// Where the list it draws starts, and how tall it is.
     list_top: f32,
     room: f32,
 }
@@ -264,7 +224,6 @@ impl Frame {
                 .is_some_and(|plan| plan.stop_of(&UiKey::new(key)).is_some())
     }
 
-    /// How much of `key` the screen paints.
     fn shown(&self, key: &str) -> Option<(f32, f32)> {
         self.screen
             .semantic(&UiKey::new(key))
@@ -278,17 +237,14 @@ impl Frame {
         }
     }
 
-    /// Whether the screen draws the chooser's list.
     fn chooser(&self) -> bool {
         self.screen.semantic(&UiKey::new(LIST)).is_some()
     }
 
-    /// Whether the chooser's row `key` is whole inside the chooser's list.
     fn in_list(&self, key: &str) -> bool {
         self.chooser() && whole_in_list(&self.screen, key)
     }
 
-    /// Whether no screen shows `landing` whole with `kept` of `key` ([`crate::native_ui::ListRoom`]).
     fn apart(&self, landing: &str, key: &str, kept: Kept) -> bool {
         let rect = |key: &str| self.screen.semantic(&UiKey::new(key)).map(|node| node.rect);
         let (Some(row), Some(control)) = (rect(landing), rect(key)) else {
@@ -309,13 +265,11 @@ impl Frame {
         bottom - top > self.room + 0.5
     }
 
-    /// The identity of the stop the screen starts at.
     fn first(&self) -> Option<UiKey> {
         let (plan, top) = self.plan.as_ref().zip(self.top)?;
         plan.identities(top).next().cloned()
     }
 
-    /// Where the list lays `key` out on this screen.
     fn placed(&self, key: &str) -> Option<(f32, f32)> {
         let rect = self.screen.semantic(&UiKey::new(key))?.rect;
         self.listed(key)
@@ -323,7 +277,6 @@ impl Frame {
     }
 }
 
-/// What one screen of the list shows: of the keyboard's control ([`Frame::placed`]).
 #[derive(Clone, Copy, Debug)]
 struct Screenful {
     control: Option<Kept>,
@@ -333,27 +286,20 @@ struct Screenful {
     room: f32,
 }
 
-/// EVERY SCREEN A LIST CAN DRAW.
 struct Reach {
     screens: Vec<Screenful>,
-    /// Whether any of its screens paints a stop of the list ([`Frame::paints`]).
     list: bool,
-    /// The plain status's bar its screens draw ([`StatusBar`]).
     bar: Option<StatusBar>,
 }
 
-/// Plain status bar under the page and its minimum height ([`Reaches::cause`]).
 #[derive(Clone, Copy, Debug)]
 struct StatusBar {
     tall: f32,
-    /// Its words on one line ([`plain_bar_layout`]'s least).
     least: f32,
-    /// Docked in a compact toolbar, setting every line of its words ([`dock_words_height`]).
     docked: bool,
 }
 
 impl StatusBar {
-    /// The bar `frame` draws for its plain status, if it draws one.
     fn of(
         runtime: &mut NativeRuntime,
         view: crate::native_app::ViewId,
@@ -385,21 +331,18 @@ impl StatusBar {
         })
     }
 
-    /// Whether the code could make it shorter.
     fn above_least(self) -> bool {
         !self.docked && self.tall > self.least + 0.5
     }
 }
 
 impl Reach {
-    /// The first scroll whose screen shows the keyboard's control as `owed` asks.
     fn covering(&self, owed: Kept) -> Option<usize> {
         self.screens
             .iter()
             .position(|screen| screen.control.is_some_and(|kept| kept.covers(owed)))
     }
 
-    /// The first scroll whose screen shows the theme in use's row whole in the list.
     fn landing_with(&self, owed: Option<Kept>) -> Option<usize> {
         self.screens.iter().position(|screen| {
             screen.landing
@@ -407,7 +350,6 @@ impl Reach {
         })
     }
 
-    /// WHY NO SCREEN SHOWS what a rule asks of a stop of the list ([`scroll::ListFoot::Whole`]).
     fn cause(
         &self,
         at: fn(&Screenful) -> Option<(f32, f32)>,
@@ -456,19 +398,14 @@ impl Reach {
     }
 }
 
-/// What a reach is measured for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ReachOf {
     drawn: Drawn,
-    /// Whether the keyboard is on the theme in use's row.
     on_landing: bool,
-    /// Pending reveal that a status bar makes room for ([`SettingsViewState::note_status_room`]).
     reveal: Option<UiKey>,
-    /// Whether a status's bar is drawn at its least ([`StatusBar`], [`STATUS_BAR_LEAST`]).
     least: bool,
 }
 
-/// The reaches a sweep has measured.
 struct Reaches {
     scenario: Scenario,
     landing: String,
@@ -476,7 +413,6 @@ struct Reaches {
 }
 
 impl Reaches {
-    /// The reach `key` names, measured once.
     fn of(&self, key: &ReachOf) -> Arc<Reach> {
         let cell = self
             .seen
@@ -488,7 +424,6 @@ impl Reaches {
         cell.get_or_init(|| Arc::new(self.measure(key))).clone()
     }
 
-    /// Why no screen of `key` shows what a rule asks ([`Reach::cause`], [`StatusBar`]).
     fn cause(
         &self,
         key: &ReachOf,
@@ -583,11 +518,9 @@ impl Reaches {
     }
 }
 
-/// What walks found.
 #[derive(Default)]
 struct Findings {
     faults: Vec<(Rule, String)>,
-    /// Each frame geometry kept a rule from asking anything of: the rule and the frame, then why.
     exceptions: Vec<String>,
     frames: usize,
 }
@@ -607,7 +540,6 @@ fn cx_of(drawn: Drawn) -> ViewCx<'static> {
     view_cx_at(f32::from(width), f32::from(height))
 }
 
-/// A view on the scenario's theme with the keyboard where it says.
 fn opened(
     scenario: Scenario,
     start: Drawn,
@@ -650,7 +582,6 @@ fn opened(
     (service, runtime, instance, view)
 }
 
-/// Draw a frame as `drawn` says.
 fn draw(
     runtime: &mut NativeRuntime,
     instance: crate::native_app::AppInstanceId,
@@ -701,7 +632,6 @@ fn draw(
     }
 }
 
-/// What R2 keeps of the keyboard's control.
 #[derive(Clone, Copy, Debug)]
 struct Left {
     kept: Kept,
@@ -709,21 +639,16 @@ struct Left {
     drawn: Drawn,
 }
 
-/// A wheel's screen, which R4 holds until an event of the person's.
 struct Wheeled {
     at: usize,
     drawn: Drawn,
     screen: crate::native_ui::CompiledUi,
     first: Option<UiKey>,
-    /// How much of the keyboard's control it showed.
     kept: Option<Kept>,
-    /// The list it drew and the stop it started at: the wheel's place.
     place: Option<(scroll::ScrollPlan, usize)>,
-    /// Whole keyboard control and stops under its first ([`SettingsViewState::seat_scroll`]).
     held: Option<(String, usize)>,
 }
 
-/// Walk `steps` from a view opened at `start`, each rule asserted on every frame.
 #[expect(
     clippy::too_many_lines,
     reason = "the four rules read each frame together, each with what it keeps of the walk"
@@ -1032,7 +957,6 @@ fn walk(reaches: &Reaches, start: Drawn, steps: &[Step]) -> Findings {
     found
 }
 
-/// The windows whose list no earlier one's measures as it does at `scale`.
 fn distinct_windows(scenario: Scenario, scale: u8) -> Vec<Size> {
     let mut seen: Vec<Vec<Option<scroll::ScrollPlan>>> = Vec::new();
     let mut windows = Vec::new();
@@ -1052,7 +976,6 @@ fn distinct_windows(scenario: Scenario, scale: u8) -> Vec<Size> {
     windows
 }
 
-/// The walks from `start`.
 fn walks_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) -> Vec<Vec<Step>> {
     let changes = windows
         .iter()
@@ -1089,7 +1012,6 @@ fn walks_from(start: Drawn, windows: &[Size], keyboard: Keyboard, taken: Walks) 
     walks
 }
 
-/// `count` walks of `length` steps from random windows.
 fn random_walks(seed: u64, count: usize, length: usize) -> Vec<(Drawn, Vec<Step>)> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut next = move |below: usize| {
@@ -1119,7 +1041,6 @@ fn random_walks(seed: u64, count: usize, length: usize) -> Vec<(Drawn, Vec<Step>
         .collect()
 }
 
-/// EACH SEQUENCE A REVIEW FOUND BY HAND, walked as found.
 fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
     use Step::{Again, Focus, Refresh, Status, Text, Tick, Warning, Wheel, Window};
     let [
@@ -1476,7 +1397,6 @@ fn reviewed() -> Vec<(Scenario, Drawn, Vec<Step>)> {
     ]
 }
 
-/// Sweep a scenario ([`walks_from`], [`reviewed`]).
 fn sweep(scenario: Scenario, taken: Walks) {
     let started = std::time::Instant::now();
     let landing = {

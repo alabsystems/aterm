@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-edge tests for `atpkg __selfupdate claude <prefix> -- <args…>`
-//! (`atpkg::selfupdate`) over a temporary prefix and local `dir:` registry.
-//!
-//! Covers the `update claude --wait-lock 1800` child under a contended store
-//! lock (`lock-waiting:` and `lock-acquired:` markers, followed by the
-//! incomplete-check fallback when the registry is unreachable), `--help`
-//! forwarding and re-entry through `bin/claude`, unrostered tools, prefix
-//! mismatch refusal, tool-name validation, and non-executable shims (exit 126).
+//! Process-edge tests for `atpkg __selfupdate claude <prefix> -- <args…>`.
 
 #![cfg(unix)]
 
@@ -16,9 +9,7 @@ use std::ffi::OsString;
 use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-// `spawnfd`'s: every child here holds its stdio and nothing else of this
-// process — not a pipe another test thread had open unflagged at the spawn,
-// held for as long as a waiting child lives.
+// Close non-stdio fds across spawn.
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::process::{ExitStatus, Output};
 use std::sync::{Arc, Mutex};
@@ -72,9 +63,6 @@ impl Fixture {
         atpkg::selfupdate::row_for("claude").expect("claude is rostered")
     }
 
-    /// A fake `bin/<tool>` — the shim the verb forwards to — that echoes its argv on
-    /// stdout as `fake: <args>` and exits 7, so an exec'd forward is unmistakable in
-    /// the exit code too.
     fn fake_shim(&self, tool: &str) {
         let layout = self.layout();
         layout.ensure_dir(&layout.bin_dir()).unwrap();
@@ -83,9 +71,6 @@ impl Fixture {
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// A managed `claude` at `build`, the real way: a store tree whose `bin/claude` is
-    /// the same echoing fake, its `bin/` shim laid by the activation code, so
-    /// `ops::active_builds` names the build the epilogues speak of.
     fn install_claude(&self, build: u64) {
         let layout = self.layout();
         let dir = layout.build_dir("claude", build);
@@ -115,7 +100,6 @@ impl Fixture {
         );
     }
 
-    /// The verb's argv: `__selfupdate <program> <prefix> -- <args…>`.
     fn verb_argv(&self, program: &str, args: &[&str]) -> Vec<OsString> {
         let mut argv: Vec<OsString> = vec![
             OsString::from(atpkg::selfupdate::HIDDEN_VERB),
@@ -127,15 +111,10 @@ impl Fixture {
         argv
     }
 
-    /// The verb, confined to this fixture: `HOME`, config and registry pinned, the
-    /// manager's kill switch and the spawner's pid cleared unless `env` sets them, both
-    /// pipes captured, run to completion.
     fn selfupdate(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
         self.raw(&self.verb_argv(program, args), env)
     }
 
-    /// The binary as `atpkg <argv…>` verbatim, confined the same way — a command not
-    /// yet run, so a lane may stream it ([`stream`]) or wait for it ([`Fixture::raw`]).
     fn command(&self, argv: &[OsString], env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.args(argv)
@@ -152,8 +131,6 @@ impl Fixture {
         cmd
     }
 
-    /// [`Fixture::command`], run to completion — for the endings ahead of the hand-over
-    /// grammar (the usage line, the tool-name gate) and every ending that does not wait.
     fn raw(&self, argv: &[OsString], env: &[(&str, &str)]) -> Output {
         self.command(argv, env).output().expect("run the dev atpkg")
     }
@@ -176,9 +153,6 @@ fn describe(out: &Output) -> String {
     )
 }
 
-/// A spawned child with its stdout collected LINE BY LINE as it arrives (so a lane can
-/// react to the `lock-waiting:` marker while the child is still waiting) and its stderr
-/// drained concurrently (the two-pipe rule) — the shape `tests/store_lock_wait.rs` uses.
 struct Streamed {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
@@ -222,8 +196,6 @@ impl Streamed {
             .any(|l| l.contains(needle))
     }
 
-    /// Block until stdout carries `needle`, or panic (killing the child) after
-    /// `within`.
     fn wait_for_line(&mut self, needle: &str, within: Duration) {
         let deadline = Instant::now() + within;
         while !self.stdout_has(needle) {
@@ -245,8 +217,6 @@ impl Streamed {
         }
     }
 
-    /// Wait for the child to exit (killing it past `within`), returning its status,
-    /// the elapsed time since spawn, every stdout line and the whole stderr.
     fn finish(mut self, within: Duration) -> (ExitStatus, Duration, Vec<String>, String) {
         let deadline = Instant::now() + within;
         let status = loop {
@@ -271,14 +241,8 @@ impl Streamed {
     }
 }
 
-/// A hang detector, not a latency budget: the grace itself is 2 s, and the first exec
-/// of a freshly linked binary has been measured at 26 s on a loaded machine.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
-/// The stdout lines a pass may carry that are not the wait lane's markers: what the
-/// `[machine]` settings, applied at the dispatch edge ABOVE the lock and refused here
-/// under a synthetic `HOME`, say about the host (the shape `tests/store_lock_wait.rs`
-/// filters the same way).
 fn wait_markers(stdout: &[String]) -> Vec<&str> {
     stdout
         .iter()
@@ -291,14 +255,9 @@ fn wait_markers(stdout: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// When the store lock is held at start, the `update claude --wait-lock 1800` child
-/// prints `lock-waiting:` on stdout after the grace (none here), waits until the lock is
-/// released, prints `lock-acquired:`, and then runs the check.
 #[test]
 fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
-        // A build that pins no root key is disabled everywhere; the verb refuses before
-        // the child (pinned below) and this ending is unreachable.
         aterm_uds::host::could_not_run(
             "this build pins no root key, so the package manager is off and waits for nothing",
         );
@@ -321,10 +280,7 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
         child.child.try_wait().expect("poll").is_none(),
         "the child is still waiting, not exited 75, while the pass is merely busy"
     );
-    // The holder lets go, a few seconds in.
     drop(guard);
-    // The wait ends with the holder, not with the 1800 s bound: a child still
-    // waiting fails `finish`'s minute.
     let (status, _, stdout, stderr) = child.finish(Duration::from_secs(60));
     let shown = format!("status {status:?}\nstdout:\n{stdout:?}\nstderr:\n{stderr}");
     assert_eq!(
@@ -360,21 +316,9 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
         !stdout.iter().any(|l| l.contains("fake:")),
         "the vendor's verb never ran: {shown}"
     );
-    // The child took and released the lock: takeable again now.
     let _ = atpkg::lock::try_lock_store(&fx.layout()).expect("released by the child");
 }
 
-/// HELP FORWARDS: `update --help` prints the one note on stderr and execs the `bin/`
-/// shim with the arguments verbatim — its stdout, its exit code (7) — and no store lock
-/// ever comes into being.
-///
-/// AND THE MANAGED NAME ITSELF ANSWERS: outside an aterm session the rc
-/// hook puts `bin/` on PATH and not `agents/`, so there `claude` IS `bin/claude`, and the
-/// activation lays it with the twin's block. Run through `/bin/sh` with this dev binary as
-/// the embedded atpkg — named by a twin an older client laid, the field's shape — `bin/claude
-/// update --help` is handed to the verb (the note), whose forward re-enters `bin/claude`;
-/// the block lets that re-entry through to the store build, once. Without the re-entry
-/// guard every forward would hand over again, forever (a minute's hang detector).
 #[test]
 fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
     let fx = Fixture::new("help");
@@ -433,8 +377,6 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
     assert!(!fx.lock_held(), "help takes no lock");
 }
 
-/// AN UNROSTERED PROGRAM (a twin laid by a newer roster than this binary's) forwards to
-/// its `bin/` shim verbatim with nothing printed at all.
 #[test]
 fn an_unrostered_program_forwards_silently() {
     let fx = Fixture::new("unrostered");
@@ -447,10 +389,6 @@ fn an_unrostered_program_forwards_silently() {
     assert!(!fx.lock_held());
 }
 
-/// THE PREFIX CROSS-CHECK at the edge: the twin's operand names a store other than the
-/// one `HOME` resolves in this environment, so the verb refuses with the exact line
-/// naming both, exit 2, and runs nothing — never an update of a store this twin does
-/// not run.
 #[test]
 fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
     let fx = Fixture::new("prefix");
@@ -485,8 +423,6 @@ fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
     assert!(!Path::new(&elsewhere).join("store.lock").exists());
 }
 
-/// THE TOOL-NAME GATE: a sensitive name (`sudo`) and the empty name are refused before
-/// anything resolves — exit 2, no lock, nothing run.
 #[test]
 fn a_name_that_is_not_a_tool_name_is_refused_with_its_line_and_exits_2() {
     let fx = Fixture::new("toolname");
@@ -506,9 +442,6 @@ fn a_name_that_is_not_a_tool_name_is_refused_with_its_line_and_exits_2() {
     assert!(!fx.lock_held());
 }
 
-/// A FORWARD THAT CANNOT EXEC: `bin/claude` present but not executable (mode 0644), a
-/// pass-through shape (`--probe`) — the verb's `exec` fails: exit 126, nothing on
-/// stdout, no lock.
 #[test]
 fn a_shim_that_cannot_be_run_answers_126_with_the_could_not_run_line() {
     let fx = Fixture::new("noexec");

@@ -652,6 +652,46 @@ fn each_lens_shows_its_sections() {
 }
 
 #[test]
+fn how_to_read_draws_the_cause_mark_in_words2() {
+    let snap = lens_scene(Scene::Calm);
+    let inks = dark_inks();
+    assert!(
+        inks.words2 != inks.stuck && inks.words2 != inks.warn_text,
+        "CONTROL: the inks differ"
+    );
+    let laid = lay_lens(
+        &shell(1024.0, 250.0, 2.0),
+        &input(&snap, inks),
+        &pinned(Instrument::HowToRead),
+        &FaceMetrics::helvetica_neue(),
+        true,
+    );
+    let mark_before = |label: &str| -> Vec<Rgba> {
+        let at = laid
+            .prims
+            .iter()
+            .position(|p| matches!(p, DrawPrim::Text { s, .. } if s == label))
+            .unwrap_or_else(|| panic!("{label:?} drawn"));
+        laid.prims[..at]
+            .iter()
+            .rev()
+            .map_while(|p| match p {
+                DrawPrim::Dot { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        mark_before("the cause aterm names"),
+        [rgba(inks.words2, 0xFF); 3]
+    );
+    assert_eq!(
+        mark_before("memory pressure, a GPU reset"),
+        [rgba(inks.warn_text, 0xFF)]
+    );
+}
+
+#[test]
 fn the_keys_step_and_copy_the_instruments() {
     let snap = lens_scene(Scene::Calm);
     assert_eq!(

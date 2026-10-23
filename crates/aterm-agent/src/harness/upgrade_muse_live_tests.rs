@@ -1,22 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Muse Code live upgrade's pure half: the revision-aware order of two
-//! builds, the session log's part of a process and what in it holds a restart
-//! off (records shaped as 1.4.10-R6427.1 writes them, measured in the lab),
-//! and the gate's order. Each guard positive and negative.
+//! Unit tests for Muse Code live-upgrade version ordering, session-log parsing, and gate order.
 
 use std::cmp::Ordering;
 
 use super::*;
 
-/// The pid of the process whose part of the log is read, and another.
 const PID: u32 = 57_495;
 const OTHER_PID: u32 = 72_752;
-/// The process's start (microseconds) and its log's records after it.
 const START_US: u64 = 1_792_284_625_000_000;
 
-/// One record line as Muse writes it: `payload_type`, `payload`, at `at_us`.
 fn rec(payload_type: &str, payload: &str, at_us: u64) -> String {
     format!(
         r#"{{"schema_version":1,"stream":{{"kind":"session","id":"s"}},"sequence":1,"recorded_at":{at_us},"record_type":"event","durability":"durable","payload_type":"{payload_type}","payload_schema_version":1,"payload":{payload}}}"#
@@ -49,7 +43,6 @@ fn task(id: &str, event: &str, at_us: u64) -> String {
     )
 }
 
-/// A whole turn: started, then terminal.
 fn turn(id: &str, at_us: u64) -> Vec<String> {
     vec![
         run(id, r#"{"kind":"started","prompt":"hi"}"#, at_us),
@@ -61,9 +54,6 @@ fn turn(id: &str, at_us: u64) -> Vec<String> {
     ]
 }
 
-/// A backgrounded shell's records while it runs (the measured shape: the
-/// task accepted and started, its status `terminal process running`, its
-/// output `background_running`).
 fn backgrounded(id: &str, at_us: u64) -> Vec<String> {
     vec![
         task(id, r#"{"kind":"proposed","task_kind":"tool.bash"}"#, at_us),
@@ -82,8 +72,6 @@ fn backgrounded(id: &str, at_us: u64) -> Vec<String> {
     ]
 }
 
-/// Its end: the inbox item queued, the output with its exit code, the task
-/// completed.
 fn bg_end(id: &str, run_id: &str, at_us: u64) -> Vec<String> {
     vec![
         run(
@@ -102,7 +90,6 @@ fn bg_end(id: &str, run_id: &str, at_us: u64) -> Vec<String> {
     ]
 }
 
-/// Muse's own run on it: started with an empty prompt, the item drained.
 fn drain(id: &str, run_id: &str, at_us: u64) -> Vec<String> {
     vec![
         run(run_id, r#"{"kind":"started","prompt":""}"#, at_us),
@@ -125,12 +112,6 @@ fn log(lines: &[Vec<String>]) -> String {
     out
 }
 
-/// THE ORDER IS REVISION-AWARE: atpkg's grammar reads `1.4.11-R6500.1` over
-/// `1.4.10-R6427.1`, a higher revision of the same `x.y.z` over a lower, and
-/// a sub-revision over none. NEGATIVE CONTROLS: the Claude lane's
-/// `upgrade::Version` refuses the revision form outright (the very reason
-/// this order exists); the same version, an older revision and an older
-/// `x.y.z` are no move; two grammars and an unparsable word have no order.
 #[test]
 fn the_order_reads_the_revision_form() {
     assert_eq!(
@@ -164,10 +145,6 @@ fn the_order_reads_the_revision_form() {
     }
 }
 
-/// A build's version is its record's, only where the build's directory is
-/// that version's build id, as atpkg lays it. NEGATIVE CONTROLS: a record
-/// whose directory names another build, a directory that is no number, and a
-/// version the grammar refuses.
 #[test]
 fn a_build_version_is_its_record_under_its_own_build_id() {
     assert!(build_version("1.4.10-R6427.1", Some("2001004010006427002")).is_some());
@@ -178,10 +155,6 @@ fn a_build_version_is_its_record_under_its_own_build_id() {
     assert!(build_version("1.4.11-R6500.x", None).is_none());
 }
 
-/// THE PROCESS'S PART OF THE LOG is from the LAST route record naming its
-/// pid, written since it started. NEGATIVE CONTROLS: a log with another
-/// process's route only, and a route of the same pid number written before
-/// this process started (an earlier process's), prove no part.
 #[test]
 fn the_part_of_a_process_starts_at_its_own_route_record() {
     let text = log(&[
@@ -203,9 +176,6 @@ fn the_part_of_a_process_starts_at_its_own_route_record() {
     assert_eq!(quiet_log(&stale, PID, START_US), Err(Open::Unproved));
 }
 
-/// G-M1: a run started with no terminal holds; every run ended (a cancelled
-/// one too) does not. NEGATIVE CONTROL: an earlier process's open run (a
-/// SIGKILLed one, before this process's route) is no run of this part.
 #[test]
 fn an_open_run_holds_and_an_ended_one_does_not() {
     let open = log(&[
@@ -243,13 +213,6 @@ fn an_open_run_holds_and_an_ended_one_does_not() {
     assert_eq!(quiet_log(&earlier, PID, START_US), Ok(START_US));
 }
 
-/// G-M2, the measured backgrounded shell: while it runs its run is over and
-/// its task open (`background-work`); once it ended its item stands queued
-/// until Muse's own run drains it (`queued-work`), and that run is open
-/// (`turn-open`) until its terminal; then nothing holds. A task's end is any
-/// of the four: `failed` and `rejected` close it as `completed` and
-/// `cancelled` do. NEGATIVE CONTROL: a task with no background word is still
-/// open work (`open-task`).
 #[test]
 fn background_work_and_its_queued_end_hold_until_drained() {
     let base = || vec![vec![route(PID, START_US)], turn("r1", START_US + 1)];
@@ -298,7 +261,6 @@ fn background_work_and_its_queued_end_hold_until_drained() {
         quiet_log(&plain, PID, START_US),
         Err(Open::Task { background: false })
     );
-    // The other task shape Muse writes (`runtime.session.task`).
     let other = log(&[
         vec![route(PID, START_US)],
         vec![rec(
@@ -313,8 +275,6 @@ fn background_work_and_its_queued_end_hold_until_drained() {
     );
 }
 
-/// A drain of another item drains nothing of this one; an item drained
-/// before it was queued (not in order) is still queued.
 #[test]
 fn a_drain_closes_only_its_own_item() {
     let text = log(&[
@@ -330,9 +290,6 @@ fn a_drain_closes_only_its_own_item() {
     assert_eq!(quiet_log(&text, PID, START_US), Err(Open::Queued));
 }
 
-/// FAIL CLOSED: a line that does not parse — a torn tail as it is written —
-/// proves nothing (`log-unreadable`). A retained frame or marker (no
-/// `payload_type`) is no record and holds nothing.
 #[test]
 fn a_torn_log_fails_closed_and_a_frame_is_no_record() {
     let mut text = log(&[vec![route(PID, START_US)], turn("r1", START_US + 1)]);
@@ -346,9 +303,6 @@ fn a_torn_log_fails_closed_and_a_frame_is_no_record() {
     assert_eq!(quiet_log(&framed, PID, START_US), Ok(START_US));
 }
 
-/// A SUBAGENT'S LOG has no route of its own: read from the part's start by
-/// its records' time. Its open task holds; one recorded before the part (an
-/// earlier process's, never ended) does not.
 #[test]
 fn a_subagent_log_is_read_from_the_parts_start() {
     let open = log(&[backgrounded("s1", START_US + 5)]);
@@ -360,9 +314,6 @@ fn a_subagent_log_is_read_from_the_parts_start() {
     assert_eq!(open_work(&earlier, START_US), Ok(()));
 }
 
-/// THE GATE'S ORDER: a person, the screen, the draft, the log, the process
-/// table, a child — each alone holds with its own word, and with none the
-/// restart goes.
 #[test]
 fn the_gate_names_each_hold_and_lets_a_quiet_point_go() {
     let quiet = Look {
@@ -456,13 +407,8 @@ fn the_gate_names_each_hold_and_lets_a_quiet_point_go() {
     }
 }
 
-/// The measured backgrounded-shell log (2026-10-17, records 161-251 of the
-/// lab's `q3-session-after-bg-finish.jsonl`, reduced to the records the gate
-/// reads and in their order): every stage of it reads as measured.
 #[test]
 fn the_measured_background_shell_reads_as_measured() {
-    // While it runs: the run's terminal (record 228) is written after the
-    // task's `background_running` output (174), and the task is still open.
     let mut lines = vec![vec![route(PID, START_US)]];
     lines.push(vec![run(
         "r1",
@@ -483,11 +429,6 @@ fn the_measured_background_shell_reads_as_measured() {
     );
 }
 
-/// THE PART IS BOUNDED BY WHERE ITS ROUTE RECORD LIES IN THE FILE, never by
-/// the records' wall clock: a run started and a task accepted AFTER the route
-/// record but stamped before it (the clock stepped back) are this process's
-/// open work. NEGATIVE CONTROL: an earlier process's open run written BEFORE
-/// the route record holds nothing, however late its stamp says it was.
 #[test]
 fn a_record_written_after_the_route_holds_whatever_its_stamp() {
     let stepped_back = log(&[
@@ -520,10 +461,6 @@ fn a_record_written_after_the_route_holds_whatever_its_stamp() {
     assert_eq!(quiet_log(&before_route, PID, START_US), Ok(START_US));
 }
 
-/// The session-name reservation's records as 1.4.10-R6427.1 writes them
-/// (`runtime.session.task`, the payloads of a real log's records 14-18,
-/// `d1rv`, 2026-10-16), for task `id` of kind `kind`: proposed, accepted,
-/// scheduled, its side-effect intent, started — and never ended.
 fn reservation(id: &str, kind: &str, at_us: u64) -> Vec<String> {
     let t = |event: String, at: u64| {
         rec(
@@ -558,15 +495,6 @@ fn reservation(id: &str, kind: &str, at_us: u64) -> Vec<String> {
     ]
 }
 
-/// G-M2 READS NO WORK INTO THE SESSION-NAME RESERVATION: a process whose
-/// `session_name.allocate` task stayed open (as 55 of the 72 in the kept lab
-/// logs did, the next process failing it at its resume and proposing its
-/// own) is upgraded once its turns and its background work are over — the
-/// real `d1rv` part's shape: the reservation at the start, a turn, a
-/// backgrounded shell that ended and was drained. NEGATIVE CONTROLS: the same
-/// records of any other kind (`tool.bash`) are open work; the reservation
-/// exempts only its own task, never another left open beside it; and a task
-/// whose `proposed` record is missing is work.
 #[test]
 fn an_open_session_name_reservation_holds_no_restart() {
     let part = |kind: &str| {

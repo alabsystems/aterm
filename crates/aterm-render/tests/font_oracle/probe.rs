@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shaping half of the font oracle on rustybuzz: what `rustybuzz` answers
-//! for a face, written as text. Only `tests/font_oracle/recorder` includes it
-//! (by `#[path]`), a crate outside the workspace that links the registry
-//! crates without aterm's `[patch.crates-io]` facades, so this file names only
-//! `std`, `rustybuzz` and the std-only `corpus.rs` (the corpus line format, the
-//! digest and the face table).
-//!
-//! In the workspace, `tests/font_oracle.rs` answers the same `shape` lines
-//! with aterm-font's shaper (`shaper.rs`), which writes its answer as `shape`
-//! does here; a line it answers differently must be one of the accepted deltas
-//! `shaping_answers_hold` names.
+//! Rustybuzz shaping probe for the font oracle recorder.
 
 use std::fmt::Write as _;
 
@@ -19,17 +9,7 @@ use std::fmt::Write as _;
 pub(crate) mod corpus;
 pub(crate) use corpus::*;
 
-/// Shape `text` with rustybuzz as `ligature_shaping::RowShaper::shape_buffer`
-/// shapes with aterm-font: a fresh buffer, `guess_segment_properties`, a plan
-/// built from the guessed direction, script (absent when unknown) and language
-/// (rustybuzz guesses none, and aterm-font's plan takes none), then
-/// `shape_with_plan`. Variation coordinates are set only when there are any,
-/// as the primary-face path does; the non-macOS `shape_colour_cluster`'s
-/// `shape(&face, &[], ..)` is the same with no features.
-///
-/// The answer is `<direction> <script> |` and one `gid:cluster:x_advance`
-/// token per output glyph, with `,y_advance` when it is non-zero and
-/// `@x_offset,y_offset` when either offset is.
+/// Shapes `text` with `rustybuzz` and formats `<direction> <script> |` followed by `gid:cluster:x_advance[,y_advance][@x_offset,y_offset]` tokens.
 pub(crate) fn shape(
     bytes: &[u8],
     index: u32,

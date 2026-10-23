@@ -272,7 +272,7 @@ fn every_rollout_key_is_in_the_store_codex() -> Outcome {
 
 /// The drift check for [`reset_templates`], admitted by [`store_binary`].
 /// NOT gated on the build's version: the readers read one build's wording,
-/// the store's (`aterm_phase::reset`'s module doc), so the store's build
+/// the store's, so the store's build
 /// owes every template. NEGATIVE CONTROL: a template of a kind no build
 /// names is named missing.
 fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {

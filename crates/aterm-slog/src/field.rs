@@ -226,7 +226,7 @@ impl Key {
     /// The key's row of [`FIELDS`].
     fn row(self) -> &'static (Key, Tier, Cap) {
         // `FIELDS` is declared in `Key` order (one macro list), so the
-        // discriminant is the row; `fields_table_is_in_key_order` holds it.
+        // discriminant is the row; `fields_table_is_in_key_order_and_names_are_unique` holds it.
         &FIELDS[self as usize]
     }
 

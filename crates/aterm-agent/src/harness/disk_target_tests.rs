@@ -225,7 +225,7 @@ impl Parked {
         if let Some(mut go) = self.go.take() {
             let _ = go.write_all(b"g");
         }
-        if let Some(status) = self.reaped.take() {
+        if let Some(status) = self.reaped.get() {
             return Ok(status);
         }
         let mut status: libc::c_int = 0;
@@ -233,7 +233,9 @@ impl Parked {
             // SAFETY: `self.pid` is the live child forked in `Parked::fork`.
             let r = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
             if r >= 0 {
-                return Ok(std::process::ExitStatus::from_raw(status));
+                let status = std::process::ExitStatus::from_raw(status);
+                self.reaped.set(Some(status));
+                return Ok(status);
             }
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {

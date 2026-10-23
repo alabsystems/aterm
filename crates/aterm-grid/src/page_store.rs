@@ -27,29 +27,15 @@ pub(crate) struct PoolStats {
     pub reused: usize,
 }
 
-/// Page-backed allocator with memory pooling. Released pages go to a free list
-/// that new allocations check first; the pool grows unbounded until
-/// `shrink_to_fit()`. `page_used_bytes` records how much of each page was used,
-/// so a recycled page zeroes only that portion.
+/// Page-backed allocator with memory pooling.
 #[derive(Debug, Default)]
 pub struct PageStore {
-    /// Cell slices returned by removed rows, before `pages` for drop order.
-    /// Each is a unique allocation token; reusing it transfers that token
-    /// back to a Row. Never discard these during `shrink_to_fit`: their
-    /// backing allocations remain in active pages until the arena is reset.
     recycled_cells: Vec<PageSlice<Cell>>,
-    /// Active pages (currently holding allocations).
     pages: Vec<Box<Page>>,
-    /// Free list of recycled pages (available for reuse).
-    /// Each entry is (page, used_bytes) where used_bytes tracks how much was allocated.
     free_pages: Vec<(Box<Page>, usize)>,
-    /// Current page index for allocations.
     current_page: usize,
-    /// Next offset within current page.
     next_offset: usize,
-    /// Pool statistics.
     stats: PoolStats,
-    /// Track bytes used per active page for partial zeroing on recycle.
     page_used_bytes: Vec<usize>,
 }
 
@@ -80,7 +66,6 @@ impl PageStore {
     pub(crate) fn preheat(&mut self, page_count: usize) {
         for _ in 0..page_count {
             let page = Page::new();
-            // Fresh pages are already zeroed, used_bytes = 0
             self.free_pages.push((page, 0));
             self.stats.pages_allocated += 1;
             self.stats.pages_free += 1;
@@ -111,8 +96,7 @@ impl PageStore {
         self.free_pages.len()
     }
 
-    /// Total memory used by all pages (active + free), in bytes. Saturating, as
-    /// in `Grid::memory_used`: exact whenever it fits, `usize::MAX` otherwise.
+    /// Total memory used by all pages (active + free), in bytes.
     #[must_use]
     #[inline]
     pub(crate) const fn total_memory(&self) -> usize {
@@ -134,24 +118,17 @@ impl PageStore {
         self.free_pages.shrink_to_fit();
     }
 
-    /// Reset the page store, moving all active pages to the free list. No `PageSlice` from
-    /// before the reset may be used after it.
+    /// Reset the page store, moving all active pages to the free list.
     #[cfg(test)]
     pub fn reset(&mut self) {
-        // These handles point into the pages reset is about to recycle.
-        // Discard them before an allocation can overwrite their old ranges.
         self.recycled_cells.clear();
-        // Build used-byte metadata in page order so it stays aligned when
-        // pages are popped in reverse order below.
         let mut used_bytes_by_page = std::mem::take(&mut self.page_used_bytes);
         if !self.pages.is_empty() {
             used_bytes_by_page.push(self.next_offset);
         }
         debug_assert_eq!(used_bytes_by_page.len(), self.pages.len());
 
-        // Move all active pages to free list with their used byte counts.
         while let Some(page) = self.pages.pop() {
-            // If metadata is missing, zero the full page on reuse as a safe fallback.
             let used_bytes = used_bytes_by_page.pop().unwrap_or(PAGE_SIZE);
             self.free_pages.push((page, used_bytes));
             self.stats.pages_in_use -= 1;
@@ -161,13 +138,11 @@ impl PageStore {
         self.next_offset = 0;
     }
 
-    /// Take a page from the free list (zeroing only its used portion) or
-    /// allocate a new one.
     fn alloc_page(&mut self) -> Box<Page> {
         if let Some((page, used_bytes)) = self.free_pages.pop() {
             if used_bytes > 0 {
-                // SAFETY: The page came from the free list, so we have exclusive
-                // access and no PageSlice references its data.
+                // SAFETY: The page came from the free list, so we have exclusive access and no
+                // PageSlice references its data.
                 unsafe {
                     let data = &mut *page.data.get();
                     data[..used_bytes].fill(0);
@@ -177,15 +152,12 @@ impl PageStore {
             self.stats.reused += 1;
             page
         } else {
-            // Allocate fresh page (already zeroed by Page::new)
             self.stats.pages_allocated += 1;
             Page::new()
         }
     }
 
     /// Allocate row cells, consuming a returned slice of the exact width first.
-    /// A grid arena keeps one width; the reverse search also tolerates other
-    /// typed users without handing a row a short or overlapping allocation.
     pub(crate) fn alloc_cells(&mut self, cols: u16) -> PageSlice<Cell> {
         if let Some(index) = self
             .recycled_cells
@@ -198,15 +170,9 @@ impl PageStore {
     }
 
     /// Return a removed row's unique allocation to this arena.
-    ///
-    /// The pool is bounded by the arena's allocations, not the viewport height:
-    /// dropping handles at a cap would strand their bump allocations and let
-    /// shrink/reveal/scroll cycles grow memory forever.
-    ///
     /// # Safety
-    ///
-    /// `cells` must have been allocated by this live PageStore, and no other
-    /// handle or reference may retain access to its range after this transfer.
+    /// `cells` must have been allocated by this live PageStore, and no other handle or reference
+    /// may retain access to its range after this transfer.
     pub(crate) unsafe fn recycle_cells(&mut self, cells: PageSlice<Cell>) {
         self.recycled_cells.push(cells);
     }
@@ -217,8 +183,7 @@ impl PageStore {
         self.recycled_cells.len()
     }
 
-    /// Allocate a typed slice within the page store. Exposed under
-    /// `debug_assertions` for downstream property tests.
+    /// Allocate a typed slice within the page store.
     #[cfg(any(test, debug_assertions))]
     #[allow(clippy::expect_used)]
     #[inline]
@@ -246,7 +211,6 @@ impl PageStore {
         let mut offset = align_up(self.next_offset, align);
 
         if self.pages.is_empty() || offset + bytes > PAGE_SIZE {
-            // Save the used bytes for the current page before moving to a new one
             if !self.pages.is_empty() {
                 self.page_used_bytes.push(self.next_offset);
             }
@@ -258,11 +222,9 @@ impl PageStore {
         }
 
         let page_id = self.current_page;
-        // Use data_ptr() which goes through UnsafeCell, avoiding borrow invalidation
-        // under Stacked/Tree Borrows when other pages are accessed later.
         let base_ptr = self.pages[page_id].data_ptr();
-        // SAFETY: offset is aligned to T and offset + size_of::<T>() * len <= PAGE_SIZE
-        // (the size assert and the new-page check above); base_ptr is valid for the Page's life.
+        // SAFETY: offset is aligned to T and offset + size_of::<T>() * len <= PAGE_SIZE (the size
+        // assert and the new-page check above); base_ptr is valid for the Page's life.
         let ptr = unsafe { base_ptr.add(offset).cast::<T>() };
         let ptr = NonNull::new(ptr).expect("page slice pointer is null");
 
@@ -275,7 +237,6 @@ impl PageStore {
             #[cfg(any(test, debug_assertions))]
             page_id,
             #[cfg(test)]
-            // offset bounded by PAGE_SIZE (64KB) — always fits in u32
             offset: Offset::new(u32::try_from(offset).unwrap_or(u32::MAX)),
         }
     }

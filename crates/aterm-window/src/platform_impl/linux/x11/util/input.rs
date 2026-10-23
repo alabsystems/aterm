@@ -4,6 +4,8 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/input.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): XInput 2's requests are aterm-x11's encoders, where upstream used x11rb's.
+
 use std::{slice, str};
 
 use aterm_x11::proto::xinput;

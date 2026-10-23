@@ -31,7 +31,6 @@ mod winsock {
     use std::os::windows::io::{FromRawSocket as _, RawSocket};
     use std::time::Duration;
 
-    /// `SOCKET`: the pointer-width unsigned integer std's `RawSocket` carries.
     type Socket = usize;
     const INVALID_SOCKET: Socket = usize::MAX;
     const SOCKET_ERROR: i32 = -1;
@@ -39,17 +38,12 @@ mod winsock {
     const AF_INET6: u16 = 23;
     const SOCK_STREAM: i32 = 1;
     const IPPROTO_TCP: i32 = 6;
-    /// std's own flags for a socket: overlapped-capable, never inherited by a child.
     const WSA_FLAG_OVERLAPPED: u32 = 0x01;
     const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
-    /// `_WSAIOW(IOC_VENDOR, 17)`.
     const SIO_TCP_INITIAL_RTO: u32 = 0x9800_0011;
-    /// `TCP_INITIAL_RTO_UNSPECIFIED_RTT`: the system's initial RTO, untouched.
     const RTT_UNSPECIFIED: u16 = u16::MAX;
-    /// The one SYN retransmission kept: a refusal arrives promptly, and a lost SYN still gets a retry.
     const SYN_RETRANSMISSIONS: u8 = 1;
     const WSAEWOULDBLOCK: i32 = 10035;
-    /// Winsock 2.2, what std asks for.
     const WINSOCK_2_2: u16 = 0x0202;
 
     /// `TCP_INITIAL_RTO_PARAMETERS`.
@@ -130,15 +124,11 @@ mod winsock {
         fn WSAGetLastError() -> i32;
     }
 
-    /// The calling thread's last winsock error (winsock keeps its own slot, which
-    /// `io::Error::last_os_error` does not read).
     fn last_error() -> io::Error {
         // SAFETY: takes no arguments and only reads this thread's winsock error slot.
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
     }
 
-    /// Winsock for this process, once — as std starts its own sockets, and like
-    /// std's never cleaned up before the process ends.
     fn ensure_winsock() -> io::Result<()> {
         static STARTED: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
         let code = *STARTED.get_or_init(|| {
@@ -154,7 +144,6 @@ mod winsock {
         }
     }
 
-    /// A set holding the one socket `s`.
     fn one(s: Socket) -> FdSet {
         let mut set = FdSet {
             count: 1,
@@ -164,8 +153,6 @@ mod winsock {
         set
     }
 
-    /// `timeout` as `select` takes it: whole seconds saturated, and a positive
-    /// sub-microsecond remainder rounded up to one microsecond (std's rule).
     fn timeval(timeout: Duration) -> Timeval {
         let mut tv = Timeval {
             sec: i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX),
@@ -201,7 +188,8 @@ mod winsock {
             return Err(last_error());
         }
         // SAFETY: `s` is a socket this call just created and owns alone; from here the stream
-        // closes it on every return.
+        // closes it on every return. `RawSocket` is `u64`, as wide as `SOCKET` on every 64-bit
+        // Windows.
         let stream = unsafe { TcpStream::from_raw_socket(s as RawSocket) };
         let rto = InitialRto {
             rtt: RTT_UNSPECIFIED,
@@ -294,8 +282,6 @@ mod tests {
 
     use super::*;
 
-    /// A live loopback listener takes the connection, and the stream comes back
-    /// blocking: a read waits for the byte the peer writes.
     #[test]
     fn a_listening_port_connects_and_the_stream_blocks() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
@@ -310,9 +296,6 @@ mod tests {
         assert_eq!(&byte, b"x");
     }
 
-    /// A port nothing listens on is refused by the kernel's own word. No child
-    /// is spawned in this test binary, so no forked copy of the dropped listener
-    /// can still be accepting.
     #[test]
     fn a_closed_port_is_refused() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
@@ -322,7 +305,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{err}");
     }
 
-    /// Windows rejects zero before creating a socket; other platforms follow std.
     #[test]
     fn a_zero_budget_is_invalid_input() {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));

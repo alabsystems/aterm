@@ -2102,7 +2102,7 @@ mod tests {
         );
     }
 
-    /// The shrink rule (`pane.rs` module doc) holds for the canonical planner too:
+    /// Shrinking clamps and never restructures the tree, in the canonical planner too:
     /// `constrained_extent` makes children plus divider tile the parent, so no rect
     /// leaves the bounds, no leaf drops, and growing back restores the geometry.
     #[test]

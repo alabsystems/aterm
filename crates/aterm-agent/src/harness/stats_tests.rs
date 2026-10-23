@@ -2716,13 +2716,13 @@ fn a_fact_line_typed_counts_as_no_act_and_ends_no_wait() {
 
 /// THE FACT LINES, BY KIND (occupancy 1e, "What the harness did"): a `fact-hold@v1` row typed
 /// counts toward `facts_told`'s `hold`, a `fact-would@v1` row naming a built-in rule toward
-/// `facts_would`'s; the door's intent and skip rows and the hold's own `waiting` rows count
-/// toward neither, nor does a row before the window. NEGATIVE CONTROL: a would-be row naming
-/// no rule this build knows counts nowhere.
+/// `facts_would`'s; the door's intent and skip rows, a held verdict's `fact-held@v1` row and the
+/// hold's own `waiting` rows count toward neither, nor does a row before the window. NEGATIVE
+/// CONTROL: a would-be row naming no rule this build knows counts nowhere.
 #[test]
 fn the_fact_lines_count_by_kind() {
     use crate::supervise::occupancy::door::INTENT_RULE;
-    use crate::supervise::occupancy::rules::WOULD_RULE;
+    use crate::supervise::occupancy::rules::{HELD_RULE, WOULD_RULE};
     let hold = crate::supervise::facts::FactKind::Hold.rule();
     let lines = [
         said(
@@ -2763,10 +2763,17 @@ fn the_fact_lines_count_by_kind() {
             "rule=hold-room@v1 episode=00000000000000af held_ms=7200000 why=unfenced",
         ),
         said(3_300, hold, Outcome::Waiting, "hold=open held_ms=600000"),
+        said(
+            3_400,
+            HELD_RULE,
+            Outcome::Waiting,
+            "rule=hold-room@v1 episode=00000000000000b0 held_ms=7200000 ordinal=0 guard=person",
+        ),
     ];
     let acc = fold_ledger(&lines, 1_000);
     let one = |n: u64| std::collections::BTreeMap::from([("hold".to_string(), n)]);
     assert_eq!(acc.facts_would, one(2), "{acc:#?}");
     assert_eq!(acc.facts_told, one(1), "{acc:#?}");
     assert_eq!(acc.by_rule.get(hold), None, "still no act");
+    assert_eq!(acc.by_rule.get(HELD_RULE), None, "a held row is no act");
 }

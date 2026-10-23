@@ -26,18 +26,13 @@ impl Grid {
     /// use [`Grid::with_tiered_scrollback`].
     #[must_use]
     pub fn with_scrollback(rows: u16, cols: u16, max_scrollback: usize) -> Self {
-        // Ingress clamp: bound the allocation a hostile caller can request.
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
 
-        // Preheat only enough pages for the visible rows; the page store grows
-        // on demand in `alloc_slice`.
         let bytes_per_row = (cols as usize) * std::mem::size_of::<Cell>();
         let initial_bytes = (rows as usize) * bytes_per_row;
         let pages_needed = (initial_bytes / PAGE_SIZE).max(1);
         let mut pages = PageStore::with_capacity(pages_needed);
-        // Reserve only the visible rows; the scrollback ring grows lazily
-        // (`grow_scrollback_ring`), and `row_index` uses the current length.
         let mut row_storage = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             // SAFETY: `row_storage` and `pages` are moved into the same
@@ -46,8 +41,6 @@ impl Grid {
         }
 
         Self {
-            // A fresh grid has no history, so the memo starts empty and sizes
-            // itself on first use from the epoch it is asked about.
             viewport_cache: ViewportRowCache::default(),
             storage: GridStorage {
                 pages,
@@ -76,7 +69,6 @@ impl Grid {
                 handback: super::resize_handback::HandBack::default(),
                 resize_law: super::resize_handback::ResizeLaw::default(),
                 absolute_row_counter: u64::from(rows),
-                // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,
@@ -116,11 +108,6 @@ impl Grid {
 
     /// Create a grid with tiered scrollback: the ring holds `ring_buffer_size`
     /// lines and older lines go to `scrollback`.
-    ///
-    /// A pre-filled store (a restored checkpoint) holds
-    /// lines this grid's lineage already pushed, so the absolute row counter
-    /// starts past them: the oldest carried line is `0` and the live top
-    /// `carried`, as [`Grid::oldest_absolute_row`] expects.
     #[must_use]
     pub fn with_tiered_scrollback(
         rows: u16,
@@ -128,19 +115,15 @@ impl Grid {
         ring_buffer_size: usize,
         scrollback: impl Into<ScrollbackStorage>,
     ) -> Self {
-        // Ingress clamp: bound the allocation a hostile caller can request.
         let rows = rows.clamp(1, MAX_GRID_ROWS);
         let cols = cols.clamp(1, MAX_GRID_COLS);
         let scrollback: ScrollbackStorage = scrollback.into();
         let carried = u64::try_from(scrollback.line_count()).unwrap_or(u64::MAX);
 
-        // Preheat only enough pages for the visible rows.
         let bytes_per_row = (cols as usize) * std::mem::size_of::<Cell>();
         let initial_bytes = (rows as usize) * bytes_per_row;
         let pages_needed = (initial_bytes / PAGE_SIZE).max(1);
         let mut pages = PageStore::with_capacity(pages_needed);
-        // Reserve only the visible rows; the ring grows lazily up to
-        // `ring_buffer_size`.
         let mut row_storage = Vec::with_capacity(rows as usize);
         for _ in 0..rows {
             // SAFETY: `row_storage` and `pages` are moved into the same
@@ -149,7 +132,6 @@ impl Grid {
         }
 
         Self {
-            // See `with_scrollback`: derived state, starts empty.
             viewport_cache: ViewportRowCache::default(),
             storage: GridStorage {
                 pages,
@@ -178,7 +160,6 @@ impl Grid {
                 handback: super::resize_handback::HandBack::default(),
                 resize_law: super::resize_handback::ResizeLaw::default(),
                 absolute_row_counter: u64::from(rows).saturating_add(carried),
-                // Nonzero, so `0` is a usable "never observed" sentinel.
                 content_gen: 1,
                 reader_live_bottom_gen: 0,
                 wrap_serial: 0,
@@ -227,8 +208,6 @@ impl Default for Grid {
 mod tests {
     use super::*;
 
-    /// Every constructor clamps its dimensions into `1..=MAX` and builds a
-    /// grid whose invariants hold.
     #[test]
     fn constructors_clamp_dimensions_and_hold_invariants() {
         let cases = [

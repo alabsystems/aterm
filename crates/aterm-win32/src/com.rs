@@ -48,13 +48,16 @@ impl Com {
 
     /// Takes over the reference an interface value of another binding owns.
     /// # Safety
-    /// `T` is exactly such a value.
+    /// `T` is exactly such a value: a non-null interface pointer owning one reference, whose
+    /// drop does nothing but release it.
     #[inline]
     pub unsafe fn from_interface<T>(interface: T) -> Self {
         const { assert!(size_of::<T>() == size_of::<NonNull<c_void>>()) };
         const { assert!(needs_drop::<T>(), "an owned interface releases on drop") };
         let interface = ManuallyDrop::new(interface);
-        // SAFETY: `T` is pointer-sized (asserted above) and, by the caller's contract, is.
+        // SAFETY: `T` is pointer-sized (asserted above) and, by the caller's contract, is the
+        // non-null interface pointer itself; `ManuallyDrop` keeps its own release from running,
+        // so the reference moves here.
         Self(unsafe {
             ptr::read_unaligned(ptr::from_ref::<T>(&interface).cast::<NonNull<c_void>>())
         })
@@ -73,14 +76,16 @@ impl Com {
     #[inline]
     #[must_use]
     pub const unsafe fn vtable<V>(&self) -> &V {
-        // SAFETY: every COM object begins with its vtable pointer, which lives as long as.
+        // SAFETY: every COM object begins with its vtable pointer, which lives as long as the
+        // reference `self` holds; the caller vouches for `V`.
         unsafe { &**self.as_raw().cast::<*const V>() }
     }
 
     /// `QueryInterface` for `iid`: the same object as that interface, owned.
     pub fn query(&self, iid: &GUID) -> Result<Self, HRESULT> {
         let mut out = ptr::null_mut();
-        // SAFETY: every vtable begins with IUnknown's slots; `self` holds a live reference.
+        // SAFETY: every vtable begins with IUnknown's slots; `self` holds a
+        // live reference, and `out` is written only on success.
         let hr = unsafe {
             (self.vtable::<IUnknown_Vtbl>().QueryInterface)(self.as_raw(), iid, &mut out)
         };
@@ -94,7 +99,8 @@ impl Com {
 
 impl Drop for Com {
     fn drop(&mut self) {
-        // SAFETY: `self` owns one reference to a live object, released here once through.
+        // SAFETY: `self` owns one reference to a live object, released here
+        // once through the IUnknown slots every vtable begins with.
         unsafe { (self.vtable::<IUnknown_Vtbl>().Release)(self.as_raw()) };
     }
 }
@@ -111,7 +117,8 @@ pub const fn check(hr: HRESULT, step: &'static str) -> Result<(), StepError> {
 /// `CoCreateInstance` of `clsid` as `iid`, in process, owned.
 pub fn co_create(clsid: &GUID, iid: &GUID, step: &'static str) -> Result<Com, StepError> {
     let mut out = ptr::null_mut();
-    // SAFETY: standard object creation; `out` receives the interface pointer only on success.
+    // SAFETY: standard object creation; `out` receives the interface pointer
+    // only on success, and a success with a null pointer is refused below.
     let hr =
         unsafe { CoCreateInstance(clsid, ptr::null_mut(), CLSCTX_INPROC_SERVER, iid, &mut out) };
     check(hr, step)?;
@@ -130,7 +137,8 @@ pub struct Apartment {
 impl Apartment {
     /// Enters (or shares) this thread's single-threaded apartment.
     pub fn enter() -> Result<Self, StepError> {
-        // SAFETY: no reserved parameter; STA is the apartment a shell dialog wants, and is.
+        // SAFETY: no reserved parameter; STA is the apartment a shell dialog
+        // wants, and is the one a UI thread is already in.
         let hr = unsafe { CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) };
         if hr >= 0 {
             Ok(Self {
@@ -151,7 +159,9 @@ impl Apartment {
 impl Drop for Apartment {
     fn drop(&mut self) {
         if self.owned {
-            // SAFETY: balanced against the successful CoInitializeEx in `enter`; the type is not.
+            // SAFETY: balanced against the successful CoInitializeEx in
+            // `enter`; the type is not Send, so this is the same thread, as
+            // COM requires.
             unsafe { CoUninitialize() };
         }
     }

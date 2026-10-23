@@ -1,43 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `[update] enabled` ("Check for updates automatically"), read by the updater itself, and
-//! `[update] auto_apply`, whether a downloaded build installs by itself.
-//!
-//! The switch is a key in `aterm.toml` (Settings ▸ Software Update writes it), not an
-//! environment variable, which would never reach a window started from the Dock or a login
-//! item. Every process that runs the updater reads it here. Only the `[update]` table is
-//! deserialized, so a typo in another table cannot flip it, and a missing, unreadable or
-//! malformed file reads as on: an updater a typo switched off silently stops receiving
-//! security fixes.
+//! Readers for `[update] enabled` and `[update] auto_apply` in `aterm.toml`, defaulting
+//! to `true` when absent, unreadable, or malformed.
 
 use std::path::{Path, PathBuf};
 
-/// The same admission budget the native config service and atpkg's reader use.
 const MAX_CONFIG_BYTES: u64 = 512 * 1024;
 
-/// The ONE name of `[update] enabled`'s switch, on every surface that names it:
-/// Settings (its registry label, so Software Update's card, Search, Modified, the
-/// status line and the Reset All question), the Manual page `aterm help update`,
-/// and what the updater says it is holding for. A second spelling of it anywhere
-/// is a second name for one switch.
+/// Canonical UI label for `[update] enabled`.
 pub const CHECK_LABEL: &str = "Check for updates automatically";
-/// The ONE name of `[update] auto_apply`'s switch, as [`CHECK_LABEL`] is the check
-/// switch's.
+/// Canonical UI label for `[update] auto_apply`.
 pub const INSTALL_LABEL: &str = "Install updates automatically";
 
-/// Why a downloaded build waits for a press when `[update] auto_apply` holds it,
-/// in the words every updater surface says it with (the macOS ready row and
-/// Software Update's staged line, the Linux held download): the install switch by
-/// its one name, [`INSTALL_LABEL`], never by its key.
+/// Status string explaining why a downloaded build is held when `[update] auto_apply` is off.
 #[must_use]
 pub fn install_switch_off() -> String {
     format!("\u{201c}{INSTALL_LABEL}\u{201d} is off")
 }
 
-/// The user config file, resolved as the GUI's `app_config::config_path` does:
-/// `$XDG_CONFIG_HOME/aterm/aterm.toml`, else (Windows) `%APPDATA%\aterm\aterm.toml`, else
-/// `$HOME/.config/aterm/aterm.toml`.
+/// Resolve the user `aterm.toml` path (`$XDG_CONFIG_HOME`, `%APPDATA%` on Windows, or `~/.config`).
 #[must_use]
 pub fn config_path() -> Option<PathBuf> {
     // `aterm_types::dirs::config_home`: `$XDG_CONFIG_HOME`, or a test binary's own root.
@@ -68,8 +50,7 @@ struct UpdateOnly {
     update: Option<UpdateTable>,
 }
 
-/// `[update] enabled` out of full `aterm.toml` text: `false` only when the table parses and
-/// says so.
+/// Parse `[update] enabled` from `aterm.toml` text (`false` only when explicitly set to `false`).
 #[must_use]
 pub fn parse_update_enabled(text: &str) -> bool {
     match aterm_toml::from_str::<UpdateOnly>(text) {
@@ -81,8 +62,6 @@ pub fn parse_update_enabled(text: &str) -> bool {
     }
 }
 
-/// The log line for text [`parse_update_enabled`] could not read, telling a file that does not
-/// parse apart from a mistyped `[update]` value.
 fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
     let what = if aterm_toml::from_str::<aterm_toml::Table>(text).is_err() {
         "aterm.toml does not parse"
@@ -92,8 +71,7 @@ fn update_parse_notice(text: &str, e: &aterm_toml::Error) -> String {
     format!("{what} — automatic updates stay on: {e}")
 }
 
-/// [`parse_update_enabled`] over the file at `path`; an absent, non-regular, oversized or
-/// non-UTF-8 file is on.
+/// Read [`parse_update_enabled`] from `path` (`true` if absent, non-regular, oversized, or non-UTF-8).
 #[must_use]
 pub fn update_enabled_at(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
@@ -119,9 +97,7 @@ struct AutoApplyOnly {
     update: Option<AutoApplyTable>,
 }
 
-/// `[update] auto_apply` out of full `aterm.toml` text: whether a downloaded build installs
-/// by itself. `false` only when the table parses and says so, as the window reads it
-/// (`app_config::update_auto_apply_setting`).
+/// Parse `[update] auto_apply` from `aterm.toml` text (`false` only when explicitly set to `false`).
 #[must_use]
 pub fn parse_update_auto_apply(text: &str) -> bool {
     aterm_toml::from_str::<AutoApplyOnly>(text)
@@ -131,8 +107,7 @@ pub fn parse_update_auto_apply(text: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// [`parse_update_auto_apply`] over the user config, read now (for `aterm update
-/// status|check`). An absent, non-regular, oversized or non-UTF-8 file is on.
+/// Read [`parse_update_auto_apply`] from the user config (`true` if absent, oversized, or unreadable).
 #[must_use]
 pub fn update_auto_apply() -> bool {
     let Some(path) = config_path() else {
@@ -146,8 +121,7 @@ pub fn update_auto_apply() -> bool {
     }
 }
 
-/// "Check for updates automatically" for this process, read once: a change in Settings
-/// applies from the next launch, and every lane of one process agrees for its whole life.
+/// Cached `[update] enabled` setting for this process.
 #[must_use]
 pub fn update_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -167,8 +141,6 @@ mod tests {
         assert!(!parse_update_enabled("[update]\nenabled = false\n"));
     }
 
-    /// `auto_apply` is on unless the table says `false`, and a malformed key never flips the
-    /// other.
     #[test]
     fn auto_apply_is_on_unless_the_table_says_false() {
         assert!(parse_update_auto_apply(""));
@@ -183,8 +155,6 @@ mod tests {
         ));
     }
 
-    /// Only `[update]` is type-checked: a typo in another table leaves an explicit
-    /// `enabled = false` standing, and a malformed `[update]` is on, never a panic.
     #[test]
     fn only_the_update_table_is_read() {
         assert!(!parse_update_enabled(

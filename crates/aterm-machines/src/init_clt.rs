@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `base.clt`: Apple's Command Line Tools for this account's Mac
-//! (docs/DESIGN-init-system-2026-10-20.md §4.2, S6).
-//!
-//! No new privileged code: the install is the developer table's own item
-//! ([`crate::items::developer`], `softwareupdate` as root), reached through the root path
-//! that exists. The apply writes the one-table baseline `[developer] command_line_tools =
-//! true` into owned scratch and runs `sudo <aterm> machines here apply <that file>` on the
-//! person's own terminal, so they see one password prompt. Without a terminal (a window's
-//! pass, a script with no tty) the item is `Blocked` on `aterm init --only base.clt`.
-//!
-//! The probe is atpkg's C toolchain probe (`atpkg::prereq`, which raises no Apple dialog),
-//! handed in by the front door (`crates/aterm`), since this crate does not link atpkg.
+//! `base.clt` item for Apple's Command Line Tools ([`crate::items::developer`]).
 
 use crate::items::{Ctx, Item};
 use crate::model::Probe;
@@ -25,13 +14,11 @@ pub const ID: &str = "base.clt";
 /// What the C toolchain probe found, in the item's terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
-    /// The tools build a C program: what builds it.
+    /// The tools build a C program.
     Present(String),
-    /// No developer directory holds a compiler: what the probe found instead.
+    /// No developer directory holds a compiler.
     Missing(String),
-    /// A compiler is installed and refuses to build (an unaccepted Xcode license, a
-    /// PATH-first `cc` without an SDK): what it said. Installing the tools again would not
-    /// change it.
+    /// A compiler is installed and refuses to build.
     Refuses(String),
     /// The probe could not tell (a compiler that did not answer in time).
     Unknown(String),
@@ -39,8 +26,7 @@ pub enum Found {
     NotHere(String),
 }
 
-/// The probe [`CommandLineTools`] reads, injected: atpkg's C toolchain probe in
-/// production, which reads this Mac itself; a test's reads the fake host it is given.
+/// The probe [`CommandLineTools`] reads.
 pub type ProbeClt = Box<dyn Fn(&dyn System) -> Found + Send + Sync>;
 
 /// `base.clt`: installs Apple's Command Line Tools by the root path that exists.
@@ -51,8 +37,7 @@ pub struct CommandLineTools {
 }
 
 impl CommandLineTools {
-    /// The item over `found`, whose root half runs as `aterm machines here apply` from the
-    /// executable at `aterm`.
+    /// The item over `found`.
     #[must_use]
     pub fn new(found: ProbeClt, aterm: PathBuf) -> Self {
         Self { found, aterm }
@@ -77,8 +62,7 @@ impl CommandLineTools {
     }
 }
 
-/// Where `aterm init` places the item: the base layer, an elevated apply, any shell of the
-/// account's own (over SSH too), remedied by `aterm init --only base.clt`.
+/// Where `aterm init` places the item.
 #[must_use]
 pub fn place() -> crate::engine::Place {
     crate::engine::Place {
@@ -97,7 +81,7 @@ pub fn selected(word: &str) -> bool {
     aterm_converge::selects(word, ID, "developer", Some(aterm_converge::Layer::Base))
 }
 
-/// Why the item cannot install from here: its one prompt needs a terminal.
+/// Why the item cannot install from here.
 pub const NO_TTY: &str = "installing the Command Line Tools asks for your password, and this \
                           run has no terminal to ask it in: run `aterm init --only base.clt` \
                           in a terminal";
@@ -171,10 +155,8 @@ mod tests {
 
     const ATERM: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 
-    /// Where the fake install lands: the probe reads `Present` once a file stands there.
     const CC: &str = "/Library/Developer/CommandLineTools/usr/bin/cc";
 
-    /// The item over a probe that answers `found` until the fake host holds [`CC`].
     fn item(found: Found) -> CommandLineTools {
         CommandLineTools::new(
             Box::new(move |sys: &dyn System| {
@@ -197,9 +179,6 @@ mod tests {
         rows.remove(0)
     }
 
-    /// On a terminal the plan names the root path's argv and changes nothing; the apply
-    /// writes the one-table baseline to owned scratch and runs exactly that argv there, and
-    /// the read-back judges it.
     #[test]
     fn missing_tools_plan_the_machines_here_argv_and_apply_runs_it_on_the_terminal() {
         let mut sys = Fake::default();
@@ -250,7 +229,6 @@ mod tests {
                 .any(|call| call == &format!("scratch closed {}", scratch.display())),
             "the scratch goes with the run: {calls:?}"
         );
-        // The baseline the root half reads is one the parser takes, asking for the tools.
         let parsed = crate::baseline::parse(&CommandLineTools::baseline()).unwrap();
         assert_eq!(
             parsed.developer.and_then(|table| table.command_line_tools),
@@ -258,8 +236,6 @@ mod tests {
         );
     }
 
-    /// Without a terminal nothing can ask for the password: `Blocked`, naming the one
-    /// command, and nothing runs.
     #[test]
     fn without_a_terminal_the_item_is_blocked_on_init_only_base_clt() {
         let sys = Fake::default();
@@ -277,8 +253,6 @@ mod tests {
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     }
 
-    /// Installed tools are `Ok`; a refusing compiler is not an install's to fix; an
-    /// unanswered probe is unread; off macOS there is nothing to do.
     #[test]
     fn the_probe_maps_each_finding() {
         let mut sys = Fake::default();

@@ -88,8 +88,9 @@ pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
     }
 }
 
-/// The first instant after `now_unix_ms` at which a time word said of a record stamped `at_unix_ms`
-/// ([`relative_words`], [`spoken_relative_words`], [`local_words`], [`day_heading`]).
+/// The first instant after `now_unix_ms` at which a time word said of a record stamped
+/// `at_unix_ms` reads otherwise ([`relative_words`], [`spoken_relative_words`], [`local_words`],
+/// [`day_heading`]).
 #[must_use]
 pub fn words_change_after(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> u64 {
     let ago = now_unix_ms.saturating_sub(at_unix_ms);
@@ -156,7 +157,8 @@ pub fn local_day(at_unix_ms: u64, offset_s: i64) -> i64 {
         .div_euclid(86_400)
 }
 
-/// When `at` was on the reader's local clock.
+/// When `at` was on the reader's local clock, `offset_s` from UTC, without
+/// the day or the seconds.
 #[must_use]
 pub fn clock_words(at_unix_ms: u64, offset_s: i64) -> String {
     let secs = i64::try_from(at_unix_ms / 1000)
@@ -244,8 +246,9 @@ const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
-/// Proleptic-Gregorian `(year, month, day)` → days since 1970-01-01, the inverse of
-/// [`civil_from_days`].
+/// Proleptic-Gregorian `(year, month, day)` → days since 1970-01-01, the
+/// inverse of [`civil_from_days`] (Howard Hinnant's `days_from_civil`), on
+/// the non-negative half only.
 #[inline]
 const fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
     let y = if month <= 2 {
@@ -284,7 +287,7 @@ pub(crate) fn home_abbreviate(path: &str, home: Option<&str>) -> String {
     }
 }
 
-/// Every path atom in `text` ([`home_abbreviate`]).
+/// `text` with every path atom abbreviated by [`home_abbreviate`].
 #[must_use]
 pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
     let Some(home) = home.filter(|h| !h.is_empty()) else {
@@ -306,7 +309,7 @@ pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
 }
 
 /// The closed table a Complete echo reads a title's leading present participle through: the verbs
-/// band titles.
+/// band titles use.
 const FINISHED_VERBS: [(&str, &str); 43] = [
     ("Downloading", "Downloaded"),
     ("Installing", "Installed"),

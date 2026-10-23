@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm_objc::MainThreadBound`, measured on the real process main thread.
-//!
-//! The container's third obligation (the value is dropped on the main thread) is discharged by
-//! [`aterm_objc::run_on_main`] inside `Drop`, which libtest cannot exercise: it runs each test
-//! on a worker and parks its main thread joining them. So this target is `harness = false` and
-//! its `main` is the process main thread. It answers libtest's argv as one test named
-//! `main_thread_bound_drive` ([`asked`]): a filter that does not match, a matching `--skip`,
-//! `--ignored` or `--bench` runs nothing and passes, and `--list` names it. Off macOS it passes
-//! without running; on macOS a NOT RUN (`2`: no main thread, no witness, no probe class) is a
-//! failing exit.
-//!
-//! The drop obligation has no type-system half, so it is measured: stage 2 drops a container on
-//! a worker and reads the thread its `T`'s destructor ran on, and stage 3 does the same with a
-//! `Retained` of a declared class whose ivar has a destructor (`S3`'s release end in the crate's
-//! soundness list, closed for everything this container holds).
-//!
-//! `Drop` skips the dispatch entirely when `T` has no destructor; without the skip, a container
-//! dropped on a worker while the main thread is parked (a libtest binary's shape) would block
-//! for ever. Stage 4 runs that position in a child process with a drop-less `T` and requires it
-//! to exit 0.
+//! Measures [`aterm_objc::MainThreadBound`] on the real process main thread (`harness = false`).
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -33,7 +14,6 @@
     )
 )]
 
-/// The name libtest's argv selects this target by: its `[[test]] name`.
 const TEST_NAME: &str = "main_thread_bound_drive";
 
 fn main() -> std::process::ExitCode {
@@ -54,7 +34,6 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code as u8)
 }
 
-/// What libtest's argv asks of the one test this binary is.
 enum Asked {
     Run,
     /// `--list`: print the name when the rest of the argv selects it.
@@ -65,9 +44,6 @@ enum Asked {
     Nothing,
 }
 
-/// Read libtest's argv as libtest would for one test named [`TEST_NAME`]: filters and `--skip`
-/// match by substring (whole under `--exact`), options that take a value consume it, and an
-/// unknown option is an error rather than a filter that silently selects nothing.
 fn asked(args: impl IntoIterator<Item = String>) -> Result<Asked, String> {
     let (mut filters, mut skips) = (Vec::new(), Vec::new());
     let (mut list, mut exact, mut ignored, mut bench) = (false, false, false, false);
@@ -183,8 +159,6 @@ mod macos {
         fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: u8) -> i32;
     }
 
-    /// Whether this thread is the process main thread, asked of Foundation directly: a stage that
-    /// used the crate's own [`MainThread`] witness could not catch the witness being wrong.
     fn is_main_thread() -> bool {
         // SAFETY: `+[NSThread isMainThread]` is a side-effect-free class-method
         // `BOOL` query and the cast is exactly `-(BOOL)(id, SEL)`.
@@ -193,8 +167,6 @@ mod macos {
             f(class(c"NSThread").as_id(), sel!(isMainThread)).as_bool()
         }
     }
-
-    // -- The payloads whose destructors report where they ran ------------
 
     /// 1 if the destructor ran on the main thread, 2 if it did not, 0 if it has
     /// not run.
@@ -208,17 +180,12 @@ mod macos {
         }
     }
 
-    /// Stage 3's ivars: a destructor that records the thread `-dealloc` ran on, and a `Cell` so
-    /// the type is `!Send` as real ivars are.
     struct DeallocWatch {
         _calls: Cell<i64>,
-        /// Held for its `Drop`, which is the observation stage 3 makes.
         _where_died: WhereDidIDie,
     }
 
     declare_class! {
-        /// A class whose Rust ivar destructor reports its thread — `S3`'s
-        /// release end, made observable.
         struct Watched: NSObject {
             const NAME: &str = "AtermBoundDriveWatched";
             type Ivars = DeallocWatch;
@@ -231,7 +198,6 @@ mod macos {
         }
     }
 
-    /// Pump the main run loop until `rx` produces, or the watchdog fires.
     fn pump_until<T>(rx: &mpsc::Receiver<T>) -> Option<T> {
         let deadline = Instant::now() + WATCHDOG;
         while Instant::now() < deadline {
@@ -252,8 +218,6 @@ mod macos {
             _ => "a WORKER",
         }
     }
-
-    // -- The child probe: stage 4, in its own process (the failure it guards is a hang) --
 
     /// A drop-less container dropped on a worker with the main thread parked, as in a libtest
     /// binary. The short-circuit means this never reaches the queue, so it must return at once.
@@ -291,7 +255,6 @@ mod macos {
             return NOT_RUN;
         };
 
-        // -- Stage 1: the direct path -------------------------------------
         eprintln!("stage 1: dropped ON the main thread, the destructor runs there and does not");
         eprintln!("         dispatch (which from this position would be the SIGTRAP re-entrancy)");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
@@ -302,7 +265,6 @@ mod macos {
             "stage1: the destructor ran on the main thread",
         );
 
-        // -- Stage 2: the reschedule --------------------------------------
         eprintln!("stage 2: dropped on a WORKER, the destructor still runs on the MAIN thread");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
         let bound = MainThreadBound::new(WhereDidIDie(flag.clone()), mt);
@@ -324,7 +286,6 @@ mod macos {
             "stage2: and the destructor still ran on the MAIN thread",
         );
 
-        // -- Stage 3: S3's release end, on a real declared class -----------
         eprintln!("stage 3: an aterm_objc::Retained of a declared class — S3's release end");
         let flag = std::sync::Arc::new(AtomicU32::new(0));
         let Some(obj): Option<Retained<Watched>> = Watched::alloc_init(
@@ -337,8 +298,6 @@ mod macos {
             eprintln!("objc-bound-drive: NOT RUN — the probe class could not be instantiated.");
             return NOT_RUN;
         };
-        // Messaged once, so the instance is live and the class registered before its death
-        // is measured.
         // SAFETY: `-ping` is registered `v@:` by the macro above and `obj` owns a live +1.
         unsafe {
             let send: unsafe extern "C-unwind" fn(Id, Sel) = msg();
@@ -348,7 +307,6 @@ mod macos {
         let (tx, rx) = mpsc::channel::<bool>();
         let worker = std::thread::spawn(move || {
             let off_main = !is_main_thread();
-            // The last release happens here, on a worker, through safe code.
             drop(bound);
             let _ = tx.send(off_main);
         });
@@ -368,7 +326,6 @@ mod macos {
              end, closed for everything this container holds",
         );
 
-        // -- Stage 4: the needs_drop short-circuit --------------------------
         eprintln!("stage 4: a drop-less container dropped off-main with the main thread parked");
         let outcome = probe("nodrop", WATCHDOG);
         if let Err(e) = &outcome {
@@ -379,14 +336,11 @@ mod macos {
             "stage4: a drop-less T dropped on a worker with the main thread parked exits 0",
         );
 
-        // -- Stage 5: get_on_main from a worker ---------------------------
         eprintln!("stage 5: get_on_main from a worker reaches the value ON the main thread");
         let bound = std::sync::Arc::new(MainThreadBound::new(Cell::new(41_i64), mt));
         let (tx, rx) = mpsc::channel::<(i64, bool)>();
         let shared = std::sync::Arc::clone(&bound);
         let worker = std::thread::spawn(move || {
-            // Sharing `Arc<MainThreadBound<Cell<i64>>>` needs `Sync`, which `Cell` is not:
-            // this line uses the `Sync` impl.
             let got = shared.get_on_main(|cell| {
                 cell.set(cell.get() + 1);
                 (cell.get(), is_main_thread())
@@ -417,10 +371,6 @@ mod macos {
         }
     }
 
-    // -- Child-process plumbing ------------------------------------------
-
-    /// Re-execute this binary in `mode` and watch it for `budget`: its
-    /// lowercased stdout if it exited 0, otherwise what happened instead.
     fn probe(mode: &str, budget: Duration) -> Result<String, String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let mut child = std::process::Command::new(exe)

@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Anchored reads for `doc read` and `amacs --read` (design §7b-§7c; slice
-//! S6).
-//!
-//! Each line prints as `<n>:<h6>|<text>`: its anchor (`anchor`), a bar, and
-//! its bytes without the end-of-line. A trailer ends the read:
-//! `-- lines=<total> seq=<s> [next=<n>]`. `lines=` counts the whole text, not
-//! the range read; `seq=` is the document sequence the read saw (the `base=`
-//! of a later script); `next=` appears only when the byte cap stopped the read
-//! before the range's end, and names the first line it did not print, so the
-//! next read asks for `lines=<n>-...`.
-//!
-//! The cap bounds the printed lines, not the trailer. Lines print whole, and
-//! the read stops before the first that would pass the cap, except that the
-//! first line of a read always prints: when it alone passes the cap it is cut
-//! at a character boundary and the trailer says `cut=<n>`. So a read always
-//! makes progress, and an agent never mistakes a cut line for a whole one.
+//! Anchored line formatting and range parsing for `doc read` and `amacs --read`.
 
 use std::fmt;
 use std::fmt::Write as _;
@@ -27,8 +12,7 @@ use super::anchor::{Hash6, Lines, parse_line_number};
 /// The cap `doc read` prints under: 256 KiB of lines.
 pub const DOC_READ_CAP: usize = 256 * 1024;
 
-/// Which lines to read: `A-B` (both 1-based, inclusive), `A-` (to the end) or
-/// `A` (one line).
+/// Line range to read: `A-B` (1-based inclusive), `A-` (to the end), or `A` (single line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LineRange {
     /// The first line, 1-based.
@@ -84,9 +68,7 @@ impl FromStr for LineRange {
     }
 }
 
-/// `range` of `text` as anchored lines and the trailer, printing at most
-/// `cap_bytes` of lines (see the module docs). `seq` is the document sequence
-/// `text` is at.
+/// Format `range` of `text` at sequence `seq` as anchored lines within `cap_bytes`, then a trailer.
 #[must_use]
 pub fn format_lines(text: &str, seq: u64, range: LineRange, cap_bytes: usize) -> String {
     let lines = Lines::of(text);
@@ -107,8 +89,6 @@ pub fn format_lines(text: &str, seq: u64, range: LineRange, cap_bytes: usize) ->
                 next = Some(line);
                 break;
             }
-            // The read's first line alone passes the cap: print what fits,
-            // cut at a character boundary, and say so.
             let room = cap_bytes.saturating_sub(row.len()).saturating_sub(1);
             row.push_str(prefix_within(content, room));
             row.push('\n');
@@ -133,8 +113,6 @@ pub fn format_lines(text: &str, seq: u64, range: LineRange, cap_bytes: usize) ->
     out
 }
 
-/// The longest prefix of `text` at most `max` bytes long that ends on a
-/// character boundary.
 fn prefix_within(text: &str, max: usize) -> &str {
     let mut end = max.min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
@@ -159,8 +137,6 @@ mod tests {
             Hash6::of("}")
         );
         assert_eq!(read, expected);
-        // Every printed anchor is the anchor of its line, so an agent copies
-        // it as is.
         for row in read.lines().filter(|row| !row.starts_with("--")) {
             let (anchor, _) = row.split_once('|').unwrap();
             let anchor: Anchor = anchor.parse().unwrap();
@@ -185,23 +161,17 @@ mod tests {
         let text = (1..=10)
             .map(|n| format!("line {n:02}\n"))
             .collect::<String>();
-        // Each row is `<n>:<h6>|line NN\n`: 17 bytes for lines 1-9.
         let row = format_lines(&text, 3, "1".parse().unwrap(), 1024);
         let row_len = row.lines().next().unwrap().len() + 1;
         assert_eq!(row_len, 17);
         let read = format_lines(&text, 3, LineRange::ALL, row_len * 4 + 5);
         assert_eq!(read.lines().count(), 5, "four lines and the trailer");
         assert!(read.ends_with("-- lines=10 seq=3 next=5\n"), "{read}");
-        // Paging from `next=` reads on, and the last page has no `next=`.
         let rest = format_lines(&text, 3, "5-".parse().unwrap(), 1024);
         assert!(rest.starts_with("5:"), "{rest}");
         assert!(rest.ends_with("-- lines=10 seq=3\n"), "{rest}");
-        // A range the cap does not reach has no `next=`, even before the end
-        // of the text.
         let bounded = format_lines(&text, 3, "1-2".parse().unwrap(), 1024);
         assert!(bounded.ends_with("-- lines=10 seq=3\n"), "{bounded}");
-        // A first line longer than the cap prints cut, at a character
-        // boundary, and the read still moves on.
         let wide = format!("{}\nshort\n", "é".repeat(40));
         let read = format_lines(&wide, 0, LineRange::ALL, 30);
         let first = read.lines().next().unwrap();

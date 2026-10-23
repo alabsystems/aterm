@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The present-path blit on Metal, test-only: the macOS backend runs its blit
-//! from the same pipeline row inside [`super::present::encode_present_sequence`].
-//!
-//! [`super::tests::blit_matches_wgpu_byte_for_byte`] pushes the same source
-//! pixels and 112 uniform bytes through the wgpu blit and this one and requires
-//! every byte to agree, so a gamma shift, swapped channel, filtered sample or
-//! half-texel offset fails on arbitrary pixels.
-//!
-//! # Binding map
-//!
-//! WGSL's `@group @binding` has no Metal equivalent, so this module binds by
-//! reading `Pipeline::Blit.spec().binds` ([`crate::pipeline_table::BindSpec`]).
-//! The Metal-vs-wgpu blit differential pins the bytes, so a swapped slot
-//! fails it.
-//!
-//! Test-only: the macOS backend runs its blit from the same row inside
-//! [`super::present::encode_present_sequence`].
+//! Test-only Metal present-blit runner using [`Pipeline::Blit`], compared byte-for-byte against the wgpu blit oracle.
 
 #[cfg(wgpu_arm)]
 use super::ffi::{self, Device, Obj, PixelFormat, SamplerDesc};
@@ -26,52 +10,37 @@ use super::pipelines;
 #[cfg(wgpu_arm)]
 use crate::pipeline_table::Pipeline;
 
-/// Bytes per `BlitUniform`, asserted against the Rust struct where it is
-/// filled, so a field added on one side only fails loudly.
+/// Size in bytes of `BlitUniform`.
 pub(crate) const UNIFORM_BYTES: usize = 112;
 
-/// Metal twin of `renderer.rs::build_blit_resources`: the shader library, the
-/// pipeline state for one destination format, the nearest sampler and the
-/// 112-byte uniform buffer. wgpu's bind-group and pipeline layouts have no
-/// Metal counterpart; Metal binds by slot at encode time. The differential is
-/// the wgpu oracle's, so the pass compiles with it (`--features wgpu-oracle`).
+/// Metal present-blit pipeline, nearest sampler, and 112-byte uniform buffer for one destination format.
 #[cfg(wgpu_arm)]
 pub(crate) struct MetalBlit {
     device: Device,
     queue: Obj,
-    /// `MTLRenderPipelineState` for `vs_blit` + `fs_blit` at one destination
-    /// format (the readable swapchain stand-in's).
+    /// `MTLRenderPipelineState` for `vs_blit` + `fs_blit` at `self.format`.
     pipeline: Obj,
-    /// [`SamplerDesc::NEAREST_CLAMP`], as `build_blit_resources` uses. Bound
-    /// because the shader declares it; `fs_blit` fetches with `read()`.
+    /// Nearest-clamp sampler bound for `fs_blit`.
     sampler: Obj,
-    /// The shared 112-byte `BlitUniform` buffer, written per present.
+    /// Shared 112-byte `BlitUniform` buffer.
     uniform: Obj,
     format: PixelFormat,
 }
 
 #[cfg(wgpu_arm)]
 impl MetalBlit {
-    /// [`UNIFORM_BYTES`], where the differential reads it.
+    /// [`UNIFORM_BYTES`], re-exported for the differential test.
     pub(crate) const UNIFORM_BYTES: usize = UNIFORM_BYTES;
 
-    /// The offscreen frame's format; the upload stride uses its
-    /// [`PixelFormat::bytes_per_texel`].
+    /// Offscreen source frame pixel format.
     const SRC_FORMAT: PixelFormat = PixelFormat::Rgba8Unorm;
 
-    /// Compile `shaders/blit.metal` and build every object the pass needs.
-    /// Returns `Err` without a Metal device.
+    /// Compiles `shaders/blit.metal` and allocates the blit pipeline, sampler, and uniform buffer.
     pub(crate) fn new(format: PixelFormat) -> Result<Self, String> {
-        // The device the metal arm renders on (the low-power GPU of a dual-GPU
-        // Mac) — see `Device::preferred`.
         let device = Device::preferred().ok_or_else(|| "no Metal device".to_owned())?;
         let queue = device
             .new_command_queue()
             .ok_or_else(|| "MTLCommandQueue allocation failed".to_owned())?;
-        // The pipeline state comes from the `Pipeline::Blit` row, the one
-        // `renderer.rs::ensure_blit_pipeline` uses: entry points, REPLACE (Metal:
-        // blending disabled), the all-channel mask (the blit publishes alpha),
-        // and no vertex descriptor (`vs_blit` reads `[[vertex_id]]`).
         let spec = Pipeline::Blit.spec();
         let library = pipelines::compile(&device, spec)?;
         let pipeline = pipelines::build(&device, &library, spec, format)?;
@@ -93,15 +62,12 @@ impl MetalBlit {
         })
     }
 
-    /// The GPU this blit runs on, for diagnostics.
+    /// Name of the Metal device this blit runs on.
     pub(crate) fn device_name(&self) -> String {
         self.device.name()
     }
 
-    /// Run `vs_blit` + `fs_blit` over `src` and read the destination back as
-    /// tightly packed RGBA8. `src` is `src_w * src_h` RGBA8 texels; `uniform` is
-    /// the 112 bytes of a `BlitUniform` from `present_blit_uniform`, as the
-    /// wgpu path uses.
+    /// Runs `vs_blit` + `fs_blit` over `src` (`src_w * src_h` RGBA8 texels) with `uniform` and returns the destination texels.
     pub(crate) fn run(
         &self,
         src: &[u8],
@@ -162,8 +128,6 @@ impl MetalBlit {
         // `&self` on a non-`Sync` type.
         unsafe { ffi::buffer_write(&self.uniform, uniform) };
 
-        // The destination format's own texel size (8 for `Rgba16Float`); a wrong
-        // stride copies silently with validation off.
         let row = dw
             .checked_mul(self.format.bytes_per_texel())
             .ok_or_else(|| format!("readback row {dw} texels overflows usize"))?;
@@ -174,7 +138,6 @@ impl MetalBlit {
             .device
             .new_buffer(readback_len)
             .ok_or_else(|| "blit readback buffer allocation failed".to_owned())?;
-        // Binding indices come from the row's `BindSpec`.
         let binds = Pipeline::Blit.spec().binds;
         ffi::draw_and_read(
             &self.queue,
@@ -183,8 +146,6 @@ impl MetalBlit {
                 dst: &dst_tex,
                 dst_w: dw,
                 dst_h: dh,
-                // Opaque black; the pass writes every pixel, so this only
-                // matters if the pass fails.
                 load: ffi::LoadAction::Clear(ffi::ClearColor {
                     r: 0.0,
                     g: 0.0,

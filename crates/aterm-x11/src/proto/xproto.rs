@@ -5,7 +5,7 @@
 
 use super::{ParseError, Reader, Reply, Request, ValueList, Void, Writer, reply_head};
 
-/// The protocol's id types, here as well, where x11rb's `xproto` module has them.
+/// Re-exported X11 protocol ID types.
 pub use super::{
     Atom, Colormap, Cursor, Drawable, Gcontext, Keycode, Pixmap, Timestamp, Visualid, Window,
 };
@@ -29,7 +29,7 @@ pub mod cw {
     pub const CURSOR: u32 = 1 << 14;
 }
 
-/// ConfigureWindow value-list bits (a 16-bit mask on the wire).
+/// ConfigureWindow value-list bits.
 pub mod config {
     pub const X: u32 = 1 << 0;
     pub const Y: u32 = 1 << 1;
@@ -971,7 +971,7 @@ pub struct Screen {
     pub allowed_depths: Vec<Depth>,
 }
 
-/// The server's answer to the connection setup (`xcb_get_setup`'s bytes).
+/// Connection setup reply from the X11 server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Setup {
     pub status: u8,

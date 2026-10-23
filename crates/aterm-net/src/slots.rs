@@ -37,7 +37,8 @@ pub(crate) fn wait_listener_readable(
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `descriptor` is one initialized pollfd valid for the call.
+        // SAFETY: `descriptor` is one initialized pollfd valid for the call;
+        // `listener` keeps its borrowed descriptor open for the whole wait.
         let result = unsafe {
             libc::poll(
                 std::ptr::from_mut(&mut descriptor),
@@ -74,7 +75,8 @@ pub(crate) fn wait_listener_readable(
         events: POLLIN,
         revents: 0,
     };
-    // SAFETY: Std initialized Winsock before it created `listener`.
+    // SAFETY: std initialized Winsock before it created `listener`;
+    // `descriptor` names that live borrowed socket for the duration of the call.
     let result = unsafe {
         WSAPoll(
             std::ptr::from_mut(&mut descriptor),
@@ -98,7 +100,7 @@ pub(crate) fn wait_listener_readable(
     Ok(false)
 }
 
-/// The address a connection is counted against (the module doc's rule 1).
+/// The address a connection is counted against ([`pick_displaced`]).
 pub(crate) fn source_of(peer: IpAddr) -> IpAddr {
     match peer.to_canonical() {
         IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
@@ -722,8 +724,11 @@ pub(crate) mod tests {
         (listener, port)
     }
 
-    /// The module doc's rule, case by case, on synthetic addresses. The real-socket
-    /// tests reach two sources through a dual-stack listener (127.0.0.1 and
+    /// [`pick_displaced`]'s rule, case by case, on synthetic addresses: when the heaviest
+    /// address holds at least two more unauthenticated connections than the newcomer's, the
+    /// oldest of the heaviest goes at once (rule 1); otherwise the oldest unauthenticated one
+    /// past the grace goes, from an address no lighter than the newcomer's (rule 2). The
+    /// real-socket tests reach two sources through a dual-stack listener (127.0.0.1 and
     /// ::1), which is enough for rule 1 and rule 2's address bound end to end;
     /// the margin of two, ties, relays and ages are pinned here, where any
     /// number of addresses is free.

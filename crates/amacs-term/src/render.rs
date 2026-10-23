@@ -55,7 +55,6 @@ pub(crate) struct DrawnRow {
 }
 
 impl DrawnRow {
-    /// Display column for a caret at `offset` into `source`.
     fn column_of(&self, offset: usize) -> u16 {
         self.cells
             .iter()
@@ -63,7 +62,7 @@ impl DrawnRow {
             .map_or(self.end, |(_, column)| *column)
     }
 
-    /// The document byte a press at `column` lands on: the start of the grapheme drawn there.
+    /// Returns the document byte at `column`, or the row's end when past its text.
     pub(crate) fn byte_at(&self, column: u16) -> usize {
         let offset = self
             .cells
@@ -103,7 +102,6 @@ pub(crate) fn class_style(class: SyntaxClass) -> Style {
     }
 }
 
-/// `style` drawn in reverse video.
 const fn reversed(style: Style) -> Style {
     Style {
         attrs: style.attrs.union(Attrs::REVERSE),
@@ -111,7 +109,6 @@ const fn reversed(style: Style) -> Style {
     }
 }
 
-/// The blank cells a tab at display column `column` takes.
 const fn tab_cells(column: usize) -> u16 {
     match column % 4 {
         0 => 4,
@@ -162,7 +159,6 @@ pub(crate) fn draw_body(
     (drawn, caret)
 }
 
-/// Lay one projected line out on `row`.
 fn draw_line(
     screen: &mut Screen,
     row: u16,
@@ -199,6 +195,7 @@ fn draw_line(
             column = to;
         } else if grapheme.chars().any(char::is_control) {
             // The engine gives a control character no column; neither does
+            // the frame, so the caret's column is the one `C-n` keeps.
         } else {
             let next = screen.put(row, column, grapheme, style);
             if next == column && editor_grapheme_columns(grapheme, usize::from(column)) > 0 {
@@ -336,7 +333,6 @@ impl EchoLine {
     }
 }
 
-/// The echo area's label and query for an open minibuffer, and the completions M-x offers after it.
 fn minibuffer_line(minibuffer: &Minibuffer, status: Option<&str>) -> (String, Vec<String>) {
     let (label, query) = match minibuffer {
         Minibuffer::Inactive => return (String::new(), Vec::new()),
@@ -364,7 +360,6 @@ fn minibuffer_line(minibuffer: &Minibuffer, status: Option<&str>) -> (String, Ve
     (format!("{label}{query}"), completions)
 }
 
-/// Lay `echo` out on `rows` of `screen`: the text wraps from row to row and stops at the last.
 fn lay_echo(screen: &mut Screen, rows: Range<u16>, echo: &EchoLine) -> (u16, Option<Pos>) {
     let plain = Style::default();
     let cols = screen.size().cols;

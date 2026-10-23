@@ -53,7 +53,8 @@ fn watchers(inst: &Instance, sid: &str) -> usize {
         .unwrap_or_else(|| panic!("no watchers= in {row}"))
 }
 
-/// The fake worker: raw mode.
+/// The fake worker: raw mode, a background reader appending every byte it
+/// receives to `$2`, box A, then — once `$1` exists — box B, then idle.
 const FAKE_WORKER: &str = r#"#!/bin/sh
 go="$1"
 log="$2"
@@ -489,7 +490,7 @@ fn a_supervisor_claim_shows_in_the_roster_and_clears_when_its_connection_closes(
 struct Recording<C> {
     inner: C,
     requests: Vec<String>,
-    /// Once a `key` has gone out.
+    /// Once a `key` has gone out, every later `await` answers `ERR exited`.
     end_after_press: bool,
 }
 

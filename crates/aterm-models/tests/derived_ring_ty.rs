@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Tier-0 for `ty_model!` models (`aterm_spec::derive`'s module docs).
+//! Tier-0 for `ty_model!` models: each model checked on its own, within its bounds, not the code.
 
 #![allow(
     clippy::disallowed_types,

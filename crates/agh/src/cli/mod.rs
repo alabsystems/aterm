@@ -478,7 +478,9 @@ pub enum Completeness {
 }
 
 impl Completeness {
-    /// `End::Complete` → Complete.
+    /// `End::Complete` → Complete; `Limited { at }` → `Limited { asked: at }`;
+    /// `Capped { pages }`, which a listing ends with only under `--partial` →
+    /// `Partial { why: "the listing stopped at the {pages}-page cap" }`.
     #[must_use]
     pub fn of(end: End) -> Completeness {
         match end {

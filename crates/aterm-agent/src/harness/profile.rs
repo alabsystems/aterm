@@ -1201,7 +1201,8 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// READ A PROFILE FROM ITS BYTES: the allowlist and nothing else (the module docs say how).
+/// READ A PROFILE FROM ITS BYTES: the allowlist and nothing else (the six keys `RawFile`
+/// names; every other key is skipped, its value never built).
 ///
 /// # Errors
 /// [`NoProfile::Unreadable`] for bytes that are not one JSON object.

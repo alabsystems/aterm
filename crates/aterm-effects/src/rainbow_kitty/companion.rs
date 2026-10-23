@@ -137,8 +137,6 @@ pub enum BodyImpulse {
     Ignore,
 }
 
-impl BodyImpulse {}
-
 /// One impulse, two readings (§7.2, D13): route a [`CompanionImpulse`] to what the owning body does with it.
 #[inline]
 #[must_use]

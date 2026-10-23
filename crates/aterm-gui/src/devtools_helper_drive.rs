@@ -72,7 +72,9 @@ fn run(_windowed: crate::platform::Windowed, out: Option<&Path>) -> i32 {
         println!("{ME}: NOT RUN — not on the process main thread");
         return NOT_RUN;
     };
-    // SAFETY: Main thread; `+sharedApplication`, `-setActivationPolicy:`, and `-activationPolicy` are valid on `NSApplication`.
+    // SAFETY: Main thread; `+sharedApplication` is `+(NSApplication *)`, +0 and
+    // process-lifetime; `-setActivationPolicy:` is `-(BOOL)(NSInteger)` and
+    // `-activationPolicy` `-(NSInteger)`.
     let policy = unsafe {
         let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
         if app.is_null() {
@@ -311,7 +313,9 @@ unsafe fn view_checks(
     at: &str,
     findings: &mut Findings,
 ) {
-    // SAFETY: Main thread; AppKit geometry and subview selectors match their Objective-C signatures.
+    // SAFETY: Main thread; `-bounds`/`-frame` are `-(NSRect)`; `-subviews`
+    // `-(NSArray *)`, +0, read with `-count`/`-objectAtIndex:`; `-isKindOfClass:` is
+    // `-(BOOL)(Class)`; `-cell` `-(id)` and `-cellSizeForBounds:` `-(NSSize)(NSRect)`.
     unsafe {
         let view = preview.view.as_id();
         let bounds = appkit::send_rect(view, sel!(bounds));
@@ -377,7 +381,13 @@ unsafe fn view_checks(
 /// # Safety
 /// Must be called on the main thread while `view` is a live `NSView`.
 unsafe fn capture(view: Id, dark: bool) -> Option<(usize, usize, Vec<u8>, bool)> {
-    // SAFETY: Main thread; `NSAppearance` and `NSBitmapImageRep` selectors match their Objective-C signatures.
+    // SAFETY: Main thread. `+appearanceNamed:` is `+(NSAppearance *)(NSString *)`,
+    // +0, given AppKit's own name global; `-setAppearance:` `-(void)(id)`; the
+    // caching pair `-(NSBitmapImageRep *)(NSRect)` and `-(void)(NSRect, id)`; the
+    // rep's accessors `-(NSInteger)` and `-(unsigned char *)`;
+    // `-representationUsingType:properties:` `-(NSData *)(NSUInteger, id)`;
+    // `-length` `-(NSUInteger)` and `-getBytes:length:` `-(void)(void *,
+    // NSUInteger)` into a buffer of exactly that length.
     unsafe {
         let look = appkit::send_id_id(
             class(c"NSAppearance").as_id(),
@@ -441,7 +451,12 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
         return;
     };
     let p = panel.id();
-    // SAFETY: Main thread; read-only window property selectors and `-setDelegate:nil` on a live `NSPanel`.
+    // SAFETY: Main thread; read-only `-(NSUInteger)`, `-(NSInteger)`, `-(BOOL)`,
+    // `-(NSRect)` and `-(id)` sends (`-contentRectForFrameRect:` takes an
+    // `NSRect`, `-objectAtIndex:` an `NSUInteger`) to the live, never-shown
+    // panel, the bare preview's view, the tile and its tracking areas; the
+    // tile's own `-mouseEntered:`/`-mouseExited:` read no event, so nil serves;
+    // then `-setDelegate:` nil before the panel goes.
     unsafe {
         let mask = appkit::send_usize(p, sel!(styleMask));
         findings.check(mask == consts::NS_WINDOW_STYLE_MASK_UTILITY_PANEL, || {
@@ -543,7 +558,11 @@ fn payload(findings: &mut Findings) {
         findings.check(false, || "no drag payload was built".to_string());
         return;
     };
-    // SAFETY: Main thread; operates on a unique process-local `NSPasteboard` and releases it globally.
+    // SAFETY: Main thread. `+pasteboardWithUniqueName` is `+(NSPasteboard *)`,
+    // +0, a pasteboard of this process's own; `-clearContents` is
+    // `-(NSInteger)`; `-writeObjects:` `-(BOOL)(NSArray *)`; `-stringForType:`/
+    // `-propertyListForType:` `-(id)(NSPasteboardType)`, +0; `-releaseGlobally`
+    // `-(void)` gives the pasteboard back.
     unsafe {
         let board = appkit::send_id(
             class(c"NSPasteboard").as_id(),
@@ -597,7 +616,9 @@ fn symbols(findings: &mut Findings) {
         let Ok(symbol) = std::ffi::CString::new(*name) else {
             continue;
         };
-        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a NUL-terminated symbol name returns a valid `NSString *` symbol or null.
+        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a C string; a non-null answer
+        // is the address of an exported `CFStringRef`/`NSString *` constant,
+        // read once and only as a string.
         let value = unsafe {
             let at = dlsym(RTLD_DEFAULT, symbol.as_ptr()).cast::<Id>();
             if at.is_null() {
@@ -643,7 +664,8 @@ fn encodings(findings: &mut Findings) {
         ),
     ];
     for (proto, cls, name) in rows {
-        // SAFETY: `cls` is a registered class and `name` is an interned selector.
+        // SAFETY: `cls` is a registered class and `name` is an interned selector;
+        // the protocol is looked up (live or nil), never registered here.
         let (got, want) = unsafe {
             (
                 aterm_objc::method_types(cls, name).map(|t| aterm_objc::strip_method_offsets(&t)),

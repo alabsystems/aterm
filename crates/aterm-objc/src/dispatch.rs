@@ -97,8 +97,21 @@ where
 }
 
 /// Runs `f` on the process main thread inside an autorelease pool and returns its result.
+///
+/// # Blocking
+/// Off the main thread this waits for the main queue, so two situations hang silently: a main
+/// thread that never services its queue (call this only where the main thread runs an event
+/// loop; a libtest binary's main thread is parked joining workers), and a main thread inside a
+/// `run_on_main` closure that waits on a thread calling `run_on_main` (reachable from safe code,
+/// e.g. a closure that spawns and joins a helper). Both are `dispatch_sync` semantics.
+///
 /// # Panics
-/// Re-raises any panic from `f`, or panics with [`ContainedInRunOnMain`] if an `NSException` was contained.
+///
+/// Re-raises any panic from `f`, or panics with [`ContainedInRunOnMain`] if an
+/// `NSException` was contained. Off the main thread, an `NSException` that `f`
+/// raises is contained on the main thread (reported against `"run_on_main"`
+/// through [`crate::exception`], Rust frames dropped, main thread continuing).
+/// Also panics if libdispatch never runs the submitted function.
 ///
 /// # Examples
 ///
@@ -126,7 +139,11 @@ where
         out: None,
     };
 
-    // SAFETY: `job` outlives `dispatch_sync_f` and this thread is not the main thread.
+    // SAFETY: `job` is a live local that outlives the call because
+    // `dispatch_sync_f` returns only after the trampoline has finished.
+    // `trampoline::<F, R>` matches the `Job<F, R>` passed, and `job.f` is
+    // `Some`. The branch above established this is not the main thread, so the
+    // sync is not re-entrant.
     unsafe {
         dispatch_sync_f(
             &raw const _dispatch_main_q,

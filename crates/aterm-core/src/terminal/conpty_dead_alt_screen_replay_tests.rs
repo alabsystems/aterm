@@ -2,21 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! A full-screen app killed under Windows ConPTY, replayed from reads recorded
-//! by the `cast` tap (the fixtures' headers say how). The scaled streams in
-//! `handler_dec.rs` (`conhost_left_alt_screen_tests`) pin each rule; these pin
-//! the whole session byte for byte, and what the terminal can and cannot do
-//! about conhost's own screen state (see
-//! `TerminalHandler::leave_orphaned_alternate_screen`).
+//! Replay tests for killed full-screen applications under Windows ConPTY.
 use crate::terminal::Terminal;
 
-/// 40 history rows, `less`, `Stop-Process` on it, two commands, a second
-/// `less` (on win.ini) and `q`.
 const KILLED_THEN_SECOND_PAGER: &str =
     include_str!("testdata/conpty_killed_pager_then_second_pager.reads");
 
-/// The same, with one command right after the kill that writes `ESC[?1049l`
-/// to the console: a console client leaving the dead app's buffer.
 const KILLED_THEN_CONSOLE_RESYNC: &str =
     include_str!("testdata/conpty_killed_pager_console_resync.reads");
 
@@ -31,7 +22,6 @@ const TYPED_AFTER_THE_KILL: [&str; 5] = [
     WIN_INI,
 ];
 
-/// The fixture's reads, one per non-comment line, escapes decoded.
 fn reads(fixture: &str) -> std::vec::IntoIter<Vec<u8>> {
     fixture
         .lines()
@@ -62,7 +52,6 @@ fn unescape(line: &str) -> Vec<u8> {
     out
 }
 
-/// Process reads up to and including the first one that contains `marker`.
 fn replay_through(term: &mut Terminal, reads: &mut impl Iterator<Item = Vec<u8>>, marker: &str) {
     for read in reads.by_ref() {
         term.process(&read);
@@ -79,7 +68,6 @@ fn replay_rest(term: &mut Terminal, reads: impl Iterator<Item = Vec<u8>>) {
     }
 }
 
-/// Every retained row, scrollback first, trailing blanks trimmed.
 fn all_rows(term: &Terminal) -> Vec<String> {
     let first = term.grid().oldest_absolute_row();
     let n = term.grid().scrollback_lines() + usize::from(term.grid().rows());
@@ -108,16 +96,12 @@ fn history(n: usize) -> String {
     format!("clean history {n}")
 }
 
-/// A session behind a console host: the posture aterm-gui applies to a ConPTY
-/// session (`spawn::apply_pty_keyboard_posture`).
 fn conpty_term() -> Terminal {
     let mut term = Terminal::new(24, 80);
     term.set_win32_input_enabled(true);
     term
 }
 
-/// Replay through the shell's prompt on the dead pager's screen — the read
-/// whose `133;A` makes the engine leave that screen — and check the recovery.
 fn recovered(fixture: &str) -> (Terminal, std::vec::IntoIter<Vec<u8>>) {
     let mut term = conpty_term();
     let mut reads = reads(fixture);
@@ -126,7 +110,6 @@ fn recovered(fixture: &str) -> (Terminal, std::vec::IntoIter<Vec<u8>>) {
         !term.modes().alternate_screen,
         "the prompt left the dead screen"
     );
-    // conhost's cursor: its alternate buffer scrolled for the prompt's `\r\n`.
     let cursor = term.cursor();
     assert_eq!((cursor.row, cursor.col), (23, 8));
     let rows = screen(&term);
@@ -142,8 +125,6 @@ fn recovered(fixture: &str) -> (Terminal, std::vec::IntoIter<Vec<u8>>) {
 #[test]
 fn the_next_pager_after_a_kill_shows_the_consoles_frozen_screen_and_loses_no_row() {
     let (mut term, mut reads) = recovered(KILLED_THEN_SECOND_PAGER);
-    // Two commands on conhost's dead buffer, then the second pager's command
-    // line, all where conhost put them: the bottom of the screen.
     replay_through(&mut term, &mut reads, "win.ini\x07");
     let rows = screen(&term);
     assert_eq!(rows[18..23], TYPED_AFTER_THE_KILL, "{rows:?}");
@@ -153,10 +134,6 @@ fn the_next_pager_after_a_kill_shows_the_consoles_frozen_screen_and_loses_no_row
     for want in TYPED_AFTER_THE_KILL {
         assert_eq!(count(&all, want), 1, "{want:?}: {all:?}");
     }
-    // conhost's `?1049l` returns to the primary buffer it froze when the killed
-    // pager entered, so its repaint is the pre-kill screen with the prompt on
-    // the row that `?1049h` saved. The terminal cannot stop that repaint; the
-    // rows it lost are in the scrollback just above.
     let rows = screen(&term);
     for (row, n) in (20..=40).enumerate() {
         assert_eq!(rows[row], history(n));
@@ -165,18 +142,12 @@ fn the_next_pager_after_a_kill_shows_the_consoles_frozen_screen_and_loses_no_row
     assert_eq!(rows[23], PROMPT);
     let cursor = term.cursor();
     assert_eq!((cursor.row, cursor.col), (23, 8));
-    // So the frozen screen's rows exist twice: in the history the recovery
-    // kept, and on conhost's repaint of them.
     assert_eq!(count(&all, &history(40)), 2, "{all:?}");
     assert_eq!(count(&all, &history(1)), 1, "{all:?}");
 }
 
 #[test]
 fn the_same_reads_without_conhosts_mode_request_lose_the_rows_typed_after_the_kill() {
-    // Negative control, so the pass above is not vacuous: the same ConPTY
-    // session, with `?9001h` dropped from the first read, so conhost never
-    // asked and the recovery lays the screen out the unix way; conhost's
-    // blank repaint ahead of the second pager's `?1049h` erases the rows.
     let mut reads = reads(KILLED_THEN_SECOND_PAGER);
     assert_eq!(
         reads.next().as_deref(),
@@ -194,9 +165,6 @@ fn the_same_reads_without_conhosts_mode_request_lose_the_rows_typed_after_the_ki
 #[test]
 fn a_console_client_leaving_the_dead_buffer_puts_the_next_pager_back_in_step() {
     let (mut term, mut reads) = recovered(KILLED_THEN_CONSOLE_RESYNC);
-    // `[Console]::Write("$([char]27)[?1049l")`: conhost leaves the dead buffer
-    // at once and repaints its frozen primary, the same repaint the second
-    // pager's exit brings without it.
     replay_through(&mut term, &mut reads, "clean history 20\x1b[K");
     assert!(!term.modes().alternate_screen);
     let rows = screen(&term);
@@ -205,9 +173,6 @@ fn a_console_client_leaving_the_dead_buffer_puts_the_next_pager_back_in_step() {
     }
     let resync = "PS C:\\> [Console]::Write(\"$([char]27)[?1049l\")";
     assert_eq!(count(&all_rows(&term), resync), 1);
-    // From then on conhost's primary is the buffer the shell prints on, so the
-    // second pager's exit repaints the live screen: the commands typed after
-    // the kill, the pager's own command line and the new prompt.
     replay_rest(&mut term, reads);
     assert!(!term.modes().alternate_screen);
     let rows = screen(&term);

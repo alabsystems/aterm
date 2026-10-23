@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A release of part of a run takes exactly that part.
-//!
-//! The content witness releases a cell whose glyph went and stands nowhere
-//! else. A partial release leaves like an erase's suffix: the named cells are
-//! stamped onto the retract and counted, the cohort's clock is untouched, and
-//! exact identities stay restorable, dark after the melt, until the original
-//! run expires or editing revokes them. A composer that restores a delayed
-//! repaint therefore keeps its light. A release naming
-//! every standing cell is the text gone whole, and the cohort leaves.
-//!
-//! Driven at the host seam through a real [`Terminal`], as
-//! `tests/new_line_fade.rs` drives it.
+//! Partial release tests for rainbow-kitty runs.
 
 use crate::common::{
     caret_sample, geom, note_blink, observe_caret_row, observe_ribbon_rows, rainbow_cfg,
@@ -27,9 +16,7 @@ const ROWS: usize = 24;
 const COLS: usize = 80;
 const CW: usize = 8;
 const CH: usize = 16;
-/// The whole exit: retract plus fade, with a frame of slack.
 const RETRACT_SPAN_MS: u64 = ((RETRACT_DUR_S + RETRACT_FADE_S) * 1000.0) as u64 + 40;
-/// A stamped cell's melt, with a frame of slack.
 const FADE_MS: u64 = (RETRACT_FADE_S * 1000.0) as u64 + 40;
 
 struct Host {
@@ -93,7 +80,6 @@ impl Host {
         }
     }
 
-    /// Program output with no key behind it, one frame on.
     fn program(&mut self, bytes: &[u8]) {
         self.now += Duration::from_millis(16);
         self.term.process(bytes);
@@ -130,7 +116,6 @@ impl Host {
             .collect()
     }
 
-    /// `(abandoned, retracting)` per cohort on the row.
     fn cohorts(&self, row: u16) -> Vec<(bool, bool)> {
         self.glow
             .v2_ribbon()
@@ -151,7 +136,6 @@ impl Host {
         })
     }
 
-    /// Columns with any light (alpha > 8) at the row's centre.
     fn lit_cols(&self, row: u16) -> Vec<u16> {
         let mut cols = [false; COLS];
         for q in self.row_quads(row) {
@@ -177,7 +161,6 @@ impl Host {
         self.glow.v2_status().map_or(0, |s| s.retired)
     }
 
-    /// Idle until the row is dark or `max_ms`; the ms it took.
     fn dark_after(&mut self, row: u16, max_ms: u64) -> Option<u64> {
         let start = self.now;
         while self.now.duration_since(start).as_millis() < u128::from(max_ms) {
@@ -191,7 +174,6 @@ impl Host {
     }
 }
 
-/// `hello world` typed at column 0 of `row`, the band rested 200 ms.
 fn hello(row: u16) -> Host {
     let mut h = Host::at_row(row);
     h.type_str("hello world");
@@ -200,9 +182,6 @@ fn hello(row: u16) -> Host {
     h
 }
 
-/// A program clears the suffix of a typed line and parks the caret back: the
-/// suffix leaves as an erase's would (stamped, counted), the prefix stands,
-/// and the cohort is not abandoned.
 #[test]
 fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
     let mut h = hello(5);
@@ -230,7 +209,6 @@ fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
         "no light over the cleared cells: {:?}",
         h.lit_cols(5)
     );
-    // A glyph landing under the standing prefix is replaced text, counted once more.
     h.program(b"\x1b[6;1HXXX\x1b[6;4H");
     assert!(
         h.live(5).is_empty(),
@@ -239,9 +217,6 @@ fn a_suffix_the_program_cleared_leaves_and_the_prefix_stands() {
     assert_eq!(h.retired(), 11);
 }
 
-/// `hello world ` (the trailing space never armed) rests 200 ms, then the program
-/// clears from `w` on: the space leaves with the cleared suffix, since no standing
-/// glyph of the run lies right of it, and the cohort keeps its clock.
 #[test]
 fn a_trailing_space_after_a_suffix_the_program_cleared_leaves_with_it() {
     let mut h = Host::at_row(5);
@@ -274,8 +249,6 @@ fn a_trailing_space_after_a_suffix_the_program_cleared_leaves_with_it() {
     );
 }
 
-/// A whole clear after a partial one is the text gone whole: the cohort is
-/// abandoned into its retract and the row is dark inside the retract's span.
 #[test]
 fn a_whole_clear_after_a_suffix_the_program_cleared_still_leaves_through_the_swoosh() {
     let mut h = hello(5);
@@ -300,8 +273,6 @@ fn a_whole_clear_after_a_suffix_the_program_cleared_still_leaves_through_the_swo
     );
 }
 
-/// Ink's blank-and-restore on part of the line: the suffix blanked on one frame,
-/// the same text back on the next. The stamps lift and nothing is abandoned.
 #[test]
 fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
     let mut h = hello(5);
@@ -321,7 +292,6 @@ fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
     );
     assert_eq!(h.cohorts(5), vec![(false, false)]);
     h.idle(300);
-    // The eleven cells, plus the attach the head carries under the caret at 11.
     let lit = h.lit_cols(5);
     assert!(
         (0..11).all(|c| lit.contains(&c)) && lit.iter().all(|&c| c <= 11),
@@ -335,8 +305,6 @@ fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
         h.cohorts(5),
         h.cells(5)
     );
-    // Each cell once: the eight the partial counted came back; the whole adds the
-    // three letters and the space.
     assert_eq!(
         h.retired(),
         12,
@@ -344,8 +312,6 @@ fn a_partial_clear_and_an_identical_rewrite_a_frame_later_restore_the_light() {
     );
 }
 
-/// A suffix the program cleared leaves no light ahead of a hand that keeps
-/// typing: the stamped cells melt, the new keys lay their own.
 #[test]
 fn a_suffix_the_program_cleared_leaves_no_light_ahead_of_a_typing_hand() {
     let mut h = hello(5);
@@ -354,7 +320,6 @@ fn a_suffix_the_program_cleared_leaves_no_light_ahead_of_a_typing_hand() {
     h.idle(FADE_MS);
     let caret = h.term.cursor().col;
     assert_eq!(caret, 9);
-    // The hand's cells and the attach under the caret; nothing past it.
     let lit = h.lit_cols(5);
     assert!(
         lit.iter().all(|&c| c <= caret),

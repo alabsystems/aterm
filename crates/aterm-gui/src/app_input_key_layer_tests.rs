@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's key layers on real winit events, through the shipping `on_key`:
-//! the chords the GUI claims before the program sees them, and the keys it builds
-//! for a layout that is not US. The 2026-10-17 Windows audit found these by
-//! reading the code, since no headless instrument presses a key through the
-//! window: the Windows seeds took PSReadLine's selection and edit chords, the
-//! scrollback chords were claimed on the alternate screen, and a non-US layout's
-//! Shift glyph was shifted a second time.
+//! Window key-layer routing tests through `on_key`.
 
 use crate::{App, PhysicalPressOwner, WindowId};
 #[cfg(windows)]
@@ -29,7 +23,6 @@ fn named_press(code: KeyCode, key: NamedKey) -> KeyEvent {
     )
 }
 
-/// The platform's seeded `[keybindings]` (no user table) under `mods`.
 fn app_with_defaults(mods: ModifiersState) -> (App, WindowId) {
     let mut app = App::headless_for_test();
     app.keybindings = crate::keybinding::Keybindings::resolved(None);
@@ -38,7 +31,6 @@ fn app_with_defaults(mods: ModifiersState) -> (App, WindowId) {
     (app, wid)
 }
 
-/// The key a press was forwarded to the program as, or `None` when the GUI kept it.
 fn forwarded(app: &App, code: KeyCode) -> Option<(TKey, Modifiers, Option<char>)> {
     match app.physical_press_owners.get(&PhysicalKey::Code(code)) {
         Some(PhysicalPressOwner::Forwarded {
@@ -51,9 +43,6 @@ fn forwarded(app: &App, code: KeyCode) -> Option<(TKey, Modifiers, Option<char>)
     }
 }
 
-/// The alternate screen keeps no scrollback, so a scrollback chord there moved
-/// nothing and the program never saw the key: Shift+PageUp now reaches less or
-/// vim. On the main screen it still pages the view.
 #[test]
 fn scrollback_chords_reach_the_program_on_the_alternate_screen() {
     let (mut app, wid) = app_with_defaults(ModifiersState::SHIFT);
@@ -175,7 +164,6 @@ fn windows_presses_type_the_layouts_characters() {
         app.physical_press_owners
             .get(&PhysicalKey::Code(KeyCode::KeyS))
     );
-    // Held, it repeats the key alone, as Windows' own repeat does: `'sss`.
     for tick in 0..2 {
         app.route_physical_repeat(wid, PhysicalKey::Code(KeyCode::KeyS));
         match crate::app_input::take_physical_release_trace() {

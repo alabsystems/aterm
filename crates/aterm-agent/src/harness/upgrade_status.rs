@@ -163,7 +163,9 @@ fn sysctl_secs(name: &std::ffi::CStr) -> u64 {
         tv_usec: 0,
     };
     let mut len: libc::size_t = std::mem::size_of::<libc::timeval>();
-    // SAFETY: `name` is NUL-terminated and outlives the call.
+    // SAFETY: `name` is NUL-terminated and outlives the call; `tv` and `len` are live locals,
+    // `len` the buffer's real size so the copy is bounded; the new-value pair is null/0, so
+    // this only reads the sysctl. No pointer escapes.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),

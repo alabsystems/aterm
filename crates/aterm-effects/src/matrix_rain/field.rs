@@ -106,7 +106,6 @@ pub struct ColParams {
 #[must_use]
 #[inline]
 pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
-    // Floor at 3 rows so trail clamping `3..=rows` remains well-ordered on 1–2-row viewports.
     let rows = if fp.rows > 3 { fp.rows } else { 3 };
     let h = rain_hash32(fp.seed32 ^ ((col << 1) | 1));
     let p0 = (2 + bits(h, 0, 2)) as i64;

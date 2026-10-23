@@ -47,7 +47,8 @@ impl<'a> Door<'a> {
         self.run
     }
 
-    /// The rules of the socket (module docs).
+    /// The socket's rules: this lab's `<sockdir>/a.sock`, shaped `/tmp/at.*/a.sock`, in a
+    /// directory this user owns, neither it nor its token a link, and a socket.
     /// # Errors
     /// Which rule the socket broke.
     pub fn check_socket(&self) -> Result<(), String> {

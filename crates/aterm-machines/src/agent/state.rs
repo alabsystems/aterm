@@ -84,7 +84,8 @@ pub fn raise_floor(
 
 /// Raise each of `principals` to at least the highest floor any principal has.
 /// # Errors
-/// One line when `floors.toml` cannot be read or written.
+/// One line when `floors.toml` cannot be read or written; the caller must not go on as if
+/// they had been raised.
 pub fn inherit_floors(
     sys: &dyn System,
     layout: &Layout,

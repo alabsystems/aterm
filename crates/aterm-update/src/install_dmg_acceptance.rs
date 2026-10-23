@@ -5,15 +5,11 @@
 
 use super::*;
 
-/// The build, commit and version the stand-in bundle is sealed as and its manifest names.
 const BUILD: u64 = 777;
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const VERSION: &str = "0.0.777";
-
-/// A run of `install.sh` that must end: a hang detector, never a latency budget.
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The no-zip manifest the stand-in release is staged under.
 fn manifest() -> Manifest {
     Manifest {
         #[cfg(test)]
@@ -33,7 +29,6 @@ fn manifest() -> Manifest {
     }
 }
 
-/// A `0700` updates root under `dir`, laid out as [`Staging::resolve`] lays the real one.
 fn staging(dir: &Path) -> std::io::Result<Staging> {
     let root = dir.join("Updates");
     ensure_private_dir(&root)?;
@@ -49,9 +44,6 @@ fn staging(dir: &Path) -> std::io::Result<Staging> {
     })
 }
 
-/// A release image's tree at `src`: the `Applications` link and, when `app`, an ad hoc
-/// signed `aterm.app` sealed as [`BUILD`] / [`COMMIT`] whose executable answers
-/// `--version` naming the build; otherwise a README in its place.
 fn release_tree(src: &Path, app: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(src)?;
@@ -83,8 +75,6 @@ fn release_tree(src: &Path, app: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `hdiutil create -srcfolder <src>`: a compressed image named as a release's volume (with
-/// its space).
 fn create_image(src: &Path, image: &Path) -> std::io::Result<()> {
     let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
         .arg("create")
@@ -102,8 +92,6 @@ fn create_image(src: &Path, image: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Every image `hdiutil info` lists as attached from under `dir` (as spelled and as
-/// resolved: `/var/folders` is `/private/var/folders`), with its first device node.
 fn attached_under(dir: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
     let out = aterm_uds::spawnfd::command("/usr/bin/hdiutil")
         .arg("info")
@@ -132,9 +120,6 @@ fn attached_under(dir: &Path) -> std::io::Result<Vec<(PathBuf, String)>> {
     Ok(found)
 }
 
-/// Detaches every image attached from under its folder when it goes out of scope, on
-/// every path out of a row (an assertion's panic included): an attached image outlives
-/// the process.
 struct DetachAll(PathBuf);
 
 impl Drop for DetachAll {
@@ -148,7 +133,6 @@ impl Drop for DetachAll {
     }
 }
 
-/// The `mnt-*` mount points left in the updates root.
 fn mount_points(staging: &Staging) -> Vec<String> {
     std::fs::read_dir(&staging.root)
         .map(|entries| {
@@ -260,9 +244,6 @@ pub fn a_real_image_without_aterm_app_is_refused_and_detached(dir: &Path) -> std
     Ok(())
 }
 
-/// `curl` for `install.sh`'s release host, serving one tag's assets from `$STUB_DIR`
-/// in the three shapes the installer asks for: a redirect-refusing HEAD's status code
-/// (an asset's presence), a redirected HEAD's headers (its size), and a GET (its bytes).
 const RELEASE_HOST: &str = r#"#!/bin/sh
 head=0 follow=0 fmt= url=
 while [ $# -gt 0 ]; do
@@ -293,9 +274,6 @@ case "$head$follow" in
 esac
 "#;
 
-/// One whole run of `script` (`tools/install.sh`'s text) pinned to the stand-in release,
-/// the app half alone, against [`RELEASE_HOST`] serving `dir/host`: its scratch HOME,
-/// TMPDIR and install folder under `dir`. Returns (exit status, stdout and stderr).
 fn install_sh(dir: &Path, script: &str, image_has_app: bool) -> std::io::Result<(i32, String)> {
     use std::os::unix::fs::PermissionsExt as _;
     let host = dir.join("host");
@@ -353,8 +331,6 @@ fn install_sh(dir: &Path, script: &str, image_has_app: bool) -> std::io::Result<
     ))
 }
 
-/// What `install.sh` left in its TMPDIR (its `aterm-install.*` folder, mount point
-/// inside).
 fn left_in(tmp: &Path) -> Vec<String> {
     std::fs::read_dir(tmp)
         .map(|entries| {
@@ -368,7 +344,8 @@ fn left_in(tmp: &Path) -> Vec<String> {
 
 /// INSTALL.SH INSTALLS A RELEASE THAT SHIPS NO ZIP FROM ITS REAL IMAGE.
 /// # Errors
-/// A setup failure.
+/// A setup failure: no `hdiutil`, an image that cannot be made, or a run that cannot
+/// start or did not end within the hang detector.
 /// # Panics
 /// When the install fails, or leaves its image attached or its scratch behind.
 pub fn install_sh_installs_from_a_real_image(dir: &Path, script: &str) -> std::io::Result<()> {

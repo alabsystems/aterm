@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! doc-sentence: a doc comment or a SAFETY note does not end mid-sentence.
+//! doc-sentence: a comment does not end mid-sentence.
 //!
 //! A doc comment whose last line ends on a joining word (`and`, `the`, `of`, …) or a comma
 //! was cut short: a prune that keeps only each paragraph's first line leaves exactly that,
@@ -18,15 +18,19 @@
 //! what it opened open, and a cut that adds its own period leaves an article or conjunction
 //! before it (`…, or.`), so every paragraph is also read whole at its end for either. A
 //! `// SAFETY:` note is read the same way: it is the proof its `unsafe` block stands on, and
-//! the same prunes cut it.
+//! the same prunes cut it, once down to the name of what it was about
+//! (``SAFETY: `-setContentMinSize:`.``), so a note with no word outside its code spans is cut
+//! too. So is every other `//` comment on lines of its own: the prunes cut those as well,
+//! and one took the `//` of a URL in a string for a comment and copied the URL's tail above
+//! it as one (`// 127.0.0.1:9".into()`).
 
 use super::rules::PRODUCT;
 use super::{Finding, Rule, Tree};
 
 pub(super) const DOC_SENTENCE: Rule = Rule {
     id: "doc-sentence",
-    why: "a doc comment or SAFETY note that ends on a joining word or a comma, or leaves a \
-          parenthesis, code span or quote open, was cut mid-sentence; finish the sentence",
+    why: "a comment that ends on a joining word or a comma, or leaves a parenthesis, code span \
+          or quote open, was cut mid-sentence; finish the sentence (code it shows goes in a span)",
     scope: &[],
     check: doc_sentence,
 };
@@ -47,7 +51,7 @@ const BEFORE_NO_PERIOD: &[&str] = &["a", "an", "and", "nor", "or", "the"];
 
 fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in tree.corpus.under(PRODUCT) {
-        if !file.mentions(&["///", "//!", "SAFETY"]) {
+        if !file.mentions(&["//"]) {
             continue;
         }
         let raw: Vec<&str> = file.raw.lines().collect();
@@ -69,9 +73,6 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             };
             let body = body_of(line.no, own);
             safety = own == "//" && (safety || body.starts_with("SAFETY"));
-            if own == "//" && !safety {
-                continue;
-            }
             if body.starts_with("```") {
                 fenced = !fenced;
                 paragraph.clear();
@@ -91,20 +92,26 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 paragraph.push(' ');
             }
             let left_open = paragraph_ends && !fenced && open(paragraph.trim_end());
+            let bare = paragraph_ends && safety && names_only_code(paragraph.trim_end());
             if paragraph_ends {
                 paragraph.clear();
             }
-            if (ends && cut(body)) || left_open {
+            if (ends && cut(body)) || left_open || bare {
                 let tail = &body[body.char_indices().rev().nth(47).map_or(0, |(at, _)| at)..];
-                let what = if own == "//" {
-                    "a SAFETY note"
+                let what = match own {
+                    "//" if safety => "a SAFETY note",
+                    "//" => "a comment",
+                    _ => "a doc comment",
+                };
+                let says = if bare {
+                    "names only code"
                 } else {
-                    "a doc comment"
+                    "ends mid-sentence"
                 };
                 out.push(file.finding(
                     DOC_SENTENCE.id,
                     line.no,
-                    format!("{what} ends mid-sentence: `…{tail}`"),
+                    format!("{what} {says}: `…{tail}`"),
                 ));
             }
         }
@@ -167,6 +174,17 @@ fn open(text: &str) -> bool {
             .strip_suffix('.')
             .and_then(|text| text.rsplit(|c: char| !c.is_ascii_alphabetic()).next())
             .is_some_and(|word| BEFORE_NO_PERIOD.contains(&word))
+}
+
+/// Whether a SAFETY note, `text`, has no word outside its code spans: it names what it is about
+/// and states nothing of it.
+fn names_only_code(text: &str) -> bool {
+    let note = text.strip_prefix("SAFETY:").unwrap_or(text);
+    outside_code(note).is_some_and(|prose| {
+        !prose
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|word| word.len() > 1)
+    })
 }
 
 /// `text` without its code spans, or `None` when one never closes: a run of backticks opens
@@ -237,7 +255,8 @@ mod tests {
                     /// # Where it comes from\n\
                     fn heading() {}\n\
                     // A plain comment ends on the\n\
-                    fn plain() {}\n\
+                    fn plain() { let x = 1; // a trailing one is code's\n\
+                    }\n\
                     const S: &str = \"\n\
                     /// a string's text and\n\
                     \";\n\
@@ -282,10 +301,11 @@ mod tests {
             [
                 "crates/aterm-x/src/lib.rs:4",
                 "crates/aterm-x/src/lib.rs:6",
-                "crates/aterm-x/src/lib.rs:25",
-                "crates/aterm-x/src/lib.rs:28",
-                "crates/aterm-x/src/lib.rs:42",
-                "crates/aterm-x/src/lib.rs:53",
+                "crates/aterm-x/src/lib.rs:16",
+                "crates/aterm-x/src/lib.rs:26",
+                "crates/aterm-x/src/lib.rs:29",
+                "crates/aterm-x/src/lib.rs:43",
+                "crates/aterm-x/src/lib.rs:54",
             ]
         );
         assert_eq!(
@@ -321,16 +341,33 @@ mod tests {
                     unsafe { g() };\n\
                     // SAFETY: both pointers are live; the call is synchronous.\n\
                     unsafe { g() };\n\
-                    // A plain note (never read.\n\
+                    // SAFETY: `-setContentMinSize:`.\n\
+                    unsafe { g() };\n\
+                    // SAFETY: `-frame` is `{CGRect}@:`.\n\
+                    unsafe { g() };\n\
+                    // A plain note (cut here.\n\
+                    g();\n\
+                    // The ids in `(lo, head]`, then `ESC ( B`.\n\
+                    g();\n\
+                    // 127.0.0.1:9\".into()\n\
                     }\n";
         let found = run(&DOC_SENTENCE, &[("crates/aterm-x/src/lib.rs", rust)]);
         assert_eq!(
             spots(&found),
-            [1, 3, 5, 7, 15, 20, 22].map(|no| format!("crates/aterm-x/src/lib.rs:{no}"))
+            [1, 3, 5, 7, 15, 20, 22, 26, 30, 34]
+                .map(|no| format!("crates/aterm-x/src/lib.rs:{no}"))
         );
         assert_eq!(
             found[5].detail,
             "a SAFETY note ends mid-sentence: `…SAFETY: `hwnd` is live and`"
+        );
+        assert_eq!(
+            found[7].detail,
+            "a SAFETY note names only code: `…SAFETY: `-setContentMinSize:`.`"
+        );
+        assert_eq!(
+            found[9].detail,
+            "a comment ends mid-sentence: `…127.0.0.1:9\".into()`"
         );
     }
 }

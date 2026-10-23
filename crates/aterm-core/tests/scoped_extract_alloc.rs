@@ -2,11 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The damage-scoped refill (`Terminal::cell_frame_damage_scoped_into`, the extraction every
-//! native echo frame rides) allocates nothing once warm, and every frame takes the scoped arm
-//! (a fallback to full refills would prove nothing about its row mask). The scrolled arm is
-//! not measured: its debug-build oracle in `render_cells.rs` clones the scratch. The counter
-//! is thread-local, so only this test thread's allocations count.
+//! Damage-scoped refill allocates nothing once warm and stays on the scoped arm.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -18,8 +14,8 @@ thread_local! {
 
 struct Counting;
 
-// SAFETY: every method forwards to `System` with the caller's layout and
-// pointer; the thread-local counter never allocates.
+// SAFETY: every method forwards to `System` with the caller's layout and pointer; the thread-local
+// counter never allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let _ = ACTIVE.try_with(|active| {
@@ -48,7 +44,6 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// Run `f`; count its allocations and reallocations on this thread.
 fn allocs_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     ALLOC_CALLS.with(|n| n.set(0));
     ACTIVE.with(|a| a.set(true));
@@ -57,9 +52,6 @@ fn allocs_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
     (r, ALLOC_CALLS.with(Cell::get))
 }
 
-/// One keystroke's echo on a single row: a printable byte, and every 70th
-/// keystroke a carriage return plus erase-in-line so the caret stays on the
-/// same row forever (no scroll, no wrap — exactly one damaged row per frame).
 fn echo(i: usize) -> &'static [u8] {
     const LETTERS: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
     if i % 70 == 69 {
@@ -78,8 +70,6 @@ fn ten_thousand_one_row_echoes_extract_with_zero_allocations_after_warm_up() {
     let (rows, cols) = (24usize, 80usize);
     let mut term = Terminal::new(24, 80);
     let mut scratch = RenderInput::empty();
-    // Warm-up: the first fill is Full (unstamped scratch) and sizes every row
-    // buffer; the next echo frames take the scoped arm and size the mask.
     term.process(b"$ ");
     let _ = term.cell_frame_damage_scoped_into(&mut scratch, rows, cols);
     for i in 0..140 {

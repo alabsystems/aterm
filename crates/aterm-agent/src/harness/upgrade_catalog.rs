@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The baked model catalog inside a Claude Code build.
-//!
-//! A build carries its model catalog as a JavaScript object literal: one
-//! `{id:"claude-…",family:"…",display_name:"…",…,capabilities:[…]}` per model, then
-//! `latest_per_family:{opus:"claude-opus-5-5",…}`, the build's newest model of each family.
-//! That is how a new build recommends a new model offline, and how the harness knows whether a
-//! model id is one the build understands. The scan finds `latest_per_family:{` and parses the
-//! entries before it.
+//! Scans and caches the baked model catalog inside a Claude Code binary.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -38,16 +31,15 @@ pub fn version_triple(s: &str) -> Option<(u64, u64, u64)> {
 /// One model entry of the baked catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BakedModel {
-    /// `claude-opus-5-5`.
+    /// Model identifier (`claude-opus-5-5`).
     pub id: String,
-    /// `opus`.
+    /// Model family (`opus`).
     pub family: String,
-    /// `Opus 5.5`.
+    /// Display name (`Opus 5.5`).
     pub display_name: String,
-    /// `context.native_1m` — a 1M window with no `[1m]` suffix.
+    /// Whether the model has a native 1M context window without a `[1m]` suffix.
     pub native_1m: bool,
-    /// The effort levels its `capabilities` admit (`low`,`medium`,`high`
-    /// from `effort`; `xhigh` from `xhigh_effort`; `max` from `max_effort`).
+    /// Effort levels admitted by the model's `capabilities`.
     pub efforts: Vec<String>,
 }
 
@@ -79,12 +71,9 @@ impl Baked {
 }
 
 const MARKER: &[u8] = b"latest_per_family:{";
-/// How far before the marker the model entries may start.
 const WINDOW_BEFORE: usize = 512 * 1024;
-/// Chunk size for the bounded read.
 const CHUNK: usize = 8 * 1024 * 1024;
 
-/// `key:"value"` pairs up to the first `}`.
 fn parse_pairs(s: &str) -> Vec<(String, String)> {
     let body = s.split('}').next().unwrap_or("");
     body.split(',')
@@ -98,7 +87,6 @@ fn parse_pairs(s: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A quoted string value after `key:"` inside `entry`.
 fn field<'a>(entry: &'a str, key: &str) -> Option<&'a str> {
     let at = entry.find(&format!("{key}:\""))? + key.len() + 2;
     let rest = entry.get(at..)?;
@@ -116,7 +104,6 @@ pub fn parse_window(text: &str) -> Option<Baked> {
     let mut models: Vec<BakedModel> = Vec::new();
     for (i, _) in text.get(..at)?.match_indices("{id:\"claude-") {
         let entry = text.get(i..at)?;
-        // An entry ends where the next one begins.
         let entry = entry
             .get(1..)
             .and_then(|e| e.find("{id:\"claude-").map(|n| &entry[..=n]))
@@ -169,13 +156,10 @@ pub fn parse_window(text: &str) -> Option<Baked> {
 pub struct BuildFacts {
     /// The baked catalog, when the marker was found.
     pub baked: Option<Baked>,
-    /// The version the build reports: the most frequent `VERSION:"x.y.z"`
-    /// literal, seen at least twice (the build-info object repeats hundreds of
-    /// times; a bundled dependency's `VERSION` appears once).
+    /// Most frequent `VERSION:"x.y.z"` literal seen at least twice in the binary.
     pub version: Option<String>,
 }
 
-/// First index of `needle` in `hay`, first-byte filtered.
 fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     let first = *needle.first()?;
     let mut i = from;
@@ -190,8 +174,7 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Scan a Claude Code binary once for its catalog and its version, in bounded chunks (a 217 MB
-/// file is never held whole). [`baked_cached`] caches the result.
+/// Scans a Claude Code binary once in bounded chunks for its catalog and version.
 #[must_use]
 pub fn scan_build(binary: &Path) -> BuildFacts {
     const VNEEDLE: &[u8] = b"VERSION:\"";
@@ -200,7 +183,6 @@ pub fn scan_build(binary: &Path) -> BuildFacts {
     };
     let mut out = BuildFacts::default();
     let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    // Keep the last WINDOW_BEFORE bytes so a marker is seen with its entries.
     let mut carry: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; CHUNK];
     while let Ok(n) = f.read(&mut chunk) {
@@ -210,7 +192,6 @@ pub fn scan_build(binary: &Path) -> BuildFacts {
         let mut hay = std::mem::take(&mut carry);
         let carried = hay.len();
         hay.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-        // Version literals that start in the new bytes; older ones were counted already.
         let mut from = carried.saturating_sub(VNEEDLE.len() + 24);
         while let Some(at) = find_from(&hay, VNEEDLE, from) {
             from = at + 1;
@@ -354,8 +335,7 @@ pub fn parse_facts(text: &str) -> Option<BuildFacts> {
     Some(BuildFacts { baked, version })
 }
 
-/// The binary a managed twin (`<prefix>/agents/claude`, atpkg's POSIX shim)
-/// executes: the path of its last `exec '<path>' "$@"` line.
+/// Returns the target binary path from the last `exec '<path>' "$@"` line of a managed twin shim.
 #[must_use]
 pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     twin_text.lines().rev().find_map(|l| {
@@ -365,8 +345,7 @@ pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
     })
 }
 
-/// The baked catalog of `binary`, cached on disk under `cache_dir` by path, size and mtime: the
-/// sweep runs every minute, and a 217 MB scan must not.
+/// Returns the baked catalog of `binary`, cached under `cache_dir` by path, size, and mtime.
 #[must_use]
 pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
     let m = std::fs::metadata(binary).ok()?;
@@ -375,7 +354,6 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
-    // FNV-1a over the key: a file name, not a secret.
     let key = format!("{}|{}|{mtime}", binary.display(), m.len());
     let h = aterm_hash::fnv1a_64(key.as_bytes());
     let file = cache_dir.join(format!("{h:016x}.json"));
@@ -387,7 +365,6 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
     }
     let facts = scan_build(binary);
     let _ = std::fs::create_dir_all(cache_dir);
-    // Ordered: a cache; a file that does not parse is rescanned above.
     let _ = super::upgrade_models::write_atomic_ordered(&file, &render_facts(&facts));
     facts.baked
 }
@@ -396,7 +373,6 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
 mod tests {
     use super::*;
 
-    /// A trimmed copy of the 2.1.280 literal, two entries.
     const WINDOW: &str = concat!(
         r#"models:[{id:"claude-opus-5",family:"opus",display_name:"Opus 5",knowledge_cutoff:"May 2026","#,
         r#"context:{window:2e5,native_1m:!1,supports_1m_beta:!0},capabilities:["effort","max_effort","adaptive_thinking"],default_effort:"high"},"#,

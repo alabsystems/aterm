@@ -281,7 +281,9 @@ fn user_info(session: Option<u64>) -> Option<aterm_objc::Id> {
     }
     let keys: Vec<Id> = keys.iter().map(Obj::id).collect();
     let values: Vec<Id> = values.iter().map(Obj::id).collect();
-    // SAFETY: `+dictionaryWithObjects:forKeys:count:` is `abi::MakeDictionary`.
+    // SAFETY: `+dictionaryWithObjects:forKeys:count:` is
+    // `abi::MakeDictionary`; both arrays hold `count` live objects, which
+    // the dictionary retains (and copies, for keys). Autoreleased.
     let info = unsafe {
         let make: abi::MakeDictionary = checked_msg();
         make(
@@ -548,7 +550,9 @@ mod live {
             let Some(identifier) = aterm_objc::ns_string(&identifier) else {
                 return false;
             };
-            // SAFETY: `+requestWithIdentifier:content:trigger:` is `abi::MakeRequest`; a nil trigger delivers at once.
+            // SAFETY: `+requestWithIdentifier:content:trigger:` is
+            // `abi::MakeRequest`; a nil trigger delivers at once. The request is
+            // autoreleased into this pool.
             let request = unsafe {
                 let make: abi::MakeRequest = checked_msg();
                 make(
@@ -577,7 +581,9 @@ mod live {
                 BlockPtr::from_ptr(std::ptr::null_mut()),
                 RcBlock::as_block_ptr,
             );
-            // SAFETY: `-addNotificationRequest:withCompletionHandler:` is `abi::AddRequest` on the live center.
+            // SAFETY: `-addNotificationRequest:withCompletionHandler:` is
+            // `abi::AddRequest` on the live center; the handler may be nil, and
+            // the center copies it.
             unsafe {
                 let add: abi::AddRequest = checked_msg();
                 add(
@@ -605,7 +611,9 @@ mod live {
         let Some(delegate) = NoticeDelegate::alloc_init(main, ()) else {
             return;
         };
-        // SAFETY: `-setDelegate:` is `-(void)(id)` on the live center, which holds its delegate weakly.
+        // SAFETY: `-setDelegate:` is `-(void)(id)` on the live center, which
+        // holds its delegate weakly — so the delegate is kept for the process
+        // below.
         unsafe { send_v_id(center, sel!(setDelegate:), delegate.as_id()) };
         std::mem::forget(delegate);
         ADOPTED.store(true, Ordering::Release);
@@ -699,7 +707,9 @@ mod clicks {
             return None;
         }
         let key = aterm_objc::ns_string(key)?;
-        // SAFETY: `-objectForKey:` is `-(id)(id)` and `-isKindOfClass:` `-(BOOL)(Class)`, on live objects.
+        // SAFETY: `-objectForKey:` is `-(id)(id)` and `-isKindOfClass:`
+        // `-(BOOL)(Class)`, on live objects; the value is borrowed from
+        // `info`.
         unsafe {
             let value = send_id_id(info, sel!(objectForKey:), key.id());
             if value.is_null() || !send_bool_cls(value, sel!(isKindOfClass:), class(c"NSString")) {
@@ -1179,7 +1189,9 @@ mod tests {
             .expect("a handler block");
             let _ = crate::notify::take_wakes();
             aterm_objc::autoreleasepool(|_| {
-                // SAFETY: the delegate row is `DidReceive`.
+                // SAFETY: the delegate row is `DidReceive`; the delegate and
+                // the response are live, the center nil (the delegate reads
+                // none) and the block a live `abi::ResponseDone`.
                 unsafe {
                     let send: DidReceive = checked_msg();
                     send(
@@ -1252,7 +1264,9 @@ mod tests {
         .expect("a handler block");
         let _ = crate::notify::take_wakes();
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: the delegate row is `WillPresent`.
+            // SAFETY: the delegate row is `WillPresent`; the delegate and the
+            // notice are live, the center nil and the block a live
+            // `abi::PresentDone`.
             unsafe {
                 let send: WillPresent = checked_msg();
                 send(

@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The two files git hands its editor: a commit message and the todo list
-//! of `git rebase -i`.
-//!
-//! A commit message is read the way git reads it back. Comment lines (`#`,
-//! git's default `core.commentChar`) are dropped, and so is everything after
-//! the scissors line `git commit -v` writes. The summary is the first line
-//! left that is not blank, and the message's second line is the next one
-//! left. So a comment between them does not hide a body that starts right
-//! under the summary.
+//! Lexing and diagnostics for git commit messages and interactive rebase todo lists.
 
 use super::{
     CommitPhase, Cursor, Diag, DiagKind, LexState, Mode, Severity, Spans, SyntaxClass, diff,
     leading_blanks, line_space,
 };
 
-/// The line after which git cuts a verbose commit message away.
 const SCISSORS: &str = "# ------------------------ >8 ------------------------";
 
-/// The commands a rebase todo line may start with, long and short.
 const TODO_COMMANDS: &[&str] = &[
     "pick",
     "p",
@@ -48,12 +38,10 @@ const TODO_COMMANDS: &[&str] = &[
     "noop",
 ];
 
-/// Whether `line` (without its line end) is the scissors line.
 fn is_scissors(line: &str) -> bool {
     line.trim_end_matches([' ', '\t', '\r']) == SCISSORS
 }
 
-/// Whether `line` is a comment git drops from a message or a todo list.
 fn is_comment(line: &str) -> bool {
     line.starts_with('#')
 }
@@ -94,8 +82,6 @@ pub(super) fn lex_commit(state: LexState, line: &str, out: &mut Spans) -> LexSta
     }
 }
 
-/// A trailer's key (`Signed-off-by:`, `Co-Authored-By:`): a hyphenated word
-/// at the start of a line, then a colon and a blank.
 fn trailer(line: &str, out: &mut Spans) {
     let mut cur = Cursor::new(line);
     let mut hyphens = 0usize;
@@ -125,7 +111,6 @@ pub(super) fn lex_todo(state: LexState, line: &str, out: &mut Spans) -> LexState
         return state;
     }
     out.push(start, cur.pos(), SyntaxClass::Keyword);
-    // `fixup -C` and `merge -c` take an option before their commit.
     let mut argument = word(&mut cur);
     if argument
         .as_ref()
@@ -151,7 +136,6 @@ pub(super) fn lex_todo(state: LexState, line: &str, out: &mut Spans) -> LexState
     state
 }
 
-/// The next blank-separated word, with its range.
 fn word<'a>(cur: &mut Cursor<'a>) -> Option<(&'a str, std::ops::Range<usize>)> {
     cur.eat_while(line_space);
     let start = cur.pos();
@@ -224,8 +208,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `commit-summary-limit` (SPECS.md), kernel-checked against the compiled
-// body. On this target Trust reads a `usize` as a `UInt64`.
 verify_island! {
     clean {
         theorem summary_too_long_is_past_the_limit (chars limit : UInt64) :

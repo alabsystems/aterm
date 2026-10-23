@@ -2,16 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 bind for `TerminalModes` (`aterm_models_core::terminal_modes_model`): drives
-//! every `#[refines(machine = "terminal_modes", …)]` action through real
-//! `Terminal::process_at` bytes, projects the modes with [`project_modes`], and validates
-//! each step against the model (in-process, plus `ty trace validate` where installed).
-//! It lives in the unit-test build, where the anchors expand: each step runs in a
-//! [`StepEvidence`] window proving it entered its action's anchored sites, and every
-//! action sets its variable to an exact value, so a handler that does nothing is rejected.
-//!
-//! Negative control: a DECSTR that forgets the synchronized-output hold is rejected by
-//! the committed model and admitted by `Buggy = 1`.
+//! Conformance tests for `TerminalModes` ([`aterm_models_core::terminal_modes_model`]).
 
 use std::collections::BTreeMap;
 
@@ -25,8 +16,6 @@ use super::{ClockReading, MouseEncoding, MouseMode, Terminal};
 
 type State = BTreeMap<&'static str, i64>;
 
-/// The host's configured default cursor shape for this run — deliberately not
-/// `CursorStyle::default()`.
 const HOST_STYLE: CursorStyle = CursorStyle::SteadyBar;
 
 /// Project the real terminal onto `TerminalModes`' variables. `reset` is the
@@ -55,9 +44,6 @@ pub(crate) fn project_modes(term: &Terminal, reset: bool) -> State {
     .collect()
 }
 
-/// Every step: the model action it drives and the real bytes that drive it.
-/// Ordered so each toggle is seen both ways, and so the resets meet a terminal
-/// with every restorable mode moved off its default.
 const STEPS: &[(&str, &[u8])] = &[
     ("SetApplicationCursorKeys", b"\x1b[?1h"),
     ("ResetApplicationCursorKeys", b"\x1b[?1l"),
@@ -91,23 +77,18 @@ const STEPS: &[(&str, &[u8])] = &[
     ("ResetMouseMode", b"\x1b[?1003l"),
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("ResetSgrMouseEncoding", b"\x1b[?1006l"),
-    // Every other encoding replaces SGR 1006.
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("ResetSgrMouseEncoding", b"\x1b[?1005h"),
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("ResetSgrMouseEncoding", b"\x1b[?1015h"),
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("ResetSgrMouseEncoding", b"\x1b[?1016h"),
-    // The host's shape is a steady bar: DECSCUSR and mode 12 each land on it
-    // and off it.
     ("SetCursorStyle", b"\x1b[2 q"),
     ("SetCursorStyle", b"\x1b[?12h"),
     ("RestoreCursorStyle", b"\x1b[6 q"),
     ("SetCursorStyle", b"\x1b[5 q"),
     ("RestoreCursorStyle", b"\x1b[?12l"),
     ("SetCursorStyle", b"\x1b[0 q"),
-    // Move every restorable mode off its default, inside the alternate screen,
-    // then soft-reset: DECSTR must restore all of them and keep the screen.
     ("SetAlternateScreen", b"\x1b[?1049h"),
     ("SetApplicationCursorKeys", b"\x1b[?1h"),
     ("SetOriginMode", b"\x1b[?6h"),
@@ -122,7 +103,6 @@ const STEPS: &[(&str, &[u8])] = &[
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("SetCursorStyle", b"\x1b[3 q"),
     ("SoftReset", b"\x1b[!p"),
-    // Again for RIS, which must also leave the alternate screen.
     ("SetApplicationCursorKeys", b"\x1b[?1h"),
     ("SetOriginMode", b"\x1b[?6h"),
     ("ResetAutoWrap", b"\x1b[?7l"),
@@ -136,12 +116,9 @@ const STEPS: &[(&str, &[u8])] = &[
     ("SetSgrMouseEncoding", b"\x1b[?1006h"),
     ("SetCursorStyle", b"\x1b[4 q"),
     ("FullReset", b"\x1bc"),
-    // A mode change after a reset closes the reset window.
     ("SetBracketedPaste", b"\x1b[?2004h"),
 ];
 
-/// A terminal with the host's non-factory default shape, and one fixed batch clock for
-/// every step (so no mode-2026 timeout fires while `ty` validates the previous step).
 fn fixture() -> (Terminal, ClockReading) {
     let mut term = Terminal::new(24, 80);
     term.set_default_cursor_style(HOST_STYLE);
@@ -206,8 +183,6 @@ fn real_mode_handlers_conform_to_terminal_modes_model() {
     assert_eq!(driven, modelled, "every model action was driven");
 }
 
-/// The modelled defect from a real held state: DECSTR that keeps the
-/// synchronized-output hold.
 #[test]
 fn a_soft_reset_that_keeps_the_sync_hold_is_the_buggy_step() {
     let model = terminal_modes_model();

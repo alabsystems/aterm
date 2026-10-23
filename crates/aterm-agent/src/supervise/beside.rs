@@ -17,7 +17,9 @@ impl<C: Ctl> Session<'_, C> {
         self.beside_self_claim() || self.claim.watching_behind().is_some()
     }
 
-    /// THE MEMORY CEILING'S RESTART BESIDE A PROVEN SELF-CLAIM (module header).
+    /// THE MEMORY CEILING'S RESTART BESIDE A PROVEN SELF-CLAIM: the server's `restart`, only
+    /// once two reads `beside_idle_min` apart, on one unchanged screen, find the agent at its own
+    /// idle point.
     pub(super) fn beside_memory_remedy(
         &mut self,
         over: Option<super::super::memory::MemoryOver>,

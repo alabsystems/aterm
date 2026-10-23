@@ -1,6 +1,13 @@
 // Copyright 2026 Andrew Yates
 // Copyright (c) 2018 The Servo Project Developers
 // SPDX-License-Identifier: Apache-2.0
+//
+// Derived in part from smallvec 1.15.1 (https://github.com/servo/rust-smallvec,
+// MIT OR Apache-2.0, used here under Apache-2.0): the `smallvec!` macro is
+// upstream's, and `retain`, `drain`'s bounds, `reserve`, `reserve_exact`,
+// `resize`, `resize_with`, `from_elem` and `clone_from` follow upstream's
+// algorithms. Modified by the aterm project in 2026: the vector is
+// aterm_alloc's and everything here is safe code over it.
 
 //! `smallvec`: aterm's first-party replacement for the upstream `smallvec` 1.x crate.
 

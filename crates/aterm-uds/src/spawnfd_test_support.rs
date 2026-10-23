@@ -48,8 +48,7 @@ pub(crate) fn leaky_output(program: &str, args: &[impl AsRef<OsStr>]) -> io::Res
     Ok(LeakyOutput { status, stdout })
 }
 
-/// Run `program` (an absolute path) with `args` through `fork`, then [`InheritStrip::apply`] in the
-/// child, then `execve`.
+/// Run `program` (an absolute path) with `args` through `fork`, [`InheritStrip::apply`], and `execve`.
 /// # Errors
 /// A NUL in the program or an argument, a failed `fork`, or the errno of a failed `execve`.
 pub(crate) fn stripped_status(program: &str, args: &[impl AsRef<OsStr>]) -> io::Result<ExitStatus> {
@@ -57,8 +56,6 @@ pub(crate) fn stripped_status(program: &str, args: &[impl AsRef<OsStr>]) -> io::
     reap(fork_exec(&image, None, Some(InheritStrip::prepare()))?)
 }
 
-/// Everything the child execs, built before the spawn: the program, argv,
-/// and this process's environment as it stands now.
 struct Image {
     program: CString,
     argv: Vec<CString>,
@@ -93,8 +90,6 @@ impl Image {
         })
     }
 
-    /// `strings` as the NULL-terminated pointer array `exec` reads; the
-    /// pointers live as long as `strings`.
     fn pointers(strings: &[CString]) -> Vec<*const c_char> {
         strings
             .iter()
@@ -111,7 +106,7 @@ pub(crate) fn bound_read(near: &UnixStream) -> io::Result<()> {
 
 /// Run `round` while a background thread repeatedly stats `/dev/fd/{number}` until
 /// [`Looker::probe`] observes `races` `EBADF` races (Darwin's `/dev/fd/N` shares a single vnode
-/// across lookups; see [`super::descriptor_metadata`]).
+/// across lookups).
 #[cfg(test)]
 #[cfg(target_vendor = "apple")]
 #[track_caller]
@@ -168,7 +163,6 @@ impl Looker {
     }
 }
 
-/// Wait for `pid`, this process's own child, and give its status.
 fn reap(pid: i32) -> io::Result<ExitStatus> {
     let mut raw = 0;
     loop {
@@ -215,7 +209,8 @@ fn leaky_spawn(image: &Image, out: Option<(RawFd, RawFd)>) -> io::Result<i32> {
     }
     let mut pid = 0;
     // SAFETY: `actions` was initialised above and is destroyed once, below; the program, `argv` and
-    // `envp` are C strings and NULL-terminated arrays of them that outlive the call.
+    // `envp` are C strings and NULL-terminated arrays of them that outlive the call. A NULL
+    // attribute pointer asks posix_spawn for its documented default attributes.
     let rc = unsafe {
         let mut rc = 0;
         if let Some((stdout, stderr)) = out {
@@ -258,9 +253,6 @@ unsafe extern "C" {
     fn _exit(code: i32) -> !;
 }
 
-/// `fork`; in the child, `strip` when one is given, `out`'s two descriptors
-/// at 1 and 2 when given, then `execve`. Without a strip the child inherits
-/// every descriptor this process holds without close-on-exec at the fork.
 fn fork_exec(
     image: &Image,
     out: Option<(RawFd, RawFd)>,
@@ -275,7 +267,9 @@ fn fork_exec(
     // SAFETY: `fork` takes no arguments; the child branch never returns.
     let pid = unsafe { fork() };
     if pid == 0 {
-        // SAFETY: the forked child.
+        // SAFETY: the forked child. Async-signal-safe calls only (the strip's raw syscalls, `dup2`,
+        // `execve`, `write`, `_exit`), on the stack and on memory this process prepared before the
+        // fork; nothing is heap-allocated.
         unsafe {
             if let Some(strip) = strip {
                 strip.apply();

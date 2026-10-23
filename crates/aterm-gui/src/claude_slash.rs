@@ -387,7 +387,8 @@ fn live_turn(screen: Option<&lights::Screen>, rows: &[String]) -> bool {
     screen.is_some_and(|s| s.busy && !aterm_phase::phase::background_only(rows))
 }
 
-/// THE CLICK'S CHECKS ON THE ENGINE (module header, step 1): the caret row to type at, or why not.
+/// THE CLICK'S CHECKS ON THE ENGINE, before the probe `/` is written: the caret row to type at,
+/// or why not.
 pub(crate) fn ready(read: &EngineRead) -> Result<usize, SlashRefusal> {
     let rows = &read.rows;
     let screen = lights::read_screen(rows).ok_or(SlashRefusal::Covered)?;
@@ -431,7 +432,8 @@ pub(crate) enum Step {
     },
 }
 
-/// THE WAKE'S DECISION for `press` from the engine as `read` shows it at `now` (module header, steps 2 and 3, and the answer).
+/// THE WAKE'S DECISION for `press` from the engine as `read` shows it at `now`: the rest of the
+/// command once the probe reads back, Enter once the command holds quiet, then Claude's answer.
 #[must_use]
 pub(crate) fn decide(press: &SlashPress, read: Option<&EngineRead>, now: Instant) -> Step {
     let late = now >= press.deadline;
@@ -680,7 +682,8 @@ impl App {
         )
     }
 
-    /// THE CLICK'S HALF (module header, step 1): begin typing `slash` into `session` for a gesture in window `wid` — the probe `/` written as the person's — or say why not, having typed nothing.
+    /// THE CLICK'S HALF: begin typing `slash` into `session` for a gesture in window `wid` — the
+    /// probe `/` written as the person's — or say why not, having typed nothing.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -796,7 +799,9 @@ impl App {
         Err(SlashRefusal::Moved)
     }
 
-    /// THE WAKE'S HALF (module header, steps 2 and 3, and the answer): every press in flight one step from its engine as it is now — never a painted frame — its writes aterm's own (`Source::Controller`).
+    /// THE WAKE'S HALF (the rest of the command, the Enter, Claude's answer): every press in flight
+    /// one step from its engine as it is now — never a painted frame — its writes aterm's own
+    /// (`Source::Controller`).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(

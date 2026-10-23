@@ -23,6 +23,8 @@ pub trait EventLoopExtPumpEvents {
     ) -> PumpStatus;
 }
 
+// LOCAL PATCH (aterm): upstream's deprecated closure form, `pump_events`, is gone;
+// `pump_app_events` drives the backend's pump directly.
 impl<T> EventLoopExtPumpEvents for EventLoop<T> {
     type UserEvent = T;
 

@@ -796,7 +796,7 @@ impl crate::supervise::IdleHost for Occupied {
         false
     }
     fn occupancy(&self) -> crate::supervise::occupancy::OccupancyReading {
-        self.0.clone()
+        self.0
     }
 }
 
@@ -831,7 +831,7 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
         held_slot_last_ms: Some(1_759_999_940_000),
     };
     same(OccupancyReading::default());
-    same(full.clone());
+    same(full);
     let refused = |bytes: &[u8]| OccupancyReading::take(bytes, Instant::now()).is_err();
     let wire = |pressure: &str, disk: &str| {
         format!(
@@ -846,7 +846,7 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
 
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
     let host = TapedHost::new(
-        Arc::new(Occupied(full.clone())) as Arc<dyn IdleHost>,
+        Arc::new(Occupied(full)) as Arc<dyn IdleHost>,
         tape.fx.clone(),
     );
     assert_eq!(IdleHost::occupancy(&host), full);
@@ -927,38 +927,75 @@ impl crate::supervise::IdleHost for Paced {
 }
 
 /// THE DOOR'S HOST CALLS ON A TAPE (the occupancy red-team's F10, F11): every
-/// pace answer reads back as written and a word this build does not know is
-/// refused; `occupancy_pace` is a round trip whose request names the rule and
-/// the hold's start, `upgrade_due` a round trip, `break_taken` an output, and
-/// a replay of the same calls answers from the tape alone. NEGATIVE CONTROL: a
-/// replay asked the pace for another rule diverges at `host.occupancy_pace`.
+/// pace answer reads back as written, a re-read board's with its reading, and
+/// a word this build does not know is refused, as is a re-read board's whose
+/// reading it cannot read; an older build's tape (every answer a word, its
+/// slot rule's grant `granted`) reads as that build wrote it; `occupancy_pace`
+/// is a round trip whose request names the rule and the hold's start,
+/// `upgrade_due` a round trip, `break_taken` an output, and a replay of the
+/// same calls answers from the tape alone. NEGATIVE CONTROL: a replay asked the
+/// pace for another rule diverges at `host.occupancy_pace`.
 #[test]
 fn the_doors_host_calls_are_taped() {
     use astream_effects::EffectRecord;
 
     use crate::supervise::IdleHost;
     use crate::supervise::fx::ClockSource;
-    use crate::supervise::occupancy::{PaceGrant, PaceRefusal, RuleId};
+    use crate::supervise::occupancy::{
+        OccupancyReading, PaceGrant, PaceRefusal, RuleId, SlotsSeen,
+    };
     use crate::supervise::tape::header::VERBATIM;
     use crate::supervise::tape::replay::ReplayCore;
     use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
 
+    let reread = OccupancyReading {
+        taken_ms: 1_760_000_000_000,
+        stale: false,
+        avail_mib: Some(64 * 1024),
+        pressure: Some(Pressure::Normal),
+        disk: Some(crate::harness::disk::Level::Ok),
+        slots: Some(SlotsSeen { usable: 2, n: 3 }),
+        slots_free_ms: Some(1_500_000),
+        room: Some(true),
+        held_slot_last_ms: Some(1_759_999_940_000),
+    };
     for grant in [
         PaceGrant::Local,
         PaceGrant::Granted,
+        PaceGrant::Room(OccupancyReading::default()),
+        PaceGrant::Room(reread),
         PaceGrant::Machine,
         PaceGrant::Reserved,
+        PaceGrant::Stale,
+        PaceGrant::Unmet,
     ]
     .into_iter()
     .chain(PaceRefusal::ALL.map(PaceGrant::Refused))
     {
         same(grant);
     }
-    let refused = |bytes: &[u8]| PaceGrant::take(bytes, Instant::now()).is_err();
+    let read = |bytes: &[u8]| PaceGrant::take(bytes, Instant::now());
+    let refused = |bytes: &[u8]| read(bytes).is_err();
     assert!(refused(b"\"refused:tired\""));
     assert!(refused(b"\"slow\""));
+    assert!(
+        refused(b"\"room\""),
+        "a re-read board's word without its reading"
+    );
+    let room = String::from_utf8(PaceGrant::Room(reread).put(Instant::now())).expect("utf-8");
+    assert!(room.starts_with("{\"room\":{"), "{room}");
+    assert!(refused(room.replace("\"normal\"", "\"panic\"").as_bytes()));
     // CONTROL: a word it knows is read.
     assert!(!refused(b"\"refused:carry-owed\""));
+    // AN OLDER BUILD'S TAPE: every answer a word, read as it wrote it.
+    for (word, grant) in [
+        (&b"\"granted\""[..], PaceGrant::Granted),
+        (b"\"local\"", PaceGrant::Local),
+        (b"\"machine\"", PaceGrant::Machine),
+        (b"\"reserved\"", PaceGrant::Reserved),
+    ] {
+        assert_eq!(read(word).ok(), Some(grant));
+    }
 
     let since = 1_760_000_000_000;
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));

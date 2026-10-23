@@ -116,9 +116,31 @@ fn file_id(path: &Path) -> Option<FileId> {
 }
 
 /// [`first_exec`]'s one run: `path` with `args` in a scratch environment,
-/// killed once `bound` has passed.
+/// killed once `bound` has passed, and one line on stderr when macOS's
+/// program check still held it then.
 #[cfg_attr(trust_verify, trust::skip)]
 fn run_once(path: &Path, args: &[&str], bound: Duration) {
+    run_once_judged(
+        path,
+        args,
+        bound,
+        &|pid| aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0)),
+        &mut |line| eprintln!("{line}"),
+    );
+}
+
+/// [`run_once`], with `held` asked whether the run is held at macOS's
+/// program check before it is killed at `bound`, and `say` given the one
+/// line that says so. It never panics: a program held before its `main`
+/// cannot be the code's hang.
+#[cfg_attr(trust_verify, trust::skip)]
+fn run_once_judged(
+    path: &Path,
+    args: &[&str],
+    bound: Duration,
+    held: &dyn Fn(u32) -> Option<bool>,
+    say: &mut dyn FnMut(String),
+) {
     use aterm_uds::spawnfd::Stdio;
     let scratch = scratch_dir();
     let home = scratch.clone().unwrap_or_else(std::env::temp_dir);
@@ -138,8 +160,16 @@ fn run_once(path: &Path, args: &[&str], bound: Duration) {
             Ok(Some(_)) | Err(_) => Some(()),
         });
         if ended.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let pid = child.id();
+            let was_held = held(pid) == Some(true);
+            aterm_uds::deadline::kill_within(&mut child, MUST_HAPPEN);
+            if was_held {
+                say(format!(
+                    "first_exec: macOS's program check held {} (pid {pid}) for the whole \
+                     {bound:?} warm-up; it was ended unrun",
+                    path.display()
+                ));
+            }
         }
     }
     if let Some(dir) = scratch {
@@ -158,4 +188,44 @@ fn scratch_dir() -> Option<PathBuf> {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&dir).ok().map(|()| dir)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A warm-up killed at its bound while the program check holds it says so in one line
+    /// naming its pid, and one that is not held says nothing. (`sleep 30` outlives the 50 ms
+    /// bound by construction.) The reader is asked while the run still runs: the fake answers
+    /// only while the program check's own reader still reads the pid, which on macOS a killed
+    /// and reaped child no longer does.
+    #[test]
+    fn a_warm_up_killed_while_held_says_so_once() {
+        let sleep = Path::new("/bin/sleep");
+        let bound = Duration::from_millis(50);
+        let asked = std::cell::Cell::new(None);
+        let mut lines = Vec::new();
+        run_once_judged(
+            sleep,
+            &["30"],
+            bound,
+            &|pid| {
+                asked.set(Some(pid));
+                aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0)).map(|_| true)
+            },
+            &mut |line| lines.push(line),
+        );
+        let pid = asked.get().expect("the killed run was asked about");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("first_exec: macOS's program check held /bin/sleep")
+                && lines[0].contains(&format!("(pid {pid})")),
+            "{lines:?}"
+        );
+        let mut quiet = Vec::new();
+        run_once_judged(sleep, &["30"], bound, &|_| Some(false), &mut |line| {
+            quiet.push(line);
+        });
+        assert_eq!(quiet, Vec::<String>::new());
+    }
 }

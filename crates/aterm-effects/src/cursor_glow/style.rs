@@ -15,11 +15,11 @@ pub enum GlowStyle {
     Phaser,
     /// Rainbow kitty: a momentum-driven continuous rainbow ribbon streaming the swept path, brighter and longer with typing heat, with a sparse twinkling starfield.
     RainbowKitty,
-    /// A wide ribbon in one rolling hue (the whole streak steps round the wheel a little each key; a multi-cell move sweeps half the wheel tail to head) on its own tight bloom stack, plus a shower of night-sky grains: round stardust and glitter, the odd crescent moon and mini-comet, and a dealt four-point star.
+    /// Wide ribbon in a rolling hue with a night-sky grain shower.
     Sparkle,
     /// Black-body warm comet + rising, drifting embers.
     Fire,
-    /// Lightning: a monochrome beam in storm violet ([`LASER_DEFAULT_COLOR`]; an explicit `cursor_trail_color` wins), its dim tail brightening to the pure hue at the head around a white-hot filament core, a jagged strike (white-hot main channel, same-hue forks) on a jump and short same-hue crackle arcs off a hot typing run.
+    /// Storm-violet beam around a white-hot filament core with jump strikes and typing crackle arcs.
     Laser,
     /// Beam: a clean, steady tube of cool light with near-constant power along its length, no particles, scintillation or lightning.
     Beam,
@@ -42,7 +42,7 @@ impl GlowStyle {
         )
     }
 
-    /// Whether this style string explicitly asks for the flying kitty head ([`crate::kitty_cursor`]), the rare earned flypast, on the same rainbow ribbon.
+    /// Whether this style string explicitly requests the flying kitty head.
     #[must_use]
     #[cfg(test)]
     pub fn style_names_flying_kitty(s: &str) -> bool {
@@ -56,7 +56,7 @@ impl GlowStyle {
         spellings::canonical(s) == Some("rainbow dog pet")
     }
 
-    /// Whether this style string asks for the full-body pet in any species: the predicate the render path asks; use [`Self::style_names_dog_pet`] after only to pick the skin.
+    /// Whether this style string selects a full-body pet in any species.
     #[inline]
     #[must_use]
     pub fn style_names_any_pet(s: &str) -> bool {
@@ -78,14 +78,14 @@ impl GlowStyle {
         spellings::canonical(s) == Some("rainbow kitty underline")
     }
 
-    /// Whether this style string selects the flat body (`docs/design/RAINBOW-KITTY-V2.md` §30): the same shape at every cell, the bed alone below the row bottom, a uniform 18 ms edge-in.
+    /// Whether this style string selects the flat rainbow ribbon body.
     #[inline]
     #[must_use]
     pub fn style_names_flat_ribbon(s: &str) -> bool {
         spellings::canonical(s) == Some("rainbow kitty flat")
     }
 
-    /// The resolved style's diagnostic name, printed by `trail status` beside the raw config string so a spelling that fell back to the default reads as a fallback.
+    /// Diagnostic name of the resolved style.
     #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -103,7 +103,7 @@ impl GlowStyle {
         }
     }
 
-    /// Whether a resolved `classic` spelling names the mono face (the two-tone `accent → color` tracer) rather than the default spectrum: the old `classic mono` spellings.
+    /// Whether a `classic` spelling selects the two-tone monochrome face.
     #[inline]
     #[must_use]
     pub fn style_names_classic_mono(style_raw: &str) -> bool {
@@ -121,6 +121,7 @@ impl GlowStyle {
             .and_then(|row| row.style)
             .unwrap_or(Self::Lumen)
     }
+
     /// Whether this style spawns particles (sparks / embers / droplets / laser-ablation sparks / beam stardust / comet debris glitter).
     #[inline]
     pub(super) const fn has_particles(self) -> bool {
@@ -144,9 +145,9 @@ pub struct GlowConfig {
     pub duration: Duration,
     /// Max comet length in cells.
     pub length: usize,
-    /// Additive brightness scale 0.0..=1.0 (0 ⇒ effectively off): the visual half, folding the user's brightness knob, the Reduce Motion policy, and the host's load-shed envelope.
+    /// Additive brightness scale `0.0..=1.0` (`0` = off).
     pub intensity: f32,
-    /// The audio half: whether a key pressed on this tick's window should be heard.
+    /// Whether a key pressed on this tick's window should be heard.
     pub audible: bool,
     /// Bloom-crown radius in cells (0 ⇒ no crown, comet only).
     pub radius: f32,
@@ -165,17 +166,17 @@ pub struct GlowConfig {
     pub ribbon_tall: bool,
     /// The flat body, selected only by the explicit `… flat` spelling ([`GlowStyle::style_names_flat_ribbon`]).
     pub ribbon_flat: bool,
-    /// The classic wake's colour face: `false` (plain `classic`) is a rolling spectrum sweep independent of the theme; `true` (`classic mono`) is the two-tone tracer fading `accent → color`, which follows the theme's cursor colour, `cursor_trail_color` and live OSC 12.
+    /// Whether the classic wake uses the two-tone tracer (`true`) instead of a rolling spectrum (`false`).
     pub classic_mono: bool,
 }
 
-/// `Glow size`'s shipped default, in cells: the size every crown is authored at, from which `cursor_trail_radius` scales it.
+/// Default glow crown radius in cells.
 pub const GLOW_RADIUS_DEFAULT: f32 = 0.6;
 
-/// The shipped `Length` (cells): the knob's default, against which a style whose tail is drawn by distance scales it (sparkle's gold rail).
+/// Default maximum trail length in cells.
 pub const GLOW_LENGTH_DEFAULT: usize = 24;
 
-/// One tuning knob of the cursor family that a style may or may not read: the `cursor_trail_*` keys the Settings Adjust card lists per style.
+/// Cursor trail tuning knob that a style may read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrailKnob {
     /// `cursor_trail_length`: how many cells one move's trail may span.
@@ -192,7 +193,7 @@ pub enum TrailKnob {
     FireShimmer,
 }
 
-/// The facts besides the style that decide whether a knob reaches the frame: the ground, the live cursor shape, whether the landing ring is on, and the classic wake's colour face.
+/// Context flags that determine whether a [`TrailKnob`] affects a frame.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct KnobContext {
     /// The ground is dark.
@@ -203,12 +204,12 @@ pub struct KnobContext {
     pub ring: bool,
     /// The classic wake draws its one-colour face (a trail colour is set, or the old `classic mono` spelling is saved).
     pub classic_tinted: bool,
-    /// The move crosses letters only (a shell's completion over the text it prints): on a dark ground Fire's streak lays no light over a line of text and its meteor ignores `Length`, so the path `Length` cuts shows nowhere.
+    /// The move crosses text cells only.
     pub over_text: bool,
 }
 
 impl KnobContext {
-    /// The context in which a knob shows at its widest for a style: the ring on and the classic face tinted.
+    /// Context where knobs apply most broadly for `bar`.
     #[inline]
     #[must_use]
     pub const fn widest(bar: bool) -> Self {
@@ -223,7 +224,7 @@ impl KnobContext {
 }
 
 impl GlowStyle {
-    /// THE KNOB LAW: whether a trail drawn in this style reads `knob` in `ctx`.
+    /// Whether a trail drawn in this style reads `knob` in `ctx`.
     #[inline]
     #[must_use]
     pub const fn reads_knob(self, knob: TrailKnob, ctx: KnobContext) -> bool {
@@ -249,7 +250,7 @@ impl GlowStyle {
         }
     }
 
-    /// Whether the style draws the trail colour on a block cursor: the auto accent then brightens it, and an explicit colour is pinned against the live cursor's.
+    /// Whether this style draws the trail colour on a block cursor.
     #[inline]
     #[must_use]
     pub const fn draws_trail_color(self) -> bool {
@@ -273,21 +274,21 @@ pub fn style_has_beam(style_raw: &str) -> bool {
     style_has_beam_of(GlowStyle::parse(style_raw.trim()), style_raw)
 }
 
-/// [`style_has_beam`] for a caller that already parsed the style (the per-frame `glow_config` path), avoiding a re-parse while sharing one source of truth.
+/// [`style_has_beam`] for an already-parsed [`GlowStyle`].
 #[inline]
 #[must_use]
 pub const fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
     !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty)
 }
 
-/// The default laser/lightning hue: storm violet (`0x00RRGGBB`), applied when no `cursor_trail_color` is pinned (a night strike is a white-violet flash).
+/// Default laser/lightning hue (`0x00RRGGBB`).
 pub const LASER_DEFAULT_COLOR: u32 = 0x00B4_8CFF;
 
-/// The default beam hue: photon ice-blue (`0x00RRGGBB`), applied when no `cursor_trail_color` is set and no cursor colour is pinned (config `cursor_color`, a live OSC 12 — either one recolours the tube), so the tube reads as cool light (a searchlight, not a weapon).
+/// Default beam hue (`0x00RRGGBB`).
 pub const BEAM_DEFAULT_COLOR: u32 = 0x008C_DCFF;
 
-/// The default sparkle hue: starlight gold (`0x00RRGGBB`), applied when no `cursor_trail_color` is set and no cursor colour is pinned (config `cursor_color`, a live OSC 12).
+/// Default sparkle hue (`0x00RRGGBB`).
 pub const SPARKLE_DEFAULT_COLOR: u32 = 0x00FF_D9A0;
 
-/// The default comet hue: pale glacial blue (`0x00RRGGBB`), applied when no `cursor_trail_color` is set and no cursor colour is pinned (config `cursor_color`, a live OSC 12) — a comet is ice lit white-hot at the nucleus.
+/// Default comet hue (`0x00RRGGBB`).
 pub const COMET_DEFAULT_COLOR: u32 = 0x009E_D6FF;

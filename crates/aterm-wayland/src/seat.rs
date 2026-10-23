@@ -491,6 +491,10 @@ impl Drop for SeatSlot {
 }
 
 /// Listen to a seat.
+///
+/// # Safety
+/// `proxy` is a live seat this module bound, without a listener, released before the listener is
+/// freed.
 unsafe fn seat_listener(
     proxy: Proxy,
     seat_book: &Arc<Mutex<SeatBook>>,

@@ -276,8 +276,9 @@ pub(crate) fn native_document_action(action: &str) -> Option<CommandSpec> {
     Some(result)
 }
 
-/// The registry's row for an editor command ([`EditorCommand::name`],
-/// [`EditorCommand::authority`]).
+/// The registry's row for an editor command
+/// ([`EditorCommand::name`](crate::native_editor::EditorCommand::name),
+/// [`EditorCommand::authority`](crate::native_editor::EditorCommand::authority)).
 pub(crate) const fn editor_command(command: crate::native_editor::EditorCommand) -> CommandSpec {
     spec(
         command.name(),

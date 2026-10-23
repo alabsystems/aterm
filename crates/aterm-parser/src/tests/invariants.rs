@@ -2,20 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runtime invariant tests: `assert_invariants` holds from every
-//! representative state through every two-byte tail.
+//! Runtime invariant tests across representative parser states and two-byte tails.
 
 use super::super::*;
 
-/// Representative states at every bound the invariant names: each of the 14
-/// states, a full parameter list, a saturated parameter, a subparameter, a full
-/// intermediate list, a string's split UTF-8 character, an OSC with data, all
-/// three `SosPmApcString` introducers; and at Ground every lead `0xC0..=0xF7`
-/// and, for each three- and four-byte row of Unicode Table 3-7, the character
-/// pending with the row's lowest and highest second byte (and a third byte for
-/// four-byte rows): `E0`, `ED`, `F0` and `F4` have narrowed ranges, `E1`, `EE`
-/// and `F1` stand for the rest. No prefix holds a C1 byte outside a character,
-/// so each reaches its state in both C1 modes.
 fn reachable_starts() -> Vec<(Vec<u8>, State)> {
     let full_params = |intro: &[u8]| [intro, &b"1;".repeat(MAX_PARAMS)].concat();
     let starts: &[(&[u8], State)] = &[
@@ -44,8 +34,6 @@ fn reachable_starts() -> Vec<(Vec<u8>, State)> {
         (b"\x1b_\xe6", State::SosPmApcString),
         (b"\x1bX", State::SosPmApcString),
         (b"\x1b^", State::SosPmApcString),
-        // A tmux passthrough wrapper: its head, open, at its ESC, and with
-        // the payload's own DCS hooked and at that DCS's ESC.
         (b"\x1bPt", State::DcsIgnore),
         (b"\x1bPtmux", State::DcsIgnore),
         (b"\x1bPtmux;", State::Ground),
@@ -81,7 +69,6 @@ fn reachable_starts() -> Vec<(Vec<u8>, State)> {
     out
 }
 
-/// Assert the invariant, naming the input that broke it.
 fn assert_invariants_at(parser: &Parser, at: impl Fn() -> String) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.assert_invariants()))
         .is_err()
@@ -90,17 +77,6 @@ fn assert_invariants_at(parser: &Parser, at: impl Fn() -> String) {
     }
 }
 
-/// THE TYPE INVARIANT HOLDS FROM REPRESENTATIVE STATES AT EVERY BOUND THROUGH
-/// EVERY TWO-BYTE TAIL. From each of [`reachable_starts`], with C1 controls
-/// off and on, every byte and then every byte after it (65,792 tails), fed one
-/// byte at a time, leaves the parser inside `assert_invariants` — the TLA+
-/// `TypeInvariant`, the flag-state couplings, the UTF-8 decoder's consistency
-/// and the string-head placement — after every byte: so every lead
-/// `0xC0..=0xF7` meets every two following bytes, and each row's pending
-/// prefixes every two bytes more, driven through `advance_fast` from the
-/// states it reaches itself. Two transitions are pinned on the
-/// way: CAN (0x18) and SUB (0x1A) end every sequence at `Ground`, and with C1
-/// controls off no byte in 0x80..=0x9F moves a `Ground` parser.
 #[test]
 fn every_state_every_byte_keeps_the_type_invariant() {
     let starts = reachable_starts();
@@ -129,8 +105,6 @@ fn every_state_every_byte_keeps_the_type_invariant() {
                 if first == 0x18 || first == 0x1A {
                     assert_eq!(one.state(), State::Ground, "{}", at());
                 }
-                // (Not where an open tmux wrapper holds an ESC: that ESC
-                // reaches the payload with the byte after it.)
                 if !c1
                     && *state == State::Ground
                     && start.tmux_passthrough() != TmuxPassthrough::Escape

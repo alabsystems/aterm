@@ -71,6 +71,48 @@ fn hold_rows(path: &Path) -> Vec<HoldRow> {
         .collect()
 }
 
+/// The `fact-held@v1` rows of the ledger text `body`, oldest first: each `(rule, guard)` its
+/// reason names, every one `waiting` with no command (nothing follows it, nothing was typed).
+fn held_rows_of(body: &str) -> Vec<(String, String)> {
+    let rule = crate::supervise::occupancy::rules::HELD_RULE;
+    body.lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| v.get("rule_id").and_then(aterm_json::Value::as_str) == Some(rule))
+        .map(|v| {
+            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str).unwrap_or("");
+            assert_eq!(text("decision"), "waiting", "{v:?}");
+            assert_eq!(text("command"), "", "{v:?}");
+            let word = |key: &str| {
+                text("reason")
+                    .split(' ')
+                    .find_map(|w| w.strip_prefix(key))
+                    .unwrap_or_else(|| panic!("no {key} in {v:?}"))
+                    .to_string()
+            };
+            (word("rule="), word("guard="))
+        })
+        .collect()
+}
+
+/// `(rule, guard)` as [`held_rows_of`] gives them.
+fn held_by(rule: &str, guard: &str) -> (String, String) {
+    (rule.to_string(), guard.to_string())
+}
+
+/// `body` with every row stamped `ts`, in its order: the scripted clock's time, where the rows a
+/// test's ledger stamps are the machine's.
+fn stamped(body: &str, ts: i64) -> String {
+    body.lines()
+        .map(|line| {
+            let rest = line
+                .strip_prefix("{\"ts\":")
+                .and_then(|r| r.split_once(','))
+                .map_or(line, |(_, rest)| rest);
+            format!("{{\"ts\":{ts},{rest}\n")
+        })
+        .collect()
+}
+
 /// The reasons of `rows`, each its words; every row `waiting` (no act follows one).
 fn reasons(rows: &[HoldRow]) -> Vec<Vec<String>> {
     assert!(rows.iter().all(|(d, _)| d == "waiting"), "{rows:?}");

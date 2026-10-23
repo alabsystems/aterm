@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Window-owned artwork: cache reuse, replacement and teardown on both backends.
-//! The bounded model describes two owners, each with two possible snapshots.
-//! Its mutant is a renderer-wide slot that evicts the other owner.
+//! Window-owned artwork cache reuse, replacement, and teardown on both backends.
 
 use super::{GpuRenderer, RenderInput, SceneAtlas, SpriteTex, WindowGpu};
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, SpriteQuad};
@@ -54,8 +52,6 @@ fn artwork_input(gpu: &GpuRenderer, tag: u8) -> RenderInput {
     let (cw, ch) = gpu.cell_size();
     let (width, height) = ((12 * cw) as u32, (4 * ch) as u32);
     let pixel = [tag, 80, 255 - tag, 255];
-    // Both windows deliberately use the same version and dimensions. The
-    // immutable source identity, not either value, distinguishes their pixels.
     let atlas = Arc::new(SceneAtlas {
         width,
         height,
@@ -102,7 +98,6 @@ fn artwork_input(gpu: &GpuRenderer, tag: u8) -> RenderInput {
         ..quad
     });
 
-    // Exercise the fifth window-owned atlas: the packed inline-image plane.
     let mut png = Vec::new();
     {
         let mut enc = aterm_png::Encoder::new(&mut png, 1, 1);
@@ -145,8 +140,6 @@ fn sprites(win: &WindowGpu) -> [&SpriteTex; 4] {
     .map(|s| s.as_deref().expect("fixture must build every sprite atlas"))
 }
 
-/// Retain the actual GPU handles while alternating frames: a spurious rebuild
-/// cannot pass by reusing the address of a texture just freed by the test.
 struct Handles {
     #[cfg(wgpu_arm)]
     wgpu: [wgpu::BindGroup; 5],
@@ -296,8 +289,6 @@ fn run_ownership_replay(native: bool) {
         aterm_spec::interp::admits(&model, &state, &evicted).is_none(),
         "the old global-slot eviction must fail conformance"
     );
-    // A fresh source with the same version/dimensions must replace A, without
-    // disturbing B's resident textures. Its pixels intentionally match B.
     let replacement = artwork_input(&gpu, 220);
     let replacement_weak = Arc::downgrade(replacement.free_atlas.as_ref().unwrap());
     let prior = state.clone();
@@ -320,8 +311,6 @@ fn run_ownership_replay(native: bool) {
     );
     drop(replacement);
 
-    // Disable artwork without closing A, then close B while keeping the shared
-    // renderer alive. Neither action may leave a renderer-owned source pin.
     let prior = state.clone();
     gpu.try_render_input(&mut windows[0], &blank_input(), None)
         .unwrap();
@@ -342,7 +331,6 @@ fn run_ownership_replay(native: bool) {
         weak[1].upgrade().is_none(),
         "closed window's source must be released"
     );
-    // Reopening does not inherit the closed window's cached pixels/identity.
     for _ in 0..3 {
         let input = artwork_input(&gpu, 40);
         let source = Arc::downgrade(input.free_atlas.as_ref().unwrap());
@@ -390,9 +378,6 @@ fn window_atlas_metal_reuses_distinct_artwork_and_releases_closed_windows() {
     run_ownership_replay(true);
 }
 
-/// Two owners can select either immutable snapshot. The physical upload count
-/// is the number of distinct live sources, including after one owner leaves.
-/// The mutant allocates per window for an already resident source.
 fn sharing_model() -> Model {
     aterm_spec::ty_model! {
         SharedWindowArtwork {
@@ -529,8 +514,6 @@ fn run_sharing_replay(native: bool) {
                         first_handles = Some(handles);
                     }
                     Some(upload) if source == 0 && upload.upgrade().is_some() => {
-                        // The second owner and its unchanged repaint must use the
-                        // very same native texture/wgpu bind, not just equal pixels.
                         let first = first_handles.as_ref().unwrap();
                         #[cfg(wgpu_arm)]
                         assert_eq!(first.wgpu[..4], handles.wgpu[..4]);
@@ -589,8 +572,6 @@ fn run_sharing_replay(native: bool) {
             .all(|entry| entry.upgrade().is_none())
     );
 
-    // Overflow only forgets a sharing candidate: it cannot evict a window's
-    // resident texture. Repeated distinct sources also bound dead metadata.
     let mut owners = Vec::new();
     let keep = inputs[0].free_atlas.as_ref().unwrap().clone();
     for _ in 0..super::SPRITE_TEXTURE_LOOKUP_LIMIT + 3 {
@@ -620,7 +601,6 @@ fn run_sharing_replay(native: bool) {
     drop(first);
     drop(owners);
     assert!(first_source.upgrade().is_none());
-    // A new source triggers dead-weak pruning; no old source or upload survives.
     assert!(gpu.sprite_textures.find(&keep).is_none());
     assert!(gpu.sprite_textures.recent.is_empty());
 }

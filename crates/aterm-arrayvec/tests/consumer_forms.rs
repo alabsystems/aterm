@@ -272,7 +272,8 @@ mod wgpu_core {
     }
 
     pub fn read_mip(complex: &ComplexTextureState, mip_id: usize) -> u32 {
-        // SAFETY: `mip_id` is bounds-checked against `current_complex.mips.len()` above.
+        // SAFETY: the caller has bounds-checked `mip_id`, as wgpu-core does one line above its own
+        // call.
         *unsafe { complex.mips.get_unchecked(mip_id) }
     }
 

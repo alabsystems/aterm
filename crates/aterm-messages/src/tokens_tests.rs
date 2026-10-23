@@ -19,7 +19,6 @@ fn bytes(c: aterm_types::Rgb) -> [u8; 3] {
     [c.r, c.g, c.b]
 }
 
-/// One built-in: its theme inks, ANSI hues and selection band.
 struct Builtin {
     name: &'static str,
     theme: ThemeInks,
@@ -55,7 +54,6 @@ fn builtins() -> Vec<Builtin> {
         .collect()
 }
 
-/// The two band grounds a host draws: the blend, and Linux's CSD greys.
 const BASES: [BarBase; 2] = [
     BarBase::Blend,
     BarBase::Fixed {
@@ -80,11 +78,6 @@ fn tokens(theme: ThemeInks, ansi: Option<AnsiHues>, authored: AuthoredChrome) ->
     ChromeTokens::derive(&seeds(theme, ansi, authored))
 }
 
-/// THE ACCENT FOLLOWS THE THEME: a cursor with a colour is the accent; a
-/// near-grey one borrows the ANSI blue or cyan, and the accent is exactly that
-/// slot; an authored accent wins over either. NEGATIVE CONTROL: a theme whose
-/// cursor and ANSI blue and cyan are all grey has no colour to borrow, so its
-/// accent is Neutral (the grey cursor), not Blue.
 #[test]
 fn accent_rule_follows_the_theme() {
     let mut seen = [false; 3];
@@ -113,7 +106,6 @@ fn accent_rule_follows_the_theme() {
             "{}",
             b.name
         );
-        // Without the palette a grey cursor has nothing to borrow.
         let bare = tokens(b.theme, None, AuthoredChrome::NONE);
         if near_grey(b.theme.cursor) {
             assert_eq!(bare.accent_source, AccentSource::Neutral, "{}", b.name);
@@ -140,9 +132,6 @@ fn accent_rule_follows_the_theme() {
     );
 }
 
-/// A host that follows the OS accent hands it in as a seed: it outranks every
-/// borrowed accent (the cursor, the ANSI blue or cyan), and an authored
-/// `accent_color` outranks it.
 #[test]
 fn the_system_accent_follows_an_authored_one_and_leads_the_borrowed_ones() {
     let windows_blue = [0x4c, 0xc2, 0xff];
@@ -174,11 +163,6 @@ fn the_system_accent_follows_an_authored_one_and_leads_the_borrowed_ones() {
     assert_eq!(AccentSource::System.label(), "system");
 }
 
-/// THE BAND'S METER IS THE TOKEN ACCENT, and the parity proof: on every
-/// built-in, on both band grounds, the meter, its ring and its edge are what
-/// the band derived before the tokens existed, computed here from the palette
-/// primitives (ruling 250's pick, ruling 260's outline, ruling 264's pastel);
-/// and the accent is that same hue, floored.
 #[test]
 fn band_meter_is_the_token_accent() {
     for b in builtins() {
@@ -214,9 +198,6 @@ fn band_meter_is_the_token_accent() {
     }
 }
 
-/// THE BAND'S SEAM IS ITS LABEL UNLESS A BORDER IS AUTHORED: unauthored, the
-/// hairline over a panel keeps the label tone it always had; an authored
-/// border is that border floored on the band, which is not the label.
 #[test]
 fn band_seam_is_the_label_unless_a_border_is_authored() {
     for b in builtins() {
@@ -234,8 +215,6 @@ fn band_seam_is_the_label_unless_a_border_is_authored() {
     assert_ne!(c.seam, c.label, "CONTROL: the border is not the label");
 }
 
-/// A SEAM CLEARS ITS FLOOR on every ground, authored or not; unauthored, it
-/// is the plain step toward the ink wherever that step already clears it.
 #[test]
 fn seam_on_clears_its_floor() {
     let mut plain = 0;
@@ -270,12 +249,6 @@ fn seam_on_clears_its_floor() {
     assert!(plain > 0 && lifted > 0, "CONTROL: both arms exercised");
 }
 
-/// FIND'S HIGHLIGHT IS VISIBLE AND APART FROM THE SELECTION: on every
-/// built-in the tint stands [`MATCH_RISE`]:1 off the background and
-/// [`MATCH_DISTINCT_OKLAB`] from the selection the current match wears. An
-/// authored tint equal to the background is lifted to the rise. NEGATIVE
-/// CONTROL: an authored tint equal to the selection is kept as authored (no
-/// distinctness search overrides the author; `theme check` warns instead).
 #[test]
 fn search_match_is_visible_and_apart_from_the_selection() {
     for b in builtins() {
@@ -319,8 +292,6 @@ fn search_match_is_visible_and_apart_from_the_selection() {
     }
 }
 
-/// THE STATUS HUES COME FROM THE PALETTE: a chromatic ANSI red or green is
-/// a hue; a grey slot is none.
 #[test]
 fn status_hues_come_from_the_palette() {
     let mut chromatic = 0;

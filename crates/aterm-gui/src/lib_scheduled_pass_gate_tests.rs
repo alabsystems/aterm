@@ -10,8 +10,6 @@ const NOW: i64 = 1_790_000_000;
 const HOUR: i64 = 3600;
 const WALK: i64 = FULL_PASS_INTERVAL_SECS as i64;
 
-/// A record whose last full pass ended at `attempt`: the success itself (it was `ok`),
-/// or a pass that recorded a failure.
 fn record(success: Option<i64>, attempt: Option<i64>, build: u64) -> Stamps {
     Stamps {
         last_success: success,
@@ -29,7 +27,6 @@ fn record(success: Option<i64>, attempt: Option<i64>, build: u64) -> Stamps {
     }
 }
 
-/// A record checked `ago` seconds before now, index `build` verified.
 fn checked(ago: i64, build: u64) -> Stamps {
     record(Some(NOW - ago), None, build)
 }
@@ -43,8 +40,6 @@ fn gate(
     scheduled_pass_gate(why, stamps, own, ran_at, NOW)
 }
 
-/// An owed launch and a stub's wish always run, even over a sibling's installing pass
-/// (they queue at the store lock).
 #[test]
 fn a_forced_launch_and_a_stubs_wish_always_run() {
     let installing = Stamps {
@@ -60,9 +55,6 @@ fn a_forced_launch_and_a_stubs_wish_always_run() {
     }
 }
 
-/// A sibling's installing or recently attempted pass holds every other scheduled pass
-/// until the next look (a published build rechecks a live holder in 5 s). An attempt
-/// no later than this lane's own last child is this lane's (negative control).
 #[test]
 fn a_siblings_pass_in_flight_or_a_moment_old_holds_every_scheduled_pass() {
     let installing = Stamps {
@@ -92,7 +84,6 @@ fn a_siblings_pass_in_flight_or_a_moment_old_holds_every_scheduled_pass() {
             "{why:?} a minute after a sibling's attempt"
         );
     }
-    // Our own attempt a minute ago is no sibling's: the walk is owed on the record.
     assert_eq!(
         gate(
             PassWhy::LaunchDue,
@@ -197,8 +188,6 @@ fn published_45_runs_after_sibling_checked_44_but_same_or_failed_attempts_still_
     );
 }
 
-/// A published index a sibling already landed is not run again; the walk resumes.
-/// Negative control: an index above the floor runs.
 #[test]
 fn a_published_index_a_sibling_landed_is_the_walk_not_a_pass() {
     let landed = checked(20 * 60, 43);
@@ -212,9 +201,6 @@ fn a_published_index_a_sibling_landed_is_the_walk_not_a_pass() {
     );
 }
 
-/// A launch parked behind a sibling whose pass succeeded owes nothing and returns to
-/// the walk. Negative controls: the sibling failed, the record is stale, or never
-/// checked: the launch runs.
 #[test]
 fn a_launch_pass_a_sibling_covered_while_it_parked_is_the_walk() {
     let none = OwnPasses::default();
@@ -246,8 +232,6 @@ fn a_launch_pass_a_sibling_covered_while_it_parked_is_the_walk() {
     );
 }
 
-/// A retry healed by a sibling's later success is done; the walk takes over.
-/// Negative control: no success since the failure, the retry runs.
 #[test]
 fn a_retry_a_siblings_success_healed_is_done() {
     let own = OwnPasses {
@@ -266,9 +250,6 @@ fn a_retry_a_siblings_success_healed_is_done() {
     );
 }
 
-/// The walk is machine-wide: a sibling's recent success defers it, this lane's own
-/// success counts when the record is unreadable, a six-hour-old success runs it. A
-/// sibling's failure never pushes the walk back.
 #[test]
 fn the_walk_is_owed_on_the_machine_wide_rule() {
     let none = OwnPasses::default();
@@ -310,9 +291,6 @@ fn the_walk_is_owed_on_the_machine_wide_rule() {
     );
 }
 
-/// What a park that ended asks for next: the same pass after contention, the retry
-/// after a failure park, the walk after a healthy one — and a wish or a published
-/// index whatever the park was.
 #[test]
 fn a_park_ending_names_the_next_pass() {
     let published = PassWhy::Published(43);

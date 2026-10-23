@@ -502,7 +502,7 @@ impl UpdateState {
             // Nothing has read this copy yet (the startup or first-open reconcile is
             // in flight): it may be an installed copy or one that can't replace
             // itself, so the page claims neither — no "up to date", no "can't update
-            // itself", no timing for the switches.
+            // itself".
             UPDATE_UNOBSERVED_HEADLINE.to_string()
         } else if self.linux_host {
             if let Some(fact) = self.linux_fact_headline() {

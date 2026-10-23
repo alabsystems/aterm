@@ -659,7 +659,7 @@ const NAMED_TOOL_HEADS: [&str; 4] = [
 
 fn tool_row(head: &str) -> bool {
     let [ran, wrote, edited] = TOOL_HEADS;
-    head.starts_with(ran)
+    head.strip_prefix(ran).is_some_and(ran_tail)
         || [wrote, edited]
             .iter()
             .any(|h| head.strip_prefix(h).is_some_and(names_a_path))
@@ -669,6 +669,38 @@ fn tool_row(head: &str) -> bool {
                 .is_some_and(names_a_path)
         })
         || bare_tool_row(head)
+}
+
+/// What follows `Ran ` on a shell row of Muse Code's: the command and its
+/// outcome after ` — ` ([`own_tail`]: `Ran ls — failed`, `Ran touch probe.txt
+/// — denied`), or what ran (a command, `command · <description>`, `<n>
+/// commands · …`) and then ` · ` parts ending in a duration and the expander
+/// (`Ran ls · ✓ · 0.2s · ctrl+o`, `Ran 2 commands · … · 18s · ctrl+o`), every
+/// shell row measured on 1.4.9, 1.4.10 and 1.4.12. A reply that opens with
+/// `Ran ` ends in neither.
+fn ran_tail(rest: &str) -> bool {
+    let outcome = rest
+        .rfind(" — ")
+        .is_some_and(|at| at > 0 && own_tail(&rest[at..], false));
+    let timed = rest
+        .strip_suffix(" · ctrl+o")
+        .and_then(|r| r.rsplit_once(" · "))
+        .is_some_and(|(what, took)| !what.is_empty() && duration(took));
+    outcome || timed
+}
+
+/// A run's duration as Muse Code draws it on a shell row: one or more
+/// space-separated amounts, each digits with an optional fraction and a
+/// unit (`0.2s`, `44s`, `1m`).
+fn duration(text: &str) -> bool {
+    text.split(' ').all(|part| {
+        let unit = part.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+        let amount = &part[..part.len() - unit.len()];
+        amount.starts_with(|c: char| c.is_ascii_digit())
+            && amount.matches('.').count() <= 1
+            && !amount.ends_with('.')
+            && ["ms", "s", "m", "h"].contains(&unit)
+    })
 }
 
 /// Muse Code's tool rows that draw no outcome branch, measured on 1.4.10 (`◆ Fetched <url> —
@@ -2135,6 +2167,10 @@ pub mod fixtures {
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-edit.txt");
     pub const TOOL_ROW_BASH: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-bash.txt");
+    pub const TOOL_ROW_BASH_RAN: &str =
+        include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran.txt");
+    pub const TOOL_ROW_BASH_RAN_DESCRIBED: &str =
+        include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran-described.txt");
     pub const TOOL_ROW_READ_MEMORY: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-read-memory.txt");
     pub const TOOL_ROW_ADD_MEMORY: &str =

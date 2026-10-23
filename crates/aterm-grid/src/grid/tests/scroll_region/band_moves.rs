@@ -2,15 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The row-band move record (`RowBandMoves`) behind `coordinates_invalidated`, so a host that
-//! caches screen coordinates (the ribbon under a Codex composer) can translate instead of discard.
-//!
-//! The shapes are Codex CLI's (57x151): an Enter is `ESC[12;57r ESC[12;1H` and five reverse
-//! indices; a streamed line before the viewport reaches the bottom is one reverse index on
-//! `[vt..57]` then an LF that does not scroll; one with the viewport at the bottom is the
-//! top-anchored archival scroll `ESC[1;52r ESC[52;1H \r\n`. The grid has no parser, so each is
-//! driven through the `Grid` methods the VT handler calls; byte-verbatim replays live in
-//! `aterm-core`'s processing tests.
+//! Row-band move (`RowBandMoves`) tests for region scrolls and line operations.
 
 use super::*;
 use crate::{AbsoluteRowUpdate, ROW_BAND_MOVES_PER_BATCH, RowBandMove, RowBandMoves};
@@ -29,8 +21,6 @@ fn one(top: u16, bottom: u16, delta: i16) -> RowBandMoves {
     moves
 }
 
-/// `ESC[12;57r ESC[12;1H (ESC M)x5`: five reverse indices at the top of region
-/// `[11..=56]` compose into one `+5` band, and the coordinate flag is still set.
 #[test]
 fn a_reverse_index_at_a_region_top_records_one_composed_down_band() {
     let mut grid = codex_grid();
@@ -51,9 +41,6 @@ fn a_reverse_index_at_a_region_top_records_one_composed_down_band() {
     );
 }
 
-/// `ESC[25;57r ESC[25;1H ESC M ESC[r ESC[1;25r ESC[24;1H \r\n`: band `[24..=56]`
-/// moves down one row; the LF lands on the `[0..=24]` region's bottom row, so
-/// nothing scrolls, archives or splices.
 #[test]
 fn a_codex_phase_a_line_records_the_viewport_band_and_no_splice() {
     let mut grid = codex_grid();
@@ -79,9 +66,6 @@ fn a_codex_phase_a_line_records_the_viewport_band_and_no_splice() {
     );
 }
 
-/// `ESC[1;52r ESC[52;1H \r\n` with transcript on screen: the archival scroll records band
-/// `[0..=51]` moving up one row beside its splice (the history insertion point), and history grows
-/// by one row.
 #[test]
 fn a_top_anchored_archival_scroll_records_the_transcript_band_beside_its_splice() {
     let mut grid = codex_grid();
@@ -113,10 +97,6 @@ fn recorded(moves: &[(u16, u16, i16)]) -> RowBandMoves {
     grid.take_row_band_moves()
 }
 
-/// The compose rule (see `record_row_band_move`): the same band twice composes
-/// either way; a downward band narrowed from above by exactly the first
-/// displacement composes; anything else is a separate entry, and a ninth band
-/// or an `i16` overflow poisons the record rather than dropping a move.
 #[test]
 fn band_moves_compose_exactly_and_refuse_everything_else() {
     assert_eq!(recorded(&[(11, 56, 1); 5]), one(11, 56, 5), "the Enter");
@@ -197,9 +177,6 @@ fn band_moves_compose_exactly_and_refuse_everything_else() {
     assert_eq!(recorded(&[(3, 3, 0), (5, 2, 1)]), RowBandMoves::default());
 }
 
-/// Coordinate moves that are not row translates poison the record: margined
-/// (DECLRMM) SU, DECIC, a forced invalidation. Full-width IL and DL record
-/// exact bands over `cursor_row..=region.bottom`.
 #[test]
 fn margined_scrolls_line_ops_and_forced_invalidations_poison_the_band_record() {
     let mut grid = Grid::new(20, 20);

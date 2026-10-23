@@ -6,8 +6,8 @@
 
 //! Keyboard key and modifier types.
 
-// Variant names in `Key` and `KeyCode` are derived from the W3C UI Events KeyboardEvent
-// `key` (https://www.w3.org/TR/2017/CR-uievents-key-20170601/) and `code`
+// Variant names in `Key` and `KeyCode`, and their documentation, are derived from the W3C UI
+// Events KeyboardEvent `key` (https://www.w3.org/TR/2017/CR-uievents-key-20170601/) and `code`
 // (https://www.w3.org/TR/2017/CR-uievents-code-20170601/) specifications,
 // Copyright © 2017 W3C® (MIT, ERCIM, Keio, Beihang), under the license below.
 
@@ -60,6 +60,7 @@
 //
 // --------- END OF W3C SHORT NOTICE ---------------------------------------------------------------
 
+// LOCAL PATCH (aterm): the crate's own key-text type, not a re-export of the `smol_str` crate.
 mod smol_str;
 pub use self::smol_str::SmolStr;
 

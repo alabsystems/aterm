@@ -694,7 +694,10 @@ pub struct GroupOutcome {
 /// Re-verifies `program`'s checkout commit, cleanliness, and floor clearance before packing.
 ///
 /// # Errors
-/// Returns a refusal if the checkout moved, became dirty, or no longer clears the floor.
+/// A refusal naming what moved: the checkout moved, became dirty, would now pack a build
+/// lower than the one judged, or no longer clears the floor; a refusal for a `program` the
+/// preflight never judged; whatever [`pack_build`] fails on. Nothing of `program` is packed
+/// after one.
 pub fn recheck(ctx: &Ctx, pf: &Preflight, program: &str, force: bool) -> Result<u64> {
     let judged = pf
         .judged

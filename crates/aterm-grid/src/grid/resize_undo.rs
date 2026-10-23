@@ -36,7 +36,7 @@ pub(crate) struct CursorPicture {
     has_margins: bool,
 }
 
-/// The stash (see the module doc).
+/// The stash: the rows a rows-only shrink took off the screen, popped LIFO by a grow.
 #[derive(Debug)]
 pub(crate) struct ResizeUndo {
     /// LIFO: the newest shrink's rows are at the end.

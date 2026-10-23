@@ -1155,10 +1155,7 @@ impl App {
             {
                 // A footer splice is piecewise and a reflow renumbers wholesale, so a
                 // uniform base_y delta could select unrelated text, and ordinary edits
-                // can move the columns: refuse until the output wake or the next
-                // navigation refreshes the batch. The highlight on glass is destroyed
-                // only when output could have reached it, and then (press custody) a
-                // `UserClear` is recorded.
+                // can move the columns: refuse until the find re-runs and refreshes the batch.
                 if clear_selection_if_content_is_mutable(&mut term) {
                     note_selection_custody(&mut term, false);
                 }

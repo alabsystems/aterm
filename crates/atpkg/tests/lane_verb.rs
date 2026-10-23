@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm pkg lane`, run as a process the way a wired guard calls it:
-//! a hook payload on stdin, `lane --json
-//! tool_input.command`, the answer in the exit code — 0 let through, 2 refused, 1
-//! unreadable — and on stderr.
-//!
-//! The reader's unit tests judge path-form commands against a SIMULATED directory
-//! probe. The fix they pin — a Trust toolchain's own `rustc`/`rustdoc` by path is
-//! not stock, its `cargo` is refused with its own `targo` — also needs the probe
-//! to find the directory the way the shell would: absolute, relative to the
-//! hook's working directory, or under `~/`. So these drive the dev `atpkg`
-//! binary against a REAL temp tree, with a temp `HOME` and the tree's checkout as
-//! the working directory, as Claude Code runs a `PreToolUse` hook.
+//! Subprocess tests for `aterm pkg lane`.
 
 #![cfg(unix)]
 #![allow(
@@ -24,9 +13,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// The directories of the guard's own cases, as files on disk: a trust checkout's
-/// `stage0/bin` (Trust binary names, with no `rustdoc`),
-/// a Trust toolchain under `~/`, and rustup's stock 1.97.1 under `~/`.
 struct Fixture {
     root: aterm_tempfile::TempDir,
     home: PathBuf,
@@ -68,8 +54,6 @@ impl Fixture {
         }
     }
 
-    /// `atpkg lane --json tool_input.command [extra…]`, `payload` on stdin, run in
-    /// the checkout.
     fn lane(&self, payload: &[u8], extra: &[&str]) -> Output {
         let mut child = Command::new(env!("CARGO_BIN_EXE_atpkg"))
             .args(["lane", "--json", "tool_input.command"])
@@ -97,8 +81,6 @@ impl Fixture {
     }
 }
 
-/// The shape Claude Code hands a `PreToolUse` hook for a Bash call; the reader
-/// looks at `tool_input.command` alone.
 fn hook_payload(command: &str) -> Vec<u8> {
     let mut quoted = String::from('"');
     for c in command.chars() {
@@ -127,9 +109,6 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// A Trust toolchain's own `rustc`/`rustdoc` BY PATH exits 0 and says nothing,
-/// wherever the directory is written from; the same names in a stock directory,
-/// or read under a working directory where no Trust toolchain sits, exit 2.
 #[test]
 fn a_trust_toolchains_own_rustc_by_path_goes_through_the_wired_verb() {
     let fx = Fixture::new("bypath");
@@ -148,15 +127,12 @@ fn a_trust_toolchains_own_rustc_by_path_goes_through_the_wired_verb() {
     }
     for cmd in [
         "~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc -V",
-        // No `rustdoc` twin beside rustup's stock toolchain, and no `trustc`.
         "~/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc --version",
         "rustc -vV",
     ] {
         let out = fx.bash(cmd);
         assert_eq!(out.status.code(), Some(2), "{cmd:?}\n{}", text(&out));
     }
-    // The relative directory is read under `--cwd` when one is given: there is no
-    // Trust toolchain under the fixture's root, so the same words are stock.
     let root = fx.root.path().display().to_string();
     let out = fx.lane(
         &hook_payload("build/aarch64-apple-darwin/stage0/bin/rustc -Vv"),
@@ -165,11 +141,6 @@ fn a_trust_toolchains_own_rustc_by_path_goes_through_the_wired_verb() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
 }
 
-/// Its `cargo` by path is refused — with the `targo` beside it, never as "stock
-/// Rust" — and the owner's other answers hold through the process: a stock
-/// command is refused with its Trust spelling, the escape lets it through with
-/// one line, text nested past the reader's cap is refused, a payload with no
-/// command is nothing to read, and input that is not JSON claims nothing.
 #[test]
 fn the_wired_verb_answers_with_its_exit_code_and_stderr() {
     let fx = Fixture::new("answers");
@@ -207,8 +178,6 @@ fn the_wired_verb_answers_with_its_exit_code_and_stderr() {
     let out = fx.lane(b"cargo build", &[]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 
-    // A usage error claims nothing either: never the refusal's 2. (No payload: the
-    // verb exits before it reads stdin, and a write could meet a closed pipe.)
     let out = fx.lane(b"", &["--verbose"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 }

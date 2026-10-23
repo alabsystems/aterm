@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 //
 // CPU==GPU parity with a ligating font: plain, under a selection, under a block
-// cursor and under ink. No GPU or no font: COULD NOT RUN.
+// cursor and under ink.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
@@ -10,10 +10,6 @@ use aterm_render::{LigatureMode, Renderer, TextShapingConfig, Theme};
 
 use crate::common::{backends_with_font, max_channel_delta_frame as max_channel_delta};
 
-// The ligature test font: $ATERM_LIGATURE_TEST_FONT if set and present, else the
-// committed fixture in the sibling aterm-render crate. The path is handed to both
-// renderers as their family (`backends_with_font`), so nothing writes the
-// environment.
 fn ligature_test_font() -> std::path::PathBuf {
     if let Some(p) = std::env::var("ATERM_LIGATURE_TEST_FONT")
         .ok()
@@ -39,7 +35,6 @@ fn ligature_font_gpu_matches_cpu() {
     let font = ligature_test_font();
 
     let (mut cpu, mut gpu) = backends_with_font(&font, px, theme);
-    // Negative control: a CPU renderer with ligatures off.
     let mut cpu_off = Renderer::from_system_with_family(font.to_str(), px, theme)
         .expect("the ligature fixture loads");
     cpu_off.set_text_shaping(TextShapingConfig {
@@ -63,14 +58,11 @@ fn ligature_font_gpu_matches_cpu() {
         "dimensions differ"
     );
 
-    // Non-vacuous: the operators ligate.
     assert_ne!(
         cpu_frame.pixels, cpu_off_frame.pixels,
         "operators did not ligate — test would be vacuous (is this really a ligature font?)"
     );
 
-    // Both paths key and place the same `mono_gid` glyph, so only blend rounding
-    // differs.
     let delta = max_channel_delta(&cpu_frame, &gpu_frame);
     eprintln!("ligature GPU vs CPU max per-channel delta = {delta}");
     assert!(
@@ -79,11 +71,6 @@ fn ligature_font_gpu_matches_cpu() {
     );
 }
 
-/// CPU==GPU parity with a selection over part of a ligature:
-/// `ligature_break_cols_into` breaks runs on selection columns, so a ligature
-/// never spans the highlight boundary. Selects col 1 of "a=>b" and asserts the
-/// CPU frame changed vs no selection (the break fired) and the GPU frame
-/// still matches within tolerance.
 #[test]
 fn ligature_selection_gpu_matches_cpu() {
     let theme = Theme::default();
@@ -96,7 +83,6 @@ fn ligature_selection_gpu_matches_cpu() {
     let (rows, cols) = (1usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25la=>b");
-    // Select exactly col 1 (the '=' half of the '=>' arrow): Left start + Right end.
     let sel = term.text_selection_mut();
     sel.start_selection(0, 1, SelectionSide::Left, SelectionType::Simple);
     sel.update_selection(0, 1, SelectionSide::Right);
@@ -107,7 +93,6 @@ fn ligature_selection_gpu_matches_cpu() {
     let cpu_sel = cpu.render_input(&input);
     let gpu_sel = gpu.render_input(&mut win, &input, None);
 
-    // Non-vacuous: the same text with no selection renders differently.
     let mut no_sel_term = Terminal::new(rows as u16, cols as u16);
     no_sel_term.process(b"\x1b[?25la=>b");
     let cpu_no_sel = cpu.render_input(&no_sel_term.cell_frame(rows, cols));
@@ -129,15 +114,6 @@ fn ligature_selection_gpu_matches_cpu() {
     );
 }
 
-/// Cursor ink integrity, CPU==GPU: a block cursor over ligature and wide-glyph
-/// geometry binds the GPU's quad slicing (`glyph_quad` x-clip, widened
-/// `cursor_block` fill, ligature-run cut-out sources) to the CPU frames that
-/// aterm-render/tests/cursor_ink.rs verifies:
-///   * cursor on the '>' of '=>' (the covering-glyph column),
-///   * cursor on the '=' lead,
-///   * cursor on a wide 日 lead.
-///
-/// Non-vacuous: each cursor frame differs from the cursor-hidden frame.
 #[test]
 fn cursor_cutout_gpu_matches_cpu() {
     let theme = Theme::default();
@@ -146,14 +122,11 @@ fn cursor_cutout_gpu_matches_cpu() {
     let font = ligature_test_font();
 
     let (mut cpu, mut gpu) = backends_with_font(&font, px, theme);
-    // 日 is not in the fixture, so each renderer parses its own CJK fallback in
-    // the background; block on it so neither compares 日 against `.notdef`.
+    // Block on lazy CJK fallback parsing so neither backend compares 日 against `.notdef`.
     cpu.debug_block_on_lazy_fallbacks();
     gpu.debug_block_on_lazy_fallbacks();
 
     let (rows, cols) = (1usize, 12usize);
-    // '=>' at cols 1-2; wide 日 lead+continuation at cols 5-6. DECSCUSR 2 =
-    // steady block, cursor visible.
     let scenario = |cursor: Option<usize>| -> aterm_render::RenderInput {
         let mut term = Terminal::new(rows as u16, cols as u16);
         term.process(b"\x1b[2 q");
@@ -190,10 +163,6 @@ fn cursor_cutout_gpu_matches_cpu() {
     }
 }
 
-/// Animated ink over a ligated run: the run's single glyph takes its owning
-/// column's ink colour (both backends read the same per-column plan and ink
-/// slice), so inking every column equals recolouring the run via SGR
-/// truecolor fg on each backend, and the backends agree within the bar.
 #[test]
 fn ligature_ink_gpu_matches_cpu() {
     use aterm_core::render::InkCell;
@@ -207,8 +176,6 @@ fn ligature_ink_gpu_matches_cpu() {
     let (rows, cols) = (1usize, 16usize);
     let ink: [u8; 3] = [0x7C, 0xC8, 0xFF];
 
-    // "a=>b": ink cols 0..=3 (the whole run, so the owning column is covered
-    // regardless of which cell the plan hands the shaped glyph).
     let mut term_a = Terminal::new(rows as u16, cols as u16);
     term_a.process(b"\x1b[?25la=>b");
     let mut inked = term_a.cell_frame(rows, cols);
@@ -220,7 +187,6 @@ fn ligature_ink_gpu_matches_cpu() {
         })
         .collect();
 
-    // The same run recoloured via SGR truecolor fg — no ink.
     let mut term_b = Terminal::new(rows as u16, cols as u16);
     term_b.process(b"\x1b[?25l\x1b[38;2;124;200;255ma=>b\x1b[39m");
     let recolored = term_b.cell_frame(rows, cols);
@@ -239,7 +205,6 @@ fn ligature_ink_gpu_matches_cpu() {
         "GPU: inking the ligature run must equal the SGR fg recolor byte-for-byte"
     );
 
-    // Non-vacuous: ink recoloured the ligated glyph.
     let plain = term_a.cell_frame(rows, cols);
     assert_ne!(cpu_ink.pixels, cpu.render_input(&plain).pixels);
 

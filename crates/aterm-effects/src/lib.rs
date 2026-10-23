@@ -24,8 +24,7 @@ pub mod cat_glyphs_gen {
 /// The top line's marks.
 pub mod cli_marks;
 pub mod color_math;
-/// The pet driver: `CompanionOwner` owns a resident [`kitty_pet`] brain per surface and senses for
-/// it.
+/// Per-surface [`kitty_pet`] companion driver.
 pub mod companion;
 /// Which cat the companions wear ([`companion_look::LookPolicy`]).
 pub mod companion_look;
@@ -50,7 +49,6 @@ pub mod cursor_glow;
 pub mod cursor_phaser;
 pub mod cursor_rainbow;
 pub mod cursor_trail;
-/// Crate-private shared render kit for the cursor emitters.
 mod effect_util;
 /// WCAG 2.3.1's general-flash bound every flash rate here is held under.
 pub use effect_util::TWINKLE_FLASH_BOUND_HZ;
@@ -61,7 +59,7 @@ pub mod genome;
 pub mod harness_card;
 /// The agents panel's glass.
 pub mod harness_panel;
-/// The host contract (`docs/DESIGN-host-boundary-2026-08-30.md` §3).
+/// Host boundary contract for effect engines.
 pub mod host;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty` trail style.
 pub mod kitty_cursor;
@@ -94,7 +92,7 @@ pub mod pane;
 pub mod pipeline;
 /// Rainbow kitty ([`rainbow_kitty::Engine`]).
 pub mod rainbow_kitty;
-/// Claude Code's mascot ripple (2.1.304), decoded.
+/// Glint wave field for Claude Code's mascot ripple.
 pub mod ripple;
 /// Sound-cue policy.
 pub mod sound_policy;
@@ -106,14 +104,12 @@ pub mod supernova;
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_pool;
-/// Tone of typing: a small hashed char-n-gram classifier that maps the line being typed to a mood
-/// hint for `trail_sound`'s tone tables.
+/// Hashed char-n-gram classifier mapping typed text to a mood hint.
 pub mod tone;
 /// The tone-of-typing tracker.
 pub mod tone_infer;
 pub mod trail_sound;
 pub mod trail_sweep;
-/// Kitty-command word flash ([`word_decorations::WordDecorations`]).
 mod trick_flash;
 /// Kitty-command listener.
 pub mod typed_tricks;

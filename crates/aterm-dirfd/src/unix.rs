@@ -445,7 +445,9 @@ pub fn renameat_with<F1: AsFd, F2: AsFd, P: Arg, Q: Arg>(
                 if flags.contains(RenameFlags::NOREPLACE) {
                     raw |= RENAME_NOREPLACE;
                 }
-                // SAFETY: raw syscall form because not every libc has a `renameat2` wrapper.
+                // SAFETY: raw syscall form because not every libc has a
+                // `renameat2` wrapper; the argument list is the kernel's and all
+                // four inputs are live.
                 let ret = unsafe {
                     libc::syscall(
                         libc::SYS_renameat2,
@@ -519,7 +521,8 @@ pub struct Dir {
     errored: bool,
 }
 
-// SAFETY: this type owns its `DIR*` exclusively and closes it on drop, so it may move between threads.
+// SAFETY: this type owns its `DIR*` exclusively and closes it on drop, so it may
+// move between threads. Not `Sync`: `readdir` mutates the stream position.
 unsafe impl Send for Dir {}
 
 impl Dir {
@@ -544,7 +547,9 @@ impl Dir {
             Ok(owned) => owned,
             Err(Errno::NOENT) => {
                 errored = true;
-                // SAFETY: `borrowed` is live.
+                // SAFETY: `borrowed` is live; F_DUPFD_CLOEXEC returns a new
+                // descriptor. Sharing the offset is harmless because `errored`
+                // makes the stream yield nothing.
                 let dup = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
                 if dup < 0 {
                     return Err(Errno::last());
@@ -555,7 +560,8 @@ impl Dir {
             Err(err) => return Err(err),
         };
         let raw = owned.into_raw_fd();
-        // SAFETY: `raw` is a fresh directory descriptor this function owns.
+        // SAFETY: `raw` is a fresh directory descriptor this function owns; on
+        // success `fdopendir` takes ownership of it.
         let dirp = unsafe { libc::fdopendir(raw) };
         if dirp.is_null() {
             let err = Errno::last();
@@ -623,7 +629,9 @@ impl Iterator for Dir {
                 Some(Err(err))
             };
         }
-        // SAFETY: a non-null `readdir` result points at a valid `dirent` owned by the stream with a NUL-terminated `d_name`.
+        // SAFETY: a non-null `readdir` result points at a valid `dirent` owned
+        // by the stream with a NUL-terminated `d_name`; the name is copied
+        // before the next `readdir` invalidates it.
         let name = unsafe { CStr::from_ptr((&raw const (*entry).d_name).cast()) };
         Some(Ok(DirEntry {
             name: name.to_owned(),

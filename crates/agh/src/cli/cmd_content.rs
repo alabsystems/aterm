@@ -14,6 +14,10 @@ use crate::policy::Access;
 const MAX_BYTES: u64 = 33_554_432;
 
 /// `agh cat REPO[@REF]:PATH [--max-bytes N]`: the file's bytes, exactly.
+///
+/// # Errors
+///
+/// Usage for no `:PATH` or a bad `--max-bytes`; the read's error.
 pub(crate) fn cat(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named, at) = inv.content(gh.router())?;
@@ -70,6 +74,11 @@ pub(crate) fn ls(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 }
 
 /// `agh find REPO[@REF] [PREFIX] [--type blob|tree] [--match RE]`.
+///
+/// # Errors
+///
+/// Usage for a `:PATH`, a bad `--type` or `--match`; Incomplete `TruncatedTree` when GitHub
+/// truncated the tree (a `Partial` answer under `--partial`); the read's error.
 pub(crate) fn find(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
     let (slug, named, at) = inv.content(gh.router())?;

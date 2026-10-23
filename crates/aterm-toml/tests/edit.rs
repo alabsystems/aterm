@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The document half, through the surface aterm uses: the Preferences window's
-//! non-destructive save (`prefs::apply_prefs_edits`) and the config editor's diagnostics
-//! (`native_config_language`, which walks the tree and underlines spans).
+//! Editable TOML document (`aterm_toml::edit`) tests.
 
 use aterm_toml::edit::{DocumentMut, Item, Key, Table, TableLike, Value};
 
@@ -20,8 +18,6 @@ listen = \"127.0.0.1:7777\"  # local only
 keys = \"ctrl+c\"
 ";
 
-/// The prefs contract: change only the named keys, keep every other byte, including the
-/// edited key's own trailing comment.
 #[test]
 fn a_non_destructive_edit_keeps_every_other_byte() {
     let ours = edit_ours(CONFIG);
@@ -41,7 +37,6 @@ keys = \"ctrl+c\"
 "
     );
 
-    // And the result still means what it should.
     let value: aterm_toml::Value =
         aterm_toml::from_str(&ours).expect("the edit produced valid TOML");
     assert_eq!(
@@ -60,14 +55,12 @@ keys = \"ctrl+c\"
 fn edit_ours(source: &str) -> String {
     let mut doc: DocumentMut = source.parse().expect("parse");
 
-    // Top-level replacement, adopting the old value's same-line decor.
     let mut item = Item::Value(Value::from(18.0));
     adopt_ours(doc.get("font_px"), &mut item);
     doc["font_px"] = item;
 
     doc.remove("blink");
 
-    // Dotted-leaf replacement through the table chain.
     set_nested_ours(
         &mut doc,
         &["net", "listen"],
@@ -117,9 +110,6 @@ fn set_nested_ours(doc: &mut DocumentMut, path: &[&str], mut item: Item) {
     table.insert(leaf, item);
 }
 
-/// A removed line takes its own text, same-line comment included, and leaves the comment
-/// lines above it. `rain.on` prints among the root's lines; `port` is `[net]`'s last line,
-/// and its comment stays under `[net]` although the same edit adds a table right after it.
 #[test]
 fn a_removed_line_keeps_the_comment_lines_above_it() {
     let mut doc: DocumentMut = "\
@@ -163,10 +153,6 @@ a = 1
     );
 }
 
-/// A removal that leaves its table with no entries takes the bare header with
-/// it, and the walk climbs while each parent is bare too. A table that keeps an
-/// entry, or a comment of its own (above its header, on its header line, or
-/// kept from the removed line), stays.
 #[test]
 fn a_removal_prunes_the_tables_it_left_bare() {
     fn pruned(text: &str, path: &[&str]) -> String {
@@ -196,7 +182,6 @@ fn a_removal_prunes_the_tables_it_left_bare() {
         pruned("rain = { on = true }\nx = 1\n", &["rain", "on"]),
         "x = 1\n"
     );
-    // A parent that still holds a table stops the walk.
     assert_eq!(
         pruned(
             "[s.feline]\nenabled = false\n[s.profanity]\nenabled = false\n",
@@ -204,8 +189,6 @@ fn a_removal_prunes_the_tables_it_left_bare() {
         ),
         "[s.profanity]\nenabled = false\n"
     );
-    // A header left holding only a sub-table prints no more, and comes back
-    // with the next line written under it.
     let text = "x = 1\n\n[s]\nenabled = false\n\n[s.feline]\nenabled = false\n";
     let mut doc: DocumentMut = text.parse().expect("parse");
     assert!(doc.remove_path_pruning(&["s", "enabled"]).is_some());
@@ -220,7 +203,6 @@ fn a_removal_prunes_the_tables_it_left_bare() {
         "# mine\n[s]\n[s.feline]\nenabled = false\n",
         "a commented header stays"
     );
-    // Comments are the person's, so their tables stay.
     for text in [
         "# mine\n[rain]\non = true\n",
         "[rain] # mine\non = true\n",
@@ -234,19 +216,11 @@ fn a_removal_prunes_the_tables_it_left_bare() {
     }
     let out = pruned("rain = { on = true } # mine\n", &["rain", "on"]);
     assert!(out.contains("# mine"), "{out:?}");
-    // Nothing removed, nothing pruned.
     let mut doc: DocumentMut = "[rain]\n".parse().expect("parse");
     assert!(doc.remove_path_pruning(&["rain", "on"]).is_none());
     assert_eq!(doc.to_string(), "[rain]\n");
 }
 
-/// THE COMMENT LINES UNDER A TABLE'S LAST LINE ARE THAT TABLE'S: run up to
-/// the first blank line before the next header or the end of the file, they
-/// describe what is above them. Pruning the table's last key keeps the
-/// header with them (it has a comment of its own), putting the key back
-/// gives the original text byte for byte, and a table added after it prints
-/// below them. Negative control: a comment touching the next header, after a
-/// blank line, is that header's, and stays with it when the table above goes.
 #[test]
 fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
     fn pruned(text: &str, path: &[&str]) -> String {
@@ -262,13 +236,11 @@ fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
         pruned(text, &["s", "feline", "enabled"]),
         "[machine]\nu = 1\n[s.feline]\n# kitties\n\n[harness]\nh = 1\n"
     );
-    // At the end of the file the comment block is the last table's.
     let at_end = "[machine]\nu = 1\n[s.feline]\nenabled = false\n# kitties\n";
     assert_eq!(
         pruned(at_end, &["s", "feline", "enabled"]),
         "[machine]\nu = 1\n[s.feline]\n# kitties\n"
     );
-    // Reset, then the key written again, is the original file.
     for original in [text, at_end] {
         let mut doc: DocumentMut = original.parse().expect("parse");
         doc.remove_path_pruning(&["s", "feline", "enabled"]);
@@ -279,8 +251,6 @@ fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
         );
         assert_eq!(doc.to_string(), original);
     }
-    // A table added after it prints below the comment, ahead of the next
-    // header.
     let mut doc: DocumentMut = text.parse().expect("parse");
     set_nested_ours(
         &mut doc,
@@ -293,7 +263,6 @@ fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
             && out.find("# kitties") < out.find("[s.emphasis]"),
         "{out:?}"
     );
-    // Negative control: a comment touching the next header is that header's.
     assert_eq!(
         pruned("z = 0\n[a]\nx = 1\n\n# about b\n[b]\ny = 1\n", &["a", "x"]),
         "z = 0\n\n# about b\n[b]\ny = 1\n"
@@ -303,7 +272,6 @@ fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
         "z = 0\n# about b\n[b]\ny = 1\n",
         "with no blank line the comment is the header's"
     );
-    // Every shape round-trips byte for byte.
     for shape in [
         text,
         at_end,
@@ -317,8 +285,6 @@ fn the_comment_lines_under_a_tables_last_line_are_that_tables() {
     }
 }
 
-/// A leading byte-order mark stays first whatever an edit removes or adds: Settings' Reset
-/// then Undo, and `packages.auto_update` giving way to `packages.enabled`.
 #[test]
 fn a_byte_order_mark_stays_first() {
     fn print(doc: &DocumentMut) -> String {
@@ -362,8 +328,6 @@ fn a_byte_order_mark_stays_first() {
     );
 }
 
-/// The diagnostics surface: a dotted lookup, and a span on the mutable document that
-/// points at the authored token.
 #[test]
 fn a_dotted_lookup_finds_the_value_and_keeps_its_span() {
     let doc: DocumentMut = CONFIG.parse().expect("parse");
@@ -398,8 +362,6 @@ fn dotted_item<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Item> {
     Some(item)
 }
 
-/// `Key::parse` is a parser, not a `split('.')`: a dot inside a quoted segment
-/// is part of the name.
 #[test]
 fn key_parsing_and_canonical_spelling() {
     for (expression, segments) in [
@@ -419,7 +381,6 @@ fn key_parsing_and_canonical_spelling() {
         assert!(Key::parse(bad).is_err(), "{bad:?} is not a key expression");
     }
 
-    // The canonical escaped spelling, used to build config key paths.
     for (raw, spelled) in [
         ("plain", "plain"),
         ("with space", "\"with space\""),
@@ -430,8 +391,6 @@ fn key_parsing_and_canonical_spelling() {
     }
 }
 
-/// The tree-walking surface: every arm of `Item`, both table spellings, and the
-/// type names diagnostics print.
 #[test]
 fn the_walking_surface() {
     let source = "\
@@ -463,7 +422,6 @@ k = 2
     assert!(matches!(doc.get("explicit"), Some(Item::Table(_))));
     assert!(matches!(doc.get("aot"), Some(Item::ArrayOfTables(_))));
 
-    // An implicit parent knows it was never authored.
     let implicit = doc
         .get("implicit")
         .and_then(Item::as_table)
@@ -478,14 +436,12 @@ k = 2
         .expect("explicit table");
     assert!(!explicit.is_implicit());
 
-    // Arrays, and the all-strings predicate the config editor uses.
     let arr = doc.get("arr").and_then(Item::as_array).expect("an array");
     assert!(arr.iter().all(Value::is_str));
     let mixed = doc.get("mixed").and_then(Item::as_array).expect("an array");
     assert!(!mixed.iter().all(Value::is_str));
     assert!(arr.span().is_some());
 
-    // Inline tables answer the table-like questions too.
     let inline = doc.get("inline").expect("inline");
     assert!(inline.is_table_like());
     assert_eq!(inline.get("x").and_then(Item::as_integer), Some(1));
@@ -510,7 +466,6 @@ k = 2
         3
     );
 
-    // Top-level iteration order is the authored order.
     let keys: Vec<&str> = doc.iter().map(|(k, _)| k).collect();
     assert_eq!(
         keys,
@@ -520,8 +475,6 @@ k = 2
     );
 }
 
-/// Interleaved dotted keys share one `net` node; grouping them would rewrite a file the
-/// save should leave alone.
 #[test]
 fn interleaved_dotted_keys_keep_their_authored_order() {
     let source = "net.listen = \"a\"\nfont_px = 12\nnet.timeout_ms = 5\n";
@@ -540,7 +493,6 @@ fn interleaved_dotted_keys_keep_their_authored_order() {
     );
 }
 
-/// A document built from nothing prints legal TOML, as the serializer relies on.
 #[test]
 fn a_document_built_by_hand_prints_legal_toml() {
     let mut doc = DocumentMut::new();
@@ -565,8 +517,6 @@ fn a_document_built_by_hand_prints_legal_toml() {
     );
 }
 
-/// `Value::from_str` (which `native_settings` uses) takes the whole input as one value:
-/// ` 1 `, `1\n`, `# c\n1` and `1 # c` are refused.
 #[test]
 fn a_standalone_value_is_the_whole_input() {
     const ACCEPTED: &[&str] = &[
@@ -589,10 +539,8 @@ fn a_standalone_value_is_the_whole_input() {
         "07:32:00",
     ];
     const REFUSED: &[&str] = &[
-        // Trivia is not part of a value.
-        " 1 ", "1\n", "\n1", "# c\n1", "1 # c", "1 # c\n", "\t[1]\t", "[1]\n\n", "", "  ",
-        // Not one value.
-        "1 2", "a = 1", "1\nx = 2", "[1,", "{ a = 1",
+        " 1 ", "1\n", "\n1", "# c\n1", "1 # c", "1 # c\n", "\t[1]\t", "[1]\n\n", "", "  ", "1 2",
+        "a = 1", "1\nx = 2", "[1,", "{ a = 1",
     ];
 
     for case in ACCEPTED {
@@ -617,8 +565,6 @@ fn a_standalone_value_is_the_whole_input() {
     }
 }
 
-/// `Item::is_*`, the predicates `native_config_language` types a setting with: every kind,
-/// in both polarities.
 #[test]
 fn item_kind_predicates() {
     const SOURCE: &str = "\
@@ -638,8 +584,6 @@ k = 1
 ";
     let ours: DocumentMut = SOURCE.parse().expect("parse");
 
-    // Columns: none, value, str, integer, float, bool, datetime, array, table,
-    // table_like, array_of_tables.
     const F: bool = false;
     const T: bool = true;
     for (key, expected) in [
@@ -670,18 +614,13 @@ k = 1
         assert_eq!(kinds, expected, "the kind predicates for `{key}`");
     }
 
-    // Indexing a missing key yields the vacant entry, a place to write.
     let vacant = &ours["absent"];
     assert!(vacant.is_none(), "a missing key is the vacant entry");
     assert!(!vacant.is_value() && !vacant.is_str() && !vacant.is_table_like());
 }
 
-/// A key added after a final line with no terminator (VS Code's default save) starts a line
-/// of its own. Each case prints back unedited byte-for-byte, keeps every source byte through
-/// the edit, parses back, and has both the old key and the new one.
 #[test]
 fn a_key_added_after_an_unterminated_final_line_starts_its_own_line() {
-    // (source, path of the new key, path of a key the source already had)
     let cases: &[(&str, &[&str], &[&str])] = &[
         ("a = 1", &["b"], &["a"]),
         ("a = 1 # note", &["b"], &["a"]),
@@ -725,9 +664,6 @@ fn a_key_added_after_an_unterminated_final_line_starts_its_own_line() {
     }
 }
 
-/// A new table, or a new element of an array of tables, after an unterminated final line
-/// gets its header on a line of its own, also when its decor asks for no blank line before
-/// it (prefix `""`).
 #[test]
 fn a_table_added_after_an_unterminated_final_line_starts_its_own_line() {
     for source in ["a = 1", "a = 1 # note", "[s]\nx = 1", "[[k]]\nx = 1 # c"] {
@@ -768,8 +704,6 @@ fn a_table_added_after_an_unterminated_final_line_starts_its_own_line() {
     }
 }
 
-/// A nested write through an inline table lands in it: the `[header]` `Table` the walk
-/// vivifies is converted to the inline spelling, not dropped by the encoder.
 #[test]
 fn a_nested_write_through_an_inline_table_lands_in_it() {
     let source = "# sparkles\nsparkle_words = { lexicon = \"my.txt\" } # keep\nfont_px = 12\n";
@@ -811,8 +745,6 @@ fn a_nested_write_through_an_inline_table_lands_in_it() {
         Some(12)
     );
 
-    // An array of tables given to an inline table becomes an array of inline
-    // tables, and nested tables convert all the way down.
     let mut doc: DocumentMut = source.parse().expect("parse");
     let words = doc
         .as_table_mut()

@@ -155,7 +155,8 @@ fn offered_restoration(
     cfg: Option<&aterm_core::config::TerminalConfig>,
     used: &mut u64,
 ) -> Restoration {
-    // SAFETY: the region's one writer is this thread's journal, which writes nothing during the call.
+    // SAFETY: the region's one writer is this thread's journal, which writes nothing during
+    // the call; the mapping is dropped before it returns.
     unsafe { restore_offered(companion, attempts, cfg, used) }
 }
 
@@ -553,7 +554,8 @@ fn the_brake_and_unusable_offers_fall_to_the_rungs_below() {
         "map"
     );
     let (_region, writable) =
-        // SAFETY: the writable twin is only offered to a restore that refuses it before it maps anything.
+        // SAFETY: the writable twin is only offered to a restore that refuses it before it
+        // maps anything; nothing writes, resizes or maps it through the descriptor.
         unsafe { aterm_uds::shm::testing::create_with_writable_custody(REGION_LEN) }
             .expect("region");
     let offer = OfferedCompanion {
@@ -565,7 +567,8 @@ fn the_brake_and_unusable_offers_fall_to_the_rungs_below() {
         meta(offered_restore(Some(offer), 0, None, &mut used)),
         "map"
     );
-    // SAFETY: the blank region is never written.
+    // SAFETY: the blank region is never written: `_blank` stays inert while the restore
+    // maps the custody descriptor read-only, and nothing else holds it.
     let (_blank, custody) = unsafe { aterm_uds::shm::Region::create(REGION_LEN) }.expect("region");
     let offer = OfferedCompanion {
         region: custody,
@@ -2464,7 +2467,8 @@ fn a_replacement_the_parser_defers_waits_for_the_programs_next_bytes() {
 fn custody_bytes(custody: &OwnedFd, len: u64) -> Vec<u8> {
     use std::os::fd::AsFd as _;
     let len = usize::try_from(len).expect("a region's length");
-    // SAFETY: the region's one writer is this thread's journal, which writes nothing while the mapping lives.
+    // SAFETY: the region's one writer is this thread's journal, which writes nothing while
+    // the mapping lives; the mapping is dropped before this returns.
     let region = unsafe { aterm_uds::shm::Region::map_readonly(custody.as_fd(), len) }
         .expect("the custody maps");
     let mut bytes = vec![0u8; region.len()];

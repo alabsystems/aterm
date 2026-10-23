@@ -76,7 +76,13 @@ fn under(rel: &str, spec: &str) -> bool {
 }
 
 impl Selection {
-    /// Parses the manifest's lines (`#` to the end of a line is a comment).
+    /// Parses the manifest's lines (`#` to the end of a line is a comment). `Err`
+    /// names the 1-based line of a pathspec this reading cannot follow or the
+    /// engine refuses.
+    ///
+    /// # Errors
+    /// A line holding an absolute path, class, escape or git magic, or nothing
+    /// once its `./` is stripped.
     pub fn parse(manifest: &str) -> Result<Self, (usize, String)> {
         let mut include = Vec::new();
         let mut exclude: Vec<Spec> = CENTRAL_DENY

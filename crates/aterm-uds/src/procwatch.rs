@@ -283,7 +283,8 @@ impl ProcWatch {
         }
         // SAFETY: `raw` is a fresh descriptor this process exclusively owns.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        // SAFETY: Set close-on-exec on the kqueue descriptor.
+        // SAFETY: Set close-on-exec on the kqueue descriptor. F_SETFD takes an int and touches
+        // only this descriptor's flags.
         unsafe { kq::fcntl(fd.as_raw_fd(), kq::F_SETFD, kq::FD_CLOEXEC) };
         let shell_notes = libc::NOTE_FORK | libc::NOTE_EXEC | kq::NOTE_EXIT;
         if register(&fd, &[shell_pid], shell_notes) != [true] {
@@ -509,7 +510,8 @@ fn register(fd: &std::os::fd::OwnedFd, pids: &[i32], fflags: u32) -> Vec<bool> {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `n` change entries and `n` receipt slots, live for the call.
+    // SAFETY: `n` change entries and `n` receipt slots, live for the call; EV_RECEIPT
+    // answers every change in its own slot (never a pending event: the slots are full).
     let got = unsafe {
         kq::kevent(
             fd.as_raw_fd(),

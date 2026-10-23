@@ -9,8 +9,6 @@ use super::super::test_support::history_trimmed;
 use super::{HistoryFenceBroken, OlderHistory, OlderHistoryRefusal};
 use aterm_scrollback::{Line, Scrollback};
 
-/// A grid with a small ring and a tiered store whose hot tier spills into
-/// compressed blocks early, so a few hundred lines cross every tier.
 fn tiered(rows: u16, cols: u16) -> Grid {
     let mut store = Scrollback::new(16, 64, 64 * 1024 * 1024);
     store.set_line_limit(None);
@@ -31,8 +29,6 @@ fn text(line: &Line) -> String {
     line.to_string().trim_end().to_string()
 }
 
-/// Read the whole fenced history the way the exporter does: short chunks by
-/// absolute row.
 fn export(grid: &Grid, chunk: usize) -> Result<Vec<Line>, HistoryFenceBroken> {
     let fence = grid.history_fence();
     let mut out = Vec::new();
@@ -117,10 +113,6 @@ fn a_scrollback_clear_breaks_the_fence() {
     );
 }
 
-/// A rows grow that reveals history breaks the fence: revealed lines return to
-/// the screen under their own keys and, rewritten and pushed back, name other
-/// text under the same keys. Negative control: a rows shrink and later output
-/// leave the fence standing.
 #[test]
 fn a_rows_grow_that_reveals_history_breaks_the_fence() {
     let mut grid = tiered(5, 30);
@@ -150,7 +142,6 @@ fn a_rows_grow_that_reveals_history_breaks_the_fence() {
         Some(HistoryFenceBroken::Moved)
     );
 
-    // Negative control: nothing revealed, nothing moved.
     let mut quiet = tiered(5, 30);
     write_lines(&mut quiet, "old", 0, 40);
     let fence = quiet.history_fence();
@@ -169,8 +160,6 @@ fn eviction_past_the_reader_is_evicted_not_a_gap() {
     write_lines(&mut grid, "h", 0, 60);
     let fence = grid.history_fence();
     write_lines(&mut grid, "flood", 0, 200);
-    // Rows leave the ring into a lazy staging buffer and are evicted when it
-    // settles into the store (any history read settles it).
     let _ = grid.scrollback_mut();
     assert!(fence.holds_at(&grid.history_fence()));
     assert_eq!(
@@ -187,7 +176,6 @@ fn older_history_lands_before_the_oldest_line_and_keeps_every_key() {
     write_lines(&mut source, "old", 0, 120);
     let exported = export(&source, 9).expect("exported");
 
-    // The successor: a grid built from a small carry, its counter reserved.
     let mut grid = tiered(4, 20);
     write_lines(&mut grid, "carried", 0, 6);
     let claim = grid.reserve_older_history_keys(exported.len() as u64);
@@ -214,9 +202,6 @@ fn older_history_lands_before_the_oldest_line_and_keeps_every_key() {
     );
 }
 
-/// A grid continuing the source's numbering (checkpoint restore) has the
-/// imported lines' keys free below its oldest row, so the reserve raises only
-/// the shortfall and a carried key (a shell mark) keeps naming its line.
 #[test]
 fn a_continued_numbering_reserves_only_the_shortfall() {
     let mut grid = tiered(4, 20);
@@ -238,7 +223,6 @@ fn a_continued_numbering_reserves_only_the_shortfall() {
     assert_eq!(grid.oldest_absolute_row(), oldest - lines.len() as u64);
     assert_eq!(history_trimmed(&grid)[0], "old0");
 
-    // Fewer free keys than lines: only the difference is raised.
     let mut short = tiered(4, 20);
     write_lines(&mut short, "carried", 0, 6);
     let floor = u64::from(short.rows()) + short.scrollback_lines() as u64;
@@ -257,7 +241,6 @@ fn an_unreserved_import_raises_the_counter_and_says_it_renumbered() {
         .map(|i| Line::from(format!("old{i}").as_str()))
         .collect();
     let epoch_before = grid.history_renumber_epoch();
-    // A claim that reserves nothing: the counter stays where it was.
     let claim = grid.reserve_older_history_keys(0);
     grid.attach_older_history(OlderHistory::build(&lines, 20, 20), claim)
         .expect("attached");
@@ -341,8 +324,6 @@ fn a_ring_only_grid_has_nothing_to_place_history_in_front_of() {
     ));
 }
 
-/// An attach after an ED3 since the reserve is refused and hands the built
-/// history back. Negative control: the same attach with no clear lands.
 #[test]
 fn a_scrollback_cleared_after_the_reserve_refuses_the_import() {
     let lines: Vec<Line> = (0..40)

@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// A snapshot is final on the GPU path: `GpuRenderer::render_input` plans glyphs
-// through its inner CPU renderer, so a fresh renderer's first snapshot of a glyph
-// the primary face lacks could draw the provisional `.notdef` a background
-// fallback parse leaves. The capture path (`render_input_target`) settles the
-// parses the encode started and re-encodes while the font epoch moved during
-// the pass. Keying on the epoch matters: a chain can land between two rows and
-// be consumed by the later row's probe, leaving nothing to settle while the
-// earlier row is still blank.
-//
-// The renderer under test is deliberately not font-settled; a settled CPU
-// renderer is the oracle for which glyphs route off the primary face.
-//
-// No GPU or no font: COULD NOT RUN.
+
+//! Tests that a fresh GPU renderer's first snapshot settles lazy fallback font parses.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{FaceId, Theme};
@@ -30,8 +18,6 @@ fn a_fresh_gpu_renderers_first_snapshot_paints_every_fallback_glyph() {
     let px = 20.0;
     let mut oracle = common::cpu(px, theme);
     oracle.debug_block_on_lazy_fallbacks();
-    // The message band's fallback-face glyphs; a glyph the primary covers never
-    // touches the chain, and a glyph nothing covers is honest tofu either way.
     let probed: Vec<char> = ['\u{21BB}', '\u{26A0}', '\u{21E3}']
         .into_iter()
         .filter(|&ch| oracle.glyph_key_text(ch).source != FaceId::Primary)
@@ -71,12 +57,7 @@ fn a_fresh_gpu_renderers_first_snapshot_paints_every_fallback_glyph() {
         (cols * cw, rows * ch_px),
         "an unpadded snapshot of the grid"
     );
-    // Each cell's ground is its own `bg` (a written cell carries the terminal's
-    // default background, an untouched one the theme's), within GPU rounding;
-    // the written blank at col 0 is the control.
     let ink = |col: usize, row: usize| -> usize {
-        // A trailing untouched cell is elided from its row (a default-bg
-        // span) and painted in the theme's bg.
         let ground = input.cells[row].get(col).map_or(theme.bg, |c| {
             (u32::from(c.bg[0]) << 16) | (u32::from(c.bg[1]) << 8) | u32::from(c.bg[2])
         });

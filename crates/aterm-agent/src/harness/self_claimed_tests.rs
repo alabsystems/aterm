@@ -45,6 +45,7 @@ fn live() -> Live {
         codex_home: Some("/Users//u/.codex".to_string()),
         cwd: Some(PathBuf::from("/work")),
         twin: Some(PathBuf::from("/Users//u/.aterm/agents/codex")),
+        managed_launch: None,
     }
 }
 
@@ -102,6 +103,80 @@ fn a_uuid_is_its_one_textual_form() {
     ] {
         assert!(!is_uuid(bad), "{bad:?}");
     }
+}
+
+/// A real producer's missing stable entry makes its shim exec physical A, but
+/// Codex preserves the producer-bound route in its session record.
+#[cfg(unix)]
+#[test]
+fn a_raw_fallback_record_keeps_its_producer_bound_resume_route() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let temp = aterm_tempfile::Builder::new()
+        .prefix("atpkg-raw-resume-")
+        .tempdir()
+        .expect("private producer prefix");
+    let layout = atpkg::store::Layout {
+        prefix: temp.path().canonicalize().unwrap(),
+    };
+    let package = layout.prefix.join("store/codex/2026101601");
+    std::fs::create_dir_all(package.join("bin")).unwrap();
+    let physical = package.join("bin/codex");
+    std::fs::write(&physical, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&physical, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        package.join("codex-package.json"),
+        r#"{"layoutVersion":1,"entrypoint":"bin/codex","version":"A"}"#,
+    )
+    .unwrap();
+    std::fs::write(package.join("alab-build.json"), "{}").unwrap();
+    atpkg::store::mark_build_ready(&package).unwrap();
+    atpkg::activate::activate_build(&layout, &package).unwrap();
+    atpkg::activate::install_shims(
+        &layout,
+        &package,
+        &["codex".to_owned()],
+        atpkg::Aliases::Off,
+    )
+    .unwrap();
+    let entry = layout.prefix.join("store/codex/exec/codex");
+    assert_eq!(std::fs::read_link(&entry).unwrap(), physical);
+    std::fs::remove_file(&entry).unwrap();
+    let args = atpkg::caller_shell::ProcArgs {
+        exec_path: physical.to_str().unwrap().to_owned(),
+        argv: [
+            physical.to_str().unwrap(),
+            "--search",
+            "-m",
+            "gpt-5",
+            "-s",
+            "read-only",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+        env: vec![
+            "ATPKG_MANAGED_LAUNCH_PID=4242".to_owned(),
+            format!("ATPKG_MANAGED_LAUNCH_PATH={}", entry.display()),
+            format!("ATPKG_MANAGED_LAUNCH_TARGET={}", physical.display()),
+        ],
+    };
+    let run = Live {
+        exec_path: args.exec_path.clone(),
+        image: Some(physical),
+        argv: args.argv.clone(),
+        twin: Some(layout.prefix.join("agents/codex")),
+        managed_launch: atpkg::managed_launch::Hints::capture(&layout, &args),
+        ..live()
+    };
+    assert!(run.managed_launch.is_some());
+    assert!(
+        !entry.exists(),
+        "the producer's physical fallback was necessary"
+    );
+    let good = record(&line(entry.to_str().unwrap(), &ROOT), &[]);
+    assert_eq!(
+        validate(&good, 4242, &run).map(|resume| resume.argv),
+        good.resume_argv.clone().ok_or("no-resume-line"),
+    );
 }
 
 /// THE VALIDATION: the line the live process itself ran — on its launch

@@ -1,27 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Never-panic fuzz of the scrollback decode surfaces, as unit tests.
-//!
-//! Warm- and cold-tier blocks and checkpoint bodies are read back and may be
-//! CORRUPT (truncated writes, crashed sessions, hostile checkpoints). Every byte-level
-//! decoder on that read path must NEVER panic on arbitrary input — a panic here
-//! crashes the terminal when it tries to scroll back through a corrupt page. The
-//! tests drive the decode entry points (`lz4::decompress_size_prepended`,
-//! `Line::deserialize`, `deserialize_lines`) with crafted-plus-random bytes and
-//! assert only that each call returns (Ok/Err/None/empty).
-//!
-//! As unit tests they need no feature (the decoders are reachable
-//! crate-internally) and run in every test run, at [`ITERS`] deterministic
-//! inputs per loop.
+//! Deterministic fuzz tests for scrollback byte-level decoders.
 
 use crate::lz4;
 use crate::{Line, deserialize_lines};
 
-/// Inputs per fuzz loop.
 const ITERS: u32 = 10_000;
 
-/// Deterministic LCG: same generator shape as `aterm-parser`'s fuzz harness.
 struct Lcg(u64);
 
 impl Lcg {
@@ -38,38 +24,27 @@ impl Lcg {
         (self.0 >> 33) as u32
     }
 
-    /// Random byte vector of length `0..max_len`.
     fn bytes(&mut self, max_len: u32) -> Vec<u8> {
         let len = (self.next_u32() % max_len) as usize;
         (0..len).map(|_| (self.next_u32() & 0xFF) as u8).collect()
     }
 }
 
-/// LZ4 block decoder over an attacker-controlled size prefix and body: the
-/// prefix bound, the compression-bomb ratio gate, back-reference validation
-/// and the size-mismatch check. An `Ok` is exactly the length the prefix claims.
 #[test]
 fn fuzz_lz4_decompress_never_panics() {
     let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15);
     for i in 0..ITERS {
-        // Random bytes, biased so the first four bytes (the LE size prefix)
-        // sometimes claim huge sizes, sometimes match the body, sometimes are 0.
         let mut input = rng.bytes(96);
 
         if input.len() >= 4 {
             match i % 6 {
-                // Honest-ish prefix: claim a size near the body length.
                 0 => {
                     let claim = (input.len() as u32).saturating_sub(4);
                     input[..4].copy_from_slice(&claim.to_le_bytes());
                 }
-                // Compression-bomb shape: tiny body, enormous claim.
                 1 => input[..4].copy_from_slice(&0x00FF_FFFFu32.to_le_bytes()),
-                // Over the page cap.
                 2 => input[..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()),
-                // Zero-size prefix (empty-decode fast path when body is empty).
                 3 => input[..4].copy_from_slice(&0u32.to_le_bytes()),
-                // Leave the random prefix as-is for cases 4/5.
                 _ => {}
             }
         }
@@ -80,7 +55,6 @@ fn fuzz_lz4_decompress_never_panics() {
         }
     }
 
-    // A handful of explicit edge inputs the random stream rarely lands on.
     for case in [
         &b""[..],
         &b"\x00"[..],
@@ -99,16 +73,12 @@ fn fuzz_lz4_decompress_never_panics() {
     }
 }
 
-/// Single-line decoder over arbitrary bytes, biased to valid version bytes so
-/// the length, count and UTF-8 checks of each format branch are reached.
 #[test]
 fn fuzz_line_deserialize_never_panics() {
     let mut rng = Lcg::new(0xD1B5_4A32_D192_ED03);
     for i in 0..ITERS {
         let mut input = rng.bytes(128);
         if !input.is_empty() {
-            // Legacy, v1 attrs, v2 hyperlinks, v3 hyperlink ids, and 255, which
-            // takes the v4 underline-colour path (every version >= 4 does).
             input[0] = match i % 5 {
                 0 => 0,
                 1 => 1,
@@ -121,13 +91,6 @@ fn fuzz_line_deserialize_never_panics() {
     }
 }
 
-/// Block decoder (`deserialize_lines`) over arbitrary bytes — this is the
-/// function fed by the warm-tier `stored_line_count` / `logical_suffix` read
-/// path. The 4-byte count header plus a stream of variable-length line records
-/// are all attacker-controlled. Biased so the first four bytes claim a line
-/// count (absurd, small, zero or random) and the body looks like plausible
-/// v0..v3 records — a version byte every 1-13 bytes, so the version-specific
-/// framing helpers are reached, which uniform bytes rarely do.
 #[test]
 fn fuzz_deserialize_lines_never_panics() {
     let mut rng = Lcg::new(0x2545_F491_4F6C_DD1D);
@@ -135,8 +98,6 @@ fn fuzz_deserialize_lines_never_panics() {
         let mut input = rng.bytes(160);
 
         if input.len() >= 4 {
-            // Bias the claimed line count: sometimes absurdly large (stresses
-            // pre-allocation clamping), sometimes small/honest.
             let count: u32 = match i % 4 {
                 0 => 0xFFFF_FFFF,
                 1 => rng.next_u32() % 8,
@@ -145,9 +106,6 @@ fn fuzz_deserialize_lines_never_panics() {
             };
             input[..4].copy_from_slice(&count.to_le_bytes());
 
-            // Plausible version bytes through the record area send the size
-            // helpers (`line_size_v0`, `line_size_v1v2`, `hyperlinks_size_*`)
-            // down their non-trivial branches.
             let mut p = 4;
             while p < input.len() {
                 input[p] = (rng.next_u32() % 4) as u8; // version 0..3
@@ -156,8 +114,6 @@ fn fuzz_deserialize_lines_never_panics() {
         }
 
         let decoded = std::hint::black_box(deserialize_lines(&input));
-        // The count clamp: the minimum line record is 5 bytes, so a payload of
-        // `len` bytes holds at most `(len - 4) / 5` lines.
         let max_possible = input.len().saturating_sub(4) / 5;
         assert!(
             decoded.len() <= max_possible,
@@ -167,7 +123,6 @@ fn fuzz_deserialize_lines_never_panics() {
         );
     }
 
-    // Edge inputs the random stream rarely lands on.
     for case in [
         &b""[..],
         &b"\x00\x00\x00"[..],            // < 4 bytes -> empty

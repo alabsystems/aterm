@@ -21,8 +21,6 @@ enum Disposition {
 }
 
 /// Ghost fields still observable after the real owner-map entry is removed.
-/// Live-hold state is projected from `App::physical_press_owners`; this keeps
-/// only the completed-episode history the shipping map forgets.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProjectionWitness {
     phase: i64,
@@ -101,10 +99,6 @@ fn model_window(actual: WindowId, window_a: WindowId, window_b: WindowId) -> i64
     }
 }
 
-/// The delivery a key encoded against the stub's sentinel (`-1`) sink reads: the
-/// inline write's failure where keys are written inline (unix), accepted where every
-/// key is handed to the session's ordered writer, which writes it off this thread
-/// (Windows: `app_input`'s `UI_WRITES_CAN_BLOCK`). Either way it was encoded there.
 fn encoded_delivery() -> crate::input::Delivery {
     if cfg!(windows) {
         crate::input::Delivery::Full
@@ -246,8 +240,6 @@ fn two_window_app() -> (App, WindowId, WindowId, u64, u64) {
     (app, window_a, window_b, session_a, session_b)
 }
 
-/// The two-window owner-map Tier-1 body, on the conformance stack: its `two_window_app`
-/// outgrows libtest's 2 MiB thread stack in an unoptimized build.
 #[test]
 fn the_real_input_release_pairing_conforms() {
     crate::conformance_support::on_conformance_stack("input_release_pairing", run_conformance);
@@ -256,7 +248,6 @@ fn the_real_input_release_pairing_conforms() {
 fn run_conformance() {
     let model = input_release_pairing_model();
 
-    // A repeat arriving without any observed press epoch is fail-closed.
     let (mut untracked_app, untracked_a, untracked_b, _, _) = two_window_app();
     let untracked_physical = PhysicalKey::Code(KeyCode::KeyZ);
     let untracked_initial = project(
@@ -286,8 +277,6 @@ fn run_conformance() {
         &untracked_silent,
     );
 
-    // Consumed A press -> focus B -> release delivered through B. The real
-    // release branch removes A's owner/mirror and returns before seam egress.
     let (mut app, window_a, window_b, _, _) = two_window_app();
     let physical = PhysicalKey::Code(KeyCode::KeyA);
     let initial_witness = ProjectionWitness::initial();
@@ -351,9 +340,6 @@ fn run_conformance() {
             .contains(&physical)
     );
 
-    // Forwarded A/session-A press -> focus B/session-B -> release through B.
-    // Kitty event types on A make the sentinel sink's Failed delivery prove
-    // the release was encoded and attempted, not a silent legacy no-op.
     let (mut app, window_a, window_b, session_a, session_b) = two_window_app();
     let physical = PhysicalKey::Code(KeyCode::KeyB);
     let key = TKey::Named(NamedKey::ArrowUp);
@@ -493,8 +479,6 @@ fn run_conformance() {
     );
     assert!(!app.physical_press_owners.contains_key(&physical));
 
-    // A configured raw sequence has different release semantics (silent),
-    // but its repeated bytes obey the same immutable cross-focus target.
     let (mut raw_app, raw_window_a, raw_window_b, raw_session_a, raw_session_b) = two_window_app();
     let raw_physical = PhysicalKey::Code(KeyCode::KeyC);
     let raw_bytes = b"\x1b[99~".to_vec();
@@ -591,8 +575,6 @@ fn run_conformance() {
     );
     require_transition("ReleaseLiteralPress", &raw_repeated, &raw_released);
 
-    // Repeatable GUI actions are also bound to their press window. A real
-    // font-zoom hold crosses focus A→B without becoming B's key episode.
     let (mut local_app, local_a, local_b, _, _) = two_window_app();
     let local_physical = PhysicalKey::Code(KeyCode::KeyD);
     let local_initial = project(
@@ -646,9 +628,6 @@ fn run_conformance() {
     );
     require_transition("ReleaseLocalRepeatPress", &local_repeated, &local_released);
 
-    // Non-vacuity: a resolver that sends both repeats and the release to
-    // current focus B. Each mutant must violate its target invariant and be
-    // rejected as a transition by the healthy derived model used above.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let orphan_repeat = buggy
         .successors("SwallowUntrackedRepeat", &untracked_initial)
@@ -664,12 +643,6 @@ fn run_conformance() {
         "NEGATIVE CONTROL: orphan untracked repeat must be rejected\n{out}"
     );
 
-    // A release-time chord re-lookup, replayed on the real tables: with Ctrl
-    // let go mid-hold, re-asking `[key_sequences]` (`ctrl+c`) misses and falls
-    // through to the encoder, which owes a Kitty release for a press the PTY
-    // never saw; `[keybindings]` (`ctrl+=` zoom) misses the same way. Each real
-    // miss, applied to the real released state, is the `Buggy=1` release, and
-    // the healthy model refuses it.
     let ctrl = aterm_window::keyboard::ModifiersState::CONTROL;
     let none = aterm_window::keyboard::ModifiersState::empty();
     let sequences = crate::keybinding::KeySequences::from_config(Some(

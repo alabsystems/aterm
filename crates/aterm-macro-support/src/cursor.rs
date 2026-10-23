@@ -115,7 +115,8 @@ impl Cursor {
         }
     }
 
-    /// Whether the next two tokens spell the two-character operator `op` (`::`, `->`, `=>`).
+    /// Whether the next two tokens spell the two-character operator `op`
+    /// (`::`, `->`, `=>`): the first joint to the second.
     pub fn peek_op(&mut self, op: &str) -> bool {
         self.flatten();
         let mut chars = op.chars();
@@ -277,7 +278,6 @@ impl Cursor {
                         let word = i.to_string();
                         let ty = matches!(due, Due::TypeStart | Due::TypePath);
                         due = if std::mem::take(&mut label) {
-                            // A lifetime in a type, or a label before `:` or
                             if ty { Due::TypeStart } else { Due::Operand }
                         } else if word == "as" {
                             Due::TypeStart
@@ -350,7 +350,8 @@ pub fn is_keyword(tt: &TokenTree, word: &str) -> bool {
 /// What [`Cursor::take_expr`] expects next at the expression's top level.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Due {
-    /// An operand: at the start.
+    /// An operand: at the start, after a binary or prefix operator or `::`, or after a keyword
+    /// that takes one.
     Operand,
     /// An operator: an operand has been read.
     Operator,

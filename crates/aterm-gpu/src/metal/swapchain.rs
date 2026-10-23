@@ -39,7 +39,8 @@ unsafe extern "C" {
 /// `name` must be NULL or a live `CFString`.
 #[cfg(test)]
 unsafe fn cf_string_text(name: *const c_void) -> Option<String> {
-    // SAFETY: a live CFString is toll-free bridged to NSString.
+    // SAFETY: a live CFString is toll-free bridged to NSString; the caller vouches for it, and it
+    // is copied out at once.
     (!name.is_null()).then(|| unsafe { super::ffi::ns_string_text(Id::from_ptr(name.cast_mut())) })
 }
 
@@ -201,7 +202,8 @@ impl Swapchain {
     ) -> Result<Self, String> {
         let layer = Self::new_layer()?;
         Self::configure(&layer, device, config)?;
-        // SAFETY: `addSublayer:` is a void message on the live parent that retains the sublayer.
+        // SAFETY: `addSublayer:` is a void message on the live parent that retains the sublayer;
+        // our +1 stays ours for drop to balance.
         unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             add(parent.id(), sel(c"addSublayer:"), layer.id());
@@ -228,7 +230,9 @@ impl Swapchain {
             return;
         }
         let _pool = AutoreleasePool::new();
-        // SAFETY: `superlayer` and `contentsScale` are valid messages on the live layer.
+        // SAFETY: `superlayer` answers a borrowed `CALayer` or nil, never released here;
+        // `contentsScale` and `setContentsScale:` pass a `CGFloat` by value, scalar on every
+        // target, so no `objc_msgSend_stret`.
         unsafe {
             let superlayer: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let parent = superlayer(self.layer.id(), sel(c"superlayer"));
@@ -301,11 +305,13 @@ impl Swapchain {
         }
     }
 
-    /// Write every axis in the module header's table onto the layer.
+    /// Write `config`'s axes onto the layer, with the device, the EDR flag and
+    /// colorspace its format implies, and `allowsNextDrawableTimeout = YES`.
     fn configure(layer: &Obj, device: &Device, config: &SwapchainConfig) -> Result<(), String> {
         config.validate()?;
         let _pool = AutoreleasePool::new();
-        // SAFETY: property setters on the live layer with balanced +1 colorspace release.
+        // SAFETY: documented property setters on the live layer, each prototype written out; the
+        // colorspace is created at +1 and released after `setColorspace:`, which retains it.
         unsafe {
             let set_obj: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             let set_usize: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
@@ -517,7 +523,9 @@ impl Swapchain {
     /// The layer colorspace's CoreGraphics name, or `None` when nil or unnamed.
     #[cfg(test)]
     pub(crate) fn colorspace_name(&self) -> Option<String> {
-        // SAFETY: `colorspace` and `CGColorSpaceGetName` return borrowed references.
+        // SAFETY: `colorspace` answers a +0 `CGColorSpaceRef` or NULL, and `CGColorSpaceGetName` a
+        // CFString (or NULL) the colorspace owns, copied out at once; nothing is retained or
+        // released.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> *mut c_void = checked_msg();
             let space = f(self.layer.id(), sel(c"colorspace"));
@@ -544,7 +552,8 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         if self.is_attached {
-            // SAFETY: `removeFromSuperlayer` detaches the live layer from its parent.
+            // SAFETY: `removeFromSuperlayer` detaches the live layer, a no-op if it is already
+            // detached; the parent's retain drops and our +1 drops with `Obj`.
             unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
                 f(self.layer.id(), sel(c"removeFromSuperlayer"));
@@ -561,7 +570,8 @@ pub(crate) struct LayerAcquire {
     layer: Option<Obj>,
 }
 
-// SAFETY: `LayerAcquire` holds a retained `CAMetalLayer` whose `nextDrawable` is thread-safe.
+// SAFETY: `LayerAcquire` holds a retained `CAMetalLayer`, whose `nextDrawable` may run on another
+// thread; its owner defers every layer mutation until the request completes.
 unsafe impl Send for LayerAcquire {}
 
 impl LayerAcquire {
@@ -591,7 +601,8 @@ pub(crate) struct OwnedDrawable {
     objects: Option<(Obj, Obj)>,
 }
 
-// SAFETY: Metal drawable and texture references support cross-thread handoff.
+// SAFETY: Metal drawable and texture references support cross-thread handoff; ownership moves once
+// and neither reference is accessed concurrently.
 unsafe impl Send for OwnedDrawable {}
 
 impl OwnedDrawable {
@@ -612,7 +623,8 @@ fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     let _pool = AutoreleasePool::new();
     #[cfg(test)]
     encoder::queue_ffi_census::note();
-    // SAFETY: `layer` is a retained `CAMetalLayer` and both +0 returns are retained under the pool.
+    // SAFETY: `layer` is a retained `CAMetalLayer`; both +0 returns are retained under the pool and
+    // nil refuses. The caller serializes this with layer mutation and other acquisitions.
     unsafe {
         let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let drawable = Obj::retain(get(layer.id(), sel(c"nextDrawable")))?;
@@ -648,7 +660,8 @@ impl Frame<'_> {
     /// swapchain's loss domain, the only form the encoder's write verbs
     /// accept; a session on a different latch is refused there.
     pub(crate) fn render_target(&self) -> super::resources::SealedTexture {
-        // SAFETY: retaining a live +1 texture.
+        // SAFETY: retaining a live +1 texture; the sealed handle releases its
+        // own +1 on drop, independently of this frame's.
         let obj =
             unsafe { Obj::retain(self.texture.id()) }.expect("retain of a live drawable texture");
         super::resources::SealedTexture::from_parts(obj, Arc::clone(&self.swapchain.latch))
@@ -693,7 +706,9 @@ impl Frame<'_> {
         #[cfg(test)]
         encoder::queue_ffi_census::note();
         let _pool = AutoreleasePool::new();
-        // SAFETY: `commandBuffer` returns a +0 buffer retained into the ticket.
+        // SAFETY: `commandBuffer` returns a +0 buffer, retained into the ticket
+        // so callers can wait after the pool pops. `presentDrawable:` then
+        // `commit`, in that order.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let raw = get(session.one_shot_queue().id(), sel(c"commandBuffer"));
@@ -722,7 +737,9 @@ unsafe fn register_presented_handler(drawable: Id) {
     let registered_s = unsafe { CACurrentMediaTime() };
     let (serial, tag) = crate::present_glass::registration_begin(registered_s);
     let handler = move |presented: Id| {
-        // SAFETY: Metal passes the live drawable being reported.
+        // SAFETY: Metal passes the live drawable being reported;
+        // `presentedTime` is a `CFTimeInterval` (double) getter, 0 when the
+        // drawable was never shown.
         let presented_s = unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
             get(presented, sel(c"presentedTime"))
@@ -733,10 +750,12 @@ unsafe fn register_presented_handler(drawable: Id) {
             crate::present_glass::classify(registered_s, presented_s),
         );
     };
-    // SAFETY: `MTLDrawablePresentedHandler` matches `void (^)(id<MTLDrawable>)`.
+    // SAFETY: `MTLDrawablePresentedHandler` is `void (^)(id<MTLDrawable>)`, exactly `(Id) -> ()`,
+    // and the closure captures only `Copy` values.
     let block = unsafe { aterm_objc::RcBlock::new1(handler) };
     let Some(block) = block else { return };
-    // SAFETY: `addPresentedHandler:` copies and retains the block.
+    // SAFETY: `addPresentedHandler:` copies the block, so ours is released independently when
+    // `block` drops.
     unsafe {
         let add: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::BlockPtr) = checked_msg();
         add(drawable, sel(c"addPresentedHandler:"), block.as_block_ptr());
@@ -1766,7 +1785,8 @@ mod tests {
     /// `-[CALayer sublayers][0]`, or null.
     fn first_sublayer(layer: &Obj) -> Id {
         let _pool = AutoreleasePool::new();
-        // SAFETY: `sublayers` and `count` are valid messages on the live view's layer.
+        // SAFETY: `sublayers` answers a +0 NSArray or nil and `objectAtIndex:` a +0 element, which
+        // callers only compare by pointer.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let arr = get(layer.id(), sel(c"sublayers"));
@@ -1898,7 +1918,8 @@ mod tests {
             (sc, parent.id())
         };
         let child = sc.layer.clone_retained();
-        // SAFETY: scalar object-property read on the retained layer.
+        // SAFETY: a scalar object-property read on the retained layer; the result is compared,
+        // never dereferenced or released.
         let parent_of = || unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             get(child.id(), sel(c"superlayer"))

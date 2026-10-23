@@ -3,12 +3,6 @@
 
 use std::collections::BTreeSet;
 
-// The two custody machines' Tier-1 bodies, each step inside its own execution-evidence
-// window. The source↔spec closure (every anchor resolves, every machine is covered) is
-// aterm-models' `spec_xref_closure`, which links this crate's anchors and waivers from
-// outside; the other Tier-1 bodies of this crate are tests in their own modules.
-
-/// The eleven `SelectionCustody` actions its execution evidence must carry.
 const SELECTION_CUSTODY_ACTIONS: &[&str] = &[
     "SelectLow",
     "SelectOldest",
@@ -23,7 +17,6 @@ const SELECTION_CUSTODY_ACTIONS: &[&str] = &[
     "WholesaleInvalidate",
 ];
 
-/// The sixteen `PressCustody` actions — see [`SELECTION_CUSTODY_ACTIONS`].
 const PRESS_CUSTODY_ACTIONS: &[&str] = &[
     "UserScroll",
     "UserScrollTowardLive",
@@ -43,20 +36,6 @@ const PRESS_CUSTODY_ACTIONS: &[&str] = &[
     "OutputInvalidatesTheCoordinateSpace",
 ];
 
-/// Assert one machine's per-step execution evidence and return the derived summary of
-/// what it does and does not discriminate.
-///
-/// String coverage only proves each action name is claimed by some anchor. The
-/// conformance opens a one-step window per step (`aterm_spec::xref::StepEvidence::step`);
-/// this requires each action's anchored function to be entered by every window driving
-/// that action (`StepAudit::blind_steps`) and no anchored function to be entered by a
-/// window driving an action it does not claim (`StepAudit::stray`), which discriminates
-/// inside a `Terminal::process` batch. Residual, printed in the summary: a function whose
-/// entry pattern exactly matches its claimed actions is indistinguishable from the right
-/// seam, and labels on one function can be permuted unobservably.
-///
-/// Applied to `SelectionCustody` and `PressCustody` only; every other anchored machine
-/// has the string coverage of aterm-models' closure.
 fn assert_step_evidence(
     machine: &str,
     expected_actions: &[&str],
@@ -76,9 +55,6 @@ fn assert_step_evidence(
          the other's obligation: {:?}",
         audit.ambiguous
     );
-    // Check the action set, not an anchor count: an action may legitimately have more
-    // than one anchor site (e.g. `Evict` on both `set_scrollback_line_limit` and
-    // `Terminal::post_process`).
     let want: BTreeSet<&str> = expected_actions.iter().copied().collect();
     let got: BTreeSet<&str> = audit.actions.iter().copied().collect();
     assert_eq!(
@@ -120,9 +96,6 @@ fn assert_step_evidence(
         audit.witnessed_steps,
         audit.steps,
     );
-    // `unwitnessed` passes an action on any one of its windows; this requires every
-    // window to have entered its own action's function, so a step driven outside
-    // `ev.step` cannot drop out of the evidence while a sibling step carries the action.
     assert!(
         audit.blind_steps.is_empty(),
         "{machine}: step window(s) that did NOT enter their own action's annotated \
@@ -134,10 +107,6 @@ fn assert_step_evidence(
         audit.witnessed_steps,
         audit.steps,
     );
-    // The contrapositive: a function that is the seam for `{B, C}` must not be entered by
-    // a window driving `D`, which catches an anchor parked on a function the batch merely
-    // passes through. It can also fire for a function entered on every batch, whose entry
-    // is then no evidence for its actions; the message lists the resolutions.
     assert!(
         audit.stray.is_empty(),
         "{machine}: anchored function(s) entered by the window of an action they are \
@@ -157,11 +126,6 @@ fn assert_step_evidence(
     audit.summary()
 }
 
-/// `SelectionCustody`: anchors on the gesture/press seams (`App::finish_selection`,
-/// `app_input::apply_press_custody`) and engine seams (`Terminal::post_process`,
-/// `set_scrollback_line_limit`, `clear_scrollback`). Every one of the eleven actions is
-/// bound (the evidence's action set is exactly them, so none can be waived instead), and
-/// each step enters its own action's anchored function and no other action's.
 #[test]
 fn selection_custody_steps_enter_their_own_seams() {
     let ev = crate::conformance_support::on_conformance_stack(
@@ -177,12 +141,6 @@ fn selection_custody_steps_enter_their_own_seams() {
     );
 }
 
-/// `PressCustody`: anchors on the four recorders that write `Terminal::note_custody`
-/// (`app_input::note_press_custody`, `app_mouse::note_selection_custody`,
-/// `Terminal::note_scroll_custody` and `Terminal::note_output_custody`), distinct from
-/// `SelectionCustody`'s seams because same-named actions cannot share a function. Every
-/// one of the sixteen is bound and driven, each step named by the engine's own custody
-/// record.
 #[test]
 fn press_custody_steps_enter_their_own_seams() {
     let ev = crate::conformance_support::on_conformance_stack(

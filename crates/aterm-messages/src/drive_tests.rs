@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the band driver ([`crate::drive`]): the step's order and its freeze, the
-//! afford arithmetic, the idle law, the memo's key and cost law, the past guard, the
-//! look-change due, and the paint key, including the High Contrast toggle a theme-only
-//! key misses.
+//! Tests for [`crate::drive`].
 
 use crate::drive::{self, Commit, Lay, LookIn, View};
 use crate::ink::{self, BandInks, BarBase, ForcedPalette, ThemeInks};
@@ -87,7 +84,6 @@ fn busy() -> Message {
         .key("b")
 }
 
-/// One host step with nothing to spare but the band's own ceiling.
 fn step(center: &mut MessageCenter, gate: &mut WireGate, now: Instant) -> drive::Committed {
     let reserved = center.committed_rows();
     let c = drive::settle_and_commit(
@@ -112,7 +108,6 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
     let _ = center.post(warn("Disk nearly full", 2), STAMP, t0);
     let c = step(&mut center, &mut gate, t0);
     assert_eq!(c.regrid, Some(1), "the row is committed in the same step");
-    // A freeze past the hold: nothing folds, nothing commits, nothing drains.
     let t = t0 + Duration::from_secs(3);
     let _ = center.post(warn("Deploy failed", 2), STAMP, t);
     let frozen = drive::settle_and_commit(
@@ -132,11 +127,8 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
     assert!(lines.is_empty(), "a frozen successor writes nothing");
     let (lines, _) = drive::drain_and_pace(&mut center, &mut gate, t, true);
     assert!(!lines.is_empty(), "the lines waited for the persist");
-    // Lifted: the expired hold folds; the second row takes the slot.
     let c = step(&mut center, &mut gate, t);
     assert!(c.glass_changed, "the held row folded");
-    // A host that reserves fewer rows than the center committed converges
-    // even with no move (the handoff successor's case).
     let c = drive::settle_and_commit(
         &mut center,
         Commit {
@@ -149,7 +141,6 @@ fn the_step_commits_after_its_settle_and_a_freeze_holds_the_rows_and_the_log() {
     );
     assert_eq!(c.regrid, Some(center.committed_rows()));
     assert!(c.regrid.is_some_and(|r| r > 0));
-    // …and a shrink waits its quiet before the count moves.
     let t = t + Duration::from_secs(3);
     let c = step(&mut center, &mut gate, t);
     assert!(c.glass_changed);
@@ -206,7 +197,6 @@ fn an_idle_band_arms_nothing_a_held_row_only_its_hold_and_a_still_look_only_tick
     let mut gate = WireGate::default();
     let mut view = View::default();
     let l = lay(80);
-    // Idle.
     let _ = step(&mut center, &mut gate, t0);
     assert_eq!(drive::state_deadline(&center, &gate, false), None);
     assert_eq!(view.prepare(&center, &l, t0, Look::MOVING), 0);
@@ -228,7 +218,6 @@ fn an_idle_band_arms_nothing_a_held_row_only_its_hold_and_a_still_look_only_tick
         None
     );
     assert_eq!(view.band_fp(&center, 80, None, geom(80)), 0);
-    // A held row: its hold's end, and no motion.
     let _ = center.post(warn("Disk nearly full", 5), STAMP, t0);
     let _ = step(&mut center, &mut gate, t0);
     assert_eq!(
@@ -242,7 +231,6 @@ fn an_idle_band_arms_nothing_a_held_row_only_its_hold_and_a_still_look_only_tick
     );
     assert_eq!(view.prepare(&center, &l, t0, Look::MOVING), 0);
     assert_eq!(over(&center, &view, t0, Look::MOVING), None);
-    // A busy row: frames while moving, only its words' ticks while still.
     let mut center = MessageCenter::new(MessageLog::default(), t0);
     let _ = center.post(busy(), STAMP, t0);
     let at = t0 + PROGRESS_GRACE + Duration::from_millis(100);
@@ -287,8 +275,6 @@ fn the_next_frame_memo_hits_on_its_key_and_misses_on_each_term() {
         assert_eq!(view.motion_deadline(&center, &l, at, Look::MOVING), want);
     }
     assert_eq!(view.deadline_computations(), 1, "one scan per frame");
-    // The epoch: a restatement that moves no painted word still re-anchors
-    // the estimator, so the memo misses while the layout stays.
     let fp = center.fingerprint(80);
     assert!(center.restate(
         posted.id,
@@ -303,7 +289,6 @@ fn the_next_frame_memo_hits_on_its_key_and_misses_on_each_term() {
     assert_eq!(view.deadline_computations(), 2, "a new epoch misses");
     let _ = view.next_frame(&center, &l, at, Look::MOVING);
     assert_eq!(view.deadline_computations(), 2, "and is memoised again");
-    // The width: unprepared, from now, unmemoised.
     let probe = at + Duration::from_millis(7);
     let _ = view.next_frame(&center, &lay(81), probe, Look::MOVING);
     let _ = view.next_frame(&center, &lay(81), probe, Look::MOVING);
@@ -313,7 +298,6 @@ fn the_next_frame_memo_hits_on_its_key_and_misses_on_each_term() {
         Some(probe),
         "a layout mismatch reads from now"
     );
-    // The look: likewise, and the frame on glass is due at once.
     let _ = view.next_frame(&center, &l, probe, STILL);
     assert_eq!(view.deadline_computations(), 5);
     assert_eq!(view.last_from(), Some(probe));
@@ -322,7 +306,6 @@ fn the_next_frame_memo_hits_on_its_key_and_misses_on_each_term() {
         !view.due(&center, &l, at, Look::MOVING),
         "its own look: not yet"
     );
-    // A new frame: a new origin.
     let next = view
         .motion_deadline(&center, &l, at, Look::MOVING)
         .expect("next");
@@ -416,8 +399,6 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
             .is_some(),
         "inks"
     );
-    // The High Contrast toggle: the palette the host derives from the same theme becomes
-    // the OS's, and the rows must follow, so the key hashes the inks, not the theme.
     let before = view
         .paint(&center, 80, None, g, false, &|| dark)
         .expect("painted");
@@ -436,7 +417,6 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
     );
     assert_eq!(after, fresh, "the drive paints what a fresh paint draws");
     assert_ne!(before, fresh, "and the stale rows are not the forced ones");
-    // Motion: a busy row's comet moves the key frame to frame.
     let mut center = MessageCenter::new(MessageLog::default(), t0);
     let _ = center.post(busy(), STAMP, t0);
     let at = t0 + PROGRESS_GRACE + Duration::from_millis(100);
@@ -451,7 +431,6 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
         view.paint(&center, 80, None, g, false, &|| dark).is_some(),
         "motion"
     );
-    // The row leaves: one empty paint, then nothing; the view forgets it.
     let mut center = MessageCenter::new(MessageLog::default(), at);
     let _ = step(&mut center, &mut gate, at);
     assert_eq!(view.prepare(&center, &l, at, Look::MOVING), 0);
@@ -470,8 +449,6 @@ fn the_paint_key_moves_with_every_term_it_paints_from() {
     assert_eq!(view.paint(&center, 80, None, g, false, &|| dark), None);
 }
 
-/// One host step as `step`, with the windows' chrome regrow floor handed in
-/// and the rows `afford`ed.
 fn step_floored(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -494,11 +471,6 @@ fn step_floored(
     c
 }
 
-/// The band's quiet shrink also waits the floor the host hands in, and its state
-/// deadline names the later of the two, so the host's timer never wakes for a shrink
-/// the commit declines. Unfloored, a presence row born a few ms before the shrink makes
-/// a net-zero re-grid pair (the negative control). The window's own shrink (the afford
-/// fell below the count) is not floored, and a rise is never delayed.
 #[test]
 fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
     use crate::chrome::CHROME_REGROW_SETTLE;
@@ -515,8 +487,6 @@ fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
         assert_eq!(c.regrid, None, "the quiet");
         let due = drop + SHRINK_QUIET;
         assert_eq!(drive::state_deadline(&center, &gate, false), Some(due));
-        // A presence row is born 5 ms before the shrink's due: the host
-        // hands the floor it noted.
         let birth = due - ms(5);
         let floor = floored.then(|| birth + CHROME_REGROW_SETTLE);
         let c = step_floored(&mut center, &mut gate, birth, MAX_ROWS, floor);
@@ -538,19 +508,14 @@ fn the_bands_quiet_shrink_waits_the_windows_regrow_floor() {
     let c = step_floored(&mut center, &mut gate, floor_at, MAX_ROWS, floor);
     assert_eq!(c.regrid, Some(0), "at the floor, the shrink");
     assert_eq!(drive::state_deadline(&center, &gate, false), None, "idle");
-    // Negative control: no floor, the shrink lands 5 ms after the birth.
     let (mut center, mut gate, due, _) = run(false);
     let c = step_floored(&mut center, &mut gate, due, MAX_ROWS, None);
     assert_eq!(c.regrid, Some(0));
-    // The window's own shrink: a window that can no longer afford the row gets it back
-    // at once, inside the floor.
     let (mut center, mut gate, due, floor) = run(true);
     let c = step_floored(&mut center, &mut gate, due, 0, floor);
     assert_eq!(c.regrid, Some(0), "the window's own shrink is not floored");
 }
 
-/// A freeze keeps the floor it was handed for the next step's deadline, and arms no
-/// shrink meanwhile.
 #[test]
 fn a_frozen_step_hands_the_floor_and_arms_no_shrink() {
     use crate::chrome::CHROME_REGROW_SETTLE;

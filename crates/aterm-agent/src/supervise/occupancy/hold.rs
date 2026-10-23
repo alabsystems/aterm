@@ -377,7 +377,7 @@ pub fn seed_row_in(body: &str, sid: Option<&str>) -> Option<SeedRow> {
         }
         if text("rule_id") != Some(rule) {
             if let Some(open) = &mut last
-                && !text("rule_id").is_some_and(|r| r.starts_with("fact-"))
+                && !text("rule_id").is_some_and(crate::supervise::approvals::is_fact_rule)
             {
                 open.followed = true;
             }

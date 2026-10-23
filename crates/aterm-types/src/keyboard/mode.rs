@@ -30,56 +30,20 @@ bitflags! {
         const REPORT_ASSOCIATED_TEXT = 1 << 9;
         /// VT52 compatibility mode — arrow keys use `ESC A`..`ESC D` (no CSI/SS3).
         const VT52_MODE = 1 << 10;
-        /// DECBKM (DEC private mode 67): Backspace sends BS (0x08) instead of DEL (0x7f), and
-        /// Ctrl+Backspace the other (xterm `backarrowKey`). Legacy encoding only.
+        /// DECBKM (DEC private mode 67): Backspace sends BS (`0x08`) instead of DEL (`0x7f`).
         const BACKARROW_SENDS_BS = 1 << 11;
-        /// xterm `altSendsEscape` reset (DEC private mode 1039): an Alt-modified key in legacy
-        /// encoding goes without the ESC prefix. A negative flag, so `empty()` keeps xterm's
-        /// default ESC-prefixed Alt.
+        /// Disables the ESC prefix on Alt-modified keys in legacy mode (DEC mode 1039 reset).
         const ALT_NO_ESC = 1 << 12;
-        /// xterm `metaSendsEscape` set (DEC private mode 1036): a Meta-modified key in legacy
-        /// encoding is ESC-prefixed like Alt. Off by default.
+        /// Prefixes Meta-modified keys with ESC in legacy encoding (DEC private mode 1036).
         const META_SENDS_ESC = 1 << 13;
-        /// xterm `numLock` reset (DEC private mode 1035): the NumLock modifier bit is stripped
-        /// before encoding. Absent (the default, xterm's power-on state) keeps it.
+        /// Strips the NumLock modifier bit before encoding (DEC private mode 1035 reset).
         const NO_SPECIAL_MODIFIERS = 1 << 14;
-        /// ConPTY win32-input-mode (DEC private mode 9001) is set: conhost, which requests it
-        /// at every ConPTY start, wants INPUT_RECORD key reports
-        /// (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, microsoft/terminal spec #4999). It is the only
-        /// way a key carries Windows modifiers across the pipe: legacy VT has no Shift+Enter or
-        /// Ctrl+Enter, and conhost reads aterm's Shift+Enter LF as Ctrl+Enter. Once conhost has
-        /// read one record it also holds a lone or dangling ESC, so Escape, Ctrl+[, Alt+[,
-        /// Alt+Backspace and the like go out as records too (`conhost_holds_once_switched` in
-        /// `encode.rs`). Ctrl+H and Ctrl+Shift+H go out as the same record, the H key with
-        /// Ctrl alone: conhost reads their legacy BS as Ctrl+Backspace, which PSReadLine and
-        /// cmd.exe take as a word delete, and PSReadLine inserts a literal BS on a record that
-        /// carries Shift (measured 2026-10-16; `win32_ctrl_character_record`). Ctrl+Backspace
-        /// keeps its BS. Ctrl+J is the J key's record the same way: conhost reads its legacy
-        /// LF as Ctrl+Enter (measured 2026-10-17).
-        ///
-        /// A negotiation bit with the host, not a kitty flag, in this word only because the
-        /// encoder reads one word: it is never part of the `CSI ? flags u` answer, the kitty
-        /// stack, or any projection an application sees (`kitty_suppresses_predictive_echo`,
-        /// `kitty_reports_functional_keys`). In the encoder it outranks a kitty push for the
-        /// keys it covers, because conhost drops the CSI-u reports written back; every other key
-        /// follows the kitty flags.
+        /// ConPTY win32-input-mode (DEC private mode 9001) `INPUT_RECORD` key encoding.
         const WIN32_INPUT = 1 << 15;
-        /// The console host that asked for [`Self::WIN32_INPUT`] is OpenConsole (the host
-        /// aterm bundles, a Windows tab's default), not Windows' inbox conhost. Meaningful only
-        /// with `WIN32_INPUT`, and a negotiation bit like it: never kitty, never an answer.
-        ///
-        /// The two hosts read a few keys differently (measured 2026-10-18, OpenConsole
-        /// 1.25.2609.30003 against conhost 10.0.26200): OpenConsole types a CSI it does not
-        /// know as text, so KP_Begin's legacy `CSI E` reached PSReadLine as Escape, which
-        /// reverted the line, and `[E`; it hands a VT reader xterm's bytes for the `VK_CLEAR`
-        /// and F13-F20 records (`CSI E`, `CSI 1;2E`, `CSI 25~`, `CSI 25;5~`), where conhost
-        /// gives `CSI G` and nothing. So under it KP_Begin and F13-F20 go out as records
-        /// (`encode_win32_keys`), and under conhost they keep their legacy bytes. The keypad
-        /// under DECKPAM is records on both hosts.
+        /// Marks the [`Self::WIN32_INPUT`] console host as bundled OpenConsole.
         const OPENCONSOLE_HOST = 1 << 16;
 
-        /// Aggregate: any kitty progressive-enhancement flag. With one set the app negotiated
-        /// kitty semantics, which supersede xterm modifyOtherKeys.
+        /// Mask of all Kitty progressive-enhancement keyboard flags.
         const KITTY_PROTOCOL_FLAGS = Self::DISAMBIGUATE_ESC_CODES.bits()
             | Self::REPORT_EVENT_TYPES.bits()
             | Self::REPORT_ALTERNATE_KEYS.bits()

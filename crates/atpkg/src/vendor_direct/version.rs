@@ -1,46 +1,27 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A vendor version (canonical only) and the store build id it maps to, plus the signed
-//! `buildDate` claude's manifest carries.
+//! Canonical vendor versions, their bijective store build IDs in `[10^18, 3·10^18)`,
+//! and the UTC `buildDate` in claude's signed manifest.
 //!
-//! Two grammars, each a tier of ids `10^18` wide:
-//! - `x.y.z`: `10^18 + x·10^12 + y·10^6 + z`, each component below `10^6`;
-//! - the revision form `x.y.z-R<n>[.<s>]` (Meta's): `2·10^18 + x·10^15 + y·10^12 + z·10^9 +
-//!   n·10^3 + s'`, with `x`, `y`, `z` ≤ 999, `n` ≤ 999 999 and `s'` 0 without `.<s>`, else
-//!   `s + 1` (`s` ≤ 998).
-//!
-//! Every id from `10^18` up to `3·10^18` is exactly one version and no other id is one. An
-//! id is decimal-readable, order-preserving within its tier, above every ALab
-//! `YYYYMMDDnn` build and below `i64::MAX`, so a vendor build shares
-//! `store/<program>/<build>/` and TOML integers with every other build. A program speaks one
-//! grammar ([`Version::has_revision`]), so its versions never compare across tiers.
+//! Two `10^18`-wide tiers above every ALab `YYYYMMDDnn` build and below `i64::MAX`:
+//! - `x.y.z`: `10^18 + x·10^12 + y·10^6 + z` (`x, y, z < 10^6`).
+//! - `x.y.z-R<n>[.<s>]`: `2·10^18 + x·10^15 + y·10^12 + z·10^9 + n·10^3 + s'`
+//!   (`x, y, z <= 999`, `n <= 999_999`, `s' = 0` or `s + 1` with `s <= 998`).
 
 use std::fmt;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// The smallest vendor build id: `0.0.0`. Every ALab build number is below it.
+/// Smallest vendor build ID (`0.0.0`); every ALab build number is below it.
 pub const VENDOR_BUILD_BASE: u64 = 1_000_000_000_000_000_000;
 
-/// The smallest revision-form build id, `0.0.0-R0`: one past the largest `x.y.z` one.
 const REVISION_BASE: u64 = 2 * VENDOR_BUILD_BASE;
-
-/// One past the largest revision-form build id: no id from here up is a version.
 const VENDOR_BUILD_END: u64 = 3 * VENDOR_BUILD_BASE;
-
-/// Each `x.y.z` component, and a revision's `n`, is strictly below this (six digits).
 const COMPONENT_LIMIT: u64 = 1_000_000;
-
-/// The weight of `major` in an `x.y.z` build id.
 const MAJOR_SCALE: u64 = 1_000_000_000_000;
-
-/// A revision form's `x`, `y`, `z` and `s'` are strictly below this (three digits); it is
-/// also the weight of `n`.
 const SHORT_LIMIT: u64 = 1_000;
-
-/// The weights of a revision form's `x`, `y` and `z`.
 const REVISION_MAJOR_SCALE: u64 = 1_000_000_000_000_000;
 const REVISION_MINOR_SCALE: u64 = 1_000_000_000_000;
 const REVISION_PATCH_SCALE: u64 = 1_000_000_000;
@@ -51,13 +32,12 @@ pub const fn is_vendor_build(build: u64) -> bool {
     build >= VENDOR_BUILD_BASE
 }
 
-/// A canonical vendor version in either grammar. It is its build id, so `Ord` is version
-/// order within a grammar and two spellings of one version cannot exist.
+/// Canonical vendor version in either grammar, represented directly by its build ID.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(u64);
 
 impl Version {
-    /// `major.minor.patch`, or `None` when a component is `>= 10^6`. Never clamps.
+    /// Construct `major.minor.patch`, or `None` if any component is `>= 10^6`.
     #[must_use]
     pub const fn new(major: u32, minor: u32, patch: u32) -> Option<Self> {
         let (major, minor, patch) = (major as u64, minor as u64, patch as u64);
@@ -69,8 +49,7 @@ impl Version {
         ))
     }
 
-    /// `major.minor.patch-R<revision>[.<sub>]`, or `None` when `major`, `minor` or `patch`
-    /// is above 999, `revision` above 999 999 or `sub` above 998. Never clamps.
+    /// Construct `major.minor.patch-R<revision>[.<sub>]`, or `None` if any field exceeds its bound.
     #[must_use]
     pub const fn with_revision(
         major: u32,
@@ -103,9 +82,7 @@ impl Version {
         ))
     }
 
-    /// Parse `x.y.z` or `x.y.z-R<n>[.<s>]`, every number ASCII decimal without a leading
-    /// zero (a lone `0` is fine) and within its grammar's range. Anything else is refused:
-    /// a version with two spellings would have two build ids.
+    /// Parse canonical `x.y.z` or `x.y.z-R<n>[.<s>]` without leading zeros.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let (plain, revision) = match text.split_once("-R") {
@@ -129,8 +106,7 @@ impl Version {
         Self::with_revision(major, minor, patch, n, sub)
     }
 
-    /// The version a store build id names, or `None` for an ALab build number or an id
-    /// past the revision tier.
+    /// Version for a vendor store build ID, or `None` outside `[10^18, 3·10^18)`.
     #[must_use]
     pub const fn from_build_id(build: u64) -> Option<Self> {
         if is_vendor_build(build) && build < VENDOR_BUILD_END {
@@ -151,9 +127,6 @@ impl Version {
     pub const fn has_revision(self) -> bool {
         self.0 >= REVISION_BASE
     }
-
-    // Each field is `id / weight % limit`: a tier's base is a multiple of every weight
-    // times its limit, so it drops out.
 
     /// The major component.
     #[must_use]
@@ -342,8 +315,6 @@ impl<'de> Deserialize<'de> for BuildDate {
 mod tests {
     use super::*;
 
-    /// Revision-form fields `(x, y, z, n, s)`: the derived tuple order is the version
-    /// order (`None` below `Some(0)`, as `s'` is).
     type Fields = (u32, u32, u32, u32, Option<u32>);
 
     fn v(text: &str) -> Version {
@@ -354,7 +325,6 @@ mod tests {
         Version::with_revision(f.0, f.1, f.2, f.3, f.4).unwrap_or_else(|| panic!("{f:?}"))
     }
 
-    /// A deterministic xorshift stream: property coverage without a new dependency.
     fn stream(mut seed: u64) -> impl FnMut() -> u64 {
         move || {
             seed ^= seed << 13;
@@ -364,7 +334,6 @@ mod tests {
         }
     }
 
-    /// Components biased toward the edges (0, 1, 999_999) so the bounds are exercised.
     fn samples() -> Vec<(u32, u32, u32)> {
         let edges = [0u32, 1, 2, 9, 10, 99, 100, 280, 999_998, 999_999];
         let mut out = Vec::new();
@@ -383,7 +352,6 @@ mod tests {
         out
     }
 
-    /// Revision-form fields biased toward the edges (999, 999_999, `.998`, no `.<s>`).
     fn revision_samples() -> Vec<Fields> {
         let small = [0u32, 1, 9, 10, 998, 999];
         let revisions = [0u32, 1, 6297, 6298, 999_999];
@@ -421,8 +389,6 @@ mod tests {
         assert_eq!(v("0.156.0").to_string(), "0.156.0");
     }
 
-    /// Installed claude and codex build ids decode exactly as the `x.y.z`-only decoder
-    /// read them.
     #[test]
     fn the_installed_builds_decode_unchanged() {
         for (id, text, fields) in [
@@ -438,7 +404,6 @@ mod tests {
         }
     }
 
-    /// A revision-form head and its `.<s>`-less spelling each keep their exact text.
     #[test]
     fn the_revision_form_round_trips_its_spelling() {
         let head = v("1.4.9-R6297.1");
@@ -529,8 +494,6 @@ mod tests {
         assert!(i64::try_from(highest).is_ok());
     }
 
-    /// The two tiers tile `[10^18, 3·10^18)` with nothing between them: each id there is
-    /// one version whose text names it again, and no id outside is a version.
     #[test]
     fn the_tiers_tile_the_vendor_id_range_and_nothing_else_decodes() {
         let at = |id: u64| Version::from_build_id(id).map(|v| v.to_string());

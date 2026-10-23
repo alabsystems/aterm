@@ -776,9 +776,8 @@ struct Found {
 }
 
 fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
-    // Claude Code's autocompact offer (module header, "THE AUTOCOMPACT
-    // OFFER"): its footer names no `<key> to <verb>`, so no reader below sees
-    // a box there. Read whole, or not at all.
+    // Claude Code's autocompact offer: its footer names no `<key> to <verb>`,
+    // so no reader below sees a box there. Read whole, or not at all.
     if let Some(v2) = crate::autocompact::offer_box(rows) {
         let v1 = Prompt {
             kind: v2.kind,
@@ -982,10 +981,9 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
                 v2.description_rows = c.description_rows;
                 v2.gutter = c.gutter;
             } else {
-                // `Edit notebook` and the IDE diff name their file in the
-                // question, not in a path row (the notebook's first row is
-                // the cell; the IDE's the path, and then `Save file to
-                // continue…`).
+                // `Edit notebook` and the IDE diff take their file from the
+                // question (the notebook's first row is the cell; the IDE's
+                // is the path, and then `Save file to continue…`).
                 if names_file_in_question(title)
                     && let Some(file) = question.and_then(|q| question_file(&rows[q]))
                 {
@@ -3724,6 +3722,10 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.309-box-bash-rm-parse-diverged.txt");
     pub const TOOL_DISK_FULL_2_1_309: &str =
         include_str!("fixtures/claude-2.1.309-tool-disk-full-printed.txt");
+    pub const TOOL_ERROR_AUTO_MODE_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-error-auto-mode.txt");
+    pub const TOOL_PRESTART_PRINTED_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-prestart-printed-exit0.txt");
     pub const PLAN_READY: &str = include_str!("fixtures/claude-2.1.282-plan-ready.txt");
     pub const PLAN_APPROVAL_60_2_1_300: &str =
         include_str!("fixtures/claude-2.1.300-plan-approval-60col.txt");

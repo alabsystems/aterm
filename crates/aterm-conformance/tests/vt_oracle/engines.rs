@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The two engines, projected onto the state both of them model: per cell the
-//! character, the foreground and background as a palette index or the
-//! default, and bold/underline/reverse; the cursor, with a pending wrap
-//! spelled astream-term's way (`col == cols`); cursor visibility; and which
-//! buffer is up.
-//!
-//! The projection is deliberately lossless for that state and blind to the
-//! rest. aterm's cell flags outside the three astream-term models are kept in
-//! [`Ink::extra`] rather than dropped, so a program that turns one on (italic,
-//! blink, the wide bit of a CJK glyph) shows up as a mismatch against
-//! astream-term's zero instead of passing silently: the subset boundary is
-//! enforced by the comparison, not trusted to the generator. (That is how the
-//! oracle caught aterm turning a truncated `38;5` into blink.)
+//! Shared screen-state projection for `aterm` and `astream-term` oracle comparison.
 
 use astream_term::Record;
 use astream_term::screen::{Color, Folder, attr};
@@ -22,7 +10,6 @@ use aterm_core::terminal::Terminal;
 use std::fmt::Write as _;
 
 /// A colour both engines can name: the terminal default or a palette index.
-/// `Other` is aterm's truecolour, which no program in the subset selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paint {
     Default,
@@ -38,8 +25,7 @@ pub struct Ink {
     pub bold: bool,
     pub underline: bool,
     pub reverse: bool,
-    /// aterm-only attribute bits (see the module header); always 0 for
-    /// astream-term.
+    /// aterm-only attribute bits; always 0 for astream-term.
     pub extra: u16,
 }
 
@@ -141,8 +127,6 @@ impl Snap {
     }
 }
 
-// astream-term
-
 fn paint_of(c: Color) -> Paint {
     match c {
         Color::Default => Paint::Default,
@@ -181,8 +165,6 @@ impl Astream {
                         bold: cell.attrs & attr::BOLD != 0,
                         underline: cell.attrs & attr::UNDERLINE != 0,
                         reverse: cell.attrs & attr::REVERSE != 0,
-                        // FAINT is astream-term's speculative-echo mark; no SGR
-                        // sets it, so a folded screen never carries it.
                         extra: u16::from(
                             cell.attrs & !(attr::BOLD | attr::UNDERLINE | attr::REVERSE),
                         ),
@@ -201,11 +183,6 @@ impl Astream {
     }
 }
 
-// aterm
-
-/// Every underline style aterm stores (single, double, curly, dotted, dashed
-/// are combinations of these three bits). astream-term models one underline
-/// and folds `4:n` onto it, so any of them projects to `underline`.
 const UNDERLINE_BITS: u16 =
     CellFlags::UNDERLINE.0 | CellFlags::DOUBLE_UNDERLINE.0 | CellFlags::CURLY_UNDERLINE.0;
 const MODELLED_BITS: u16 = CellFlags::BOLD.0 | CellFlags::INVERSE.0 | UNDERLINE_BITS;
@@ -217,13 +194,11 @@ pub struct Aterm {
 
 fn aterm_cell(grid: &Grid, r: u16, c: u16) -> CellView {
     let Some(cell) = grid.cell(r, c) else {
-        // A row shorter than the grid (a lazily materialised row) is blank.
         return CellView {
             ch: ' ',
             ink: Ink::PLAIN,
         };
     };
-    // A cell's colours are inline, so they are the truth.
     let colors = cell.colors();
     let fg = if colors.fg_is_default() {
         Paint::Default
@@ -241,8 +216,6 @@ fn aterm_cell(grid: &Grid, r: u16, c: u16) -> CellView {
     };
     let flags = cell.flags().0;
     let ch = match grid.resolved_char(r, c).unwrap_or(' ') {
-        // aterm stores an erased cell as NUL in some paths and as a space in
-        // others; both are a blank on screen, which is what astream-term says.
         '\0' => ' ',
         other => other,
     };
@@ -280,8 +253,6 @@ impl Aterm {
             }
         }
         let cur = self.term.cursor();
-        // aterm parks a pending wrap ON the last column with a flag beside it;
-        // astream-term parks it one past. Same state, two spellings.
         let col = if grid.pending_wrap() {
             cur.col.saturating_add(1)
         } else {

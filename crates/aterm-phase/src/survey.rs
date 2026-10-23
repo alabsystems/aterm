@@ -774,8 +774,7 @@ mod tests {
         }
     }
 
-    /// A CARD INK WRAPPED IS STILL THE CARD (module header, "IN A NARROW PANE"; KI
-    /// S2R-F2).
+    /// A CARD INK WRAPPED IS STILL THE CARD (KI S2R-F2).
     #[test]
     fn a_card_ink_wrapped_is_still_the_card() {
         let narrow = |above: &[&str], width: usize, footer: &str| {

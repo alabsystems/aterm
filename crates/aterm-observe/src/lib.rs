@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **aterm-observe** — layer L0.5 of the RFC "The Reactive Surface": the *semantic* surface predicates, built on the core [Observation Kernel](aterm_core::terminal::WatcherSet).
+//! Bounded regular-expression row matchers and wire codecs for surface watchers.
 
 use std::sync::Arc;
 
 use aterm_core::terminal::{RowMatch, RowVerdict};
 
-/// Re-export the regex compile error so dependents (e.g. `aterm-agent`) can name it without taking a direct `aterm-regex` dependency — the regex boundary stays at this crate.
+/// Re-exports the regex compile error type for downstream crates.
 pub mod regex_compile_error {
     pub use aterm_regex::Error;
 }
 
-/// A pre-compiled regular-expression row matcher — the one place the regex engine is used in the watcher stack.
+/// Pre-compiled regular-expression row matcher.
 #[derive(Debug)]
 pub struct RegexRowMatch {
     re: aterm_regex::Regex,
@@ -28,33 +28,20 @@ impl RowMatch for RegexRowMatch {
     }
 }
 
-/// Maximum regex pattern length (bytes). Watcher patterns are untrusted control
-/// input and are rejected before compilation to bound parse/compile cost,
-/// matching `aterm-search`'s `MAX_REGEX_PATTERN_LEN`.
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
-
-/// Compiled-regex size limit (bytes) for
-/// [`aterm_regex::RegexBuilder::size_limit`].
 const REGEX_SIZE_LIMIT: usize = 128 * 1024;
-
-/// Lazy-DFA cache limit (bytes) for
-/// [`aterm_regex::RegexBuilder::dfa_size_limit`].
 const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
-
-/// Scan budget (work units) for one row, passed to
-/// [`aterm_regex::RegexBuilder::step_limit`] (~4.8 ms per row in release).
 const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
-/// Compile a bounded regex row matcher for [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) and [`Terminal::watch_rows_gone`](aterm_core::terminal::Terminal::watch_rows_gone).
+/// Compiles a bounded regex row matcher for `watch_rows` and `watch_rows_gone`.
 /// # Errors
-/// Returns an [`aterm_regex::Error`] if `pattern` exceeds the length or compiled-size limits or is not a valid regular expression.
+/// Returns an [`aterm_regex::Error`] if `pattern` exceeds length/size limits or is invalid.
 pub fn row_matcher(pattern: &str) -> Result<Arc<dyn RowMatch>, aterm_regex::Error> {
     Ok(Arc::new(RegexRowMatch {
         re: bounded_regex(pattern)?,
     }))
 }
 
-/// The pattern compiled under every bound [`row_matcher`] documents.
 fn bounded_regex(pattern: &str) -> Result<aterm_regex::Regex, aterm_regex::Error> {
     if pattern.len() > MAX_REGEX_PATTERN_LEN {
         return Err(aterm_regex::Error::Syntax(format!(
@@ -244,10 +231,6 @@ mod tests {
         );
     }
 
-    /// The inverse predicate, level-triggered: a surface with no matching row,
-    /// unchanged for `GONE_SETTLE`, latches AT ARM (the `watch_rows_gone`
-    /// immediate eval), so an agent asking "is the busy footer gone?" of an
-    /// already-finished turn is told yes now.
     #[test]
     fn row_gone_latches_immediately_if_nothing_matches() {
         let base = Instant::now();
@@ -268,9 +251,6 @@ mod tests {
         assert!(t.watch_poll(recent).is_some());
     }
 
-    /// The inverse of `row_matcher_latches_on_real_engine_output`, through the
-    /// real pipeline: a visible matching row HOLDS `gone` pending across repaints
-    /// that keep it on screen, and the paint that takes it away latches.
     #[test]
     fn row_gone_waits_for_the_matching_row_to_leave() {
         let base = Instant::now();
@@ -301,9 +281,6 @@ mod tests {
         assert!(sat.seq > 0);
     }
 
-    /// Both `watch_rows` and `watch_rows_gone` stay pending when a visible row
-    /// exhausts [`REGEX_STEP_LIMIT`], and latch once the row becomes readable
-    /// or leaves the screen.
     #[test]
     fn row_gone_waits_while_a_visible_row_exhausts_the_scan_budget() {
         let base = Instant::now();
@@ -378,8 +355,6 @@ mod tests {
         );
     }
 
-    /// Ordinary watcher patterns over ordinary rows never touch the budget: a
-    /// row the budget refused would read as undecided, not as a match.
     #[test]
     fn ordinary_patterns_never_reach_the_scan_budget() {
         let row = "PROMPT-READY 66390b5c8f user@example.com 192.168.0.1 ERROR ".repeat(70);

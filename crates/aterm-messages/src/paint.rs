@@ -608,7 +608,7 @@ fn capsule(cells: &mut Cells, cap: &CapsuleLayout, lit: bool, row: ChipRow) -> C
     }
 }
 
-/// One row at one motion frame (see the module doc's grammar).
+/// One row at one motion frame.
 #[allow(
     clippy::too_many_lines,
     reason = "one row's paint reads its layout, its frame and its window and writes its surface, its words and its chips in one order"

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Free-floating sprite layer (`free_sprites` + `free_atlas`) on the GPU: the real CatBaker atlas
-// geometry uploads (its row pitch is not wgpu's 256-byte copy alignment), and a real
-// `EffectsPipeline` cat survives the GPU present path. `free_parity.rs` holds the cross-backend
-// laws.
-//
-// No GPU or no font: COULD NOT RUN.
+// Free-floating sprite layer (`free_sprites` + `free_atlas`) on the GPU.
 
 use crate::common;
 use std::sync::Arc;
@@ -19,27 +14,10 @@ use aterm_render::Theme;
 
 use crate::common::{backends, bb, gg, rr};
 
-/// What the sprite streams may differ by, CPU against GPU, where they drew
-/// (`cat_parity.rs`, `rain_parity.rs`: target <= 1).
 const SPRITE_BAR: i32 = 2;
-
-/// What text may differ by, CPU against GPU: the glyph bar every parity suite
-/// holds text to (`gpu_matches_cpu.rs`).
 const GLYPH_BAR: i32 = 8;
 
-/// The worst channel delta between the CPU and GPU frames `(over the sprites,
-/// over the rest)`. The sprites' pixels are those where either backend's frame
-/// differs from its own frame `without` the sprites, so a sprite the GPU drew
-/// elsewhere, or not at all, is measured where both should have drawn it.
-///
-/// The rest is the word that wakes the feline pipeline (`kitty`): text, and
-/// held to the glyph bar, not the sprite bar. A GPU whose blender takes a
-/// glyph's coverage alpha at the 8-bit target's precision before it blends in
-/// linear light lands a faint fringe over a dark ground up to 5 off the CPU
-/// (NVIDIA GB10, GL arm, 2026-10-20: 17 fringe pixels of `kitty`, each where an
-/// 8-bit alpha puts it; wgpu's Vulkan frame there is byte-identical to the GL
-/// arm's, and lavapipe's, blending in float, is 1 off the CPU). Unlike
-/// `cat_parity.rs`'s block glyphs, this text is no byte-exact base.
+/// Worst channel delta between CPU and GPU frames `(over sprites, over rest)`.
 fn sprite_and_rest_delta(
     cpu: &[u32],
     gpu: &[u32],
@@ -62,8 +40,6 @@ fn sprite_and_rest_delta(
     (sprite, rest)
 }
 
-/// A NEAREST-1:1 free sprite (`aw/ah == w/h`, the cat bake==dest contract) at
-/// an on-grid pixel origin, under text (the default z).
 fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
     let [ax, ay] = src_xy;
     FreeSprite {
@@ -83,10 +59,6 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
     }
 }
 
-/// The CatBaker atlas is `4 * cell_h` pixels wide, so its row pitch is usually
-/// not wgpu's 256-byte copy alignment (a 21 px cell gives 336-byte rows). A
-/// synthetic 64 px atlas would be accidentally aligned and miss a backend that
-/// drops ordinary kitty atlases.
 #[test]
 fn free_sprite_upload_accepts_real_catbaker_row_pitch() {
     let theme = Theme::default();
@@ -121,16 +93,10 @@ fn free_sprite_upload_accepts_real_catbaker_row_pitch() {
     );
 }
 
-/// A real `EffectsPipeline` bakes its sparse CatBaker atlas and emits the arbitrary-rect
-/// `FreeSprite` (the channel sparkle-word and companion cats share), and the art survives the
-/// GPU present path. A synthetic atlas cannot catch a UV window landing in CatBaker's
-/// transparent area.
 #[test]
 fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
-    // Native windows use a padded grid: the same signed-origin translation and padded
-    // offscreen/scissor dimensions as the GUI path.
     cpu.set_pad(14);
     gpu.set_pad(14);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -188,9 +154,6 @@ fn real_catbaker_free_sprite_is_visible_on_gpu_present_path() {
         "the text beside the cat exceeded the glyph bar: {text} > {GLYPH_BAR}"
     );
 
-    // Production composes both sprite atlases in one frame: phosphor rain, then the feline
-    // free sprite. A rain-only frame primes the resident offscreen; the next adds only the
-    // CatBaker sprite and must differ on the incremental present path.
     let mut rain_term = Terminal::new(rows as u16, cols as u16);
     rain_term.process("\x1b[?25l████████".as_bytes());
     let rain_base = rain_term.cell_frame(rows, cols);

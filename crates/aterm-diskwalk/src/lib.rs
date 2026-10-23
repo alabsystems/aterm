@@ -14,8 +14,9 @@ pub mod tree;
 pub mod walk;
 
 pub use iopol::{
-    MaterializePolicy, PolicyOutcome, main_thread_never_materializes,
-    set_thread_materialize_policy, set_walker_thread_policy, thread_materialize_policy,
+    DiskIo, MaterializePolicy, PolicyOutcome, main_thread_never_materializes,
+    set_thread_materialize_policy, set_walker_thread_policy, thread_disk_throttled,
+    thread_materialize_policy,
 };
 pub use list::ListerChoice;
 pub use look::{

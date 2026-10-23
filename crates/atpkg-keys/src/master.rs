@@ -17,7 +17,8 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 /// and the fence stops the writes sinking past the buffer's death.
 fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        // SAFETY: `b` is a live, uniquely borrowed, aligned `u8`.
+        // SAFETY: `b` is a live, uniquely borrowed, aligned `u8` from a mutable slice, so a
+        // one-byte volatile write is in bounds and unaliased.
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -36,6 +37,7 @@ fn scrub_u32(v: &mut u32) {
 /// mint.
 fn try_lock(buf: &[u8]) {
     // SAFETY: `buf` points to `buf.len()` live bytes for the duration of the `mlock` call.
+    // `mlock` neither reads nor writes the contents.
     unsafe {
         let _ = libc::mlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
@@ -45,6 +47,8 @@ fn try_lock(buf: &[u8]) {
 /// locked pages.
 fn try_unlock(buf: &[u8]) {
     // SAFETY: `buf` points to `buf.len()` live bytes for the duration of the `munlock` call.
+    // `munlock` neither reads nor writes the contents, and it is harmless on a range
+    // `try_lock` never managed to lock.
     unsafe {
         let _ = libc::munlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
@@ -56,7 +60,8 @@ pub fn forbid_core_dumps() {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: `zero` is an initialized `rlimit` valid for `RLIMIT_CORE`.
+    // SAFETY: `zero` is a fully initialized `rlimit` living for the call, and
+    // `RLIMIT_CORE` is a valid resource. `setrlimit` writes nothing through the pointer.
     unsafe {
         let _ = libc::setrlimit(libc::RLIMIT_CORE, &raw const zero);
     }
@@ -317,7 +322,9 @@ impl TtyEcho {
 
 impl Drop for TtyEcho {
     fn drop(&mut self) {
-        // SAFETY: `self.fd` outlives this guard and `self.saved` was initialized in `disable`.
+        // SAFETY: `self.fd` is still open: the caller declares this guard after the `File`
+        // that owns the descriptor, so the guard drops first. `self.saved` is the initialized
+        // snapshot taken in `disable`.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &raw const self.saved);
         }

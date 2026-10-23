@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Panic sweep: the reader never panics on any window of any screen.
-//!
-//! The window runs [`aterm_phase::read`] on its main thread every frame for
-//! every agent session. A screen is whatever the pane shows — any contiguous
-//! run of rows, each cut at any width — so this sweep reads the fixture files
-//! under `aterm-phase/src/fixtures/` and (when in the workspace)
-//! `aterm-agent/src/supervise/policy/fixtures/`, plus the in-crate builders
-//! (`prompt::fixtures`), through:
-//!
-//! * every tail cut `rows[k..]` and every head cut `rows[..k]`;
-//! * every middle window of heights 1..=12;
-//! * each row truncated to [`WIDTHS`] (on char boundaries), under the same
-//!   tail and head cuts and a deterministic sample of the middles;
-//!
-//! across every [`Program::ALL`] reader, [`aterm_phase::continuation_suggestion`]
-//! at several cursor columns, the standalone phase/prompt/launch-card entry
-//! points, and every [`PromptV2`](aterm_phase::PromptV2) accessor
-//! ([`read_box`]).
+//! Panic sweep: every [`Program::ALL`] reader, phase/prompt/launch-card entry
+//! point, and [`PromptV2`](aterm_phase::PromptV2) accessor never panics on any
+//! tail, head, middle window, or width truncation of any fixture screen.
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
@@ -31,7 +16,6 @@ use aterm_phase::prompt::fixtures as fx;
 #[path = "common/fixture_files.rs"]
 mod fixture_files;
 
-/// One screen to sweep: where it came from and its rows.
 struct Screen {
     name: String,
     rows: Vec<String>,
@@ -77,8 +61,6 @@ fn screens() -> Vec<Screen> {
         fx::first_turn_under_a_table(&["❯ and then the tests", "  too"]),
     );
     builder("trust_box", fx::trust_box());
-    // The degenerate rows a pane can hold: the reader's anchors alone, with
-    // nothing around them.
     builder(
         "anchors alone",
         fx::rows(&[
@@ -103,19 +85,13 @@ fn screens() -> Vec<Screen> {
     out
 }
 
-/// `rows` with every row cut to at most `width` chars.
 fn truncated(rows: &[String], width: usize) -> Vec<String> {
     rows.iter()
         .map(|r| r.chars().take(width).collect())
         .collect()
 }
 
-/// Every call the sweep makes on one window.
 fn read_all(w: &[String]) {
-    // Each `Program::ALL` reader reads the window once at cursor column 0:
-    // the cursor column only affects `suggestion` (`continuation_suggestion`,
-    // tested across columns below), and `read(None, …)` dispatches to one of
-    // `Program::ALL` via `identify`.
     for col in [0, 1, 2, 200] {
         let _ = aterm_phase::continuation_suggestion(w, col);
     }
@@ -134,8 +110,6 @@ fn read_all(w: &[String]) {
         .get(aterm_phase::busy_zone_start(w)..)
         .expect("the live zone starts on the screen");
     let _ = aterm_phase::transcript_end(w);
-    // The agents panel's row reader, which the footer's locator runs on every
-    // row under the rule.
     for row in w {
         let _ = aterm_phase::agents_panel::parse_row(row, aterm_phase::agents_panel::one_cell);
     }
@@ -146,14 +120,10 @@ fn read_all(w: &[String]) {
     let _ = aterm_phase::phase::last_said_row(w);
     let _ = aterm_phase::limit_notice(w);
     let _ = aterm_phase::interrupted(w);
-    // The window's harness card reads the card's place every live frame.
     let _ = aterm_phase::launch_card(w);
     if let Some(place) = aterm_phase::launch_card_place(w) {
         let _ = aterm_phase::launch_card_version(w, &place);
-        // A place read off other rows: the rows above it, cut short.
         let _ = aterm_phase::launch_card_version(&w[..place.top], &place);
-        // …and holds it on the next frame by its words: on these rows, on
-        // the rows above it, and on these rows one row down the screen.
         if let Some(words) = aterm_phase::launch_card_words(w, &place) {
             let past_top = w.get(place.top + 1..).unwrap_or_default();
             for rows in [w, &w[..place.top], w.get(1..).unwrap_or_default(), past_top] {
@@ -173,18 +143,12 @@ fn read_all(w: &[String]) {
         };
         let _ = aterm_phase::launch_card_words(w, &far);
     }
-    // …and keeps its reading without a scan while the rows it reads hold:
-    // every row changed, and indices past the rows.
     let (banner, _) = aterm_phase::launch_card_scan(w);
     let every: Vec<usize> = (0..=w.len()).chain([usize::MAX]).collect();
     let _ = aterm_phase::launch_card_unmoved(w, banner, &every);
     let _ = aterm_phase::launch_card_unmoved(w, banner.map(|b| b + 2), &every);
 }
 
-/// Every accessor a caller runs on a parsed box (the presence detail's
-/// `readings`, the approval policy's `base_title` / `rm_breaker` /
-/// `runs_on`, the question dialog's `question` / `guard_row` / `focus` /
-/// `same_question`, …).
 fn read_box(p: &aterm_phase::PromptV2) {
     use aterm_phase::Role;
     let _ = p.readings();
@@ -217,15 +181,11 @@ fn read_box(p: &aterm_phase::PromptV2) {
 }
 
 std::thread_local! {
-    /// Where the last panic on this thread happened (the hook's record).
     static LAST_PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    /// This thread is one of the sweep's: its panics are the hook's to
-    /// record. Another test's, while the hook is installed, are printed.
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Check one window and record any panic. Each distinct window is read once
-/// (sharded by hash across 64 locks to avoid contention across threads).
+/// Check one distinct window (sharded across 64 locks) and record any panic.
 fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
     static READ: [Mutex<BTreeSet<u64>>; 64] = [const { Mutex::new(BTreeSet::new()) }; 64];
     let mut h = std::hash::DefaultHasher::new();
@@ -254,13 +214,8 @@ fn check(name: &str, what: &str, w: &[String], failures: &Mutex<Vec<String>>) {
     }
 }
 
-/// Part `part` of `parts` of the windows of one screen: every tail and head
-/// cut, and the middles of heights 1..=12 — all of them when `every_middle`,
-/// else one in five (by a fixed stride offset per height, so a rerun sweeps
-/// the same windows). The parts are disjoint and together are the whole: part
-/// `p` takes the cuts at `k ≡ p (mod parts)` — a tail `rows[k..]` and a head
-/// `rows[..k]` together are `n` rows whatever `k`, so the parts weigh the same
-/// — and the middles starting at `s ≡ p`, and part 0 the whole screen.
+/// Sweep shard `part` of `parts`: whole screen (part 0), tail/head cuts at
+/// `k ≡ part (mod parts)`, and middle windows of heights 1..=12.
 fn sweep(
     name: &str,
     rows: &[String],
@@ -290,7 +245,6 @@ fn sweep(
     }
 }
 
-/// Number of parts to split an `n`-row screen's quadratic tail/head sweep into.
 fn parts_for(n: usize) -> usize {
     n.div_ceil(32).max(1)
 }
@@ -302,7 +256,6 @@ enum Cut {
     Width(usize),
 }
 
-/// The widths each row is also cut to.
 const WIDTHS: &[usize] = &[1, 2, 3, 6, 12, 40];
 
 #[test]
@@ -321,8 +274,6 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
     }));
     let all = screens();
     let failures = Mutex::new(Vec::new());
-    // One job per (screen, cut, part), tallest screen first so quadratic
-    // sweeps of tall captures do not straggle at the end of the queue.
     let mut jobs: Vec<(&Screen, Cut, (usize, usize))> = Vec::new();
     for s in &all {
         let parts = parts_for(s.rows.len());
@@ -362,7 +313,6 @@ fn the_reader_never_panics_on_any_window_of_any_fixture() {
         let mut distinct: Vec<&String> = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for f in &failures {
-            // One line per distinct panic location, its first window.
             let at = f.split(": ").nth(1).unwrap_or("").to_string();
             if seen.insert(at) {
                 distinct.push(f);

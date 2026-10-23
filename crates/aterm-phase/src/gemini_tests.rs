@@ -611,7 +611,7 @@ fn the_question_tool_is_a_question_with_answers() {
     assert_eq!(answered.said_tail.as_deref(), Some("Tool call done."));
 }
 
-/// THE PER-DAY QUOTA'S DIALOG IS A BOX, NOT A WALL (module header): a
+/// THE PER-DAY QUOTA'S DIALOG IS A BOX, NOT A WALL: a
 /// [`PromptKind::UsageLimit`] box in place of the composer, read as a
 /// prompt with no wall, and neither `Keep trying` nor `Stop` has a role any
 /// rule presses.

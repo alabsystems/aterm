@@ -1,5 +1,8 @@
 // Copyright (c) 2020 Pascal Seitz et al.
 // SPDX-License-Identifier: MIT
+//
+// Derived from lz4_flex 0.11.5 and modified by the aterm project in 2026.
+// See ../../LICENSE-MIT for the upstream MIT license.
 
 //! The compression algorithm.
 

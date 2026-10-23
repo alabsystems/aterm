@@ -11,10 +11,10 @@ use crate::{MAX_INTERMEDIATES, MAX_OSC_DATA, MAX_PARAMS, Parser};
 /// The most OSC payload bytes a carry holds.
 pub const OSC_CARRY_CAP: usize = 4096;
 
-/// The most bytes of a split UTF-8 character a carry holds: a four-byte sequence missing its last byte.
+/// The most bytes of a split UTF-8 character a carry holds.
 pub const UTF8_TAIL_MAX: usize = 3;
 
-/// The state a hooked DCS string is carried in ([`Parser::carry_unhooking`]): the SOS/PM/APC string state with no APC consumer, whose transitions are `DcsPassthrough`'s for every byte (`tests::carry::the_hooked_string_carry_reads_every_byte_as_the_hooked_string`).
+/// The state a hooked DCS string is carried in ([`Parser::carry_unhooking`]).
 pub const HOOKED_STRING_CARRY: State = State::SosPmApcString;
 
 /// A parser's partial state, as data.
@@ -36,27 +36,28 @@ pub struct ParserCarry {
     pub intermediates: Vec<u8>,
     /// The OSC payload collected so far (at most [`OSC_CARRY_CAP`] bytes).
     pub osc: Vec<u8>,
-    /// The OSC payload was over [`OSC_CARRY_CAP`]: the successor discards the OSC at its terminator.
+    /// The OSC payload was over [`OSC_CARRY_CAP`].
     pub osc_overflowed: bool,
     /// The leading bytes of a split UTF-8 character (at most [`UTF8_TAIL_MAX`]).
     pub utf8_tail: Vec<u8>,
     /// The length of the character `utf8_tail` begins (0 without a tail).
     pub utf8_expected: u8,
-    /// The head of a split UTF-8 character that a DCS or APC string's payload ends in (at most [`UTF8_TAIL_MAX`] bytes): with C1 controls off, a `0x9C` that continues it is the character's byte, not ST.
+    /// Split UTF-8 character head at the end of a DCS or APC payload ([`UTF8_TAIL_MAX`]).
     pub string_utf8_tail: Vec<u8>,
-    /// The tmux passthrough wrapper the parser stands in ([`TmuxPassthrough::Open`] or [`TmuxPassthrough::Escape`], with the payload's own state in the fields above), or at the head of ([`TmuxPassthrough::Head`], only in `DcsIgnore`).
+    /// Tmux passthrough ([`TmuxPassthrough`]).
     pub tmux: TmuxPassthrough,
 }
 
 impl ParserCarry {
-    /// Whether this carry is a Ground parser holding nothing — what a fresh parser already is, so a checkpoint records no carry for it.
+    /// Whether this carry is a Ground parser holding nothing.
     #[inline]
     #[must_use]
     pub fn is_ground(&self) -> bool {
         *self == Self::default()
     }
 
-    /// The carry a build that predates DCS header carries reads in this one's place, or `None` when such a build reads this one as it is.
+    /// The carry a build that predates DCS header carries reads in this one's place, or `None` when
+    /// such a build reads this one as it is.
     #[must_use]
     pub fn for_older_builds(&self) -> Option<ParserCarry> {
         matches!(
@@ -73,7 +74,7 @@ impl ParserCarry {
 /// Why [`Parser::restore_carry`] refused a carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CarryRefusal {
-    /// The state is not one a carry may name (`DcsPassthrough`, whose string lives in the handler it hooked).
+    /// The state is not one a carry may name.
     State(State),
     /// More than [`MAX_PARAMS`] parameters.
     Params,
@@ -81,11 +82,13 @@ pub enum CarryRefusal {
     SubparamMask,
     /// `current_param` non-zero while no digit was read.
     CurrentParam,
-    /// More than [`MAX_INTERMEDIATES`] intermediates, or a byte outside the ranges the state collects.
+    /// More than [`MAX_INTERMEDIATES`] intermediates, none in `EscapeIntermediate`, or a byte
+    /// outside the ranges the state collects.
     Intermediates,
     /// An OSC payload over [`OSC_CARRY_CAP`], or one beside `osc_overflowed`.
     Osc,
-    /// A UTF-8 tail (`utf8_tail`, or `string_utf8_tail`) that is not the prefix the parser collects: a byte that begins a well-formed sequence (`0xC2..=0xF4`) — with `utf8_expected` its length — then the continuation bytes a well-formed prefix of it allows (Unicode Table 3-7), shorter than that length.
+    /// A UTF-8 tail that is not a prefix the parser collects, or a `utf8_expected` that is not its
+    /// length.
     Utf8Tail,
     /// A field set that the state does not use.
     FieldOutsideState,
@@ -109,7 +112,7 @@ impl std::fmt::Display for CarryRefusal {
 impl std::error::Error for CarryRefusal {}
 
 impl Parser {
-    /// The parser's partial state as a [`ParserCarry`]; a pure read.
+    /// The parser's partial state as a [`ParserCarry`].
     #[must_use]
     pub fn carry(&self) -> Option<ParserCarry> {
         if self.dcs_st_pending {
@@ -155,7 +158,7 @@ impl Parser {
         Some(carry)
     }
 
-    /// [`Parser::carry`], and in `DcsPassthrough` too: a hooked DCS string is carried as one to IGNORE to its terminator, so its tail is swallowed rather than printed.
+    /// [`Parser::carry`], and in `DcsPassthrough` too.
     #[must_use]
     pub fn carry_unhooking(&self) -> ParserCarry {
         if self.dcs_st_pending {
@@ -173,14 +176,7 @@ impl Parser {
         })
     }
 
-    /// Whether [`Parser::carry`] holds this parser's partial sequence only as
-    /// one to swallow, where the live parser would still deliver it:
-    ///
-    /// * an OSC string whose payload is over [`OSC_CARRY_CAP`] (the live parser
-    ///   keeps up to [`MAX_OSC_DATA`], so an OSC 52 write or OSC 1337 image
-    ///   would dispatch);
-    /// * an APC string whose consumer was started (`apc_start`), which the carry
-    ///   cannot reach.
+    /// Whether [`Parser::carry`] holds a sequence to swallow ([`OSC_CARRY_CAP`], [`MAX_OSC_DATA`]).
     #[inline]
     #[must_use]
     pub fn carry_swallows_sequence(&self) -> bool {
@@ -191,7 +187,7 @@ impl Parser {
         }
     }
 
-    /// Whether the sequence [`Parser::carry_swallows_sequence`] names is a picture a graphics stream's next frame replaces: an APC string with its consumer started (kitty graphics) or an OSC 1337 payload (an inline image).
+    /// Whether [`Parser::carry_swallows_sequence`] is a replaceable graphics frame.
     #[inline]
     #[must_use]
     pub fn carry_swallows_picture(&self) -> bool {
@@ -203,7 +199,7 @@ impl Parser {
             }
     }
 
-    /// Install `carry` (see [`Parser::carry`]) after validating it; on `Err` the parser is untouched.
+    /// Install `carry` (see [`Parser::carry`]) after validating it.
     pub fn restore_carry(&mut self, carry: &ParserCarry) -> Result<(), CarryRefusal> {
         Self::validate_carry(carry)?;
         self.reset();
@@ -233,7 +229,6 @@ impl Parser {
 
     /// The whole of [`Parser::restore_carry`]'s acceptance predicate.
     fn validate_carry(carry: &ParserCarry) -> Result<(), CarryRefusal> {
-        // A hooked string lives in its handler.
         if carry.state == State::DcsPassthrough {
             return Err(CarryRefusal::State(carry.state));
         }

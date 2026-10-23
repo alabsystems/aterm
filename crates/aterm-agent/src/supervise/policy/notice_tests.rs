@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every notice holds the owner's four-part shape (module docs): checked by structure — sentences, placeholders, the message engine's own word rules, the band's title rule — never by the words themselves.
+//! Every notice holds the owner's four-part shape (`NoticeText::parts`: what happened, what aterm
+//! already did, the one thing to do now, what to expect): checked by structure — sentences,
+//! placeholders, the message engine's own word rules, the band's title rule — never by the words
+//! themselves.
 
 use std::collections::BTreeSet;
 

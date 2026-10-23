@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the temporal `append_at` seam and its spill-not-forget
-//! obligation: `tier_residency_model`'s `NoSilentLoss` says every evicted seq
-//! stays resident in a tier. `append_at` hands each evicted event back to the
-//! caller, so a host that tiers every returned event loses nothing; the negative
-//! control shows that ignoring the return does lose seqs.
+//! Tier-1 conformance for [`EventLog::append_at`] and the `NoSilentLoss` invariant.
 
 use aterm_buffer::{BlobId, Event, EventLog, KeyframeId, MAX_LOG_EVENTS, Op, Ticks};
 
-/// `append_at` assigns a monotone gap-free Seq and records the tick + op handle.
 #[test]
 fn append_at_records_seq_tick_and_op() {
     let mut log = EventLog::default();
@@ -36,15 +31,12 @@ fn append_at_records_seq_tick_and_op() {
     assert_eq!(log.total(), 4);
 }
 
-/// `NoSilentLoss` on the real log: past `MAX_LOG_EVENTS`, tiered ∪ live covers
-/// every appended seq contiguously.
 #[test]
 fn append_at_spills_every_evicted_event_no_silent_loss() {
     let mut log = EventLog::default();
     let overflow = 5_000usize;
     let total = MAX_LOG_EVENTS + overflow;
 
-    // The host's "tier": every event handed back on eviction lands here.
     let mut tiered: Vec<Event> = Vec::new();
     for i in 0..total {
         let (_seq, evicted) = log.append_at(Op::RawIn(BlobId(i as u64)), Ticks(i as u64));
@@ -53,7 +45,6 @@ fn append_at_spills_every_evicted_event_no_silent_loss() {
         }
     }
 
-    // Live ring saturates at the cap; the rest spilled to the tier.
     let live: Vec<Event> = log.live().cloned().collect();
     assert_eq!(
         live.len(),
@@ -66,7 +57,6 @@ fn append_at_spills_every_evicted_event_no_silent_loss() {
         "every over-cap event was spilled (not dropped)"
     );
 
-    // NoSilentLoss: tiered (oldest) then live (newest) == 1..=total, contiguous.
     let mut all_seqs: Vec<u64> = tiered.iter().chain(live.iter()).map(|e| e.seq.0).collect();
     let reconstructed = all_seqs.clone();
     all_seqs.sort_unstable();
@@ -74,12 +64,10 @@ fn append_at_spills_every_evicted_event_no_silent_loss() {
     assert_eq!(all_seqs.len(), total, "no seq lost and none duplicated");
     assert_eq!(*all_seqs.first().unwrap(), 1);
     assert_eq!(*all_seqs.last().unwrap(), total as u64);
-    // Order is preserved end-to-end (tier oldest-first, then live oldest-first).
     assert!(
         reconstructed.windows(2).all(|w| w[0] + 1 == w[1]),
         "tiered++live is the contiguous spine in order"
     );
-    // Ticks rode along on the spilled events too (replay needs them).
     assert_eq!(
         tiered[0].ts,
         Ticks(0),
@@ -87,20 +75,15 @@ fn append_at_spills_every_evicted_event_no_silent_loss() {
     );
 }
 
-/// Negative control: a caller that drops the returned evicted event loses the
-/// over-cap seqs, so `NoSilentLoss` depends on tiering the return.
 #[test]
 fn dropping_the_evicted_event_loses_seqs_control() {
     let mut log = EventLog::default();
     let overflow = 1_000usize;
     let total = MAX_LOG_EVENTS + overflow;
     for i in 0..total {
-        // Ignore the evicted return — the "forget" path.
         let _ = log.append_at(Op::RawIn(BlobId(i as u64)), Ticks(i as u64));
     }
     let live: Vec<Event> = log.live().cloned().collect();
-    // The oldest `overflow` seqs are gone from the ring and, dropped, from
-    // everywhere.
     assert_eq!(live.len(), MAX_LOG_EVENTS);
     assert_eq!(
         live.first().unwrap().seq.0,

@@ -304,6 +304,7 @@ impl Policy {
     /// Serialize this policy as a TOML string.
     /// # Errors
     /// Returns [`aterm_toml::ser::Error`] if the policy contains a shape the TOML serializer cannot represent.
+    /// No built-in profile does.
     #[inline]
     pub fn to_toml(&self) -> Result<String, aterm_toml::ser::Error> {
         aterm_toml::to_string(self)

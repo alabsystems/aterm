@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `NovaPhase` (`aterm_models_effects::nova_phase_model`) on the
-//! host: the real `WordDecorations` engine over a real terminal holding a
-//! profanity word in the classic nova style, ticked at 1 ms through three arms
-//! and everything between them.
-//!
-//! The model's defect lives in `Rearm`, and only the host re-arms, so every rule that decides
-//! re-ignition runs here: the grant (`nova_start`), the spent mark (`nova_done`), `hard_reset`,
-//! the suspend time-shift in `thaw`, and the grace/rebirth rules. The projection:
-//!
-//! * `phase`: `Armed` until the grant, then the phase of `(now − nova_start, D)` (`D` from the
-//!   genome), or `Settled` for an episode born spent. Each frame checks `nova_done` is set
-//!   exactly when the window has run out.
-//! * `flashes`: frames on which the nova stream goes from dark to lit, per phase window.
-//!
-//! Window boundaries validate as `Step`, `hard_reset` + rescan as `Rearm`, and every other host
-//! transition (a grace re-hit, an identity rebirth) must leave the projection unchanged. The
-//! second arm is frozen mid-crown for two seconds and must resume where it stopped.
+//! Tier-1 host conformance test for `NovaPhase` (`aterm_models_effects::nova_phase_model`).
 
 use std::collections::BTreeMap;
 
@@ -58,7 +42,6 @@ const SETTLED: i64 = 6;
 const ROWS: usize = 2;
 const COLS: usize = 20;
 
-/// The real engine over a real terminal, driven like a pane.
 struct Host {
     wd: WordDecorations,
     screen: Terminal,
@@ -105,7 +88,6 @@ impl Host {
             .rescan(term, ROWS, COLS, &self.lex, &self.cfg, self.epoch, now);
     }
 
-    /// One presented frame; whether the host's nova stream carried any light.
     fn tick(&mut self, now: Instant) -> bool {
         let (mut out, mut ink, mut free, mut nova) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -115,13 +97,11 @@ impl Host {
         !nova.is_empty()
     }
 
-    /// The word's occurrence and the episode the host keeps for it.
     fn episode(&self) -> Option<(&Occurrence, &Episode)> {
         let occ = self.wd.occ.iter().find(|o| o.class == Class::Profanity)?;
         Some((occ, self.wd.persist.get(&occ.ident)?))
     }
 
-    /// The host's phase at `now`, after checking its spent mark against it.
     fn phase(&self, now: Instant) -> i64 {
         let (occ, ep) = self.episode().expect("the word has an episode");
         let Some(start) = ep.nova_start else {
@@ -142,16 +122,12 @@ impl Host {
     }
 }
 
-/// One contiguous phase window of a real walk and the blooms inside it.
 struct Window {
     phase: i64,
     blooms: i64,
     at: Duration,
 }
 
-/// Tick the host at 1 ms from `start` until its episode has settled, freezing
-/// it for `freeze.1` once the walk reaches `freeze.0` into the arm, and return
-/// the phase windows it went through (the first is the one it was already in).
 fn walk(host: &mut Host, start: Instant, freeze: Option<(Duration, Duration)>) -> Vec<Window> {
     let mut windows = vec![Window {
         phase: host.phase(start),
@@ -166,7 +142,6 @@ fn walk(host: &mut Host, start: Instant, freeze: Option<(Duration, Duration)>) -
         if let Some((at, pause)) = frozen
             && elapsed >= at
         {
-            // The pane is suspended: nothing ticks, the clock runs on.
             host.wd.freeze(now);
             now += pause;
             host.wd.thaw(now);
@@ -193,7 +168,6 @@ fn walk(host: &mut Host, start: Instant, freeze: Option<(Duration, Duration)>) -
     }
 }
 
-/// Validate a walk's window boundaries as the model's `Step`s from `cur`.
 fn steps(model: &Model, mut cur: State, windows: &[Window], arm: i64) -> State {
     assert_eq!(
         windows[0].phase, cur["phase"],
@@ -236,7 +210,6 @@ fn steps(model: &Model, mut cur: State, windows: &[Window], arm: i64) -> State {
     cur
 }
 
-/// A host transition that is not a model step must leave the projection alone.
 fn no_step(host: &mut Host, cur: &State, now: Instant, what: &str) {
     host.tick(now);
     let lit = host.tick(now + Duration::from_millis(300));
@@ -248,8 +221,6 @@ fn no_step(host: &mut Host, cur: &State, now: Instant, what: &str) {
     );
 }
 
-/// The host's re-arm (`hard_reset` + rescan), validated as the model's `Rearm`:
-/// a fresh episode, not yet granted, with no crown counted for the new arm.
 fn rearm(model: &Model, host: &mut Host, cur: &State, now: Instant) -> State {
     host.wd.hard_reset();
     host.rescan(true, now);
@@ -278,32 +249,26 @@ fn the_real_host_conforms_to_nova_phase_model() {
         "a fresh word is the model's Init"
     );
 
-    // Arm 0.
     let windows = walk(&mut host, t0, None);
     cur = steps(&model, cur, &windows, 0);
     let mut now = t0 + Duration::from_secs(4);
 
-    // Occluded for one rescan and back within the grace window: the same
-    // episode, still spent.
     host.rescan(false, now);
     host.rescan(true, now + Duration::from_secs(1));
     now += Duration::from_secs(1);
     no_step(&mut host, &cur, now, "a grace re-hit");
-    // Gone past the grace window and back: a new episode, born spent.
     now += Duration::from_secs(12);
     host.rescan(false, now);
     now += Duration::from_secs(1);
     host.rescan(true, now);
     no_step(&mut host, &cur, now, "an identity rebirth");
 
-    // Arm 1, frozen mid-crown for two seconds.
     now += Duration::from_secs(1);
     cur = rearm(&model, &mut host, &cur, now);
     let crown_at = Duration::from_millis(nova::DIP_MS + 30);
     let windows = walk(&mut host, now, Some((crown_at, Duration::from_secs(2))));
     cur = steps(&model, cur, &windows, 1);
 
-    // Arm 2.
     now += Duration::from_secs(8);
     cur = rearm(&model, &mut host, &cur, now);
     let windows = walk(&mut host, now, None);
@@ -321,8 +286,6 @@ fn the_real_host_conforms_to_nova_phase_model() {
     );
 }
 
-/// Negative control: from the real settled state, a re-arm into `Flash` that counts a second
-/// crown is rejected by the committed model and admitted by `Buggy = 1`.
 #[test]
 fn a_rearm_into_flash_is_the_buggy_step_the_host_bind_rejects() {
     let model = nova_phase_model();

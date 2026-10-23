@@ -1,5 +1,8 @@
 // Copyright The winit contributors
 // SPDX-License-Identifier: Apache-2.0
+//
+// Derived from winit 0.30.13 src/platform_impl/linux/x11/window.rs,
+// modified by the aterm project in 2026 (see the repository NOTICE).
 
 use std::ffi::CString;
 use std::mem::replace;
@@ -37,6 +40,12 @@ use super::{
     VoidCookie, WindowId, XConnection,
 };
 
+// LOCAL PATCH (aterm): the requests are aterm-x11's encoders and ICCCM properties, where upstream
+// used x11rb's; there is no input shape (`set_cursor_hittest` is Windows-only). A failed request is
+// reported (`XConnection::report`), never a panic, so the event loop can end the run on a lost
+// display. Where the server has SYNC the window offers EWMH's resize sync counter
+// (`sync_request.rs`).
+
 #[derive(Debug)]
 pub struct SharedState {
     pub cursor_pos: Option<(f64, f64)>,
@@ -60,12 +69,18 @@ pub struct SharedState {
     pub occlusion: Occlusion,
     /// Whether the server asked for the window to be drawn again since its last `RedrawRequested` (`Expose`).
     pub exposed: bool,
+    /// What `_NET_WM_STATE` held at its last read, until the window manager changes it
+    /// (`UnownedWindow::wm_state_changed`).
+    shown: Option<ShownState>,
+    /// How many changes of `_NET_WM_STATE` the window has seen: a read that one overtook is not kept.
+    shown_changes: u64,
 }
 
-/// The `_NET_WM_STATE` atoms that say the window manager, not the window, gives the window its
-/// frame (`UnownedWindow::shown_state`).
+/// The `_NET_WM_STATE` atoms that say how the window manager shows the window: hidden, or in a
+/// frame it gives the window (`UnownedWindow::shown_state`).
 #[derive(Clone, Copy, Debug, Default)]
 struct ShownState {
+    hidden: bool,
     maximized_horz: bool,
     maximized_vert: bool,
     fullscreen: bool,
@@ -125,6 +140,8 @@ impl SharedState {
             urgent: false,
             occlusion: Occlusion::default(),
             exposed: false,
+            shown: None,
+            shown_changes: 0,
         })
     }
 }
@@ -740,17 +757,7 @@ impl UnownedWindow {
 
     #[inline]
     pub fn is_minimized(&self) -> Option<bool> {
-        let atoms = self.xconn.atoms();
-        let state_atom = atoms[_NET_WM_STATE];
-        let state = self.xconn.get_property(self.xwindow, state_atom, atom::ATOM);
-        let hidden_atom = atoms[_NET_WM_STATE_HIDDEN];
-
-        Some(match state {
-            Ok(atoms) => {
-                atoms.iter().any(|atom: &xproto::Atom| *atom as xproto::Atom == hidden_atom)
-            },
-            _ => false,
-        })
+        Some(self.shown_state().hidden)
     }
 
     /// Refresh the API for the given monitor.
@@ -850,19 +857,41 @@ impl UnownedWindow {
         self.fullscreen().is_some() || self.shown_state().fullscreen
     }
 
-    /// What `_NET_WM_STATE` holds of the states that give the window manager's frame, in one
-    /// read; none where it cannot be read.
+    /// What `_NET_WM_STATE` holds of the states the window manager shows the window in, read
+    /// once per change of it ([`Self::wm_state_changed`]) rather than per query: a resize asks
+    /// several times while the X server is busy with it, each read a round trip; none where it
+    /// cannot be read.
     fn shown_state(&self) -> ShownState {
+        let changes = {
+            let state = self.shared_state_lock();
+            if let Some(shown) = state.shown {
+                return shown;
+            }
+            state.shown_changes
+        };
         let atoms = self.xconn.atoms();
         let state_atom = atoms[_NET_WM_STATE];
-        match self.xconn.get_property(self.xwindow, state_atom, atom::ATOM) {
-            Ok(state) => ShownState {
-                maximized_horz: state.contains(&atoms[_NET_WM_STATE_MAXIMIZED_HORZ]),
-                maximized_vert: state.contains(&atoms[_NET_WM_STATE_MAXIMIZED_VERT]),
-                fullscreen: state.contains(&atoms[_NET_WM_STATE_FULLSCREEN]),
-            },
-            Err(_) => ShownState::default(),
+        let Ok(state) = self.xconn.get_property(self.xwindow, state_atom, atom::ATOM) else {
+            return ShownState::default();
+        };
+        let shown = ShownState {
+            hidden: state.contains(&atoms[_NET_WM_STATE_HIDDEN]),
+            maximized_horz: state.contains(&atoms[_NET_WM_STATE_MAXIMIZED_HORZ]),
+            maximized_vert: state.contains(&atoms[_NET_WM_STATE_MAXIMIZED_VERT]),
+            fullscreen: state.contains(&atoms[_NET_WM_STATE_FULLSCREEN]),
+        };
+        let mut cached = self.shared_state_lock();
+        if cached.shown_changes == changes {
+            cached.shown = Some(shown);
         }
+        shown
+    }
+
+    /// `_NET_WM_STATE` changed (its `PropertyNotify`): the next query reads it again.
+    pub(super) fn wm_state_changed(&self) {
+        let mut state = self.shared_state_lock();
+        state.shown = None;
+        state.shown_changes = state.shown_changes.wrapping_add(1);
     }
 
     fn set_maximized_inner(&self, maximized: bool) -> Result<VoidCookie<'_>, X11Error> {
@@ -1364,7 +1393,8 @@ impl UnownedWindow {
 
     /// Ring the bell for this window.
     pub fn ring_bell(&self) {
-        // SAFETY: the connection's live `Display`.
+        // SAFETY: the connection's live `Display`; the window is this one's, alive while `self`
+        // is; percent 0 is the bell's base volume and name `None` the default bell.
         unsafe {
             (self.xconn.xlib.XkbBell)(self.xconn.display, self.xwindow as ffi::Window, 0, 0);
             (self.xconn.xlib.XFlush)(self.xconn.display);

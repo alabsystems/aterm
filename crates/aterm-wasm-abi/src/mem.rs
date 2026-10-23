@@ -62,7 +62,7 @@ pub unsafe fn free(ptr: usize, size: usize, align: usize) {
     }
 }
 
-/// What [`Slot::thrown`] holds.
+/// Throw kind codes stored in the return slot.
 pub mod thrown {
     /// The call returned.
     pub const NONE: u32 = 0;
@@ -197,8 +197,6 @@ mod tests {
         assert_ne!(other.1, ret_slot());
     }
 
-    /// A throw waits in the slot, at the offsets the glue reads, until it is
-    /// taken once; taking it clears it.
     #[test]
     fn a_throw_waits_in_the_slot_until_taken() {
         assert_eq!(take_thrown(), None);

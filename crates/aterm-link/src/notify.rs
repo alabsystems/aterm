@@ -695,7 +695,7 @@ struct Notifier {
     fault: Fault,
     counts: Counts,
     /// Whether a page waits for its record to be durable on a broker that
-    /// serves ordered (the module doc).
+    /// serves ordered.
     wait_durable: bool,
     /// By selector index, the records held for durability, in read order
     /// ([`Notifier::take`]).
@@ -822,7 +822,7 @@ impl Notifier {
     }
 
     /// Whether the journal's verdict for `off` says a human was TOLD: a
-    /// `fired` line whose command answered `rc=0`, the module doc's rule.
+    /// `fired` line whose command answered `rc=0`.
     fn told(&self, off: u64) -> bool {
         self.journal.iter().any(|line| {
             let mut it = line.split_whitespace();
@@ -2570,7 +2570,7 @@ mod tests {
     }
 
     /// **ON A BROKER THAT SERVES ORDERED, `--once` PAGES A RECORD ONLY ONCE IT
-    /// IS DURABLE** (the module doc).
+    /// IS DURABLE**.
     #[cfg(unix)]
     #[test]
     fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {

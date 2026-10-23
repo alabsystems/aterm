@@ -358,6 +358,26 @@ impl Terminal {
     }
 
     /// Set the XTWINOPS (`CSI t`) window manipulation and query callback.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use aterm_core::terminal::{Terminal, WindowOperation, WindowResponse};
+    ///
+    /// let mut terminal = Terminal::new(24, 80);
+    /// terminal.set_window_callback(|op| {
+    ///     match op {
+    ///         WindowOperation::ReportTextAreaSizeCells => {
+    ///             Some(WindowResponse::SizeCells { rows: 24, cols: 80 })
+    ///         }
+    ///         WindowOperation::Iconify => {
+    ///             // Minimize window (platform-specific)
+    ///             None
+    ///         }
+    ///         _ => None,
+    ///     }
+    /// });
+    /// ```
     #[cfg(any(test, target_os = "linux"))]
     #[inline]
     pub fn set_window_callback<F>(&mut self, callback: F)

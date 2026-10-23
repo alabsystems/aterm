@@ -4661,7 +4661,10 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
     const NS_COLOR_RENDERING_INTENT_PERCEPTUAL: isize = 3;
 
     autoreleasepool(|_| {
-        // SAFETY: raster work on immutable bytes.
+        // SAFETY: raster work on immutable bytes; no class here is
+        // main-thread-bound. `+dataWithBytes:length:` copies,
+        // `+imageRepWithData:` returns an autoreleased rep alive for this pool,
+        // and `-pixelsWide`/`-pixelsHigh` return `NSInteger`.
         unsafe {
             let data_with: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize) -> Id =
                 aterm_objc::checked_msg();
@@ -6781,7 +6784,7 @@ impl App {
         }
     }
 
-    /// Headless boot seal: copy the applied boot metrics (`--scale` pad, `$ATERM_HEADROOM_PX` head, resolved font) into every never-attached window's record, so [`Self::apply_window_scale`]'s auto-font arm does not re-tune from scale-1 defaults on the first recorded redraw.
+    /// Headless boot seal: copy the applied boot metrics (`--scale` pad, `$ATERM_DEV_HEADROOM_PX` head, resolved font) into every never-attached window's record, so [`Self::apply_window_scale`]'s auto-font arm does not re-tune from scale-1 defaults on the first recorded redraw.
     pub(crate) fn seed_headless_boot_metrics(&mut self) {
         let m = crate::MetricsView::applied(
             self.font_px,

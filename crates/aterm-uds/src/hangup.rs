@@ -75,7 +75,8 @@ pub trait Halves {
     /// `shutdown(2)` of the halves `how` names, on the socket every copy of this end shares.
     ///
     /// # Errors
-    /// Returns the OS `shutdown(2)` error (e.g. `ENOTCONN` on Darwin when disconnected).
+    /// The socket's own: on Darwin `ENOTCONN` for a half already shut, or a socket whose peer
+    /// closed entirely.
     fn shut(&self, how: std::net::Shutdown) -> std::io::Result<()>;
 }
 
@@ -135,7 +136,8 @@ fn poll_now(fd: std::os::fd::RawFd, events: i16) -> i16 {
         events,
         revents: 0,
     };
-    // SAFETY: `probe` is one initialized pollfd that outlives the call.
+    // SAFETY: `probe` is one initialized pollfd that outlives the call, and a zero timeout never
+    // parks. A bad fd is reported in `revents`, not UB.
     let ready = unsafe { poll(&mut probe, 1, 0) };
     if ready > 0 { probe.revents } else { 0 }
 }
@@ -154,7 +156,8 @@ fn fd_peek(fd: std::os::fd::RawFd) -> Result<usize, std::io::ErrorKind> {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     const MSG_DONTWAIT: c_int = 0x80;
     let mut byte = 0_u8;
-    // SAFETY: The buffer is one owned byte that outlives the call.
+    // SAFETY: the buffer is one owned byte that outlives the call, and `MSG_PEEK | MSG_DONTWAIT`
+    // neither consumes nor parks. A bad fd is an error return, not UB.
     let read = unsafe { recv(fd, (&raw mut byte).cast(), 1, MSG_PEEK | MSG_DONTWAIT) };
     usize::try_from(read).map_err(|_| std::io::Error::last_os_error().kind())
 }

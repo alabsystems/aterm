@@ -1,14 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vendor-direct agents (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md`): the agent
-//! programs ([`VENDORS`]) are fetched from their vendors, authenticated by compiled anchors, and
-//! never wait on the ALab index. This module holds the table, the version ↔ build id map, the
-//! decision, the lane's durable records, and the head watch ([`watch`]) the window runs (or, with
-//! no window open, one terminal session).
-//!
-//! The index keeps one power over these programs: a signed yank (`policy`), which can deny the
-//! installed version but never supply bytes.
+//! Vendor-direct agent updates: vendor specs ([`VENDORS`]), version-to-build-id mapping,
+//! durable records, yanked-version policy, and the head watch ([`watch`]).
 
 pub(crate) mod decide;
 pub(crate) mod digests;
@@ -33,8 +27,7 @@ pub use table::{
 };
 pub use version::{BuildDate, VENDOR_BUILD_BASE, Version, is_vendor_build};
 
-/// How a line names `program`'s store `build`: `claude 2.1.280` for a vendor-direct build
-/// (never its 19-digit id), `trust build 4790` for an index build.
+/// Format `program` and `build` for display (`claude 2.1.280` or `trust build 4790`).
 #[must_use]
 pub fn display_build(program: &str, build: u64) -> String {
     let mut s = String::from(program);
@@ -43,8 +36,7 @@ pub fn display_build(program: &str, build: u64) -> String {
     s
 }
 
-/// A store build as a sentence names it: `2.1.280` for a vendor-direct build, `build
-/// 4790` for an index build.
+/// Format `build` as a version string for vendor-direct builds or `build <n>` for index builds.
 #[must_use]
 pub fn build_words(build: u64) -> String {
     if Version::from_build_id(build).is_some() {
@@ -55,11 +47,7 @@ pub fn build_words(build: u64) -> String {
     s
 }
 
-/// What a person has, for a line that names `program`'s active build offline (the self-update
-/// announce, `selfupdate::announce_line`): a vendor-direct build id's version; for a legacy index
-/// build, the version the program stamp recorded for it (`ProgramStamp::legacy_version_of`, the
-/// verdict line's source too, so the two agree), else [`build_words`]; `(no version recorded)`
-/// with no active build. Nothing is fetched or run.
+/// Format `program`'s active `build` offline using its vendor version, recorded legacy version, or [`build_words`].
 #[must_use]
 pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u64>) -> String {
     let Some(build) = build else {
@@ -76,8 +64,7 @@ pub fn have_words(layout: &crate::store::Layout, program: &str, build: Option<u6
     build_words(build)
 }
 
-/// A store build as a column shows it: the version for a vendor-direct build, the
-/// number for an index build.
+/// Format `build` for a table column (version for vendor-direct builds, number for index builds).
 #[must_use]
 pub fn build_label(build: u64) -> String {
     match Version::from_build_id(build) {
@@ -86,7 +73,6 @@ pub fn build_label(build: u64) -> String {
     }
 }
 
-/// 64 lowercase hex digits: a sha256 as every vendor file spells it.
 fn is_hex64(s: &str) -> bool {
     aterm_codec::hex::is_lower(s, 64)
 }

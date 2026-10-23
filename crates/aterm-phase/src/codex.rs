@@ -26,7 +26,8 @@ fn is_prompt_row(row: &str) -> bool {
     !(digits > 0 && rest[digits..].starts_with(". "))
 }
 
-/// The row of the composer's top pad (module header).
+/// The row of the composer's top pad: the blank row right above the prompt row, the last row
+/// with `›` in column 0.
 #[must_use]
 pub fn composer_pad(rows: &[String]) -> Option<usize> {
     let prompt = rows.iter().rposition(|r| r.starts_with(PROMPT))?;
@@ -46,7 +47,7 @@ pub fn composer_pad(rows: &[String]) -> Option<usize> {
 pub(crate) mod fixtures {
     use crate::prompt::fixtures::rows;
 
-    /// codex 0.154.0's first frame (module header).
+    /// codex 0.154.0's first frame.
     pub(crate) const COMPOSER_0_154: &str = include_str!("fixtures/codex-0.154.0-composer.txt");
 
     /// codex 0.155.1's trust gate, measured.

@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! The animal class's CJK/Thai load rules:
-//!
-//! 1. Multi-character CJK animal compounds load plain: they match on the default builtin
-//!    (`languages = ["en"]`), inside running CJK text, with default scan options.
-//! 2. Single-character forms (象 / 馬 / 새 / 곰 …) need the class-agnostic `cjk_single_char`
-//!    opt-in.
-//! 3. Finite prefix bombs are suppressed by `exceptions.toml` (カメラ is no turtle) while the
-//!    bare animal still matches.
-//! 4. Open-ended in-language homographs are language-gated with `ambiguous = true` (ja くま,
-//!    ko 판다).
+
+//! CJK and Thai animal lexicon load rules, single-character gate, exceptions, and language gates.
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
@@ -35,7 +26,6 @@ fn gate_on() -> ScanOptions<'static> {
     }
 }
 
-/// The turkey in zh, ja and ko, inside running text, on the default builtin.
 #[test]
 fn turkey_speaks_chinese_japanese_and_korean() {
     let lex = Lexicon::builtin();
@@ -52,7 +42,6 @@ fn turkey_speaks_chinese_japanese_and_korean() {
     }
 }
 
-/// Plain multi-character forms for a spread of species in prose and terminal-ish lines.
 #[test]
 fn big_animals_match_whole_word_in_mixed_cjk_text() {
     let lex = Lexicon::builtin();
@@ -72,8 +61,6 @@ fn big_animals_match_whole_word_in_mixed_cjk_text() {
     }
 }
 
-/// Law 2: lone ideographs / syllables stay silent without the opt-in and
-/// resolve to the right species with it.
 #[test]
 fn single_char_animal_forms_ride_the_cjk_single_char_gate() {
     let lex = Lexicon::builtin();
@@ -101,8 +88,6 @@ fn single_char_animal_forms_ride_the_cjk_single_char_gate() {
     }
 }
 
-/// 熊猫/貓熊 are panda matches, and the longer compound keeps the lone 猫 from
-/// sparkling even under the opt-in.
 #[test]
 fn panda_compounds_are_pandas_not_suppressions_and_never_cats() {
     let lex = Lexicon::builtin();
@@ -122,8 +107,6 @@ fn panda_compounds_are_pandas_not_suppressions_and_never_cats() {
     }
 }
 
-/// Law 3: the prefix bombs stay suppressed even under the opt-in, and the bare animal behind each
-/// suppression still matches.
 #[test]
 fn prefix_bomb_exceptions_stay_silent_and_animals_survive() {
     let lex = Lexicon::builtin();
@@ -178,12 +161,10 @@ fn prefix_bomb_exceptions_stay_silent_and_animals_survive() {
     }
 }
 
-/// Law 4: open-ended in-language homographs load only for users who list the language.
 #[test]
 fn homograph_bombs_are_language_gated() {
     let dflt = Lexicon::builtin();
     let o = ScanOptions::default();
-    // ja くま (くまなく/くまで/隈), ko 판다 ('sells').
     assert!(dflt.scan("くま", &o).is_empty(), "くま must be ja-gated");
     assert!(dflt.scan("판다", &o).is_empty(), "판다 must be ko-gated");
 
@@ -197,8 +178,6 @@ fn homograph_bombs_are_language_gated() {
     let ko = Lexicon::with_languages(&["en", "ko"]);
     assert_eq!(single_species(&ko, "판다", &o), "panda");
 
-    // Latin-script languages ride the same gate for the caret-deferral reason:
-    // id 'kalkun' (turkey) is silent by default, live for id users.
     assert!(
         dflt.scan("kalkun", &o).is_empty(),
         "kalkun must be id-gated"
@@ -207,26 +186,18 @@ fn homograph_bombs_are_language_gated() {
     assert_eq!(single_species(&id, "ada kalkun di sana", &o), "turkey");
 }
 
-/// An animal compound inside a longer listed key resolves to the longer key's species (maximal
-/// munch), and hangul particles attach without breaking the match.
 #[test]
 fn maximal_munch_and_particles_behave() {
     let lex = Lexicon::builtin();
     let o = ScanOptions::default();
-    // 돌고래 (dolphin) contains 고래 (whale): the dolphin wins.
     assert_eq!(single_species(lex, "돌고래", &o), "dolphin");
     assert_eq!(single_species(lex, "고래", &o), "whale");
-    // 도마뱀 (lizard) vs lone 뱀 (snake, gated): lizard needs no gate.
     assert_eq!(single_species(lex, "도마뱀", &o), "lizard");
-    // Particle-attached hangul still matches the compound inside the run.
     assert_eq!(single_species(lex, "원숭이가", &o), "monkey");
-    // ไก่งวง (turkey) beats ไก่ (chicken).
     assert_eq!(single_species(lex, "ไก่งวง", &o), "turkey");
     assert_eq!(single_species(lex, "ไก่", &o), "chicken");
 }
 
-/// The builtin stays conflict-free (species unique per surface, exceptions
-/// well-formed), on the default and on every language.
 #[test]
 fn expanded_builtin_stays_conflict_free() {
     assert_eq!(Lexicon::builtin().conflicts(), &[] as &[String]);

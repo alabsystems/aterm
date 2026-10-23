@@ -16,7 +16,9 @@ use aterm_grapheme::{GeneralCategory, Script};
 pub struct GlyphInfo {
     /// The glyph id after shaping.
     pub glyph_id: u32,
-    /// The UTF-8 byte offset.
+    /// The UTF-8 byte offset, in the shaped string, of the first character of
+    /// the grapheme cluster this glyph belongs to (the `cluster` passed to
+    /// [`super::UnicodeBuffer::add`] for a buffer built by hand).
     pub cluster: u32,
     pub(crate) mask: u32,
     /// The character's general category.
@@ -693,7 +695,7 @@ impl Buffer {
     }
 }
 
-/// Grapheme groups.
+/// Grapheme groups: a glyph continues the group before it.
 #[inline]
 pub(crate) const fn grapheme_group(_: &GlyphInfo, b: &GlyphInfo) -> bool {
     b.unicode_props & unicode_props::CONTINUATION != 0

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The viewport projection: the bounded, source-addressable lines a frame paints, the line index ([`EditorLines`]) it reads them through, and the line and display-cell geometry that paint, hit testing and vertical motion share.
+//! Viewport line projection, line indexing ([`EditorLines`]), and display-cell geometry.
 
 use std::ops::Range;
 
@@ -87,7 +87,7 @@ pub(super) fn byte_of_line(text: &str, line: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Byte offset at which every line of `text` begins: `[0, …]`, exactly one entry per line, so the length IS the line count.
+/// Byte offset at which every line of `text` begins.
 #[cfg(any(test, debug_assertions))]
 pub fn line_starts(text: &str) -> Vec<usize> {
     let mut starts = Vec::with_capacity(1 + text.len() / 40);
@@ -119,7 +119,7 @@ pub fn line_starts_capped(text: &str) -> Option<Vec<usize>> {
     Some(starts)
 }
 
-/// How one editor path answers the three line questions (count, line-of-byte, byte-of-line) about a document.
+/// Line count, line-of-byte, and byte-of-line queries over a document.
 pub struct EditorLines<'a> {
     text: &'a str,
     starts: Option<&'a [usize]>,
@@ -143,7 +143,7 @@ impl<'a> EditorLines<'a> {
         self.text
     }
 
-    /// Total line count: trailing text after the last line break still counts as a line, and an empty document is one line.
+    /// Total line count (an empty document is one line).
     pub fn total(&self) -> usize {
         self.starts.map_or_else(
             || {
@@ -157,7 +157,7 @@ impl<'a> EditorLines<'a> {
         )
     }
 
-    /// The count of line breaks strictly before `position` — i.e. the 0-based line `position` falls on.
+    /// The count of line breaks strictly before `position`.
     pub fn number_at(&self, position: usize) -> usize {
         self.starts.map_or_else(
             || line_number(self.text, position),
@@ -422,10 +422,6 @@ pub fn editor_grapheme_columns(grapheme: &str, column: usize) -> usize {
     if grapheme == "\t" {
         4 - column % 4
     } else if grapheme.chars().any(char::is_control) {
-        // The editor suppresses control clusters rather than asking the font
-        // rasterizer to render a terminal-style replacement cell. Geometry
-        // must make the same choice or projection, hit testing, and paint
-        // disagree (and a control-only line defeats the visible-cell bound).
         0
     } else {
         grapheme_display_width(grapheme)
@@ -504,8 +500,6 @@ fn horizontal_window_anchor(
     }
 }
 
-/// Choose one UTF-8-safe, width-bounded slice using the workspace's shared
-/// horizontal anchor.
 fn bounded_line_window(
     text: &str,
     start: usize,
@@ -539,11 +533,7 @@ fn bounded_line_window(
             line_start,
             window_start,
         } => {
-            // Only the pathological primary line owns a proven bounded
-            // grapheme start. Other visible rows begin at their real line
-            // boundary rather than reusing a byte offset that could bisect a
-            // different cluster (and would require scanning an unbounded
-            // prefix merely to recover tab phase).
+            // Only the pathological primary line owns a proven bounded grapheme start.
             if start == line_start {
                 (window_start.clamp(start, end), 0)
             } else {
@@ -603,9 +593,6 @@ mod tests {
         }
     }
 
-    /// The indexed line oracle must answer EXACTLY what the scanning one does —
-    /// it is the substitution the editor render path makes on every frame, so any
-    /// divergence would move the viewport anchor or the reported line count.
     #[test]
     fn indexed_line_oracle_matches_the_scanning_one() {
         for text in [
@@ -837,8 +824,6 @@ mod tests {
         );
     }
 
-    /// The resident line index is BOUNDED, and declining to build it is not a
-    /// behaviour change — `EditorLines::scanning` answers identically.
     #[test]
     fn line_index_is_capped_and_the_fallback_answers_identically() {
         let dense = "\n".repeat(MAX_LINE_INDEX_ENTRIES + 8);

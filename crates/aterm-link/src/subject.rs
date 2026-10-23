@@ -51,7 +51,8 @@ pub struct InAddr {
     pub kind: String,
 }
 
-/// Parse an `in` subject by position from the left, against the fleet and node this bridge serves.
+/// Parse an `in` subject by position from the left, against the fleet and node this
+/// bridge serves: exactly `f`, `<F>`, `in`, `<node>`, `<sid>`, `<src>`, `<kind>`.
 /// # Errors
 /// [`Reject::Malformed`] for anything that is not that shape.
 pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject> {

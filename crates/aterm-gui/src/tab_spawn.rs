@@ -13,8 +13,9 @@
 //!
 //! Input typed while a spawn is in flight (or while a marked [`Wake::MenuAction`]
 //! from [`MenuMarks`] is pending) waits in [`App::defer_tab_spawn_input`] up to
-//! [`INPUT_HOLD`] and replays in order via [`App::settle_landed_spawn_input`]
-//! and [`App::replay_settled_input`] once its target spawn settles.
+//! [`SPAWN_HOLD`] from the spawner's start on it ([`MENU_HOLD`] for a menu mark)
+//! and replays in order via [`App::settle_landed_spawn_input`] and
+//! [`App::replay_settled_input`] once its target spawn settles.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -30,8 +31,23 @@ use aterm_window::window::WindowId as WinitWindowId;
 use crate::platform::AppRt as _;
 use crate::{App, Session, Wake, WindowId};
 
-/// How long a window's input waits for an in-flight spawn before expiring.
-const INPUT_HOLD: Duration = Duration::from_secs(15);
+/// How long a window holds input for an in-flight spawn, from when the
+/// spawner started on it ([`TabSpawns::hold_from`]): the exec verdict's own
+/// bound ([`aterm_pty::START_HANG`], which the spawn waits out after its
+/// fork) and a hang detector of the same length for the rest of the job (the
+/// folder checks before the fork, the session built after the exec, the
+/// landing on a starved event loop). A shell that starts within its exec
+/// wait therefore always lands inside the hold, and a spawn whose verdict is
+/// in keeps its input until its landing settles it. Shells measured starved
+/// past 10 s went on to start once the spawn waited for them
+/// (docs/measured/typing-under-load-2026-10-22.md); a hold timed from the
+/// booking, as long as the exec wait, ran out before a spawn that queued or
+/// started late could land, and its keys went to the tab the person left.
+const SPAWN_HOLD: Duration = Duration::from_secs(2 * aterm_pty::START_HANG.as_secs());
+
+/// How long a window holds input for a posted menu action ([`MenuMarks`]):
+/// the event loop's dispatch of it, a hang detector of one minute.
+const MENU_HOLD: Duration = aterm_pty::START_HANG;
 
 /// Max time a fork waits for the event loop to park ([`crate::watchdog::forks_wait_for_park`]).
 const FORK_PARK_WAIT: Duration = Duration::from_millis(3);
@@ -262,6 +278,8 @@ impl std::fmt::Debug for TabSpawned {
 struct CompletionState {
     cancelled: bool,
     ready: Option<TabSpawned>,
+    /// When the spawner started on the job ([`TabSpawnCompletion::note_picked`]).
+    picked: Option<Instant>,
 }
 
 /// Shared slot holding a spawn job's result or cancellation state.
@@ -281,6 +299,26 @@ impl std::fmt::Debug for TabSpawnCompletion {
 impl TabSpawnCompletion {
     fn cancelled(&self) -> bool {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).cancelled
+    }
+
+    /// The spawner started on the job at `at`: the hold on its input is
+    /// timed from here ([`SPAWN_HOLD`]).
+    fn note_picked(&self, at: Instant) {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).picked = Some(at);
+    }
+
+    /// When the spawner started on the job, once it has.
+    fn picked(&self) -> Option<Instant> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).picked
+    }
+
+    /// Whether the job's verdict is in and waits for the event loop to land it.
+    fn verdict_in(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ready
+            .is_some()
     }
 
     fn store(&self, done: TabSpawned) -> bool {
@@ -354,7 +392,9 @@ struct Held {
     /// In-flight spawn id waited on, or `None` while waiting on [`Self::menu`].
     spawn: Option<u64>,
     event: WindowEvent,
-    /// Deadline ([`INPUT_HOLD`] from booking) after which the event is dropped.
+    /// Deadline after which the event is dropped: [`MENU_HOLD`] from the menu
+    /// mark's post, or for a spawn [`SPAWN_HOLD`] from its start, brought up
+    /// to date as the spawner moves ([`TabSpawns::refresh_holds`]).
     until: Instant,
     /// Pending menu mark waited on before dispatch ([`MenuMark::NONE`] once resolved).
     menu: MenuMark,
@@ -534,11 +574,55 @@ impl TabSpawns {
             .rev()
             .find(|t| {
                 t.place.asked_from(t.window) == Some(window)
-                    && now.saturating_duration_since(t.asked) < INPUT_HOLD
+                    && now < self.hold_end(t, now)
                     // Use `alt_id` so an adopted spare compares by its fresh booking id.
                     && after.is_none_or(|first| t.alt_id.unwrap_or(t.id) >= first)
             })
-            .map(|t| (t.window, t.asked + INPUT_HOLD, t.id))
+            .map(|t| (t.window, self.hold_end(t, now), t.id))
+    }
+
+    /// When the hold on input for in-flight spawn `t` starts: when the
+    /// spawner started on it, or, while it waits in the spawner's queue, when
+    /// the spawner started on the spawn ahead of it (the queue moves only as
+    /// the spawner does), and never before it was asked for.
+    fn hold_from(&self, t: &InFlight) -> Instant {
+        self.in_flight
+            .iter()
+            .take_while(|o| o.id != t.id)
+            .chain(std::iter::once(t))
+            .filter_map(|o| o.completion.picked())
+            .fold(t.asked, Instant::max)
+    }
+
+    /// When the hold on input for in-flight spawn `t` ends at `now`:
+    /// [`SPAWN_HOLD`] after [`Self::hold_from`], or, once its verdict is in,
+    /// not before its landing settles the input (a hold [`SPAWN_HOLD`] past
+    /// `now`, taken up again each time it is read).
+    fn hold_end(&self, t: &InFlight, now: Instant) -> Instant {
+        if t.completion.verdict_in() {
+            now + SPAWN_HOLD
+        } else {
+            self.hold_from(t) + SPAWN_HOLD
+        }
+    }
+
+    /// Bring the deadlines of input held for spawns still in flight up to
+    /// date with the spawner at `now` ([`Self::hold_end`]): a deadline is
+    /// pushed later as the spawner moves, never earlier.
+    fn refresh_holds(&mut self, now: Instant) {
+        let ends: Vec<(u64, Instant)> = self
+            .in_flight
+            .iter()
+            .map(|t| (t.id, self.hold_end(t, now)))
+            .collect();
+        for h in &mut self.held {
+            if let Some(&(_, end)) = h
+                .spawn
+                .and_then(|id| ends.iter().find(|(spawn, _)| *spawn == id))
+            {
+                h.until = h.until.max(end);
+            }
+        }
     }
 
     /// Enqueue `held` (coalescing if possible), or drop and count it past [`MAX_HELD_INPUT`].
@@ -608,12 +692,12 @@ struct MarksState {
 }
 
 impl MenuMarks {
-    /// Mint a mark at `now`, pruning pending marks older than [`INPUT_HOLD`].
+    /// Mint a mark at `now`, pruning pending marks older than [`MENU_HOLD`].
     fn mint(&self, now: Instant) -> MenuMark {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         state
             .pending
-            .retain(|(_, at)| now.saturating_duration_since(*at) < INPUT_HOLD);
+            .retain(|(_, at)| now.saturating_duration_since(*at) < MENU_HOLD);
         state.minted += 1;
         let mark = MenuMark(state.minted);
         state.pending.push((mark, now));
@@ -635,14 +719,14 @@ impl MenuMarks {
         }
     }
 
-    /// Newest pending mark minted after `after` within [`INPUT_HOLD`] of `now`.
+    /// Newest pending mark minted after `after` within [`MENU_HOLD`] of `now`.
     fn pending(&self, now: Instant, after: u64) -> Option<(MenuMark, Instant)> {
         let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         state
             .pending
             .last()
             .copied()
-            .filter(|(mark, at)| mark.0 > after && now.saturating_duration_since(*at) < INPUT_HOLD)
+            .filter(|(mark, at)| mark.0 > after && now.saturating_duration_since(*at) < MENU_HOLD)
     }
 
     /// The last mark given out (0 before the first).
@@ -769,6 +853,7 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
     if completion.cancelled() {
         return;
     }
+    completion.note_picked(Instant::now());
     // Validate an adopted warm spare off the main thread; fall back to a cold spawn if rejected.
     let mut resolved = None;
     if let Some(adopt) = adopt {
@@ -1321,6 +1406,7 @@ impl App {
         if !spawns.held.iter().any(|h| h.menu == mark) {
             return Vec::new();
         }
+        let now = Instant::now();
         let fresh: Vec<(Option<WindowId>, WindowId, Instant, u64)> = spawns
             .in_flight
             .get(booked..)
@@ -1330,7 +1416,7 @@ impl App {
                 (
                     t.place.asked_from(t.window),
                     t.window,
-                    t.asked + INPUT_HOLD,
+                    spawns.hold_end(t, now),
                     t.id,
                 )
             })
@@ -1379,6 +1465,9 @@ impl App {
 
     /// Install a completed [`TabSpawned`], start its reader, and answer its waiter.
     pub(crate) fn install_spawned(&mut self, done: TabSpawned, os: &dyn LandingOs) -> bool {
+        // The input held for it is judged at its landing by the spawner's
+        // progress, before its record leaves the books.
+        self.tab_spawns.refresh_holds(Instant::now());
         let TabSpawned {
             id,
             window,
@@ -1644,7 +1733,7 @@ impl App {
         let spawns = &mut self.tab_spawns;
         let after = spawns.floor.map_or(0, |floor| floor.marks);
         let (target, until, menu, spawn) = match spawns.menu.pending(now, after) {
-            Some((mark, posted)) => (wid, posted + INPUT_HOLD, mark, None),
+            Some((mark, posted)) => (wid, posted + MENU_HOLD, mark, None),
             None => match spawns.hold_target(wid, now) {
                 Some((target, until, spawn)) => (target, until, MenuMark::NONE, Some(spawn)),
                 None => return Some(event),
@@ -1674,6 +1763,7 @@ impl App {
         now: Instant,
     ) -> (Vec<(WinitWindowId, WindowEvent)>, Option<WindowId>) {
         let spawns = &mut self.tab_spawns;
+        spawns.refresh_holds(now);
         let expired = |h: &Held| h.typed_into == typed_into && h.until <= now;
         if !spawns.held.iter().any(expired) {
             return (Vec::new(), None);
@@ -1708,8 +1798,8 @@ impl App {
         if dropped > 0 {
             aterm_log::warn!(
                 "{dropped} key(s) typed while a new tab or window was starting were dropped \
-                 (it had not started {} s after it was asked for)",
-                INPUT_HOLD.as_secs()
+                 (it had not started {} s after the spawner began it)",
+                SPAWN_HOLD.as_secs()
             );
             self.post_message(crate::message_reporters::keystrokes_dropped(dropped));
         }
@@ -2485,7 +2575,7 @@ pub(crate) mod tests {
                 .is_some(),
             "another window's input is its own"
         );
-        let stale = Instant::now().checked_sub(INPUT_HOLD + Duration::from_secs(1));
+        let stale = Instant::now().checked_sub(SPAWN_HOLD + Duration::from_secs(1));
         if let Some(stale) = stale {
             app.tab_spawns.in_flight[0].asked = stale;
             assert!(
@@ -3565,7 +3655,115 @@ pub(crate) mod tests {
         );
     }
 
-    /// Input held past [`INPUT_HOLD`] is dropped before handling newer input or late landings.
+    /// KEYS TYPED FOR A TAB A LOADED MACHINE STARVES ARE KEPT FOR IT UNTIL IT
+    /// LANDS ([`SPAWN_HOLD`], timed from the spawner's start on it). The
+    /// spawner started on the tab 100 s after it was asked for (queued behind
+    /// a starved spawn, or itself starved), and its shell may take its whole
+    /// exec wait ([`aterm_pty::START_HANG`]) from there:
+    ///
+    /// - 5 s past that exec wait the keys are still held, and new keys typed
+    ///   for the tab are held for it too; once it lands they reach it in
+    ///   order, never the tab the person left. Before, the hold ran
+    ///   [`aterm_pty::START_HANG`] from the ask: the keys were dropped while
+    ///   the spawn could still start, and the next keys went to the old tab.
+    /// - A tab queued behind it holds its keys on the same clock: the spawner
+    ///   has not reached it, and moves only as the tab ahead does.
+    /// - A tab whose verdict is in keeps its keys until the event loop lands
+    ///   it, however late that is.
+    ///
+    /// NEGATIVE CONTROL: [`SPAWN_HOLD`] after the spawner's start, with no
+    /// verdict in, the keys are dropped (and said dropped), and new keys go to
+    /// the tab the window shows.
+    #[test]
+    fn keys_typed_for_a_tab_the_spawner_started_late_are_held_until_it_lands() {
+        let exec_wait = aterm_pty::START_HANG;
+        let fresh = || {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let winit_id = WinitWindowId::from(0u64);
+            app.winit_to_window.insert(winit_id, wid);
+            let (old, old_pty) = piped_session(app.next_session_id);
+            app.push_stub_tab(wid, old);
+            let id = book(&mut app, wid, TabSpawnThen::Nothing);
+            let picked = app.tab_spawns.in_flight[0].asked + Duration::from_secs(100);
+            app.tab_spawns.in_flight[0].completion.note_picked(picked);
+            for text in ["l", "s"] {
+                assert!(
+                    app.defer_tab_spawn_input(wid, winit_id, typed(text))
+                        .is_none()
+                );
+            }
+            (app, wid, winit_id, id, picked, old_pty)
+        };
+
+        // Started late; lands.
+        let (mut app, wid, winit_id, id, picked, old_pty) = fresh();
+        let late = picked + exec_wait + Duration::from_secs(5);
+        let (events, _) = app.expire_tab_spawn_input(winit_id, late);
+        assert!(events.is_empty(), "nothing settles: {events:?}");
+        assert_eq!(app.tab_spawns.held.len(), 2, "the keys are still held");
+        assert_eq!(
+            app.tab_spawns.hold_target(wid, late),
+            Some((wid, picked + SPAWN_HOLD, id)),
+            "new keys are held for it too"
+        );
+        let (new, new_pty) = piped_session(id);
+        assert!(app.install_spawned_tab(TabSpawned {
+            id,
+            window: wid,
+            session: Ok(new),
+            reader_gate: None,
+        }));
+        let (events, _) = app.settle_tab_spawn_input(wid, true);
+        replay(&mut app, wid, events);
+        assert_eq!(drain(&new_pty), b"ls", "in order, to the tab that started");
+        assert!(
+            drain(&old_pty).is_empty(),
+            "never to the tab the person left"
+        );
+
+        // Queued behind it.
+        let (mut app, wid, _, _, picked, _) = fresh();
+        let queued = book(&mut app, wid, TabSpawnThen::Nothing);
+        assert_eq!(
+            app.tab_spawns.hold_target(wid, late),
+            Some((wid, picked + SPAWN_HOLD, queued)),
+            "held on the clock of the spawn ahead"
+        );
+        assert_eq!(app.tab_spawns.hold_target(wid, picked + SPAWN_HOLD), None);
+
+        // Its verdict is in.
+        let (mut app, wid, winit_id, id, picked, _) = fresh();
+        let (new, new_pty) = piped_session(id);
+        let completion = Arc::clone(&app.tab_spawns.in_flight[0].completion);
+        assert!(completion.store(TabSpawned {
+            id,
+            window: wid,
+            session: Ok(new),
+            reader_gate: None,
+        }));
+        let landed_late = picked + SPAWN_HOLD + Duration::from_secs(600);
+        let (events, _) = app.expire_tab_spawn_input(winit_id, landed_late);
+        assert!(events.is_empty(), "nothing settles: {events:?}");
+        assert_eq!(app.tab_spawns.held.len(), 2, "held until it lands");
+        let done = completion.take().expect("the verdict");
+        assert!(app.install_spawned_tab(done));
+        let (events, _) = app.settle_tab_spawn_input(wid, true);
+        replay(&mut app, wid, events);
+        assert_eq!(drain(&new_pty), b"ls");
+
+        // NEGATIVE CONTROL: the hold over, no verdict in.
+        let (mut app, wid, winit_id, _, picked, old_pty) = fresh();
+        let over = picked + SPAWN_HOLD;
+        let (events, _) = app.expire_tab_spawn_input(winit_id, over);
+        assert!(events.is_empty(), "keystrokes are dropped: {events:?}");
+        assert!(app.tab_spawns.held.is_empty());
+        assert!(said_dropped(&app, "retype the last 2 keys"));
+        assert_eq!(app.tab_spawns.hold_target(wid, over), None);
+        assert!(drain(&old_pty).is_empty());
+    }
+
+    /// Input held past [`SPAWN_HOLD`] is dropped before handling newer input or late landings.
     #[test]
     fn input_held_past_the_hold_is_dropped_never_replayed_late() {
         use aterm_window::event::ElementState::{Pressed, Released};
@@ -3588,7 +3786,7 @@ pub(crate) mod tests {
         assert!(inside.0.is_empty(), "inside the hold nothing settles");
         assert_eq!(app.tab_spawns.held.len(), 5);
 
-        let past = Instant::now() + INPUT_HOLD;
+        let past = Instant::now() + SPAWN_HOLD;
         let (events, repair) = app.expire_tab_spawn_input(winit_id, past);
         assert_eq!(named(&events), ["mods", "move 4"]);
         assert_eq!(repair, None);
@@ -3745,7 +3943,7 @@ pub(crate) mod tests {
         app.tab_spawns.in_flight.clear();
 
         let stale = Instant::now()
-            .checked_sub(INPUT_HOLD + Duration::from_secs(1))
+            .checked_sub(MENU_HOLD + Duration::from_secs(1))
             .expect("a monotonic clock past the hold");
         let _ = marks.mint(stale);
         assert!(
@@ -3876,7 +4074,7 @@ pub(crate) mod tests {
             app.tab_spawns.in_flight.last_mut().unwrap().asked = same_tick;
             assert_eq!(
                 app.tab_spawns.hold_target(wid, same_tick),
-                Some((wid, same_tick + INPUT_HOLD, fresh)),
+                Some((wid, same_tick + SPAWN_HOLD, fresh)),
                 "first booking made by this replay, despite the equal clock"
             );
             let fallback = book(app, wid, TabSpawnThen::Nothing);
@@ -3886,7 +4084,7 @@ pub(crate) mod tests {
             adopted.alt_id = Some(fallback);
             assert_eq!(
                 app.tab_spawns.hold_target(wid, same_tick),
-                Some((wid, same_tick + INPUT_HOLD, spare)),
+                Some((wid, same_tick + SPAWN_HOLD, spare)),
                 "an adopted spare uses the new reservation for admission"
             );
         });
@@ -3894,7 +4092,7 @@ pub(crate) mod tests {
         app.replaying(false, |app| {
             assert_eq!(
                 app.tab_spawns.hold_target(wid, same_tick),
-                Some((wid, same_tick + INPUT_HOLD, before))
+                Some((wid, same_tick + SPAWN_HOLD, before))
             );
         });
         app.tab_spawns.in_flight.clear();

@@ -49,7 +49,11 @@ impl WeakSlot {
 
     /// Register this slot as a weak reference to `value` (`objc_initWeak`).
     /// # Safety
-    /// The slot must be uninitialised (fresh from [`WeakSlot::uninit`], or [`WeakSlot::destroy`]ed since).
+    /// * The slot must be uninitialised (fresh from [`WeakSlot::uninit`], or
+    ///   [`WeakSlot::destroy`]ed since).
+    /// * Until destroyed, the slot must not move or be dropped: the runtime writes `nil`
+    ///   through this address at an unpredictable time.
+    /// * `value` must be nil, or a live object not currently deallocating.
     pub unsafe fn init(&self, value: Id) {
         // SAFETY: the slot is uninitialised and immovable until destroyed, and `value` is nil-or-live; `objc_initWeak` records `addr()` in `value`'s weak table.
         unsafe { objc_initWeak(self.addr(), value) };
@@ -58,6 +62,7 @@ impl WeakSlot {
     /// Re-point an already-registered slot at `value` (`objc_storeWeak`).
     /// # Safety
     /// The slot must be initialised, and `value` nil or a live, non-deallocating object.
+    /// [`WeakSlot::init`]'s immovability obligation continues.
     pub(crate) unsafe fn store(&self, value: Id) {
         // SAFETY: the slot is initialised; `objc_storeWeak` moves this address from the old target's weak table to `value`'s under the weak lock.
         unsafe { objc_storeWeak(self.addr(), value) };
@@ -65,7 +70,8 @@ impl WeakSlot {
 
     /// The target at +1, or nil (`objc_loadWeakRetained`).
     /// # Safety
-    /// The slot must be initialised.
+    /// The slot must be initialised. The caller owns the +1; wrap it in [`Obj`] or
+    /// [`crate::Retained`], as [`WeakObj::load`] does.
     #[must_use]
     pub unsafe fn load_retained(&self) -> Id {
         // SAFETY: the slot is initialised; the runtime reads it under the weak lock and either retains the target or answers nil.

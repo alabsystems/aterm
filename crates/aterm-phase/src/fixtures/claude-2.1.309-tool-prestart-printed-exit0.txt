@@ -1,0 +1,50 @@
+# claude-code 2.1.309 · MEASURED 2026-10-22, `aterm ctl text` of a private headless aterm (144x50, aterm 0.119.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Bash call (exit 0) whose stdout is `Error: ` and the words of 2.1.309's pre-start disk-full notice (its ENOSPC form, dir /private/tmp/claude-502), printed by the command itself: a command's stdout, drawn with its wrapped rows six columns in, not the place Claude Code draws a call it did not start (`targo --unverified lab tool` and `turn toolstart`, then `lab capture c1 tool-prestart-printed-exit0`)
+     the action is unsafe. This is usually transient — wait briefly and try this action again as-is; don't rewrite it. If it keeps failing,
+     continue with other tasks that don't require this action and come back to it later. Note: reading files, searching code, and other
+     read-only operations do not require the classifier and can still be used.
+
+⏺ Bash(rmdir ../gone)
+  ⎿  Error: Auto mode could not evaluate this action and is blocking it for safety — run with --debug for details. This is not a judgment that
+     the action is unsafe. This is usually transient — wait briefly and try this action again as-is; don't rewrite it. If it keeps failing,
+     continue with other tasks that don't require this action and come back to it later. Note: reading files, searching code, and other
+     read-only operations do not require the classifier and can still be used.
+
+⏺ Bash(echo after)
+  ⎿  after
+
+⏺ Tool call done.
+
+✻ Cogitated for 0s · done 11:21 PM
+
+❯ toolstart
+
+⏺ Bash(mkdir -p gone && cd gone)
+  ⎿  Done
+
+⏺ Bash(rmdir ../gone)
+  ⎿  Done
+
+⏺ Bash(echo after)
+  ⎿  after
+
+⏺ Tool call done.
+
+✻ Worked for 0s · done 11:22 PM
+
+❯ toolstart
+
+⏺ Bash(printf '%s\n' "Error: The command was not started: this computer's disk is full (ENOSPC) on the volume holding /private/tmp/claude-502
+      (Claude Code's temporary…)
+  ⎿  Error: The command was not started: this computer's disk is full (ENOSPC) on the volume holding /private/tmp/claude-502 (Claude Code's
+      temporary directory), so the file that captures command output could not be created there and nothing ran. Free space on that volume,
+      or restart Claude Code with CLAUDE_CODE_TMPDIR set to a directory on another one, then retry. If this is the user's own computer, tel
+     l them before deleting anything to make room.
+
+⏺ Tool call done.
+
+✻ Baked for 0s · done 11:23 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-png` decode and encode integration tests:
+//! `aterm-png` decode and encode integration tests over the repository's PNG corpus, a
+//! synthesized format matrix pinned to `MATRIX_DIGEST`, malformed and misordered files,
+//! and encoder round trips.
 
 use std::path::{Path, PathBuf};
 

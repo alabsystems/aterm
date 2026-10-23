@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A destructor that panics must drop every element EXACTLY once: no double
-//! drop, and no leak of the elements after it.
-//!
-//! The differential oracle's `Drop` impls are all infallible, so it cannot see
-//! this. Every bulk drop here — `clear`, `truncate`, the vectors' own `Drop`,
-//! a by-value iterator's `Drop` and `Drain`'s — lowers the length first, so a
-//! panic that unwinds into `Drop for ArrayVec` (or `SmallVec`) cannot drop the
-//! prefix again, and drops the cut slots with slice drop glue, which keeps
-//! dropping past a panicking element, as std `Vec` and upstream `arrayvec` do.
-//! `ArrayVec::retain` drops the elements it rejects one at a time, so a
-//! panicking one must already be outside the range its guard keeps.
-//! An "at most once" assertion let a leak of every later element through, so
-//! each test here checks the whole drop log against `0..LEN`. Any type here
-//! that manages raw memory needs at least one test whose destructor fails.
+//! Tests that panicking element destructors drop every element in [`ArrayVec`] and [`SmallVec`]
+//! once.
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -25,10 +13,8 @@ thread_local! {
     static DROPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Elements per vector; the panicking one is somewhere in the middle.
 const LEN: usize = 5;
 
-/// Records its index when dropped, and panics on the way out if it is `boom`.
 struct Recorder {
     index: usize,
     boom: bool,
@@ -54,8 +40,6 @@ const fn recorder(index: usize, boom_at: usize) -> Recorder {
     }
 }
 
-/// Every one of the `LEN` elements was dropped, and none twice. A repeated
-/// index is a double free; a missing one is a leak.
 fn assert_each_dropped_exactly_once(what: &str) {
     assert_exactly_once(&drain_log(), what);
 }
@@ -82,8 +66,6 @@ fn filled(boom_at: usize) -> ArrayVec<Recorder, 8> {
     v
 }
 
-/// A `SmallVec` of `LEN` elements: inline for `N >= LEN`, spilled otherwise.
-/// The spilled arm delegates to std `Vec`, so it is the inline arm's oracle.
 fn small<const N: usize>(boom_at: usize) -> SmallVec<Recorder, N> {
     let mut v: SmallVec<Recorder, N> = SmallVec::new();
     for index in 0..LEN {
@@ -127,7 +109,6 @@ fn array_vec_drop_drops_each_element_once_when_a_destructor_panics() {
 #[test]
 fn array_vec_into_iter_drop_drops_each_element_once_when_a_destructor_panics() {
     let _ = drain_log();
-    // 0 is yielded; 1, 2, 3 (which panics) and 4 are left to `Drop`.
     let mut it = filled(3).into_iter();
     drop(it.next());
     let caught = catch_unwind(AssertUnwindSafe(|| drop(it)));
@@ -135,10 +116,6 @@ fn array_vec_into_iter_drop_drops_each_element_once_when_a_destructor_panics() {
     assert_each_dropped_exactly_once("ArrayVec's IntoIter drop");
 }
 
-/// The drained range is gone and the tail closed up even when one of the
-/// range's destructors panics: std `Vec::Drain`'s outcome. (Upstream
-/// `arrayvec` leaks the rest of the range and the tail there; leaving them in
-/// the vec, as this did before, hands the caller elements it asked removed.)
 #[test]
 fn array_vec_drain_drop_removes_and_drops_the_range_once_when_a_destructor_panics() {
     let _ = drain_log();
@@ -153,8 +130,6 @@ fn array_vec_drain_drop_removes_and_drops_the_range_once_when_a_destructor_panic
     drop(v);
     assert_each_dropped_exactly_once("ArrayVec::drain(1..4) dropped");
 
-    // Partly consumed first: the yielded element is the caller's, the rest of
-    // the range still goes.
     let mut v = filled(3);
     let caught = catch_unwind(AssertUnwindSafe(|| {
         let mut d = v.drain(1..);
@@ -187,7 +162,6 @@ fn small_vec_drop_case<const N: usize>() {
 
 fn small_vec_into_iter_case<const N: usize>() {
     let _ = drain_log();
-    // 0 and 4 are yielded; 1, 2 (which panics) and 3 are left to `Drop`.
     let mut it = small::<N>(2).into_iter();
     drop(it.next());
     drop(it.next_back());
@@ -196,8 +170,6 @@ fn small_vec_into_iter_case<const N: usize>() {
     assert_each_dropped_exactly_once(&format!("SmallVec<_, {N}>'s IntoIter drop"));
 }
 
-/// Inline (`N = 8`) and spilled (`N = 2`, std `Vec` underneath) must agree:
-/// whether a `SmallVec` spilled is not part of its drop contract.
 #[test]
 fn small_vec_clear_drops_each_element_once_when_a_destructor_panics() {
     small_vec_clear_case::<8>();
@@ -216,9 +188,6 @@ fn small_vec_into_iter_drop_drops_each_element_once_when_a_destructor_panics() {
     small_vec_into_iter_case::<2>();
 }
 
-/// The ids `held` holds, in order, with every element disarmed: an element a
-/// broken `retain` kept after dropping it then cannot panic a second time and
-/// abort the run before the assertions report it.
 fn ids_disarmed(held: &mut [Recorder]) -> Vec<usize> {
     held.iter_mut()
         .map(|r| {
@@ -228,13 +197,6 @@ fn ids_disarmed(held: &mut [Recorder]) -> Vec<usize> {
         .collect()
 }
 
-/// `retain` whose REJECT arm's element destructor panics, at every position
-/// and under every keep mask that rejects it, against std `Vec::retain_mut`
-/// over the same elements: whether it unwinds, what the vec holds afterwards
-/// (the kept ones plus every element after the panic), the drops during the
-/// unwind and the drops afterwards, then exactly once overall. `retain` must
-/// move past an element before dropping it: otherwise its guard keeps the
-/// dropped element and it is dropped twice.
 #[test]
 fn array_vec_retain_drops_each_element_once_when_a_rejected_destructor_panics() {
     for boom_at in 0..LEN {

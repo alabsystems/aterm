@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The focused pane's damage carrier on the composed (split) present. `composed_focus_scratch`,
-//! the resident buffer only the focused pane fills, carries the identity/`extract_gen`
-//! continuity `cell_frame_damage_scoped_into` needs. The IME preedit overlay and prediction
-//! ghosts write into it, and those cells must not be retained as engine truth, so
-//! `return_focused_pane_scratch` takes whether the host wrote and then disowns the carrier.
-//! These tests pin both the retention and the disown.
+//! Tests for `composed_focus_scratch` damage-scoped retention and host-write disown in split views.
 
 use crate::{App, WindowId, term_lock};
 use std::time::{Duration, Instant};
@@ -19,22 +14,17 @@ const CARET_ROW: usize = 6;
 /// A row the caret never touches: the retention witness.
 const QUIET_ROW: usize = 2;
 
-/// A focused window holding a 2-pane split, both leaves with several rows and
-/// the caret at the start of the last one (so an echo damages only the caret
-/// row and other rows can witness retention).
+/// Creates a focused 2-pane split window with rows `0..CARET_ROW` populated and the caret on `CARET_ROW`.
 fn split_app() -> (App, WindowId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let sid = app.split_active_stub_tab(wid);
     app.windows.get_mut(&wid).expect("window").focused = true;
-    // Both cases need a second presented frame, so enable the animating resident.
     app.config.cursor_trail = Some(true);
     let bg = aterm_render::Theme::default().bg;
     for s in [0u64, sid] {
         let term = app.pool.get(s).expect("pane session").term.clone();
         let mut t = term_lock(&term);
-        // Match the renderer's configured background as a real host does;
-        // an unset background cannot certify the resident's blank perch.
         t.set_default_background(aterm_core::terminal::Rgb {
             r: (bg >> 16) as u8,
             g: (bg >> 8) as u8,
@@ -119,8 +109,7 @@ fn focus_rect(app: &App, wid: WindowId) -> crate::pane::PaneRect {
         .expect("the focused leaf is laid out")
 }
 
-/// The background leaf's session id: damage there presents a frame without touching a
-/// focused-pane row.
+/// The background leaf's session id.
 fn other_session(app: &App, wid: WindowId) -> u64 {
     let ws = app.windows.get(&wid).expect("window");
     let tree = &ws.layouts[ws.tabs.active];
@@ -148,19 +137,14 @@ fn composed_char(app: &App, wid: WindowId, pane_row: usize, pane_col: usize) -> 
         .map_or('\u{0}', |c| c.ch)
 }
 
-/// Disown the focused pane's carrier (the `snapshot_seq` bump a host mutator
-/// owes), forcing the next extraction onto the full arm.
+/// Bumps `snapshot_seq` on `composed_focus_scratch` to force the next extraction onto the full arm.
 fn disown(app: &mut App, wid: WindowId) {
     let ws = app.windows.get_mut(&wid).expect("window");
     ws.composed_focus_scratch.snapshot_seq = ws.composed_focus_scratch.snapshot_seq.wrapping_add(1);
 }
 
-/// Plant a marker in the focused pane's resident buffer without telling the
-/// carrier. On an undamaged row it survives the scoped arm and is overwritten
-/// by the full arm, so it witnesses which arm ran without a global counter.
+/// Writes an undeclared marker character into `composed_focus_scratch` with composed retention off.
 fn plant_marker(app: &mut App, wid: WindowId, pane_row: usize) {
-    // Composed retention would skip this undeclared write (its stamp has not moved) and hide
-    // the marker for another reason; retention off makes the witness test the arm.
     super::COMPOSE_RETAIN_OFF.with(|off| off.set(true));
     let ws = app.windows.get_mut(&wid).expect("window");
     ws.composed_focus_scratch
@@ -171,8 +155,7 @@ fn plant_marker(app: &mut App, wid: WindowId, pane_row: usize) {
         .ch = 'Q';
 }
 
-/// Positive leg: a settled split's focused pane takes the scoped arm, so an
-/// undamaged row is retained.
+/// A settled split's focused pane takes the damage-scoped arm and retains undamaged rows.
 #[test]
 fn the_focused_pane_retains_undamaged_rows_across_composed_frames() {
     let (mut app, wid) = split_app();
@@ -208,8 +191,7 @@ fn the_focused_pane_retains_undamaged_rows_across_composed_frames() {
     );
 }
 
-/// [`split_app`] with phosphor rain at its shipped defaults, resolved through
-/// `recompute_matrix_rain` (otherwise `App::rain` stays `None`).
+/// [`split_app`] with default matrix rain enabled.
 fn split_app_raining() -> (App, WindowId) {
     let (mut app, wid) = split_app();
     app.config.matrix_rain = Some(crate::app_config::MatrixRainConfig {
@@ -220,8 +202,7 @@ fn split_app_raining() -> (App, WindowId) {
     (app, wid)
 }
 
-/// The damage epoch the rain engine's Tier-A occupancy scan last consumed
-/// (`None` with no engine or no scan): witnesses a rain-refresh frame.
+/// Last damage epoch consumed by the rain engine's Tier-A occupancy scan.
 fn rain_scan(app: &App, wid: WindowId) -> Option<u64> {
     app.windows[&wid]
         .fx
@@ -229,9 +210,7 @@ fn rain_scan(app: &App, wid: WindowId) -> Option<u64> {
         .and_then(crate::matrix_rain::MatrixRain::scanned_epoch)
 }
 
-/// With Serious Mode dropping the rain engine and the focused pane's rain
-/// off, a failed command is still baselined, so the rebuilt engine does not
-/// light an ember for it.
+/// When Serious Mode drops the rain engine, a failed command is still baselined so rebuilding rain does not light an ember.
 #[test]
 fn a_composed_window_with_no_rain_engine_keeps_the_completion_latch_observing() {
     let (mut app, wid) = split_app_raining();
@@ -267,11 +246,7 @@ fn a_composed_window_with_no_rain_engine_keeps_the_completion_latch_observing() 
     );
 }
 
-/// Rain does not cost the focused pane its damage-scoped arm: the Tier-A
-/// rescan reuses the focused extraction instead of a second `take_damage`,
-/// which would bump `extract_gen` and refuse the next frame under
-/// `FullRefillCause::DamageTaken`. Witnesses: the scan epoch advances (a real
-/// rain-refresh frame) and the damaged row refills.
+/// Matrix rain's Tier-A rescan reuses the focused extraction instead of taking damage a second time.
 #[test]
 fn rain_does_not_cost_the_focused_pane_its_damage_scoped_arm() {
     let (mut app, wid) = split_app_raining();
@@ -283,9 +258,6 @@ fn rain_does_not_cost_the_focused_pane_its_damage_scoped_arm() {
     let focus = focus_rect(&app, wid).session;
     let scan0 = rain_scan(&app, wid)
         .expect("REACH: rain must be live and scanning, or this test pins nothing about rain");
-    // Two consecutive damaged frames: the rain refresh gate fires only when
-    // the damage epoch moved, so the defect shows on the frame following a
-    // rain-refresh frame (every frame while typing).
     feed(&app, focus, b"\rx");
     now += DT;
     assert!(compose(&mut app, wid, now), "the first echo frame presents");
@@ -322,8 +294,7 @@ fn rain_does_not_cost_the_focused_pane_its_damage_scoped_arm() {
     );
 }
 
-/// Negative leg: with the carrier disowned the full arm runs and overwrites
-/// the marker, proving the positive leg is not refilling nothing.
+/// Disowning the carrier forces a full re-resolve that overwrites the planted marker.
 #[test]
 fn a_disowned_focused_carrier_re_resolves_every_row() {
     let (mut app, wid) = split_app();
@@ -348,8 +319,7 @@ fn a_disowned_focused_carrier_re_resolves_every_row() {
     );
 }
 
-/// An inline IME composition painted into the focused pane's resident
-/// buffer disowns the carrier, so cancelling it leaves no retained cells.
+/// Painting an inline IME composition into the focused pane's scratch buffer disowns the carrier so cancelling leaves no stale cells.
 #[test]
 fn a_cancelled_composition_leaves_no_cells_behind_in_a_split() {
     let (mut app, wid) = split_app();
@@ -380,8 +350,6 @@ fn a_cancelled_composition_leaves_no_cells_behind_in_a_split() {
         "the composition really did paint into the focused leaf — otherwise \
          the cancel below proves nothing"
     );
-    // Cancel: nothing reached the terminal, so the caret row has no new
-    // damage; the background pane supplies damage to force a present.
     app.on_ime_preedit(wid, String::new(), None);
     let other = other_session(&app, wid);
     feed(&app, other, b"y");
@@ -396,15 +364,12 @@ fn a_cancelled_composition_leaves_no_cells_behind_in_a_split() {
     );
 }
 
-/// A speculative-echo ghost painted into the focused pane's resident buffer
-/// disowns the carrier, so an unechoed guess is not retained.
+/// Painting a predictive-echo ghost into the focused pane's scratch buffer disowns the carrier so an expired guess leaves no stale cells.
 #[test]
 fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
     let (mut app, wid) = split_app();
     app.config.predictive_echo = Some("always".to_string());
     app.predict_mode_cache = None;
-    // Put the caret past its written prefix so the ghost materializes a
-    // fresh cell rather than being reconciled against echoed content.
     let focus = focus_rect(&app, wid).session;
     feed(&app, focus, b"tail");
     let mut now = Instant::now();
@@ -441,8 +406,6 @@ fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
         "the ghost really did paint into the focused leaf — otherwise the \
          expiry below proves nothing"
     );
-    // Flush the guess with no echo ever arriving. The caret row carries no
-    // new damage, so a retained row would still be showing the ghost.
     app.windows.get_mut(&wid).expect("window").predictor.reset();
     let other = other_session(&app, wid);
     feed(&app, other, b"y");
@@ -456,12 +419,7 @@ fn an_expired_prediction_ghost_leaves_no_cells_behind_in_a_split() {
     );
 }
 
-/// Every channel of a composed frame that the pane extraction feeds,
-/// compared field by field so a divergence names itself.
-///
-/// Sprite atlases and the wallpaper are compared by presence, not `Arc`
-/// identity: the oracle runs two independent windows, which never share an
-/// atlas `Arc`. Every other effect stream is compared by value.
+/// Compares all pane-extraction channels of two [`aterm_core::render::RenderInput`] frames (atlases and wallpaper by presence).
 fn extraction_diff(
     a: &aterm_core::render::RenderInput,
     b: &aterm_core::render::RenderInput,
@@ -545,11 +503,7 @@ fn extraction_diff(
     out
 }
 
-/// Differential oracle: two identical split windows driven by one script,
-/// one disowned before every frame so it always takes the full arm. Every
-/// presented composite must agree on every channel the extraction feeds.
-/// The corpus covers scroll, alternate screen, erase-display and the
-/// ordinary one-row echo.
+/// Differential oracle comparing damage-scoped and full focused-pane extraction across a split-window script.
 #[test]
 fn the_scoped_focused_extraction_composes_what_the_full_one_does() {
     #[allow(clippy::type_complexity)]

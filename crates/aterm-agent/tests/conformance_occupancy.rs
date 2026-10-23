@@ -168,7 +168,7 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
         declared: r.clock.declared(),
     });
     let g = guards(st, autopilot(m), run.variant);
-    let verdicts = decide(&reading, hold, &r.books, &g, r.now);
+    let verdicts = decide(&reading, hold, &r.books, &g, WAIT_NUDGE_AFTER_MS, r.now);
     let mut said = Said::Other(String::from("no verdict"));
     for (rule, verdict) in verdicts {
         if rule != run.rule {

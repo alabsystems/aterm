@@ -116,7 +116,8 @@ fn too_long() -> io::Error {
 /// Overwrite `buf` with zeroes in a way the optimizer may not delete.
 fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        // SAFETY: `b` is a live, uniquely borrowed `u8` from a mutable slice.
+        // SAFETY: `b` is a live, uniquely borrowed `u8` from a mutable slice: a one-byte volatile
+        // write to it is in bounds and unaliased.
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -124,7 +125,8 @@ fn scrub(buf: &mut [u8]) {
 
 /// Keep `buf` out of swap, best effort (the result is ignored: `RLIMIT_MEMLOCK` may refuse).
 fn lock(buf: &[u8]) {
-    // SAFETY: `buf` is a live borrow, so its pointer and length name mapped memory for the call.
+    // SAFETY: `buf` is a live borrow, so its pointer and length name mapped memory for the
+    // call; `mlock` neither reads nor writes it.
     unsafe {
         let _ = libc::mlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
@@ -234,7 +236,8 @@ struct EchoOff {
 
 impl EchoOff {
     fn new(fd: i32) -> io::Result<Self> {
-        // SAFETY: All-zero is a valid `termios` (plain integers and an array).
+        // SAFETY: all-zero is a valid `termios` (plain integers and an array); it is read
+        // only after `tcgetattr` filled it.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is an open terminal and `saved` a live out-parameter of its type.
         if unsafe { libc::tcgetattr(fd, &raw mut saved) } != 0 {
@@ -252,7 +255,8 @@ impl EchoOff {
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        // SAFETY: `fd` is still open and `saved` is the snapshot from `new`.
+        // SAFETY: the descriptor is still open (the caller's `File` outlives this guard) and
+        // `saved` is the snapshot `new` took.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.saved);
         }

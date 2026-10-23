@@ -28,7 +28,8 @@ impl<T: Clone> Template<T> {
         }
     }
 
-    /// The fixture under `root`.
+    /// The fixture under `root` (an empty directory), and what `build` returned the
+    /// once it built it in a scratch dir of its own (the commit ids a test reads, say).
     pub(crate) fn lay(&self, root: &Path, build: impl FnOnce(&Path) -> T) -> T {
         let (from, tree, value) = self.built.get_or_init(|| {
             let dir = aterm_tempfile::Builder::new()

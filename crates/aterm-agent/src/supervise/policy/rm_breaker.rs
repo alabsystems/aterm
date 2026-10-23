@@ -28,7 +28,7 @@ fn rendered(path: &str) -> String {
         .replace(FRESH_DIR, "<mktemp -d>")
 }
 
-/// Names the shell itself sets, ties or reads (module docs): a line that
+/// Names the shell itself sets, ties or reads: a line that
 /// assigns one is not followed, whatever it assigns, since the value read
 /// back is not the one written (`$_`, `PWD` after a `cd`, `SECONDS`, zsh's
 /// read-only `status`) or the assignment changes what the rest of the line
@@ -280,7 +280,11 @@ pub struct RmScope<'a> {
     pub probe: &'a dyn PolicyProbe,
 }
 
-/// Resolve every `rm` on `cmd`: `Ok` with each operand's resolved path when every one points strictly inside a scratch root (module docs), else `Err` naming the first thing that did not resolve or did not qualify.
+/// Resolve every `rm` on `cmd`: `Ok` with each operand's resolved path when every one either names
+/// a directory this line's own `mktemp -d` makes (`"$D"` or a path under it) or points strictly
+/// inside a scratch root, as written and where the disk leads it, with no `..` or `.git` component
+/// and not the cwd, the home or an ancestor of either; else `Err` naming the first thing that did
+/// not resolve or did not qualify.
 pub fn resolve_rm_line(cmd: &str, scope: &RmScope<'_>) -> Result<Vec<String>, String> {
     let toks = lex(cmd)?;
     let unquoted = unquoted_names(&toks);
@@ -324,7 +328,7 @@ enum Part {
         text: String,
         quoted: bool,
     },
-    /// An expansion zsh computes and this resolver does not (module docs):
+    /// An expansion zsh computes and this resolver does not:
     /// `$=V`, `$~V`, `$^V`, `$+V`, `$V:h`, a non-ASCII name.
     Opaque(String),
 }
@@ -797,7 +801,7 @@ enum Val {
     Known {
         text: String,
         /// The `$(mktemp -d)` runs (numbered in line order) whose failure
-        /// would empty a part of this value (module header).
+        /// would empty a part of this value.
         runs: Vec<u32>,
         /// The value were every one of `runs` to fail.
         failed: String,
@@ -1025,7 +1029,7 @@ fn assignment_like(word: &Word) -> Option<String> {
 
 /// Whether an unquoted piece `t` of an assignment's value, after `before`,
 /// holds a `~` or `=` the shell expands there: at the value's start or after
-/// a `:` (module docs).
+/// a `:`.
 fn value_expands(before: &str, t: &str) -> bool {
     let mut prev = before.chars().last();
     for c in t.chars() {
@@ -1713,7 +1717,7 @@ impl Eval<'_> {
     }
 
     /// A variable's value as this line assigned it; a name it did not
-    /// assign is not known (module header, "Variables from the environment").
+    /// assign is not known.
     fn lookup(&self, name: &str) -> Val {
         self.env.get(name).cloned().unwrap_or(Val::Unknown)
     }
@@ -1867,8 +1871,7 @@ impl Eval<'_> {
         Ok(())
     }
 
-    /// The fresh-directory rule (module docs, "A directory the line itself
-    /// just made"): `Some(Ok(target))` when `word` is `"$D"` or lies lexically
+    /// The fresh-directory rule: `Some(Ok(target))` when `word` is `"$D"` or lies lexically
     /// under it, `D` exactly one `$(mktemp -d …)` run's output, that run
     /// proven made where the rm runs (`made`, or the operand's own `${D:?}`)
     /// unless the operand is `"$D"` alone, the operand quoted and, for a path
@@ -2158,7 +2161,7 @@ fn inside(
 }
 
 /// `mktemp -d [-q] [-t PREFIX]` → [`FRESH_DIR`] (under the Bash tool's
-/// `$TMPDIR`, which is never proven: module docs); `mktemp -d [-q]
+/// `$TMPDIR`, which is never proven); `mktemp -d [-q]
 /// /abs/dir/name.XXXX` → `/abs/dir/<mktemp>`; a relative template →
 /// [`FRESH_DIR`] (under the Bash tool's working directory).
 fn mktemp_dir(subst: &str) -> Option<String> {

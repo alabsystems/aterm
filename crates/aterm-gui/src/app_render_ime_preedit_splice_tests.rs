@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IME routing, app half: an in-flight composition goes to the grid, the find field or the
-//! rename field ([`crate::app_input::PreeditOwner`]); the field splices paint it inline and
-//! anchor the candidate window. The grid arm's ink is `RenderInput::overlay_ime_preedit`
-//! (tested in aterm-core and `crate::preedit_fingerprint_tests`), its anchor in
-//! `ime_candidate_anchor_tests`. A real OS IME cannot run headless.
+//! IME composition routing across the grid, find field, and inline rename field ([`crate::app_input::PreeditOwner`]).
 
 use crate::{App, WindowId, term_lock};
 use aterm_core::terminal::UnderlineStyle;
@@ -25,9 +21,6 @@ fn fill_scratch(app: &mut App, wid: WindowId) {
     term.cell_frame_into(&mut ws.input_scratch, rows, cols);
 }
 
-/// With the find bar open the field owns the composition: the grid splice
-/// stays out, the well shows it underlined at the field caret, and the
-/// candidate window anchors on the well.
 #[test]
 fn find_field_owns_the_preedit() {
     let mut app = App::headless_for_test();
@@ -73,13 +66,9 @@ fn find_field_owns_the_preedit() {
         ws.last_ime_rect.is_some(),
         "the candidate window anchored on the well's caret"
     );
-    // Display-only: the query itself is untouched.
     assert_eq!(ws.search.as_ref().unwrap().query, "ab");
 }
 
-/// A composition owned by a frontmost native view (`PreeditOwner::Native`)
-/// does not splice into a still-open find bar's well; the find splice asks
-/// `preedit_owner` itself.
 #[test]
 fn native_view_composition_stays_out_of_the_find_well() {
     let mut app = App::headless_for_test();
@@ -95,7 +84,6 @@ fn native_view_composition_stays_out_of_the_find_well() {
         .unwrap()
         .set_query("ab".to_string());
     fill_scratch(&mut app, wid);
-    // Synthetic ids: `preedit_owner` only asks whether a native view is frontmost.
     app.windows.get_mut(&wid).unwrap().front_content =
         Some(crate::front_content::FrontContent::Native {
             instance: crate::tab_model::AppInstanceId::from_stored(7),
@@ -122,13 +110,10 @@ fn native_view_composition_stays_out_of_the_find_well() {
     );
 }
 
-/// Routing: the inline tab-rename field outranks find (its key gate sits
-/// above find's, mirroring `on_ime_commit`), and the grid stays out.
 #[test]
 fn rename_field_outranks_find_for_the_preedit() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // The rename surface presents only while the strip is on screen (off headless).
     app.tab_strip_rows = 1;
     app.begin_active_session_rename(wid);
     assert!(app.inline_rename_edit(wid).is_some(), "rename field open");
@@ -138,8 +123,6 @@ fn rename_field_outranks_find_for_the_preedit() {
         crate::app_input::PreeditOwner::Rename
     );
     fill_scratch(&mut app, wid);
-    // The candidate window anchors on the well in the strip row, not on the grid caret;
-    // the strip splice is the frame's one reporter for `Rename`.
     app.splice_tab_strip(wid);
     let (cw, ch) = app.win_cell_size(wid);
     let (band_x, band_y) = app.frame_origin(wid);
@@ -167,16 +150,12 @@ fn rename_field_outranks_find_for_the_preedit() {
     );
 }
 
-/// `Ime::Enabled`/`Disabled`/empty preedit clears ownership, so every paint
-/// surface sees `None` and the common path is one `is_empty()` check.
 #[test]
 fn empty_preedit_owns_nothing() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.on_ime_preedit(wid, String::new(), None);
     assert_eq!(app.preedit_owner(wid), crate::app_input::PreeditOwner::None);
-    // The idle key is byte-identical to the pre-composition shape, so the
-    // settled-screen early-out still swallows the frame (FL-1).
     assert_eq!(
         crate::preedit_fingerprint(
             &app.windows.get(&wid).unwrap().preedit,
@@ -187,9 +166,6 @@ fn empty_preedit_owns_nothing() {
     );
 }
 
-/// winit's caret range is reduced to its start at the event boundary
-/// (`App::on_ime_preedit`); both the grid overlay and the field splices draw
-/// the caret at that `preedit_caret`.
 #[test]
 fn the_caret_range_is_reduced_to_its_start() {
     let mut app = App::headless_for_test();

@@ -95,7 +95,6 @@ impl World {
         at(self.clock)
     }
 
-    /// The task mails waiting inside the window, as the walk sent them.
     fn waiting_inside(&self) -> Vec<usize> {
         let now = self.now();
         (0..self.sent.len())
@@ -190,7 +189,6 @@ impl World {
         });
     }
 
-    /// A person acted: what waited is the person's, the rest forgotten.
     fn person_took(&mut self) {
         let now = self.now();
         for s in &mut self.sent {
@@ -201,9 +199,6 @@ impl World {
         }
     }
 
-    /// What the walk makes of the link `link` the turn opened at `turn_t`
-    /// was given, `inside` the task mails waiting in its window when it
-    /// opened.
     fn judge(&mut self, inside: &[usize], link: Option<MailLink>, turn_t: u64) {
         let Some(l) = link else { return };
         let s = *self
@@ -234,7 +229,6 @@ impl World {
         node
     }
 
-    /// One real step and the model's name for it, when it is enabled.
     fn step(&mut self, m: &Model, rng: &mut XorShift) -> Option<&'static str> {
         const ACTIONS: [&str; 14] = [
             "TaskMail",
@@ -260,7 +254,6 @@ impl World {
         Some(pick)
     }
 
-    /// The real records (or time) of model action `pick`.
     fn real(&mut self, pick: &str) {
         match pick {
             "TaskMail" => self.mail(true),
@@ -340,7 +333,6 @@ impl World {
         }
     }
 
-    /// The newest record: the turn open a step just wrote.
     fn newest(&self) -> Rec {
         self.log.window().last().cloned().expect("a record")
     }
@@ -413,7 +405,6 @@ fn mail_link_conforms_to_derived_model() {
     assert!(briefed > 0, "no brief printed a link");
 }
 
-/// The world after `path` of the model's actions, each checked.
 fn world_after(m: &Model, path: &[&str]) -> World {
     let mut w = World::new();
     for action in path {
@@ -425,8 +416,6 @@ fn world_after(m: &Model, path: &[&str]) -> World {
     w
 }
 
-/// The honest `action` from `w`: its pre- and post-state, checked, and the
-/// turn open it wrote.
 fn honest(m: &Model, w: &mut World, action: &str) -> (State, State, Rec) {
     let prev = w.project();
     w.real(action);
@@ -435,8 +424,6 @@ fn honest(m: &Model, w: &mut World, action: &str) -> (State, State, Rec) {
     (prev, next, w.newest())
 }
 
-/// The broken state `broken` is not the honest `action`'s, it is exactly
-/// what mutant `mutant` makes of `prev`, and law `law` fails there.
 fn rejected(m: &Model, (action, mutant, law): (&str, &str, &str), prev: &State, broken: &State) {
     assert!(
         !m.successors(action, prev).contains(broken),
@@ -449,7 +436,6 @@ fn rejected(m: &Model, (action, mutant, law): (&str, &str, &str), prev: &State, 
     assert!(!m.check_invariant(law, broken), "{law} holds at {broken:?}");
 }
 
-/// `honest` with `changes`.
 fn with(honest: &State, changes: &[(&'static str, i64)]) -> State {
     let mut s = honest.clone();
     for (k, v) in changes {
@@ -458,9 +444,6 @@ fn with(honest: &State, changes: &[(&'static str, i64)]) -> State {
     s
 }
 
-/// NEGATIVE CONTROLS: each mutant's broken call over the real fold, from its
-/// witness, makes a state the honest action never does, and exactly the one
-/// its mutant does.
 #[test]
 fn mail_link_conformance_rejects_each_broken_call() {
     let m = session_log_mail_link_model();
@@ -607,8 +590,6 @@ fn mail_link_conformance_rejects_each_broken_call() {
     );
 }
 
-/// Every `ml`-prefixed and `mail_amb=` token taken off `lines`: the carry a
-/// 3B build writes.
 fn strip_links(lines: &[String]) -> Vec<String> {
     lines
         .iter()
@@ -631,13 +612,6 @@ fn adopt_at(log: &Log, ms: u64) -> CarryAdopt {
     }
 }
 
-/// THE CARRY (T10a): a turn's link (open, then closed) and the ambiguity
-/// count cross a seamless update on their own fold lines; a 3B-shaped carry
-/// (no `ml` tokens, no `mail_amb=`) reads with neither and the same state
-/// otherwise; a token this build does not know on the same line is skipped
-/// (the R13 rule); the brief that read it back prints it as
-/// `mail=@<off>~` (6C-3, U5) and the 3B one does not, the two otherwise
-/// byte for byte; and no `log` line or record prints the link.
 #[test]
 fn a_carried_link_reads_back_and_a_3b_carry_reads_none() {
     let mut w = World::new();
@@ -801,7 +775,6 @@ fn a_carried_link_reads_back_and_a_3b_carry_reads_none() {
     }
 }
 
-/// The totals line of a carry (`fold totals …`).
 fn totals_line(lines: &[String]) -> &str {
     lines
         .iter()
@@ -809,8 +782,6 @@ fn totals_line(lines: &[String]) -> &str {
         .expect("the totals line")
 }
 
-/// `lines` with `token` (a ` <key>=<value>` the totals line carries) taken
-/// off the totals line alone.
 fn without_on_totals(lines: &[String], key: &str) -> Vec<String> {
     lines
         .iter()
@@ -827,7 +798,6 @@ fn without_on_totals(lines: &[String], key: &str) -> Vec<String> {
         .collect()
 }
 
-/// A ctl turn opened on `log` under `run` at `ms`, and its link.
 fn ctl_turn_link(log: &mut Log, run: Node, ms: u64) -> Option<MailLink> {
     let turn = log
         .open(
@@ -840,11 +810,6 @@ fn ctl_turn_link(log: &mut Log, run: Node, ms: u64) -> Option<MailLink> {
     log.fold().mail_link(turn)
 }
 
-/// THE MAIL LATCH AND THE WAITING MAILS CROSS AN UPDATE (T10a):
-/// a `kind=task` mail delivered before a seamless
-/// update rides the carry's totals line as `mlw=<off>:<t>`, with the latch
-/// as `mlh=1`; the successor holds both, and its next ctl turn (inside the
-/// window) links the mail, heuristically.
 #[test]
 fn a_waiting_task_mail_and_the_latch_cross_an_update() {
     let mut w = World::new();

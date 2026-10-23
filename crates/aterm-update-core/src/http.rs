@@ -2826,7 +2826,8 @@ mod tests {
             if pid <= 1 {
                 return Err(std::io::Error::other("the probe must lead its own group"));
             }
-            // SAFETY: Process_group(0) made this exclusively held, still-unreaped child its group.
+            // SAFETY: process_group(0) made this exclusively held, still-unreaped
+            // child its group leader; no wait above released its pid for reuse.
             let killed = unsafe { libc::kill(-pid, libc::SIGKILL) };
             let group_error = (killed != 0).then(std::io::Error::last_os_error);
             let _ = child.kill();

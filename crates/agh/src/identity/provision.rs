@@ -78,7 +78,8 @@ const OFF_UNIX: &str =
 
 /// Provision `req`.
 /// # Errors
-/// Refused for a loose `--file` (with its remedy), a fault the edit would make, or a tier change.
+/// Refused for a loose `--file` (with its remedy), a fault the edit would make, or a tier
+/// change; Unauthenticated when `GET /user` refuses the token; could_not_run on I/O.
 pub fn add(
     gh: &Github,
     dirs: &Dirs,
@@ -136,7 +137,8 @@ pub fn remove(dirs: &Dirs, name: &str) -> Result<Removed> {
 
 /// The pure edit `add` makes (aterm-toml's `edit` document, comments kept).
 /// # Errors
-/// Usage when the text does not parse.
+/// Usage when the text does not parse, when `profiles` or the profile's row is not a table,
+/// or, for a non-empty `req.owners`, when `owners` is not `[[owners]]` tables.
 pub fn edit_config(
     text: &str,
     req: &AddRequest,
@@ -220,7 +222,8 @@ pub fn edit_config(
 
 /// The pure edit `remove` makes: the new text and the owners whose rows changed.
 /// # Errors
-/// Usage when the text does not parse.
+/// Usage when the text does not parse, names no profile `name`, or has an `owners` that is
+/// neither `[[owners]]` tables nor an array of inline tables.
 pub fn remove_from_config(text: &str, name: &str) -> Result<(String, Vec<String>)> {
     let mut doc = parse_document(text)?;
     let present = doc

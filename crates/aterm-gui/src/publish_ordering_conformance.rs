@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `PublishOrdering` (`aterm_models_effects::publish_ordering_model`,
-//! published ⟹ bound): a discovery graph entry never names a socket that is not yet
-//! listening, because `proxy::sweep_stale_graph` deletes exactly such entries.
-//!
-//! Each entry is one model instance, projected from the real filesystem and socket:
-//! `bound` is whether a dial of the socket the entry names (before it exists, the
-//! one it will name) succeeds, the liveness the sweep reads; `published` is whether
-//! its `graph/<sid>` file exists. The run drives the real bind
-//! (`bind_control_listener`), publication (`publish_discovery`, `publish_session`,
-//! whose queued write each step waits for) and sweep for three entries: the root
-//! session's, one registered before the bind (published from the snapshot) and one
-//! registered after.
-//!
-//! `control::spawn` needs the event loop and is not driven; its order is fixed by
-//! types: `publish_discovery` consumes the `BoundControl` only the bind produces and
-//! returns the listener `spawn` serves on, so `spawn` cannot publish before its bind,
-//! name another socket, or serve without publishing. What the types cannot say, that
-//! publishing writes the entries and only for a listening socket, is what this checks.
-//!
-//! Negative control: an entry published before the bind is rejected by the model,
-//! admitted by `Buggy = 1`, and deleted by the real sweep.
+//! Tier-1 conformance test for `PublishOrdering` (`aterm_models_effects::publish_ordering_model`).
 
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -46,8 +26,6 @@ fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
     (dir, plan)
 }
 
-/// Project one entry: is it on disk, and is the socket it names (or, before it
-/// exists, the one it will name) listening?
 fn project(sock_dir: &std::path::Path, sock_path: &str, sid: &SessionId) -> State {
     let entry = crate::proxy::read_graph_entry(sock_dir, crate::proxy::sid_of(sid));
     let named = entry
@@ -73,7 +51,6 @@ fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
     )
 }
 
-/// One entry's model instance, advanced by observing the real code.
 struct Entry {
     name: &'static str,
     sid: SessionId,
@@ -89,8 +66,6 @@ impl Entry {
         }
     }
 
-    /// Observe the entry after a real step: either it did not move, or it moved
-    /// by exactly `action`.
     fn observe(&mut self, sock_dir: &std::path::Path, sock_path: &str, action: &str) {
         let next = project(sock_dir, sock_path, &self.sid);
         if next == self.state {
@@ -111,23 +86,16 @@ impl Entry {
     }
 }
 
-/// Clears the discovery state this test sets (its own,
-/// `proxy::self_sock_test_guard`), even when an assertion fails: its queue
-/// drains while its mirror override still stands.
 struct ProcessDiscoveryReset;
 
 impl Drop for ProcessDiscoveryReset {
     fn drop(&mut self) {
         crate::proxy::clear_self_sock();
-        // A write queued against the test's socket lands while its mirror
-        // override still stands, never in the real control dir.
         let _ = crate::proxy::flush_publications(aterm_spec::wait::MUST_HAPPEN);
         crate::proxy::set_mirror_dir_override(None);
     }
 }
 
-/// [`crate::proxy::publish_session`], then its queued write landed: what the
-/// next observation reads is the publication's own step.
 fn publish_session_landed(sid: &SessionId, nonce: &LaunchNonce) {
     crate::proxy::publish_session(sid, nonce);
     assert!(
@@ -142,8 +110,6 @@ fn discovery_entries_are_published_only_after_the_bind() {
     let mirror = crate::test_scratch::short_dir("the mirror dir");
     crate::proxy::set_mirror_dir_override(Some(mirror.path().to_path_buf()));
     crate::proxy::clear_self_sock();
-    // Made before the reset so it drops after it: the reset's flush lands every
-    // queued write while the directory stands, not in a re-created `<dir>/graph`.
     let (_dir, plan) = fixture();
     let _reset = ProcessDiscoveryReset;
 
@@ -165,8 +131,6 @@ fn discovery_entries_are_published_only_after_the_bind() {
         Entry::new("late", late.sid.clone()),
     ];
 
-    // Before the bind: the register seam's publish must be refused — `Publish`
-    // is disabled at Init, and the real entry must not appear.
     publish_session_landed(&early.sid, &early.nonce);
     for e in &mut entries {
         assert!(!model.action_enabled("Publish", &e.state));
@@ -174,7 +138,6 @@ fn discovery_entries_are_published_only_after_the_bind() {
         assert_eq!(e.state, model.init_state(), "{} published pre-bind", e.name);
     }
 
-    // The real bind: every entry's socket becomes dialable.
     let bound = bind_control_listener(&plan, None, |_| true, |_| false, None)
         .expect("bind the control socket");
     for e in &mut entries {
@@ -182,17 +145,14 @@ fn discovery_entries_are_published_only_after_the_bind() {
         assert_eq!(e.state["bound"], 1, "{} sees the bind", e.name);
     }
 
-    // The post-bind publication: the root entry and the pre-bind registration.
     let listener = publish_discovery(bound, Some(&root), &store);
     for e in &mut entries {
         e.observe(&sock_dir, &sock_path, "Publish");
     }
-    // A session registered after the bind publishes itself.
     publish_session_landed(&late.sid, &late.nonce);
     for e in &mut entries {
         e.observe(&sock_dir, &sock_path, "Publish");
     }
-    // The sweep the ordering protects against must keep every entry.
     crate::proxy::sweep_stale_graph(&sock_dir);
     for e in &mut entries {
         e.observe(&sock_dir, &sock_path, "Publish");
@@ -224,7 +184,6 @@ fn the_snapshot_entries_are_written_with_the_store_let_go() {
     let mirror = crate::test_scratch::short_dir("the mirror dir");
     crate::proxy::set_mirror_dir_override(Some(mirror.path().to_path_buf()));
     crate::proxy::clear_self_sock();
-    // Before the reset, as in `discovery_entries_are_published_only_after_the_bind`.
     let (_dir, plan) = fixture();
     let _reset = ProcessDiscoveryReset;
 
@@ -258,8 +217,6 @@ fn the_snapshot_entries_are_written_with_the_store_let_go() {
     );
     assert!(in_loop.is_some(), "the early entry was written");
     let free = store.try_write().is_ok();
-    // A reader lets the held write through either way. Non-blocking, so the
-    // open returns whether or not the publisher's write ever opens the FIFO.
     let reader = {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
@@ -275,7 +232,6 @@ fn the_snapshot_entries_are_written_with_the_store_let_go() {
     assert!(free, "the store was held across the graph write");
 }
 
-/// An entry written before the bind, from a real state: the `Buggy = 1` step.
 #[test]
 fn an_entry_published_before_the_bind_is_the_buggy_step_and_gets_swept() {
     let model = publish_ordering_model();
@@ -301,8 +257,6 @@ fn an_entry_published_before_the_bind_is_the_buggy_step_and_gets_swept() {
     );
     assert!(!model.check_invariant("PublishImpliesBound", &early));
 
-    // …and the race it loses: the real sweep deletes an entry whose socket is
-    // not listening.
     crate::proxy::sweep_stale_graph(&sock_dir);
     assert!(
         crate::proxy::read_graph_entry(&sock_dir, crate::proxy::sid_of(&sid)).is_none(),

@@ -383,7 +383,9 @@ fn join_lexically(base: &str, path: &str) -> String {
 /// Computes the sorted closure of `vendor/astream/crates/*` path dependencies reached by `export` at `rev`.
 ///
 /// # Errors
-/// Returns an error if no manifest reaches astream or a dependency is missing at `rev`.
+/// Returns an error if no exported manifest reaches astream (the scan is wrong), a crate
+/// the export reaches is not at `rev`, or an astream crate path-depends outside astream's
+/// `crates/`.
 pub fn astream_closure(export: &Path, sub: &Path, rev: &str) -> Result<Vec<String>, String> {
     let parse = |text: &str, what: &str| {
         aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| format!("{what}: {e}"))

@@ -1,41 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The incoming-row apron: the CPU raster of the row a sub-row up-glide slides in at the
-//! bottom of the grid band (see the `scroll_translate` module doc on the exposed strip).
-//!
-//! The row arrives on [`RenderInput::apron_row`] (the row one past the viewport) and is
-//! rastered as row 0 of a one-row `RenderInput` through the same phase runner every
-//! viewport row takes (`composite_free`, then `draw_cursor`), so it is raster-identical
-//! to the row once it lands. The scratch is `w × (grid_top + cell_h)` px because the
-//! row→px law places row 0 at `grid_top` (see `row_ctx`); the pad above catches upward
-//! glyph overshoot, and only the `cell_h`-row band is read back ([`ApronScratch::band`]).
-//!
-//! Cost: at most one row raster per sub-row frame that owes a strip, none on whole-row
-//! frames, and no per-frame allocation once warm.
+//! CPU raster of the incoming apron row (`RenderInput::apron_row`) exposed at the bottom of the
+//! grid band during a sub-row up-glide.
 
 use aterm_core::render::RenderInput;
 
 use crate::{ImageCache, Renderer};
 
-/// Resident scratch for the incoming-row raster, one per presenter (a GPU window uploads
-/// [`band`](Self::band) as the strip's texels).
+/// Resident scratch for the incoming-row raster, one per presenter.
 #[derive(Default)]
 pub struct ApronScratch {
-    /// The one-row `RenderInput` the raster runs over, refilled in place.
     input: RenderInput,
-    /// The row's (always empty) image cache: the phase runner takes one.
     ic: ImageCache,
-    /// `w × (grid_top + cell_h)` packed `0xTTRRGGBB` pixels.
     pixels: Vec<u32>,
-    /// Framebuffer width the last raster ran at (`0` == nothing rastered).
     w: usize,
-    /// The `cell_h`-row band inside `pixels` holding the rastered row.
     band: std::ops::Range<usize>,
-    /// What the last raster depended on: a glide inside one engine row (~119 of every
-    /// 120 trackpad frames) hits it and rasters nothing.
     key: Option<ApronKey>,
-    /// Bumped whenever the band is rewritten; the GPU arms key their strip pack on it.
     generation: u64,
 }
 
@@ -57,27 +38,19 @@ struct ApronKey {
     cursor_style: aterm_core::terminal::CursorStyle,
     cursor_effect_style_override: Option<aterm_core::terminal::CursorStyle>,
     cursor_fill_override: Option<u32>,
-    /// A landed fallback face (or a retired one) re-routes glyphs under
-    /// unchanged cells: the main damage cache repaints on it, so must the strip.
     font_epoch: u64,
-    /// `draw_cursor` gates the caret on the blink phase — on a caret row only.
     cursor_blink_phase: bool,
-    /// …and shapes it by the renderer's unfocused override — a caret row only.
     renderer_cursor_style_override: Option<aterm_core::terminal::CursorStyle>,
 }
 
 impl ApronScratch {
-    /// Forget the rastered row, so the next sub-row frame re-rasters it. The hosts'
-    /// appearance invalidation (`WindowCpu::invalidate`, `WindowGpu::invalidate_present`)
-    /// calls it for changes the key cannot see.
+    /// Forget the rastered row so the next sub-row frame re-rasters it.
     #[inline]
     pub const fn invalidate(&mut self) {
         self.key = None;
     }
 
-    /// The rastered incoming row: `rows()` rows of `width()` packed pixels, top row first,
-    /// as [`crate::scroll_translate::paint_incoming_strip`] reads it. Empty until
-    /// [`Renderer::rasterize_apron_row`] has run.
+    /// The rastered incoming row as `rows() * width()` packed pixels, or empty before rastering.
     #[inline]
     #[must_use]
     pub fn band(&self) -> &[u32] {
@@ -102,8 +75,7 @@ impl ApronScratch {
         }
     }
 
-    /// The raster generation: advances exactly when [`Renderer::rasterize_apron_row`]
-    /// rewrites the band (a key miss); unchanged on a hit.
+    /// Raster generation counter, incremented whenever the band is rewritten.
     #[inline]
     #[must_use]
     pub const fn generation(&self) -> u64 {
@@ -112,19 +84,8 @@ impl ApronScratch {
 }
 
 impl Renderer {
-    /// Raster `input.apron_row` into `scratch` as row 0 of a one-row frame (see the module
-    /// doc). An absent apron (bottom overscroll at `display_offset == 0`) fills the band
-    /// with the frame's base bg instead, so the upward translate leaves no duplicate of the
-    /// bottom row. Returns `false`, leaving `scratch` empty, only when the frame has no
-    /// columns.
-    ///
-    /// The one-row input carries the row's cells, clusters, combining marks and line size,
-    /// the frame's default bg, default fg and cursor colour, and the cursor style (the
-    /// caret only when [`ApronRow::cursor_col`] puts the cursor on this row). No
-    /// selection, effect stream, image or wallpaper (`incoming_row_applies` refuses a
-    /// wallpaper frame first).
-    ///
-    /// [`ApronRow::cursor_col`]: aterm_core::render::ApronRow::cursor_col
+    /// Raster `input.apron_row` into `scratch` as row 0 of a one-row frame, or fill with the base
+    /// background when absent. Returns `false` only when `input.cols == 0`.
     pub fn rasterize_apron_row(&mut self, input: &RenderInput, scratch: &mut ApronScratch) -> bool {
         let ap = &input.apron_row;
         if input.cols == 0 {
@@ -137,7 +98,6 @@ impl Renderer {
         let grid_top = self.grid_top();
         let h = grid_top + self.cell_h;
         let band_bg = self.frame_bg(input) | (self.bg_transmittance() << 24);
-        // A key hit keeps the band and rasters nothing.
         let key = ApronKey {
             present: ap.present,
             cols,
@@ -166,8 +126,6 @@ impl Renderer {
             scratch.generation = scratch.generation.wrapping_add(1);
             return true;
         }
-        // The one-row input still holds what the last raster ran over, so compare the
-        // row in place.
         let mi = &scratch.input;
         if scratch.w != 0
             && scratch.key == Some(key)
@@ -179,7 +137,6 @@ impl Renderer {
         {
             return true;
         }
-        // Refill the one-row input in place (the per-row Vecs keep capacity).
         let mi = &mut scratch.input;
         mi.rows = 1;
         mi.cols = cols;
@@ -206,16 +163,9 @@ impl Renderer {
         mi.cursor_row = 0;
         mi.cursor_col = ap.cursor_col.unwrap_or(0);
         mi.cursor_visible = ap.cursor_col.is_some();
-        // The band's base as `full_render`'s clear lays it (default bg plus the
-        // transmittance byte), so the bg pass elides the same runs as on a viewport row.
         scratch.pixels.clear();
         scratch.pixels.resize(w.saturating_mul(h), band_bg);
-        // Clear the cursor-row plan on both sides: the resident plan describes the
-        // caller's frame, and this row's must not outlive it (`glyph_plan_row`).
         self.glyph_plan_row = None;
-        // Row 0 of this one-row frame is not a chrome row: suspend the host's
-        // `ChromeBleed` (gutter fills, the `[0, grid_top)` lip, the seam) for the
-        // raster, or the strip carries tab-strip colour the landed row never has.
         let bleed = self.chrome_bleed.take();
         let ApronScratch {
             input: mi,
@@ -241,7 +191,6 @@ mod tests {
     use crate::{Theme, WindowCpu};
     use aterm_core::terminal::Terminal;
 
-    /// Machine-independent: the bundled face, runtime discovery off.
     fn renderer() -> Renderer {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -253,7 +202,6 @@ mod tests {
         r
     }
 
-    /// Scrolled back two rows with the cursor hidden: an apron with no caret.
     fn scrolled_input() -> RenderInput {
         let mut t = Terminal::new(8, 20);
         t.process(b"\x1b[?25l");
@@ -266,9 +214,6 @@ mod tests {
         input
     }
 
-    /// The key sees what the raster reads: a hit rasters nothing, a `font_epoch` bump, a
-    /// direct invalidation and the CPU window's `invalidate` each force one re-raster, and
-    /// the blink phase cannot churn a row with no caret.
     #[test]
     fn the_apron_raster_follows_the_font_epoch_and_every_invalidation() {
         let mut r = renderer();

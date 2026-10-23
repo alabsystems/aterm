@@ -1,26 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: the journal reader's view
-//! ([`aterm_slog::journal::view_of`]) against the derived `SessionLogJournal`
-//! model (`aterm_models_session::session_log_journal_model`, checked at Tier-0
-//! in `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded walk picks the model's enabled actions and does each for real: a
-//! session's open, a run's under it and a turn's under the run are appended
-//! to a real [`Log`] (`Append`), and the writer, behind it, journals the
-//! oldest it has not reached through the real [`take`] and [`take_frames`]
-//! (`Write`), or says it lost by a gap frame (`Lose`), or journals a line
-//! again (`Again<i>`); `Snap` writes a snap at the writer's cursor through
-//! the real take, behind the log or not; `Hand` writes the session's
-//! `#handed`; `Crash` makes the chain's writer dead with no `#fin`; `Read`
-//! decodes the chain's bytes and builds the view. Every step's projection
-//! must be the model's successor, and every law must hold. NEGATIVE
-//! CONTROLS: a reader without the dedupe, without the crash closes, blind to
-//! losses, one whose crash closes run parent first, one that keeps a
-//! `#handed` a later snap voided, and the writer and reader before phase
-//! 2B's fixes (a snap behind restating the open path past its head, counted
-//! toward the head) are each rejected by the model, by the law they break.
+//! Conformance tests checking [`aterm_slog::journal::view_of`] and [`aterm_slog::journal::take_frames`] against [`aterm_models_session::session_log_journal_model`].
+//! Seeded walks drive real journal writes, snaps, handoffs, crashes, and reads, with negative-control mutants verifying each invariant.
 
 use aterm_models_session::session_log_journal_model;
 use aterm_slog::journal::{
@@ -40,15 +22,13 @@ fn sid() -> ShortId {
     ShortId::new("s-conform").expect("a sid")
 }
 
-/// How a walk's reader and writer differ from the shipping ones (each a
-/// negative control).
+/// Negative-control mutations for the journal reader and writer.
 #[derive(Clone, Copy)]
 struct Mutant {
     rules: ViewRules,
     /// The reader's closes reordered parent first.
     reverse_closes: bool,
-    /// The writer before phase 2B's fix: a snap restates the open path as
-    /// the log stands, past the snap's head.
+    /// Restates the open path as the log currently stands rather than at the snap's head.
     present_snap: bool,
 }
 
@@ -118,8 +98,7 @@ impl World {
         self.bytes.push(b'\n');
     }
 
-    /// Append slot `lg + 1`'s record to the log: the session's open, a run
-    /// under it, a turn under the run.
+    /// Appends slot `lg + 1`'s record (session open, run, or turn) to the log.
     fn append(&mut self) {
         let ms = 10 * (self.lg + 1);
         match self.lg {
@@ -203,7 +182,6 @@ impl World {
         let read = v.log.read(Cursor::new(v.log.ep(), 0), usize::MAX);
         let mut recs: Vec<Rec> = read.recs.iter().map(|r| (*r).clone()).collect();
         if m.reverse_closes {
-            // NEGATIVE CONTROL: the same closes, parent first.
             let at: Vec<usize> = (0..recs.len())
                 .filter(|i| recs[*i].op == Op::Close)
                 .collect();
@@ -252,7 +230,6 @@ impl World {
         self.view.insert("cs", place(0));
         self.view.insert("cr", place(1));
         self.view.insert("ct", place(2));
-        // The crash gap's `after=`.
         let after = recs
             .iter()
             .find(|r| {
@@ -287,7 +264,6 @@ impl World {
         match action {
             "Append" => self.append(),
             "Write" => {
-                // The writer's own take of the one record it reaches next.
                 let tk = take(&self.log, self.nxt, 1, false);
                 assert_eq!(tk.recs.len(), 1, "one record past the cursor");
                 for f in take_frames(sid(), &tk, false, 1) {
@@ -322,11 +298,8 @@ impl World {
                 self.wrote_session_line();
             }
             "Snap" => {
-                // The writer's snap at its cursor, the log as it stands.
                 let tk = take(&self.log, self.nxt, 0, true);
                 let frames = if m.present_snap {
-                    // NEGATIVE CONTROL: the open path as the log stands,
-                    // past the snap's head.
                     let opens = tk.opens.clone().unwrap_or_default();
                     let mut f = vec![Frame::Snap {
                         sid: sid(),
@@ -381,9 +354,7 @@ const ACTIONS: [&str; 10] = [
     "Append", "Write", "Lose", "Again1", "Again2", "Again3", "Snap", "Hand", "Crash", "Read",
 ];
 
-/// One seeded walk: `Ok(actions)` when every step was the model's and every
-/// law held, `Err((why, state))` at the first step that was not, with the
-/// state the real step reached.
+/// Runs a seeded walk and returns `Ok(actions)` or `Err((why, state))` on the first transition or invariant mismatch.
 fn walk(m: &Model, seed: u64, mutant: Mutant) -> Result<Vec<&'static str>, (String, State)> {
     let mut rng = XorShift::new(seed);
     let mut w = World::new();
@@ -398,7 +369,6 @@ fn walk(m: &Model, seed: u64, mutant: Mutant) -> Result<Vec<&'static str>, (Stri
         if enabled.is_empty() {
             break;
         }
-        // Read often, so every state is looked at.
         let action = if rng.below(4) == 0 {
             "Read"
         } else {
@@ -447,11 +417,7 @@ fn slog_journal_view_conforms_to_derived_model() {
     }
 }
 
-/// NEGATIVE CONTROLS: each reader (or writer and reader) that breaks one law
-/// is refused on some walk, by the law it breaks, and only that law. Each is
-/// held to its first `REFUSALS` refusals, which the seeds reach by seed 175
-/// for the rarest (the kept `#handed`) and by seed 33 for every other
-/// (2026-10-17); walking all 2,000 seeds for each took 15 s.
+/// Each negative-control mutant is rejected on seeded walks by the specific invariant it violates.
 #[test]
 fn slog_journal_view_conformance_rejects_each_broken_reader() {
     const REFUSALS: usize = 8;
@@ -522,8 +488,6 @@ fn slog_journal_view_conformance_rejects_each_broken_reader() {
             !refused.is_empty(),
             "the reader with {name} was never refused"
         );
-        // Refused because the state its read reached breaks the law, and
-        // only that law.
         for (why, state) in &refused {
             assert!(!m.check_invariant(law, state), "{name}: {why}");
             for inv in &m.invariants {
@@ -539,8 +503,7 @@ fn slog_journal_view_conformance_rejects_each_broken_reader() {
     }
 }
 
-/// The shipping writer's snap behind the log never restates past its head:
-/// the walk's own check on the frames, beside the model's law on the view.
+/// A snap written behind the log restates only records at or below its `head`.
 #[test]
 fn a_snap_written_behind_restates_only_what_its_head_accounts_for() {
     let mut w = World::new();
@@ -567,7 +530,6 @@ fn a_snap_written_behind_restates_only_what_its_head_accounts_for() {
     assert_eq!(*head, 1);
     assert_eq!(restated, vec![1], "only the session's open, at or below 1");
     assert_eq!(*open as usize, restated.len());
-    // NEGATIVE CONTROL: the open path as the log stands names seqs 2 and 3.
     let present: Vec<u64> = tk.opens.unwrap_or_default().iter().map(|r| r.seq).collect();
     assert_eq!(present, vec![1, 2, 3]);
 }

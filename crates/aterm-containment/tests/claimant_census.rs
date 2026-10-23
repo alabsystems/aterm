@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The claimant census end to end: real bundles on disk, signed ad-hoc by the
-//! real `codesign`, read through the shipping lister and candidate reader.
-//!
-//! The table tests in `consent.rs` drive the classification with injected
-//! reads. This one exercises the reads themselves — including `codesign`'s
-//! commented `# designated =>` form, which the injected tests cannot see.
+//! End-to-end claimant census tests on signed bundles.
 
 #![cfg(target_os = "macos")]
 
@@ -20,8 +15,6 @@ use aterm_containment::consent::{
 
 const ID: &str = "com.test.aterm-census";
 
-/// Lay `<root>/<name>` as a bundle claiming [`ID`] whose executable prints
-/// `marker` (so each gets its own cdhash), and sign it ad-hoc.
 fn lay_signed(root: &Path, name: &str, marker: &str) {
     let contents = root.join(name).join("Contents");
     std::fs::create_dir_all(contents.join("MacOS")).expect("layout");
@@ -85,9 +78,6 @@ fn the_real_census_tells_a_rollback_and_a_backup_from_the_running_copy() {
     );
 }
 
-/// The Trash's last check before each move, on real bundles: `still_claims`
-/// holds for the copy the census read, and fails once that copy is re-signed
-/// (a new cdhash), when asked about another id, and once the copy is gone.
 #[test]
 fn still_claims_follows_the_bundle_on_disk() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -116,8 +106,6 @@ fn still_claims_follows_the_bundle_on_disk() {
     assert!(!still_claims(&copy, ID), "gone");
 }
 
-/// An unsigned copy is told apart from a read that failed: both have no
-/// requirement text, but the failed read has no class and is never the copy.
 #[test]
 fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -151,9 +139,6 @@ fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
     };
     assert!(still_claims(&copy, ID), "the same unsigned copy");
 
-    // An unreadable executable makes `codesign` answer `Permission denied`: a
-    // failed read with no requirement text, not an unsigned copy. (Root reads
-    // it anyway.)
     aterm_uds::host::could_not_run_as_root("an unreadable (mode 0) executable");
     use std::os::unix::fs::PermissionsExt as _;
     let exe = contents.join("MacOS/aterm");
@@ -166,14 +151,6 @@ fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
     );
 }
 
-/// One bundle is one claimant however many names reach it. Beside a running
-/// copy (presented as Developer ID, however it is spelled) sit an ad-hoc
-/// rollback, an ad-hoc dev build `LaunchServices` registered, a link in the
-/// app folder to that dev build, and a link in a second app folder to the
-/// running copy. The census finds three bundles, not five: the link to the
-/// running copy is the running copy, and the link to the dev build is that
-/// build. The rollback is offered for the Trash; the dev build a link leads
-/// to is listed and never offered, and a plan naming the link moves nothing.
 #[test]
 fn a_link_is_the_bundle_it_names() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");

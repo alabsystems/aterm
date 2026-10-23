@@ -97,7 +97,7 @@ fn thread_cpu_ns() -> u64 {
 fn instructions() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let pid = libc::c_int::try_from(std::process::id()).ok()?;
-    // SAFETY: `info` is writable for one `rusage_info_v4` and zeroed on failure.
+    // SAFETY: `info` is writable for one `rusage_info_v4`, the flavor asked for.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,

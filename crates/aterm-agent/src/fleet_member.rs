@@ -321,12 +321,14 @@ static UNSHOWN_TTY: std::sync::OnceLock<(i32, libc::termios)> = std::sync::OnceL
 /// SIGINT while the code is typed unshown.
 extern "C" fn restore_and_end(signal: libc::c_int) {
     if let Some((fd, saved)) = UNSHOWN_TTY.get() {
-        // SAFETY: `fd` is the /dev/tty `read_unshown` holds open while this handler is installed.
+        // SAFETY: `fd` is the /dev/tty `read_unshown` holds open while this
+        // handler is installed, and `saved` a termios `tcgetattr` filled.
         unsafe {
             libc::tcsetattr(*fd, libc::TCSAFLUSH, saved);
         }
     }
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value.
+    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no
+    // flags).
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
     default.sa_sigaction = libc::SIG_DFL;
     // SAFETY: The default disposition, for the signal this handler took.
@@ -358,7 +360,8 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
     }
     impl Drop for Restore {
         fn drop(&mut self) {
-            // SAFETY: `fd` is the open /dev/tty this function holds for the guard's whole life.
+            // SAFETY: `fd` is the open /dev/tty this function holds for the
+            // guard's whole life, and `saved` a termios `tcgetattr` filled.
             unsafe {
                 libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
             }
@@ -375,7 +378,8 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
         .write(true)
         .open("/dev/tty")?;
     let fd = tty.as_raw_fd();
-    // SAFETY: An all-zero termios is a valid value of the plain C struct.
+    // SAFETY: an all-zero termios is a valid value of the plain C struct, and
+    // `tcgetattr` overwrites it before it is read.
     let mut saved: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is open, and `saved` is a writable termios.
     if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
@@ -385,7 +389,8 @@ fn read_unshown(prompt: &str) -> io::Result<String> {
         .set((fd, saved))
         .is_ok()
         .then(|| {
-            // SAFETY: `sigaction` is plain data for which all-zero is a valid value.
+            // SAFETY: `sigaction` is plain data for which all-zero is a valid
+            // value (an empty mask, no flags).
             let mut restoring: libc::sigaction = unsafe { std::mem::zeroed() };
             restoring.sa_sigaction =
                 restore_and_end as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -2224,7 +2229,8 @@ fn raise_open_files() {
         return;
     }
     limit.rlim_cur = want;
-    // SAFETY: `setrlimit` reads the struct this frame owns.
+    // SAFETY: `setrlimit` reads the struct this frame owns; a soft limit at
+    // or under the hard one is all it is asked.
     let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
 }
 

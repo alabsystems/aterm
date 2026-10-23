@@ -112,7 +112,11 @@ pub fn scope_held(wgpu_oracle: bool, display: Display, end: End) -> bool {
 /// Evaluates `e` for a run ending with `end`.
 ///
 /// # Errors
-/// Returns an error describing the first check that failed.
+/// aterm-gui did not exit, panicked or was killed; for a dead display, it
+/// exited 0, never said why, or (`scoped`) never reached the scoped
+/// configure; for a person's quit, it exited nonzero or said its display
+/// connection ended; either way, it left no saved layout naming the folder,
+/// or left a crash journal.
 pub fn judge(e: &Evidence, end: End, scoped: bool) -> Result<String, String> {
     let Some(status) = e.status.as_deref().map(str::trim) else {
         return Err(format!(

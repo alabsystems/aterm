@@ -605,7 +605,9 @@ mod mac {
             /// The listener's userdata (the edge field inside the pinned
             /// allocation).
             const fn edge_user(&self) -> *mut c_void {
-                // SAFETY: `user` is a live `Arc<Shared>` raw pointer until `release_user`.
+                // SAFETY: `user` is a live `Arc<Shared>` raw pointer until
+                // `release_user`, which runs last; taking a field's address does
+                // not create a reference.
                 unsafe { std::ptr::addr_of!((*self.user).running_edge) as *mut c_void }
             }
 
@@ -613,7 +615,8 @@ mod mac {
             pub(super) fn read_is_running(&self) -> Option<bool> {
                 let mut value: u32 = 0;
                 let mut size = std::mem::size_of::<u32>() as u32;
-                // SAFETY: The queue is live (owned, not yet disposed).
+                // SAFETY: the queue is live (owned, not yet disposed); `value`
+                // and `size` outlive the call and `size` states the buffer.
                 let status = unsafe {
                     AudioQueueGetProperty(
                         self.queue,
@@ -628,7 +631,8 @@ mod mac {
 
         impl QueueOwnerCalls for AudioToolboxQueue {
             fn add_running_listener(&mut self) -> bool {
-                // SAFETY: The queue is live.
+                // SAFETY: The queue is live; the userdata's lifetime is argued at
+                // `running_listener`.
                 unsafe {
                     AudioQueueAddPropertyListener(
                         self.queue,
@@ -640,7 +644,8 @@ mod mac {
             }
 
             fn remove_running_listener(&mut self) {
-                // SAFETY: The queue is live (dispose has not run).
+                // SAFETY: the queue is live (dispose has not run); proc and
+                // userdata are the exact pair that was added.
                 unsafe {
                     AudioQueueRemovePropertyListener(
                         self.queue,
@@ -652,14 +657,16 @@ mod mac {
             }
 
             fn dispose(&mut self) {
-                // SAFETY: Synchronous dispose (immediate = 1) stops the callback thread.
+                // SAFETY: synchronous dispose (immediate = 1) stops the callback
+                // thread before `release_user` drops the refcount it was using.
                 unsafe {
                     AudioQueueDispose(self.queue, 1);
                 }
             }
 
             fn release_user(&mut self) {
-                // SAFETY: `user` came from `Arc::into_raw` in `MacOut::new` and is released once.
+                // SAFETY: `user` came from `Arc::into_raw` in `MacOut::new` and is released once,
+                // here, after the queue is gone.
                 unsafe { drop(Arc::from_raw(self.user)) };
             }
         }
@@ -752,12 +759,14 @@ mod mac {
         )
     )]
     extern "C" fn render_cb(user: *mut c_void, q: AudioQueueRef, buf: *mut AudioQueueBuffer) {
-        // SAFETY: `user` is the `Arc<Shared>` raw pointer installed at queue creation.
+        // SAFETY: `user` is the `Arc<Shared>` raw pointer installed at queue
+        // creation and outlives the queue (disposed synchronously first).
         let shared = unsafe { &*(user as *const Shared) };
         shared
             .last_cb_us
             .store(crate::metrics::now_us(), Ordering::Relaxed);
-        // SAFETY: The queue hands us a buffer allocated with `BUFFER_FRAMES * CHANNELS` `f32`s.
+        // SAFETY: the queue hands us a buffer allocated with `BUFFER_FRAMES * CHANNELS` `f32`s, and
+        // we fill exactly that.
         unsafe {
             let recycle_epoch = shared.recycle_epoch.load(Ordering::Acquire);
             if recycle_epoch & 1 == 0 {
@@ -807,7 +816,10 @@ mod mac {
         health: DeviceHealth,
     }
 
-    // SAFETY: `queue` is only touched from the audio worker (start/stop/dispose).
+    // SAFETY: `queue` is only touched from the audio worker (start/stop/
+    // dispose); the callback thread reaches state exclusively through the
+    // `Shared` (Mutex + atomics). AudioQueue control calls are themselves
+    // thread-safe per AudioToolbox's documented contract.
     unsafe impl Send for MacOut {}
 
     impl MacOut {
@@ -835,7 +847,8 @@ mod mac {
             };
             let user = Arc::into_raw(Arc::clone(&shared)) as *mut c_void;
             let mut queue: AudioQueueRef = std::ptr::null_mut();
-            // SAFETY: Fmt/queue outlive the call.
+            // SAFETY: fmt/queue outlive the call; null run loop selects
+            // AudioToolbox's internal callback thread.
             let st = unsafe {
                 AudioQueueNewOutput(
                     &fmt,
@@ -848,7 +861,8 @@ mod mac {
                 )
             };
             if st != 0 || queue.is_null() {
-                // SAFETY: Reclaim the refcount handed to the uncreated queue so it is not leaked.
+                // SAFETY: reclaim the refcount handed to the uncreated queue so it is not leaked;
+                // no queue exists, so there is no listener and nothing to dispose.
                 unsafe { drop(Arc::from_raw(user as *const Shared)) };
                 return None;
             }
@@ -858,7 +872,8 @@ mod mac {
             let mut buffers = [std::ptr::null_mut(); BUFFER_COUNT];
             for slot in &mut buffers {
                 let mut buf: *mut AudioQueueBuffer = std::ptr::null_mut();
-                // SAFETY: Queue is live.
+                // SAFETY: Queue is live; on success the pointer stays allocated until queue
+                // disposal. It remains unscheduled/available here.
                 let st = unsafe { AudioQueueAllocateBuffer(queue, bytes, &mut buf) };
                 if st != 0 || buf.is_null() {
                     // `owned` drops here: listener, dispose, refcount.
@@ -1053,7 +1068,9 @@ mod mac {
         fn render_post_cue(&mut self, index: usize) -> bool {
             let buf = self.buffers[index];
             debug_assert!(!buf.is_null());
-            // SAFETY: This adapter is constructed only while every retained pointer is available.
+            // SAFETY: this adapter is constructed only while every retained
+            // pointer is AVAILABLE (initial allocation or after synchronous
+            // immediate stop), and capacity is fixed at allocation.
             unsafe {
                 let out = std::slice::from_raw_parts_mut(
                     (*buf).m_audio_data as *mut f32,
@@ -1073,7 +1090,8 @@ mod mac {
         }
 
         fn enqueue_buffer(&mut self, index: usize) -> bool {
-            // SAFETY: The indexed pointer is still available and becomes scheduled/queue-owned.
+            // SAFETY: the indexed pointer is still AVAILABLE and becomes
+            // scheduled/queue-owned exactly once on success.
             unsafe {
                 AudioQueueEnqueueBuffer(self.queue, self.buffers[index], 0, std::ptr::null()) == 0
             }
@@ -1089,7 +1107,9 @@ mod mac {
         }
 
         fn stop_immediate(&mut self) -> bool {
-            // SAFETY: Immediate=true is synchronous.
+            // SAFETY: immediate=true is synchronous. On success AudioToolbox
+            // reset/removal has completed and all retained pointers are again
+            // available for the worker to fill.
             unsafe { AudioQueueStop(self.queue, 1) == 0 }
         }
     }
@@ -1990,7 +2010,7 @@ impl TrailAudio {
     #[cfg(test)]
     pub(crate) fn is_inert_for_test(&self) -> bool {
         // A capturing host accepts cues, so it is not inert; this stays the
-        // exact complement of `is_live`.
+        // complement of `is_live`'s capture arm.
         if self.capture.is_some() {
             return false;
         }

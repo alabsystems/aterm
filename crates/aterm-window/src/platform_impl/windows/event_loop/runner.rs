@@ -29,12 +29,7 @@ pub(crate) type EventLoopRunnerShared<T> = Rc<EventLoopRunner<T>>;
 type EventHandler<T> = Cell<Option<Box<dyn FnMut(Event<T>)>>>;
 
 pub(crate) struct EventLoopRunner<T: 'static> {
-    // The event loop's win32 handles
     pub(super) thread_msg_target: HWND,
-
-    // Setting this will ensure pump_events will return to the external
-    // loop asap. E.g. set after each RedrawRequested to ensure pump_events
-    // can't stall an external loop beyond a frame
     pub(super) interrupt_msg_dispatch: Cell<bool>,
 
     control_flow: Cell<ControlFlow>,
@@ -56,8 +51,7 @@ pub(crate) enum RunnerState {
     Uninitialized,
     /// The event loop is idling.
     Idle,
-    /// The event loop is handling the OS's events and sending them to the user's callback.
-    /// `NewEvents` has been sent, and `AboutToWait` hasn't.
+    /// Handling OS events after `NewEvents` and before `AboutToWait`.
     HandlingMainEvents,
     /// The event loop has been destroyed. No other events will be emitted.
     Destroyed,
@@ -83,7 +77,7 @@ impl<T> EventLoopRunner<T> {
         }
     }
 
-    /// Associate the application's event handler with the runner
+    /// Associates the application's event handler with the runner.
     ///
     /// # Safety
     /// This is ignoring the lifetime of the application handler (which may not
@@ -98,7 +92,6 @@ impl<T> EventLoopRunner<T> {
     where
         F: FnMut(Event<T>),
     {
-        // Erase closure lifetime.
         // SAFETY: Caller upholds that the lifetime of the closure is upheld.
         let f = unsafe {
             mem::transmute::<Box<dyn FnMut(Event<T>)>, Box<dyn FnMut(Event<T>)>>(Box::new(f))
@@ -131,7 +124,6 @@ impl<T> EventLoopRunner<T> {
     }
 }
 
-/// State retrieval functions.
 impl<T> EventLoopRunner<T> {
     #[allow(unused)]
     pub fn thread_msg_target(&self) -> HWND {
@@ -169,16 +161,12 @@ impl<T> EventLoopRunner<T> {
     }
 }
 
-/// Misc. functions
 impl<T> EventLoopRunner<T> {
     pub fn catch_unwind<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
         let panic_error = self.panic_error.take();
         if panic_error.is_none() {
             let result = panic::catch_unwind(panic::AssertUnwindSafe(f));
 
-            // Check to see if the panic error was set in a re-entrant call to catch_unwind inside
-            // of `f`. If it was, that error takes priority. If it wasn't, check if our call to
-            // catch_unwind caught any panics and set panic_error appropriately.
             match self.panic_error.take() {
                 None => match result {
                     Ok(r) => Some(r),
@@ -199,7 +187,6 @@ impl<T> EventLoopRunner<T> {
     }
 }
 
-/// Event dispatch functions.
 impl<T> EventLoopRunner<T> {
     pub(crate) fn prepare_wait(&self) {
         self.move_state_to(RunnerState::Idle);
@@ -212,13 +199,8 @@ impl<T> EventLoopRunner<T> {
     pub(crate) fn send_event(&self, event: Event<T>) {
         if let Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } = event {
             self.call_event_handler(event);
-            // As a rule, to ensure that `pump_events` can't block an external event loop
-            // for too long, we always guarantee that `pump_events` will return control to
-            // the external loop asap after a `RedrawRequested` event is dispatched.
             self.interrupt_msg_dispatch.set(true);
         } else if self.should_buffer() {
-            // If the runner is already borrowed, we're in the middle of an event loop invocation.
-            // Add the event to a buffer to be processed later.
             self.event_buffer.borrow_mut().push_back(BufferedEvent::from_event(event))
         } else {
             self.call_event_handler(event);
@@ -245,10 +227,6 @@ impl<T> EventLoopRunner<T> {
 
     fn dispatch_buffered_events(&self) {
         loop {
-            // We do this instead of using a `while let` loop because if we use a `while let`
-            // loop the reference returned `borrow_mut()` doesn't get dropped until the end
-            // of the loop's body and attempts to add events to the event buffer while in
-            // `process_event` will fail.
             let buffered_event_opt = self.event_buffer.borrow_mut().pop_front();
             match buffered_event_opt {
                 Some(e) => e.dispatch_event(|e| self.call_event_handler(e)),
@@ -257,30 +235,8 @@ impl<T> EventLoopRunner<T> {
         }
     }
 
-    /// Dispatch control flow events (`NewEvents`, `AboutToWait`, and
-    /// `LoopExiting`) as necessary to bring the internal `RunnerState` to the
-    /// new runner state.
-    ///
-    /// The state transitions are defined as follows:
-    ///
-    /// ```text
-    ///    Uninitialized
-    ///          |
-    ///          V
-    ///        Idle
-    ///       ^    |
-    ///       |    V
-    /// HandlingMainEvents
-    ///         |
-    ///         V
-    ///     Destroyed
-    /// ```
-    ///
-    /// Attempting to transition back to `Uninitialized` will result in a panic. Attempting to
-    /// transition *from* `Destroyed` will also result in a panic. Transitioning to the current
-    /// state is a no-op. Even if the `new_runner_state` isn't the immediate next state in the
-    /// runner state machine (e.g. `self.runner_state == HandlingMainEvents` and
-    /// `new_runner_state == Idle`), the intermediate state transitions will still be executed.
+    /// Dispatches control-flow events (`NewEvents`, `AboutToWait`, `LoopExiting`) to transition `self.runner_state` to `new_runner_state`.
+    /// Panics on transitions to `Uninitialized` or out of `Destroyed`.
     fn move_state_to(&self, new_runner_state: RunnerState) {
         use RunnerState::{Destroyed, HandlingMainEvents, Idle, Uninitialized};
 
@@ -290,7 +246,6 @@ impl<T> EventLoopRunner<T> {
             | (HandlingMainEvents, HandlingMainEvents)
             | (Destroyed, Destroyed) => (),
 
-            // State transitions that initialize the event loop.
             (Uninitialized, HandlingMainEvents) => {
                 self.call_new_events(true);
             },
@@ -307,7 +262,6 @@ impl<T> EventLoopRunner<T> {
             },
             (_, Uninitialized) => panic!("cannot move state to Uninitialized"),
 
-            // State transitions that start the event handling process.
             (Idle, HandlingMainEvents) => {
                 self.call_new_events(false);
             },
@@ -316,7 +270,6 @@ impl<T> EventLoopRunner<T> {
             },
 
             (HandlingMainEvents, Idle) => {
-                // This is always the last event we dispatch before waiting for new events
                 self.call_event_handler(Event::AboutToWait);
                 self.last_events_cleared.set(Instant::now());
             },
@@ -353,8 +306,6 @@ impl<T> EventLoopRunner<T> {
             },
         };
         self.call_event_handler(Event::NewEvents(start_cause));
-        // NB: For consistency all platforms must emit a 'resumed' event even though Windows
-        // applications don't themselves have a formal suspend/resume lifecycle.
         if init {
             self.call_event_handler(Event::Resumed);
         }

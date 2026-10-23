@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Settings control catalogue ([`SettingsState`]), overlay geometry and roles
-//! ([`SettingsGeom`], [`Roles`]), and row writers ([`blank_row`], [`write_str`],
-//! [`crate::native_ui`]).
+//! ([`SettingsGeom`], [`Roles`]), and row writers ([`blank_row`], [`write_str`]).
 
 use aterm_core::terminal::RenderCell;
 
@@ -99,13 +98,13 @@ pub(crate) const fn u32_rgb(c: u32) -> [u8; 3] {
     ]
 }
 
-/// The width of `s` at `px` in the mono ([`crate::tray_raster::measure_text`],
-/// [`crate::tray_raster::ui_text_width`]).
+/// The width of `s` at `px` in the regular mono face ([`crate::tray_raster::measure_text`]);
+/// UI-face text measures with [`crate::tray_raster::ui_text_width`].
 pub(crate) fn text_w(s: &str, px: f32) -> f32 {
     crate::tray_raster::measure_text(s, px, TextWeight::Regular)
 }
 
-/// `f32::clamp`, except that inverted bounds.
+/// `f32::clamp`, except that inverted bounds give `hi` floored at zero instead of panicking.
 #[inline]
 pub(crate) fn fit(value: f32, lo: f32, hi: f32) -> f32 {
     if hi <= lo {

@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal mode bitflags, including those that drive keyboard encoding (legacy VT/xterm and
-//! the Kitty keyboard protocol).
+//! Terminal mode bitflags, including keyboard encoding flags.
 
 bitflags! {
     /// Terminal mode flags; [`TermMode::to_keyboard_mode`] projects the keyboard subset.
@@ -56,7 +55,6 @@ bitflags! {
         /// VT52 compatibility mode.
         const VT52_MODE = 1 << 23;
 
-        // Kitty keyboard protocol flags (CSI > u).
         /// Disambiguate escape codes - send Esc, Alt+key, Ctrl+key using CSI u.
         const DISAMBIGUATE_ESC_CODES = 1 << 24;
         /// Report key repeat and release events.
@@ -68,7 +66,6 @@ bitflags! {
         /// Report associated text with key events.
         const REPORT_ASSOCIATED_TEXT = 1 << 28;
 
-        // xterm XTMODKEYS/XTFMTKEYS (modifyOtherKeys/formatOtherKeys).
         /// modifyOtherKeys level 1 (CSI > 4 ; 1 m).
         const XTERM_MODIFY_OTHER_KEYS_LEVEL1 = 1 << 29;
         /// modifyOtherKeys level 2 (CSI > 4 ; 2 m).
@@ -94,8 +91,7 @@ bitflags! {
 }
 
 impl TermMode {
-    /// Build a `TermMode` from the keyboard-relevant state only: `APP_CURSOR`, `APP_KEYPAD`,
-    /// `VT52_MODE`, the five kitty flags and the three xterm flags.
+    /// Build a `TermMode` from keyboard-relevant state only.
     #[inline]
     #[must_use]
     pub fn from_keyboard_state(

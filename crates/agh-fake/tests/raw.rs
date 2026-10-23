@@ -100,9 +100,9 @@ impl Req {
     }
 
     /// Send it to `port` and read the answer to EOF.
-    ///
     /// # Panics
-    /// When the fake cannot be reached or does not answer in time.
+    /// When the fake cannot be reached, or does not take the request or answer it within the
+    /// hang detector.
     pub fn send(&self, port: u16) -> Reply {
         let mut head = format!(
             "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n",
@@ -119,9 +119,9 @@ impl Req {
 }
 
 /// Send `bytes` to `port` as they are, and read the answer to EOF.
-///
 /// # Panics
-/// When the fake cannot be reached or does not answer in time.
+/// When the fake cannot be reached, or does not take the request or answer it within the
+/// hang detector.
 pub fn send_bytes(port: u16, bytes: &[u8]) -> Reply {
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect to the fake");
     stream.set_read_timeout(Some(HANG)).expect("read timeout");
@@ -135,7 +135,6 @@ pub fn send_bytes(port: u16, bytes: &[u8]) -> Reply {
 }
 
 /// Sends `bytes` to `port`, closes the write side, and reads the answer to EOF.
-///
 /// # Panics
 /// When the fake cannot be reached or does not answer in time.
 pub fn send_cut(port: u16, bytes: &[u8]) -> Reply {
@@ -213,7 +212,6 @@ impl Reply {
     }
 
     /// The body as JSON.
-    ///
     /// # Panics
     /// When the body is not JSON.
     pub fn json(&self) -> aterm_json::Value {

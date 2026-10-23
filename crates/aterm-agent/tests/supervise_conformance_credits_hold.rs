@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! Tier-1 conformance test for `SupervisorCreditsHold` (`supervisor_credits_hold_model`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -20,16 +19,9 @@ use crate::common::cnst;
 type State = BTreeMap<&'static str, i64>;
 
 const MIN: Duration = Duration::from_secs(60);
-
-/// A turn's work past the short streak's: a job.
 const JOB: Duration = Duration::from_secs(12 * 60);
-
-/// The grace a wait keeps past a reset: one tick.
 const GRACE: Duration = MIN;
 
-/// The screen at a turn's end, and the REAL reader's read of it, each made
-/// once: the measured screen with `Now using usage credits` on the mode row,
-/// or the same row with the notice gone.
 fn read(notice: bool) -> &'static (Vec<String>, aterm_phase::Reading) {
     static READ: std::sync::OnceLock<[(Vec<String>, aterm_phase::Reading); 2]> =
         std::sync::OnceLock::new();
@@ -50,9 +42,6 @@ fn read(notice: bool) -> &'static (Vec<String>, aterm_phase::Reading) {
     &both[usize::from(notice)]
 }
 
-/// The REAL turn-end reading of a point: the reader's, its credits given the
-/// reset the loop kept (`kept`) and its first read of the notice (`since`),
-/// as `Session::turn_end_reading` gives it.
 fn reading(notice: bool, known: bool, kept: Option<Instant>, since: Instant) -> TurnEndReading {
     let (rows, read) = read(notice);
     assert_eq!(
@@ -116,12 +105,10 @@ fn verdict(a: &TurnEndAction) -> Verdict {
     }
 }
 
-/// Whether `action` is enabled at `st`.
 fn enabled(m: &Model, action: &str, st: &State) -> bool {
     m.fire(action, &mut st.clone())
 }
 
-/// What the model says the decider does at the point `st`.
 fn expected(m: &Model, st: &State, real: &Real) -> Verdict {
     if enabled(m, "OwnAct", st) {
         Verdict::Types
@@ -136,7 +123,6 @@ fn expected(m: &Model, st: &State, real: &Real) -> Verdict {
     }
 }
 
-/// The policy the real decider runs under.
 fn policy(m: &Model, run: Run) -> SupervisorConfig {
     SupervisorConfig {
         usage_credits: run.key_on || cnst(m, "UsageCredits") == 1,
@@ -144,7 +130,6 @@ fn policy(m: &Model, run: Run) -> SupervisorConfig {
     }
 }
 
-/// Mirrors `action` (from `st` to `next`) on the real side.
 fn mirror(m: &Model, action: &str, next: &State, r: &mut Real, cfg: &SupervisorConfig, run: Run) {
     let reset_at = MIN * u32::try_from(cnst(m, "ResetAt")).unwrap();
     match action {
@@ -211,17 +196,12 @@ fn mirror(m: &Model, action: &str, next: &State, r: &mut Real, cfg: &SupervisorC
     }
 }
 
-/// The walk's result: every state reached, those where the real decider
-/// disagreed, and how often each action was mirrored.
 struct Walked {
     states: BTreeSet<State>,
     off: Vec<State>,
     fired: BTreeMap<&'static str, usize>,
 }
 
-/// Every reachable state of `m`, the real side mirrored along the first path
-/// to each; at every point the real decision is checked against the model's.
-/// `strict`: a disagreement, or a broken invariant, fails at once.
 fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     let cfg = policy(m, run);
     let base = Instant::now() + Duration::from_secs(24 * 3600);
@@ -285,7 +265,6 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     }
 }
 
-/// The model under the key's two values.
 fn under_key(on: bool) -> Model {
     aterm_spec::interp::with_consts(
         &supervisor_credits_hold_model(),
@@ -293,12 +272,6 @@ fn under_key(on: bool) -> Model {
     )
 }
 
-/// THE CREDITS HOLD, WALKED: every reachable state of the model, under the
-/// key off and on, agrees with the real reader and decider — the hold types
-/// nothing while credits carry the session under the key off, waits to the
-/// named reset and then continues, tells once where none is named and waits
-/// to its bound — and the model's laws hold at every state. Every action of
-/// the model's own (not its defects') is mirrored.
 #[test]
 fn tier1_the_real_decider_holds_usage_credits_exactly_where_the_model_says() {
     for on in [false, true] {
@@ -355,15 +328,6 @@ fn tier1_the_real_decider_holds_usage_credits_exactly_where_the_model_says() {
     }
 }
 
-/// NEGATIVE CONTROLS: a decider under the key on where the model has it off
-/// disagrees only at a known episode's hold, including a vanished notice;
-/// a loop that keeps no reset disagrees at the named reset (and can carry
-/// that error into a later episode); a hold with no bound only where none
-/// is — its wait, and the probe
-/// at the bound.
-/// The model's defect `ActsOnCredits` breaks `NoOwnActOnCredits`,
-/// `StaleNoticeHolds` breaks `NoStaleHold`, and `UnboundedHold` breaks
-/// `NoEndlessHold`.
 #[test]
 fn tier1_a_decider_that_ignores_the_hold_disagrees_where_the_model_holds() {
     let m = under_key(false);

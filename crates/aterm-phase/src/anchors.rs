@@ -704,6 +704,44 @@ pub const ANCHORS: &[Anchor] = &[
         " (Claude Code's temporary directory)",
         "2.1.309",
     ),
+    // A command 2.1.309 did not start because it could not create the file
+    // that captures its output (`zy(`The command was not started: ${ki} on
+    // the volume holding …`)`, `ki` naming the code in parentheses).
+    lit(
+        "wall.disk_full.pre_start",
+        "The command was not started: ",
+        "2.1.309",
+    ),
+    lit(
+        "wall.disk_full.pre_start_full",
+        "this computer's disk is full (",
+        "2.1.309",
+    ),
+    lit(
+        "wall.disk_full.pre_start_quota",
+        "the user's disk quota is used up (",
+        "2.1.309",
+    ),
+    // The rest of that template: `${ki} on the volume holding ${dir} (Claude
+    // Code's temporary directory), so the file … nothing ran. ${e9}`, `e9`
+    // being the advice the bundle keeps in a variable of its own.
+    lit(
+        "wall.disk_full.pre_start_volume",
+        " on the volume holding ",
+        "2.1.309",
+    ),
+    lit(
+        "wall.disk_full.pre_start_ran",
+        ", so the file that captures command output could not be created there and nothing ran.",
+        "2.1.309",
+    ),
+    lit(
+        "wall.disk_full.free_space",
+        "Free space on that volume, or restart Claude Code with CLAUDE_CODE_TMPDIR set to a \
+         directory on another one, then retry. If this is the user's own computer, tell them \
+         before deleting anything to make room.",
+        "2.1.309",
+    ),
     // A failed command's result opens `Exit code <n>` (the bundle's
     // `[`Exit code ${e.code}`, …]`, read on 2.1.304, 2.1.308 and 2.1.309):
     // the line the notice is drawn under.

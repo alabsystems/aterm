@@ -15,8 +15,7 @@ pub enum Key {
 }
 
 impl Key {
-    /// The main-block key a keypad key stands in for: digits and operators fold to the glyph they
-    /// type.
+    /// The main-block key a keypad key stands in for.
     #[inline]
     #[must_use]
     pub const fn main_block_twin(&self) -> Option<Key> {
@@ -291,8 +290,7 @@ pub enum NamedKey {
 }
 
 impl NamedKey {
-    /// A sided modifier key's modifier bit and its other-side twin
-    /// ([`super::encode_key_with_event`]).
+    /// Sided modifier bit and its other-side twin ([`super::encode_key_with_event`]).
     #[inline]
     #[must_use]
     pub const fn modifier_twin(self) -> Option<(Modifiers, NamedKey)> {

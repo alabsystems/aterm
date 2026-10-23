@@ -9,8 +9,6 @@ use std::sync::Arc;
 use super::super::super::reflow::ReflowMode;
 use super::super::super::*;
 
-/// Resize while display_offset > 0 reflows the live content, not scrolled-back
-/// history.
 #[test]
 fn resize_reflow_with_nonzero_display_offset_preserves_live_content() {
     let mut grid = Grid::with_scrollback(4, 10, 4);
@@ -20,7 +18,6 @@ fn resize_reflow_with_nonzero_display_offset_preserves_live_content() {
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Scroll once, advancing ring_head.
     grid.set_cursor(3, 0);
     grid.line_feed();
     grid.set_cursor(3, 0);
@@ -36,8 +33,6 @@ fn resize_reflow_with_nonzero_display_offset_preserves_live_content() {
 
     grid.resize_with_reflow_mode(4, 8, ReflowMode::Enabled);
 
-    // The resize keeps the reading position (clamped to the new history length); the reflow
-    // runs at offset 0 and restores it after.
     assert!(
         grid.storage.display_offset > 0,
         "display_offset should be PRESERVED across resize, not reset to 0"
@@ -47,7 +42,6 @@ fn resize_reflow_with_nonzero_display_offset_preserves_live_content() {
         "preserved display_offset must stay clamped to the new history length"
     );
 
-    // Back to the live view (`cell()` applies display_offset): the live content survived.
     grid.storage.display_offset = 0;
     let live_after: Vec<char> = (0..4)
         .map(|row| grid.cell(row, 0).unwrap().char())
@@ -59,7 +53,6 @@ fn resize_reflow_with_nonzero_display_offset_preserves_live_content() {
     grid.assert_invariants();
 }
 
-/// Hyperlink that moves to a new row during shrink reflow is preserved.
 #[test]
 fn reflow_shrink_hyperlink_moves_to_new_row() {
     let mut grid = Grid::new(5, 10);
@@ -71,7 +64,6 @@ fn reflow_shrink_hyperlink_moves_to_new_row() {
     extra.set_hyperlink(Some(Arc::from("https://h.example")));
     extra.set_hyperlink_id(Some(Arc::from("link-h")));
 
-    // 'H' at offset 7 lands on (1, 2).
     grid.resize(5, 5);
 
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
@@ -99,7 +91,6 @@ fn reflow_shrink_hyperlink_moves_to_new_row() {
     assert!(grid.extras().get(CellCoord::new(0, 7)).is_none());
 }
 
-/// Underline color survives grow reflow (unwrap).
 #[test]
 fn reflow_grow_preserves_underline_color() {
     let mut grid = Grid::new(5, 5);
@@ -119,7 +110,6 @@ fn reflow_grow_preserves_underline_color() {
         .get_or_create(CellCoord::new(1, 1))
         .set_underline_color(Some([255, 0, 128]));
 
-    // 'G' (logical offset 6) lands on (0,6).
     grid.resize(5, 12);
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGHIJ");
 
@@ -138,7 +128,6 @@ fn reflow_grow_preserves_underline_color() {
     );
 }
 
-/// RGB foreground color survives shrink + grow round-trip.
 #[test]
 fn reflow_round_trip_preserves_fg_rgb() {
     let mut grid = Grid::new(5, 10);
@@ -167,7 +156,6 @@ fn reflow_round_trip_preserves_fg_rgb() {
     assert_eq!(after_grow.unwrap().fg_rgb(), Some([10, 20, 30]));
 }
 
-/// Background RGB must survive shrink reflow, not just foreground RGB.
 #[test]
 fn reflow_shrink_preserves_bg_rgb() {
     let mut grid = Grid::new(5, 10);
@@ -195,7 +183,6 @@ fn reflow_shrink_preserves_bg_rgb() {
     );
 }
 
-/// Complex-char overflow survives shrink reflow and still renders via row_text().
 #[test]
 fn reflow_shrink_preserves_complex_char_and_row_text() {
     let mut grid = Grid::new(4, 10);
@@ -219,8 +206,6 @@ fn reflow_shrink_preserves_complex_char_and_row_text() {
     );
 }
 
-/// Extras on a wide cell must drop when 1-column reflow replaces the
-/// cell with a blank and skips its spacer.
 #[test]
 fn reflow_shrink_drops_wide_char_extras_when_wide_cell_is_replaced() {
     let mut grid = Grid::new(3, 4);
@@ -253,7 +238,6 @@ fn reflow_shrink_drops_wide_char_extras_when_wide_cell_is_replaced() {
     );
 }
 
-/// After reflow, HAS_EXTRAS flags match the extras map exactly.
 #[test]
 fn reflow_extras_flags_consistent_after_shrink() {
     let mut grid = Grid::new(4, 12);
@@ -271,7 +255,6 @@ fn reflow_extras_flags_consistent_after_shrink() {
         .get_or_create(CellCoord::new(0, 10))
         .set_fg_rgb(Some([0, 255, 0]));
 
-    // At 4 cols 'C', 'G', 'K' land at (0,2), (1,2), (2,2).
     grid.resize(4, 4);
 
     assert!(
@@ -323,7 +306,6 @@ fn reflow_extras_flags_consistent_after_grow() {
         .get_or_create(CellCoord::new(1, 1))
         .set_underline_color(Some([0, 0, 255]));
 
-    // 'F' at (1,1) lands on (0,5).
     grid.resize(4, 10);
 
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDEFGH");
@@ -348,8 +330,6 @@ fn reflow_extras_flags_consistent_after_grow() {
     grid.assert_invariants();
 }
 
-/// A height shrink pushes the top rows into ring history; a regrow reveals them again and the
-/// bottom row's hyperlink follows its content.
 #[test]
 fn reflow_row_shrink_retains_rows_and_extras_follow_regrow() {
     let mut grid = Grid::new(5, 10);
@@ -374,7 +354,6 @@ fn reflow_row_shrink_retains_rows_and_extras_follow_regrow() {
             "row {row} restored after the round-trip"
         );
     }
-    // The hyperlink stays with 'E'.
     let remapped = grid.cell_extra(4, 0).expect("E keeps its hyperlink");
     assert_eq!(
         remapped.hyperlink().map(|u| u.as_ref()),
@@ -389,8 +368,6 @@ fn reflow_row_shrink_retains_rows_and_extras_follow_regrow() {
     grid.assert_invariants();
 }
 
-/// A height decrease (no column change) stages the excess front rows in the lazy buffer instead
-/// of dropping them.
 #[test]
 fn adjust_row_count_height_decrease_preserves_scrollback_content() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
@@ -440,7 +417,6 @@ fn adjust_row_count_height_decrease_preserves_scrollback_content() {
     grid.assert_invariants();
 }
 
-/// A height decrease on a grid with no tiered store does not panic.
 #[test]
 fn adjust_row_count_height_decrease_no_scrollback_no_panic() {
     let mut grid = Grid::new(5, 80);
@@ -450,7 +426,6 @@ fn adjust_row_count_height_decrease_no_scrollback_no_panic() {
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Ring entries for the shrink path to drain.
     grid.set_cursor(4, 0);
     grid.line_feed();
     grid.set_cursor(4, 0);
@@ -478,7 +453,6 @@ fn logical_scrollback(grid: &Grid) -> Vec<String> {
     out
 }
 
-/// A column change rewraps all ring scrollback; the logical lines survive both directions.
 #[test]
 fn column_reflow_preserves_ring_scrollback_both_directions() {
     let mut grid = Grid::with_scrollback(4, 40, 1000);
@@ -516,8 +490,6 @@ fn column_reflow_preserves_ring_scrollback_both_directions() {
         );
     }
 
-    // Widen back: lines unwrap; content still complete and the rewrap is
-    // reversible (same physical row count).
     grid.resize(4, 40);
     grid.assert_invariants();
     assert_eq!(
@@ -534,14 +506,11 @@ fn column_reflow_preserves_ring_scrollback_both_directions() {
     }
 }
 
-/// With a tiered store, `restore_reflowed_scrollback` pushes rewrapped history into the store,
-/// then drains the lazy buffer holding the reflow overflow: [old scrollback | overflow].
 #[test]
 fn width_reflow_tiered_history_precedes_visible_overflow() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 8, 2, scrollback);
 
-    // H0..H3 scroll into history; H4/H5 are overwritten below.
     for i in 0..6u16 {
         grid.set_cursor(2, 0);
         for c in format!("H{i}").chars() {
@@ -551,8 +520,6 @@ fn width_reflow_tiered_history_precedes_visible_overflow() {
         grid.carriage_return();
     }
 
-    // Full visible rows wrap into more rows than fit; with the cursor on the bottom row,
-    // `finalize_reflow` pushes the excess top rows to the lazy buffer.
     let fills = ["V0aaaaaa", "V1bbbbbb", "V2cccccc"];
     for (row, text) in fills.iter().enumerate() {
         grid.set_cursor(row_u16(row), 0);
@@ -598,7 +565,6 @@ fn width_reflow_tiered_history_precedes_visible_overflow() {
     );
 }
 
-/// Restoring rewrapped history into the tiered store honours its line limit: oldest evicted.
 #[test]
 fn width_reflow_tiered_restore_honors_line_limit() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
@@ -614,7 +580,6 @@ fn width_reflow_tiered_restore_honors_line_limit() {
         grid.carriage_return();
     }
 
-    // No visible-grid overflow: history alone round-trips through the restore.
     grid.resize(3, 6);
     grid.assert_invariants();
 

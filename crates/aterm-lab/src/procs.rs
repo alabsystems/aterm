@@ -341,7 +341,8 @@ pub enum JailOut {
 /// Runs `argv` inside the lab's jail from `dir` with `envs` and `out` handling.
 ///
 /// # Errors
-/// Returns an error if the witness is down, spawning fails, or waiting times out.
+/// The witness is not running, the program could not start, or waiting for it
+/// failed.
 pub fn jailed(
     run: &crate::run::Run,
     dir: &Path,

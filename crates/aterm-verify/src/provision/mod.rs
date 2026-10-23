@@ -118,7 +118,8 @@ pub trait Host {
     /// Run `spawn` to completion: its stdout.
     ///
     /// # Errors
-    /// Spawn, wait, or exit failure (with stderr tail).
+    /// It could not start, its output/read or wait failed, or it exited unsuccessfully
+    /// (with its stderr's tail). An error need not prove the child's exit or first exec.
     fn run(&self, spawn: &Spawn) -> Result<String, String>;
 
     /// The Trust toolchain's `targo`.

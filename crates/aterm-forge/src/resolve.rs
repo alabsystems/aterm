@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cell matrix, and the one sanctioned way to obtain a resolved graph.
-//!
-//! # Why `cargo tree` and not `cargo metadata`
-//!
-//! `cargo metadata --filter-platform` resolves the whole workspace with
-//! features unified across members and filters by target, not reachability, so
-//! it would bill `aterm` for packages only other members pull in. `cargo tree
-//! -p aterm` walks the actual resolve from one root.
-//!
-//! `--no-dedupe` is mandatory: cargo otherwise elides repeated subtrees behind
-//! ` (*)`, and those shared edges are what make a dominator differ from a
-//! subtree. The parser still accepts ` (*)` for pasted fixtures.
-//!
-//! Resolution needs no toolchain and no network: every cell is measured
-//! offline, including triples this host cannot build for.
+//! Target cell matrix and offline `cargo tree` dependency graph resolution.
 
 use crate::model::{Cell, Graph, PkgId};
 use aterm_uds::output::CommandOutput as _;
@@ -24,8 +10,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The cargo forge asks for `tree` and `metadata`, and the PATH its children
-/// see: one value per run, so every child answers from one toolchain.
+/// Cargo executable and child `PATH` used for `tree` and `metadata` queries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cargo {
     program: OsString,
@@ -33,8 +18,7 @@ pub struct Cargo {
 }
 
 impl Cargo {
-    /// `$CARGO` (targo sets it, so a nested run asks the toolchain that
-    /// launched it), else Trust's `targo` off PATH: forge's own CLI.
+    /// Resolves cargo from `$CARGO`, falling back to `targo` on `PATH`.
     #[must_use]
     pub fn from_env() -> Self {
         Self {
@@ -43,9 +27,7 @@ impl Cargo {
         }
     }
 
-    /// `program` with `path` as its children's PATH: a caller that resolved
-    /// its toolchain once hands it here, so `$CARGO` and PATH order never pick
-    /// another.
+    /// Pins `program` with `path` as its child `PATH`.
     #[must_use]
     pub fn pinned(program: impl Into<OsString>, path: impl Into<OsString>) -> Self {
         Self {
@@ -65,9 +47,7 @@ impl Cargo {
     }
 }
 
-/// The eight measurement cells, in report order: six native `aterm` cells
-/// (covering `atpkg::manifest::TARGETS`) plus the two browser wasm modules
-/// (`aterm-wasm` and `aterm-gpu-web`).
+/// The eight measurement cells (six native `aterm` targets plus two browser wasm modules).
 pub fn default_cells() -> Vec<Cell> {
     vec![
         Cell {
@@ -113,9 +93,7 @@ pub fn default_cells() -> Vec<Cell> {
     ]
 }
 
-/// Census roots need their own wasm measurement cells: their feature-selected
-/// graphs can differ even when they share the terminal engine. A native cell
-/// with the same package does not measure its wasm dependencies.
+/// Returns wasm crate roots in `roots` that lack a `wasm32-unknown-unknown` cell in `cells`.
 pub(crate) fn unmeasured_wasm_roots<'a>(cells: &[Cell], roots: &[&'a str]) -> Vec<&'a str> {
     roots
         .iter()
@@ -129,8 +107,7 @@ pub(crate) fn unmeasured_wasm_roots<'a>(cells: &[Cell], roots: &[&'a str]) -> Ve
         .collect()
 }
 
-/// Map `--cell NAME` arguments onto cells. No names means every cell. Requested
-/// order is preserved and repeats collapse.
+/// Filters `cells` by `--cell` names, preserving order and deduplicating (empty selects all).
 pub fn select(cells: &[Cell], names: &[String]) -> Result<Vec<Cell>, String> {
     if names.is_empty() {
         return Ok(cells.to_vec());
@@ -160,27 +137,20 @@ pub fn select(cells: &[Cell], names: &[String]) -> Result<Vec<Cell>, String> {
     Ok(out)
 }
 
-/// One parsed `cargo tree --prefix depth` line. Exposed because the parser is
-/// the part most likely to drift with cargo's output, and dropped edges would
-/// silently shrink every dominator.
+/// One parsed `cargo tree --prefix depth` line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeLine {
     pub depth: usize,
     pub id: PkgId,
-    /// The directory cargo printed in parentheses — present for workspace
-    /// members and for `[patch.crates-io]` path packages, absent for registry
-    /// packages.
+    /// Path printed in parentheses for workspace or path-patched packages.
     pub path: Option<PathBuf>,
-    /// cargo's ` (proc-macro)` annotation. Kept separate from the manifest's
-    /// `[lib] proc-macro = true` so the two can be cross-checked.
+    /// Whether cargo annotated the line with `(proc-macro)`.
     pub is_proc_macro: bool,
-    /// cargo's ` (*)` "subtree shown above" marker. Never emitted under
-    /// `--no-dedupe`; parsed anyway so pasted output is not a landmine.
+    /// Whether cargo annotated the line with `(*)`.
     pub deduped: bool,
 }
 
-/// Parse one line. `Ok(None)` is a blank line. An unparseable line is an error
-/// rather than a skip: silently ignoring a line loses a package.
+/// Parses one depth-prefixed line (`Ok(None)` for blank lines).
 pub fn parse_line(line: &str) -> Result<Option<TreeLine>, String> {
     let text = line.trim_end();
     if text.trim().is_empty() {
@@ -238,10 +208,6 @@ pub fn parse_line(line: &str) -> Result<Option<TreeLine>, String> {
     Ok(Some(out))
 }
 
-/// Split the leading `(...)` group off `tail`. The closing paren is the first
-/// one that ends the line or is followed by ` (`, so a directory whose name
-/// contains `)` survives — the annotations cargo appends (` (*)`,
-/// ` (proc-macro)`) never do.
 fn parenthesised<'a>(tail: &'a str, whole: &str) -> Result<(&'a str, &'a str), String> {
     let bytes = tail.as_bytes();
     if bytes.first() != Some(&b'(') {
@@ -260,12 +226,7 @@ fn parenthesised<'a>(tail: &'a str, whole: &str) -> Result<(&'a str, &'a str), S
     ))
 }
 
-/// Rebuild the graph from depth-prefixed output: a node at depth `d` attaches
-/// to the most recent node at depth `d - 1`. `--prefix depth` avoids the
-/// ambiguous box-drawing indentation.
-///
-/// Returns the graph plus the directories cargo printed, the authority on
-/// where a path package lives.
+/// Rebuilds the dependency graph and package path map from `--prefix depth` output.
 pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
     let mut graph = Graph::default();
     let mut paths: BTreeMap<PkgId, PathBuf> = BTreeMap::new();
@@ -321,10 +282,7 @@ pub fn parse_tree(text: &str) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), Strin
     Ok((graph, paths))
 }
 
-/// Resolve one cell: the graph plus every package directory cargo disclosed.
-///
-/// Runs `--locked --offline` first. On failure, one retry without `--offline`
-/// is allowed and noted in `log`, since that number may not reproduce offline.
+/// Resolves one cell offline first, retrying once without `--offline` and logging on miss.
 pub fn graph_and_paths(
     cargo: &Cargo,
     root: &Path,
@@ -362,16 +320,6 @@ pub fn graph_and_paths(
     parse_tree(&text)
 }
 
-/// Absolutise the workspace root once, before it is used twice.
-///
-/// [`run_tree`] sets the child's `current_dir` to the root and passes
-/// `--manifest-path <root>/Cargo.toml`; a relative root would resolve twice
-/// and point outside the workspace.
-///
-/// On Windows the canonical `\\?\C:\…` form is then un-verbatimed: cargo
-/// accepts it as `--manifest-path` but then refuses `--locked` against the
-/// lock file (`crates/aterm-update/src/which_copy.rs` handles the same
-/// property).
 fn abs_root(root: &Path) -> Result<PathBuf, String> {
     let abs = root.canonicalize().map_err(|e| {
         format!(
@@ -384,9 +332,7 @@ fn abs_root(root: &Path) -> Result<PathBuf, String> {
     Ok(strip_verbatim_prefix(abs))
 }
 
-/// `\\?\C:\x` -> `C:\x`. Only the verbatim-disk form is rewritten: verbatim UNC
-/// has no shorter universally accepted spelling, and other prefixes are left
-/// as is. A no-op off Windows.
+/// Strips the Windows `\\?\` verbatim-disk prefix (`\\?\C:\x` to `C:\x`).
 pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     use std::path::{Component, Prefix};
     let verbatim_disk = matches!(
@@ -401,7 +347,6 @@ pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 }
 
 fn run_tree(cargo: &Cargo, root: &Path, cell: &Cell, offline: bool) -> Result<String, String> {
-    // `tree` takes no lane flag.
     let mut cmd = cargo.command("tree", root);
     cmd.arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
@@ -443,9 +388,6 @@ fn first_line(s: &str) -> &str {
 mod tests {
     use super::*;
 
-    /// Each browser root needs a wasm cell of its own. NEGATIVE CONTROLS: a
-    /// root whose cell is gone, and one measured only by a native cell, are
-    /// both unmeasured.
     #[test]
     fn independent_wasm_roots_each_need_a_wasm_cell() {
         let roots = ["crates/cpu", "crates/gpu"];
@@ -472,10 +414,6 @@ mod tests {
         assert_eq!(unmeasured_wasm_roots(&cells, &roots), ["crates/cpu"]);
     }
 
-    /// `cargo tree --prefix depth` lines, as cargo prints them: the depth, the
-    /// id, the directory a path package resolved to, the ` (proc-macro)` and
-    /// ` (*)` annotations, a directory that itself holds a paren, and a
-    /// build-metadata version.
     #[test]
     fn tree_lines_parse_into_depth_id_path_and_annotations() {
         type Want = (
@@ -554,8 +492,6 @@ mod tests {
         assert_eq!(parse_line("   ").unwrap(), None, "a blank line is skipped");
     }
 
-    /// A line the parser cannot read is an error, never a skip: a skipped line
-    /// is a package dropped from every count.
     #[test]
     fn an_unreadable_tree_line_refuses() {
         for raw in ["|-- serde v1.0.228", "2serde", "2serde 1.0.228"] {
@@ -566,11 +502,6 @@ mod tests {
         }
     }
 
-    /// A cell resolves `--offline` first; when that fails, one retry without
-    /// it resolves the cell and leaves a note, since the number may not
-    /// reproduce offline. The fake cargo (`sh` running the root's `tree`
-    /// script as the `tree` verb) refuses `--offline`, as an incomplete
-    /// registry cache does, and roots its graph at the `-p` it is given.
     #[cfg(unix)]
     #[test]
     fn an_offline_miss_retries_online_once_and_notes_it() {
@@ -624,8 +555,6 @@ mod tests {
         };
         assert_eq!(kids("root", "0.1.0"), ["alpha 1.0.0", "beta 2.0.0"]);
         assert_eq!(kids("alpha", "1.0.0"), ["shared 9.9.9"]);
-        // The `(*)` child under beta is still a real edge: dedupe is a display
-        // trick, and dropping it would make `shared` look uniquely alpha's.
         assert_eq!(kids("beta", "2.0.0"), ["gamma 3.0.0", "shared 9.9.9"]);
         assert_eq!(
             paths[&PkgId::new("gamma", "3.0.0")],

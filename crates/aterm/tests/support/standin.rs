@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Stand-in programs in Rust: a live lane runs a terminal program of its own (a TUI, a job
-//! that arms modes and dies) by re-executing this test binary.
-//!
-//! Each lane uses one of its real tests as the child entry. Before that test's
-//! ordinary body, it checks [`ENV`] and plays the named program when set,
-//! leaving through [`exit`] without returning to libtest. [`argv`] selects
-//! exactly that test; an ordinary run executes its full parent assertions.
-//!
-//! libtest prints `running 1 test` before the entry starts; every program
-//! here paints over that line or prints past it, and no lane reads it.
-//!
-//! The terminal calls are `libc`'s on the session's own descriptors, and the
-//! ones a forked child makes ([`answered`]) are async-signal-safe: no
-//! allocation, no lock.
+//! Stand-in terminal programs run by re-executing this test binary with [`ENV`] set.
 
 #![allow(dead_code)]
 
@@ -28,14 +15,12 @@ pub fn exe() -> PathBuf {
     std::env::current_exe().expect("the test binary's own path")
 }
 
-/// The arguments after [`exe`] that run the entry `test` (its full path in
-/// this binary, `<module>::<fn>`) and nothing else.
+/// The libtest arguments after [`exe`] that run `test` and nothing else.
 pub fn argv(test: &str) -> [&str; 4] {
     ["--exact", test, "--nocapture", "--quiet"]
 }
 
-/// A shell command line that runs the entry `test` as the program `spec`
-/// (`env` sets [`ENV`], so every shell reads the line alike).
+/// A shell command line that runs `test` as the stand-in program `spec`.
 pub fn shell_line(test: &str, spec: &str) -> String {
     let exe = exe();
     let exe = exe.to_str().expect("a UTF-8 test binary path");
@@ -73,8 +58,7 @@ pub fn put(bytes: &[u8]) {
     }
 }
 
-/// The terminal's size as the program reads it (`TIOCGWINSZ` on stdout):
-/// `(rows, cols)`.
+/// The terminal's `(rows, cols)` read via `TIOCGWINSZ` on stdout.
 pub fn winsize() -> (u16, u16) {
     // SAFETY: an all-zero `winsize` is a valid value for the ioctl to fill.
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
@@ -96,11 +80,7 @@ pub fn raw() {
     }
 }
 
-/// Ask the terminal where its cursor is (`ESC[6n`) and return once it has
-/// answered, the terminal (descriptor 0) as it was. The terminal answers only
-/// after it has parsed every byte written before the question, so everything
-/// this process wrote was read while this process's group held the terminal,
-/// however late its reader runs. Async-signal-safe: a forked child calls it.
+/// Queries the cursor position (`ESC[6n`) in async-signal-safe cbreak mode and awaits the reply.
 pub fn answered() {
     // SAFETY: an all-zero `termios` is a valid buffer for tcgetattr to fill;
     // every call below takes valid pointers to this frame's locals.

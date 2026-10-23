@@ -754,7 +754,9 @@ pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
     refreshed_local_offset_at(
         unix,
         || {
-            // SAFETY: `tzset` takes no pointers, serializes its C-library zone state, and reads the environment without changing it, as does `localtime_r`.
+            // SAFETY: `tzset` takes no pointers, serializes its C-library zone
+            // state, and reads the environment without changing it, as does
+            // `localtime_r`. No thread may mutate `TZ` beside these readers.
             unsafe { tzset() }
         },
         native_local_offset_at,
@@ -777,7 +779,8 @@ fn refreshed_local_offset_at(
 fn native_local_offset_at(unix: i64) -> Option<i64> {
     let clock: libc::time_t = unix;
     let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
-    // SAFETY: `clock` is a live `time_t` and `tm` a writable, correctly laid out `struct tm` (its size pinned above).
+    // SAFETY: `clock` is a live `time_t` and `tm` a writable, correctly laid
+    // out `struct tm` (its size pinned above); `localtime_r` writes only it.
     let filled = unsafe { localtime_r(&clock, tm.as_mut_ptr()) };
     if filled.is_null() {
         return None;
@@ -835,7 +838,9 @@ pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
     };
     let (mut utc, mut local) = (SystemTime::default(), SystemTime::default());
     let mut local_file = FileTime::default();
-    // SAFETY: every pointer addresses a live, correctly laid out `repr(C)` value of the type the call documents.
+    // SAFETY: every pointer addresses a live, correctly laid out `repr(C)`
+    // value of the type the call documents; a null zone names the active one.
+    // Each call writes only its out parameter.
     let converted = unsafe {
         FileTimeToSystemTime(&utc_file, &mut utc) != 0
             && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) != 0

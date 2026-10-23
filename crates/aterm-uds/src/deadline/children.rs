@@ -100,7 +100,8 @@ pub(super) fn kill_group(child: &mut Child) {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         const SIGKILL: i32 = 9;
-        // SAFETY: a plain syscall.
+        // SAFETY: a plain syscall. The child is not yet reaped, so its pid — and with it the group
+        // id it leads — cannot have been reused.
         unsafe { kill(-pid, SIGKILL) };
     }
     let _ = child.kill();

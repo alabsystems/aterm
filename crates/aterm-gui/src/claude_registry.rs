@@ -23,7 +23,7 @@ const SESSIONS: &str = "sessions";
 /// Where the forwarder tells what fired.
 pub(crate) type Sink = Arc<dyn Fn(Told) -> bool + Send + Sync>;
 
-/// What one wait of the forwarder tells, per fired watch (module docs).
+/// What one wait of the forwarder tells, per fired watch.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Told {
     /// A watch on this Claude dir's `sessions/`, or on a row in it, fired.
@@ -287,7 +287,9 @@ impl RegistryWatch {
         }
     }
 
-    /// Watch exactly what `awaited` needs (module docs), and return the Claude dirs where a watch was newly placed.
+    /// Watch exactly what `awaited` needs (per Claude dir, one watch on `sessions/` or else its
+    /// nearest existing ancestor, and one on each awaited row in it), and return the Claude dirs
+    /// where a watch was newly placed.
     pub(crate) fn reconcile(&mut self, awaited: &[Awaited]) -> Vec<PathBuf> {
         if awaited.is_empty() {
             self.release();

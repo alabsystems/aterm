@@ -1,17 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The seed lays `base.shell.rc` (docs/DESIGN-init-system-2026-10-20.md §4.2, S6): on a
-//! home with no rc file at all, it creates the one rc the account's LOGIN shell reads,
-//! which comes from the account record (`getpwuid`), never `$SHELL`. No other shell
-//! gains a file. A block the person deletes stays deleted under every seed, and comes
-//! back under `aterm pkg repair`'s pass.
-//!
-//! The real `atpkg seed` over a scratch `HOME`, `XDG_CONFIG_HOME` and state root
-//! (`ATERM_STATE_HOME`, where the pass's journal lands), with an empty local registry. The
-//! account record's shell is the development seam [`atpkg::hooks::LOGIN_SHELL_SEAM`] (a
-//! test's `chsh`), so the case does not depend on the host account's shell; `$SHELL`
-//! names another shell in every run.
+//! Tests that `atpkg seed` and `shell-setup` wire only the account's login
+//! shell rc file from `getpwuid` (via [`atpkg::hooks::LOGIN_SHELL_SEAM`]), never `$SHELL`.
 
 #![cfg(unix)]
 use aterm_uds::spawnfd::{Command, Stdio};
@@ -30,9 +21,7 @@ impl Fixture {
             .tempdir()
             .unwrap();
         let home = root.path().join("home");
-        // fish's config directory stands, so a pass that wrote for any shell could.
         std::fs::create_dir_all(home.join(".config/fish")).unwrap();
-        // The default consent: an empty aterm.toml.
         std::fs::create_dir_all(home.join(".config/aterm")).unwrap();
         std::fs::write(home.join(".config/aterm/aterm.toml"), "").unwrap();
         std::fs::create_dir_all(root.path().join("registry")).unwrap();
@@ -40,18 +29,14 @@ impl Fixture {
         Self { root, home }
     }
 
-    /// `atpkg seed` with the account record's shell `login` and `$SHELL` set to `shell`.
     fn seed(&self, login: &str, shell: &str) -> Output {
         self.seed_under(login, shell, Some(&self.root.path().join("state")))
     }
 
-    /// [`Self::seed`] with the private state root `state` (`ATERM_STATE_HOME`), or none: a
-    /// scratch `HOME` alone, as most spawn tests run the seed.
     fn seed_under(&self, login: &str, shell: &str, state: Option<&Path>) -> Output {
         self.seed_with(login, shell, state, None)
     }
 
-    /// [`Self::seed_under`] with `$PATH` set to `path` (`None`: the test's own).
     fn seed_with(
         &self,
         login: &str,
@@ -86,9 +71,6 @@ impl Fixture {
             .expect("run dev atpkg seed")
     }
 
-    /// `atpkg shell-setup --path`, as install.sh's PATH half runs it on a fresh lean
-    /// install (`wire_shell_path`), with the account record's shell `login` and `$SHELL` set
-    /// to `shell`.
     fn shell_setup(&self, login: &str, shell: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_atpkg"))
             .args(["shell-setup", "--path", "--toolset-coming", "--bin-dir"])
@@ -110,7 +92,6 @@ impl Fixture {
         self.home.join(name)
     }
 
-    /// Every rc atpkg could wire, and install.sh's two bash login profiles, that exists.
     fn rc_files(&self) -> Vec<&'static str> {
         [
             ".zshrc",
@@ -135,8 +116,6 @@ fn describe(out: &Output) -> String {
     )
 }
 
-/// End the calling test COULD NOT RUN in a build that pins no root key: the manager is off
-/// there and the seed adopts, and so lays, nothing.
 fn needs_a_pinned_root() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
         aterm_uds::host::could_not_run(
@@ -145,9 +124,6 @@ fn needs_a_pinned_root() {
     }
 }
 
-/// `pkg repair`'s pass over the rc item for `home`, whose login shell reads `login`: the
-/// asked-for pass, in-process (`atpkg repair` itself changes nothing from a scratch `HOME`,
-/// which is not this account's: `Requires::Account`).
 fn repair_rc(home: &Path, login: &'static str) -> Vec<aterm_converge::ItemReport> {
     use atpkg::converge::repair::{self, Ground, Pass};
     let ground = std::sync::Arc::new(Ground {
@@ -196,11 +172,9 @@ fn seed_creates_the_login_shell_s_rc_alone_and_never_reads_shell() {
         String::from_utf8_lossy(&out.stdout).contains("atpkg: created ~/.zshrc"),
         "the seed says what it made: {text}"
     );
-    // The change was journaled under the scratch state root.
     let journal = fx.root.path().join("state").join("converge");
     assert!(journal.is_dir(), "journaled under ATERM_STATE_HOME: {text}");
 
-    // The person deletes the block: every seed leaves it deleted.
     std::fs::write(fx.rc(".zshrc"), "export EDITOR=vi\n").unwrap();
     for pass in 0..2 {
         let out = fx.seed("/bin/zsh", "/bin/bash");
@@ -213,7 +187,6 @@ fn seed_creates_the_login_shell_s_rc_alone_and_never_reads_shell() {
         );
     }
 
-    // `pkg repair`'s pass lays it back, and says so.
     let rows = repair_rc(&fx.home, ".zshrc");
     let rc = rows
         .iter()
@@ -235,8 +208,6 @@ fn seed_creates_the_login_shell_s_rc_alone_and_never_reads_shell() {
     assert_eq!(fx.rc_files(), [".zshrc"]);
 }
 
-/// The negative control: a login shell atpkg has no rc row for gets no file, whatever
-/// `$SHELL` says, so the file above is the account record's doing.
 #[test]
 fn seed_creates_no_rc_for_a_login_shell_it_does_not_wire() {
     needs_a_pinned_root();
@@ -251,9 +222,6 @@ fn seed_creates_no_rc_for_a_login_shell_it_does_not_wire() {
     assert_eq!(fx.rc_files(), Vec::<&str>::new(), "{text}");
 }
 
-/// A seed under a scratch `HOME` with no private state root journals into that `HOME`'s own
-/// state root, never the account's (`aterm_types::dirs::account_state_dir`): the tree the pass changed keeps
-/// the record of the change, and the owner's journal never hears of a test's home.
 #[test]
 fn a_scratch_home_s_seed_journals_under_that_home() {
     needs_a_pinned_root();
@@ -280,10 +248,6 @@ fn a_scratch_home_s_seed_journals_under_that_home() {
     );
 }
 
-/// install.sh's PATH half, `shell-setup --path`, elects its rc from the same account record
-/// as the seed (design init-system §4.2: the login shell "never from `$SHELL`"): with
-/// `$SHELL` naming bash and the login shell zsh, it writes `~/.zshrc`, and no bash profile
-/// appears. NEGATIVE CONTROL: a login bash with `$SHELL` naming zsh gets bash's profile.
 #[test]
 fn shell_setup_elects_the_login_shell_s_rc_never_shell() {
     let fx = Fixture::new("shell-setup-zsh");
@@ -314,8 +278,6 @@ fn shell_setup_elects_the_login_shell_s_rc_never_shell() {
 /// `base.clt`, A15): with a toolset in the store and no `cc` on `PATH` it says `c-toolchain:
 /// missing`, so a toolset that arrived with no window watching (an install over SSH) is
 /// filed at the next launch; with a `cc` found it says `ready`, which ends the entry.
-/// NEGATIVE CONTROL: an empty store says nothing, leaving the filing to the pass that lays
-/// the set down.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_seed_files_missing_command_line_tools_once_a_toolset_is_here() {
@@ -345,7 +307,6 @@ fn the_seed_files_missing_command_line_tools_once_a_toolset_is_here() {
     assert!(out.status.success(), "{}", describe(&out));
     assert_eq!(marker(&out), Vec::<String>::new(), "{}", describe(&out));
 
-    // A build in the store, its tool on the managed bin/ (a legacy link shim).
     let prefix = atpkg::store::default_prefix(&fx.home);
     let tool = prefix.join("store/fakeprog/7/bin/fakeprog");
     std::fs::create_dir_all(tool.parent().unwrap()).unwrap();
@@ -356,7 +317,6 @@ fn the_seed_files_missing_command_line_tools_once_a_toolset_is_here() {
     assert!(out.status.success(), "{}", describe(&out));
     assert_eq!(marker(&out), [missing], "{}", describe(&out));
 
-    // A compiler on PATH (not the install shim): found, so `ready`, and nothing is run.
     let with_cc = fx.root.path().join("with-cc");
     std::fs::create_dir_all(&with_cc).unwrap();
     let ran = fx.root.path().join("cc-ran");

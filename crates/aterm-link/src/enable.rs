@@ -258,7 +258,7 @@ impl Paths {
     }
 
     /// Whether this root is the default one, whose label is the plain [`LABEL`]: the login
-    /// user's `~/.local/share/aterm-fabric`, not `$HOME`'s (module doc, step 6).
+    /// user's `~/.local/share/aterm-fabric`, not `$HOME`'s.
     fn default_root(&self) -> bool {
         self.login_home
             .as_deref()
@@ -1548,7 +1548,7 @@ fn trace(word: &str) {
     }
 }
 
-/// Mint the eight grants into `<root>/node.cap` as one transaction (module doc, step 5).
+/// Mint the eight grants of [`node_grants`] into `<root>/node.cap` as one transaction.
 ///
 /// # Errors
 /// A secret the reader refuses, a refused mint, or a staging/rename failure.

@@ -14,8 +14,7 @@ pub const LARGE_PASTE_BYTES: u64 = 64 * 1024;
 /// How often a host samples a watched wait while its row is on the glass.
 pub const WAIT_SAMPLE: Duration = Duration::from_millis(250);
 
-/// How often it samples a wait with no row (its session off screen, or a rewrap nobody asked
-/// after): only to notice the row becoming wanted, or the work ending.
+/// Sampling interval for an unrevealed wait.
 pub const WAIT_SAMPLE_IDLE: Duration = Duration::from_secs(1);
 
 /// A watched row's staleness cap.
@@ -26,8 +25,7 @@ pub const PASTING: &str = "Pasting";
 
 /// How long a paste's program may take none of it before the row says so.
 pub(crate) const PASTE_UNREAD_AFTER: Duration = Duration::from_secs(3);
-/// The rewrap row's title before it knows how many lines it rewraps ([`rewrap_title`] says them
-/// once it does).
+/// Default rewrap row title before the line count is known.
 pub const REWRAPPING: &str = "Rewrapping scrollback";
 /// The rewrap row's finished words.
 pub const REWRAPPED: &str = "Scrollback rewrapped";
@@ -64,8 +62,7 @@ pub fn is_wait_key(key: &str) -> bool {
     key.starts_with("session.paste.") || key.starts_with("session.rewrap.")
 }
 
-/// A paste's size in words, decimal like every download dialog, with one decimal below 10 MB where
-/// the paste sizes live: `64 KB`, `812 KB`, `4.2 MB`, `16 MB`.
+/// Format a byte count in compact decimal units (`64 KB`, `4.2 MB`, `16 MB`).
 #[must_use]
 pub fn size_words(bytes: u64) -> String {
     const KB: u64 = 1_000;
@@ -87,8 +84,7 @@ pub fn size_words(bytes: u64) -> String {
     }
 }
 
-/// `done / total` bytes of a paste as stats, `done` right-aligned to the total's width, so the row
-/// lays out once and the digits tick in place: `1.1 MB / 4.2 MB`, `812 KB / 4.2 MB`.
+/// Format `done / total` paste bytes with `done` right-aligned to the width of `total`.
 #[must_use]
 pub fn paste_stats(done: u64, total: u64) -> String {
     let (done, total) = (size_words(done.min(total)), size_words(total));
@@ -124,8 +120,7 @@ pub fn rewrap_stats(done: u64, total: u64) -> String {
     format!("{done:>width$} of {total} lines")
 }
 
-/// The paste row: `Pasting 4.2 MB`, filled by the bytes the program has taken, `1.1 MB / 4.2 MB`,
-/// the engine's ETA from their rate, and one capsule, `Stop paste`.
+/// Build the progress message row for a watched paste in `session`.
 #[must_use]
 pub fn paste_row(
     session: u64,
@@ -158,8 +153,7 @@ pub fn paste_row(
         .reveal_after(grace_left)
 }
 
-/// The rewrap row's title: the size of the whole wait, said once (`Rewrapping 3.4M lines`), or
-/// [`REWRAPPING`] before the count is known.
+/// Format the rewrap row title for `total` lines, or [`REWRAPPING`] when `total == 0`.
 #[must_use]
 pub fn rewrap_title(total: u64) -> String {
     match total {
@@ -169,8 +163,7 @@ pub fn rewrap_title(total: u64) -> String {
     }
 }
 
-/// The rewrap row: `Rewrapping 3.4M lines`, filled by the lines rewrapped of the lines detached,
-/// and the ETA.
+/// Build the progress message row for a scrollback rewrap in `session`.
 #[must_use]
 pub fn rewrap_row(session: u64, done: u64, total: u64, grace_left: Duration) -> Message {
     let done = done.min(total);
@@ -229,7 +222,8 @@ pub struct WaitSample {
     pub total: u64,
     /// How long the work has run.
     pub elapsed: Duration,
-    /// Whether the person waits on it now: the paste's session is on screen.
+    /// Whether the person waits on it now: the paste's session is on screen, or the person
+    /// scrolled into or searched the rewrap's missing history.
     pub asked: bool,
     /// `Some` once it is over.
     pub end: Option<WaitEnd>,

@@ -149,6 +149,10 @@ impl App {
     /// # Errors
     ///
     /// Returns [`AosRefusal`] if no window is in front or the publish boundary refuses.
+    /// When this call paused the glow itself, a refused repair resumes it (the old code
+    /// runs on; nothing can have queued within this call), so a refusal leaves the glow
+    /// as the call found it except for the pause's recorded query. A glow the caller
+    /// paused stays paused, its queue whole.
     pub(crate) fn aos_repair_at(
         &mut self,
         code: MomentumCode,

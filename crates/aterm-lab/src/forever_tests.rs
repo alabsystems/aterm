@@ -7202,13 +7202,14 @@ mod walls;
 /// W2'S HIDE (and W5's switch, W9's relaunch) GOES ON ONCE THE LOOP WAITS ON
 /// THE WALL, WHICHEVER SIDE OF THE WALL'S POINT ITS WAIT IS WRITTEN
 /// ([`waits_on_the_wall`]): Gemini CLI's per-day dialog's ladder is written
-/// as its badge is raised, before the point's `EVENT prompt` (measured,
-/// `z1gd`, where the hide never chose `Stop`), and the account dialog's
-/// wait after it. NEGATIVE CONTROLS: a wait of another seq, the take
-/// window's wait for the worker, a wait before the land act, and no land act
-/// at all hold the hide back. Muse Code's wall is two points, its API error
-/// and then its notice, and the wait on the second is the wall's (measured,
-/// `y3rl-muse`); both held by the take window alone hold the hide back.
+/// as its badge is raised, before the point's `EVENT prompt` (measured: a
+/// hide that looked only after the point never chose `Stop`), and the
+/// account dialog's wait after it. NEGATIVE CONTROLS: a wait of another
+/// seq, the take window's wait for the worker, a wait before the land act,
+/// and no land act at all hold the hide back. Muse Code's wall is two
+/// points, its API error and then its notice, and the wait on the second is
+/// the wall's (as measured); both held by the take window alone hold the
+/// hide back.
 #[test]
 fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
     let ladder = "WAITING seq=38891 until=2026-10-22T11:47:18Z rule=limit-retry@v1 Gemini CLI's \
@@ -7257,7 +7258,7 @@ fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
         (125_100, ladder),
         (125_200, event)
     ])));
-    // Muse Code's two points (measured, `y3rl-muse`): its API error held by
+    // Muse Code's two points (as measured): its API error held by
     // the take window alone, then its notice waited on to the reset
     let error = "EVENT limited seq=2483 message=model failed: API error 429: The usage limit has \
                  been reached (usage_limit_reached) reset=-";

@@ -79,13 +79,16 @@ unsafe fn cell<'a, T: Class>(ptr: usize) -> Result<&'a Cell<T>, Thrown> {
     if header.type_id != TypeId::of::<T>() || header.tag.get() != T::TAG {
         return Err(Thrown::Error(WRONG_CLASS.to_string()));
     }
-    // SAFETY: the Rust type identity proves this handle was made by `into_raw::<T>`.
+    // SAFETY: the Rust type identity proves this handle was made by
+    // `into_raw::<T>`, and the caller guarantees it is still live.
     Ok(unsafe { &*(ptr as *const Cell<T>) })
 }
 
 /// Borrow the value behind `ptr` for a `&self` call.
 /// # Safety
-/// As [`cell`]: `ptr` is 0 or a live handle of any class.
+/// As [`cell`]: `ptr` is 0 or a live handle of any class. The handle cannot
+/// be freed while the guard lives ([`free`] refuses a borrowed value), so
+/// any `'a` the call needs is sound.
 /// # Errors
 /// [`Thrown::Error`]: null, another class, or borrowed exclusively.
 #[inline]
@@ -120,7 +123,9 @@ pub unsafe fn borrow_mut<'a, T: Class>(ptr: usize) -> Result<RefMut<'a, T>, Thro
 /// # Safety
 /// As [`borrow`]; after an `Ok` the handle is gone and `ptr` must not be used again.
 /// # Errors
-/// [`Thrown::Error`].
+/// [`Thrown::Error`]: null, another class, or (from `free()`) a borrowed or
+/// poisoned value, which is left leaked. From the finalizer a borrowed value
+/// is leaked without an error: nothing is left to report it to.
 pub unsafe fn free<T: Class>(ptr: usize, from_finalizer: bool) -> Result<(), Thrown> {
     // SAFETY: the caller's contract.
     let cell = unsafe { cell::<T>(ptr) }?;
@@ -132,7 +137,9 @@ pub unsafe fn free<T: Class>(ptr: usize, from_finalizer: bool) -> Result<(), Thr
         };
     }
     cell.header.tag.set(0);
-    // SAFETY: `ptr` came from `Box::into_raw` in `into_raw::<T>` (Rust type identity checked).
+    // SAFETY: `ptr` came from `Box::into_raw` in `into_raw::<T>` (Rust type
+    // identity checked), nothing borrows it (flag checked), and it is not
+    // used again.
     drop(unsafe { Box::from_raw(ptr as *mut Cell<T>) });
     Ok(())
 }
@@ -168,7 +175,8 @@ impl<T> Deref for RefMut<'_, T> {
 impl<T> DerefMut for RefMut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: this guard holds the only borrow, and `&mut self` makes this reference unique.
+        // SAFETY: this guard holds the only borrow, and `&mut self` makes this reference unique for
+        // its lifetime.
         unsafe { &mut *self.cell.value.get() }
     }
 }
@@ -217,6 +225,7 @@ mod tests {
     fn calls_see_the_value_and_free_drops_it_once() {
         let (h, drops) = probe();
         assert_ne!(h, 0);
+        // SAFETY (this test): `h` is live until the `free` that returns Ok.
         unsafe {
             assert_eq!(borrow::<Probe>(h).unwrap().1, 7);
             borrow_mut::<Probe>(h).unwrap().1 = 8;

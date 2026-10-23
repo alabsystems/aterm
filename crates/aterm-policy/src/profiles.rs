@@ -213,7 +213,8 @@ pub fn hardened() -> Policy {
 pub(crate) mod refinement {
     use crate::Response;
 
-    /// Map a response to a numeric "strictness" rank:
+    /// Map a response to a numeric "strictness" rank, from `Drop` (4, strictest) down to
+    /// `Execute` (0, loosest).
     #[must_use]
     pub const fn response_rank(r: Response) -> u8 {
         match r {

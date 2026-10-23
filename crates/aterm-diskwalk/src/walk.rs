@@ -633,7 +633,7 @@ pub struct LevelRow {
 
 /// A too-broad root's one-level listing: names, kinds and direct entry counts, nothing walked.
 /// # Errors
-/// The [`Refusal`] the root earned.
+/// The [`Refusal`] the root earned, other than [`Refusal::TooBroad`].
 pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>, Refusal> {
     let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
     match refuse(

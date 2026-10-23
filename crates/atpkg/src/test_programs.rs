@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! Fake programs (`cargo`/`rustc`/`rustup`) that `reroute`'s and `upstream_identity`'s
-//! tests put on a PATH, laid and run once before any test's bound measures them.
+//! Content-addressed fake toolchain binaries pre-assessed once per test process.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// The program whose body is `body`: one content-addressed file per distinct body, shared
-/// by every test and run, and executed once per process outside any test's bound; tests
-/// place symlinks to it.
-///
-/// On macOS a file this process writes carries `com.apple.provenance`, and its first
-/// `exec` waits on `syspolicyd` (0.4 s idle, over 60 s under a heavy build); later execs
-/// of the same file, through any symlink, are free.
-///
-/// The lock is held from the check to the first run: every test thread lays through the
-/// same temporary name, and two unlocked layers rename it from under each other.
+/// Materializes `body` as an executable file and runs it once to pay first-exec assessment.
 pub(crate) fn assessed(name: &str, body: &str) -> PathBuf {
     use std::hash::{Hash as _, Hasher as _};
     use std::os::unix::fs::PermissionsExt as _;
@@ -33,7 +23,6 @@ pub(crate) fn assessed(name: &str, body: &str) -> PathBuf {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
     }
-    // Pay the first-exec assessment here, outside any test's bound.
     let status = std::process::Command::new(&path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -48,9 +37,7 @@ pub(crate) fn assessed(name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// Where the [`assessed`] programs live: `target/<profile>/atpkg-reroute-programs`, shared
-/// by every run of this checkout's suite and by no other user's (a fixed name under
-/// `/tmp` is shared across users on Linux). Canonical, because `target` may be a link.
+/// Canonical `target/<profile>/atpkg-reroute-programs` directory for [`assessed`] binaries.
 pub(crate) fn programs_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let dir = exe

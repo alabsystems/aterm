@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Dependency path, dominator cost, and fork liveness report for a third-party package.
+//! Dependency path, dominator cost, and fork liveness report for one package.
 
 use crate::model::{CellSurvey, Graph, PkgId};
 use crate::survey::{commas, fit, fit_path, survey_cells, wrap};

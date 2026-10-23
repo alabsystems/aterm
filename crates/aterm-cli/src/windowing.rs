@@ -232,8 +232,6 @@ pub struct LaunchEnv {
     pub updated_from: bool,
 }
 
-/// The `-d <dir>` spellings a plain launch may carry and stay policy-eligible:
-/// only the two the window's parser accepts (`crates/aterm-gui/src/cli.rs`).
 const PLAIN_LAUNCH_DIR_FLAGS: &[&str] = &["-d", "--working-directory"];
 
 /// Whether a plain (verb-less) window launch may be routed by policy.
@@ -281,8 +279,6 @@ mod tests {
         list.iter().map(OsString::from).collect()
     }
 
-    /// The resolver a parse test uses: absolute-looking passthrough, so the
-    /// grammar is exercised without touching a filesystem.
     fn echo_dir(raw: &str) -> Result<String, String> {
         Ok(raw.to_string())
     }
@@ -317,7 +313,6 @@ mod tests {
         }
     }
 
-    /// Every cell of the routing table.
     #[test]
     fn routing_is_the_whole_table() {
         use LaunchIntent::{NewTab, NewWindow, Plain, SplitPane};
@@ -443,8 +438,6 @@ mod tests {
         );
     }
 
-    /// A newline (second verb injection) or a quote (early close) in the value
-    /// is refused before reaching the socket.
     #[test]
     fn an_unframeable_directory_is_refused_not_encoded() {
         for hostile in ["/tmp/a\nspawn", "/tmp/a\rb", "/tmp/\"quoted\""] {
@@ -476,8 +469,6 @@ mod tests {
         assert_eq!(some.window_args(), args(&["-d", "/tmp/x"]));
     }
 
-    /// The narrow gate. Everything that is not a bare window launch spawns,
-    /// under either policy — these are the invocations a forward would corrupt.
     #[test]
     fn only_a_bare_window_launch_is_policy_eligible() {
         let plain = LaunchEnv::default();
@@ -514,8 +505,6 @@ mod tests {
         ));
     }
 
-    /// A plain launch is eligible only with the window parser's own directory
-    /// flags (`-d`, `--working-directory`), so one argv never gets two outcomes.
     #[test]
     fn the_plain_gate_only_knows_the_directory_flags_the_window_parses() {
         let plain = LaunchEnv::default();

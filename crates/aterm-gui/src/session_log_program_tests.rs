@@ -314,7 +314,7 @@ fn a_run_change_writes_the_last_runs_pending_state_first() {
     );
 }
 
-/// WHERE A PROGRAM MARK LANDS ONCE ITS RUN CLOSES (the module doc): a codex
+/// WHERE A PROGRAM MARK LANDS ONCE ITS RUN CLOSES: on that run, before the close. A codex
 /// run in front leaves `done` pending, beside it a run the producers do not
 /// hold is open with a turn under it (the deepest open node); the front
 /// moves back to the shell, which closes the codex run.

@@ -6,6 +6,9 @@
 
 #![allow(clippy::unnecessary_cast)]
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::send_v;
 use aterm_objc::{autoreleasepool, sel, Bool, Id, MainThread, MainThreadBound};
 
@@ -24,7 +27,11 @@ impl Drop for Window {
     fn drop(&mut self) {
         self.window.get_on_main(|window| {
             autoreleasepool(|_| {
-                // SAFETY: `window` borrows a live `WinitWindow`, which is registered with `NSWindow` as its superclass; `-close` is `v16@0:8` on `NSWindow`.
+                // SAFETY: `window` borrows a live `WinitWindow`, which is
+                // registered with `NSWindow` as its superclass; `-close` is
+                // `v16@0:8` on `NSWindow`. `get_on_main` has put this on the
+                // main thread, which is where a window teardown — and the
+                // `windowWillClose:` it dispatches — must run.
                 unsafe { send_v(window.as_id(), sel!(close)) };
             })
         })
@@ -37,6 +44,8 @@ impl Window {
         attributes: WindowAttributes,
     ) -> Result<Self, RootOsError> {
         let mtm = window_target.mtm;
+        // LOCAL PATCH (aterm): the display-free loop (`headless.rs`) has no application, so no
+        // window.
         let Some(app_delegate) = window_target.app_delegate() else {
             return Err(os_error!(super::OsError::CreationError(
                 "cannot create a window on a headless event loop: it has no display"
@@ -112,6 +121,7 @@ impl From<u64> for WindowId {
     }
 }
 
+// LOCAL PATCH (aterm): declared by `aterm_objc::declare_class!`, where upstream used objc2's.
 aterm_objc::declare_class! {
     /// The `NSWindow` subclass every winit window on macOS is an instance of.
     #[derive(Debug)]

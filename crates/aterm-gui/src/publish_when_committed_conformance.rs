@@ -1,26 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `HandoffAddressOwner`'s order half
-//! (`aterm_models_session::handoff_address_owner_model`,
-//! `CandidateNamedOnlyAfterCommit`): a per-process update candidate names itself in
-//! no `graph/<sid>` entry until the Commit, so one `@<sid>` is never answered by two
-//! live instances while the parent still owns the session (a supervisor reads that
-//! as `ERR ambiguous session id <sid> also served by pid <new>`).
-//!
-//! The run drives the real gated publication (`publish_when_committed`, the one
-//! function `control::spawn` publishes through) against a real bound socket and
-//! discovery directory, projecting the model's state from disk and the gate:
-//!
-//! * `entry`: 1 when the carried id's `graph/<sid>` names the candidate's socket,
-//!   0 while it still names the parent's;
-//! * `pred`: 1 until the Commit releases the gate, 0 after;
-//! * `cand = registered = 1`: the parent's lane made and registered this candidate
-//!   (the model's `Launch`).
-//!
-//! Negative control: the same publication with no gate writes the step the model
-//! rejects and `Early = 1` admits, into a state `CandidateNamedOnlyAfterCommit`
-//! refuses.
+//! Tier-1 conformance test binding `publish_when_committed` to
+//! `aterm_models_session::handoff_address_owner_model` (`CandidateNamedOnlyAfterCommit`).
 
 use std::path::Path;
 use std::sync::RwLock;
@@ -34,8 +16,7 @@ use aterm_spec::verify;
 use super::*;
 use crate::session_store::{SessionStore, test_handle};
 
-/// The model's state for one carried id, read off the real discovery entry and
-/// the real Commit gate. See the module header.
+/// Projects the model state for `sid` from the on-disk discovery entry and `gate`.
 pub(super) fn project(
     sock_dir: &Path,
     sid: &SessionId,
@@ -55,8 +36,6 @@ pub(super) fn project(
     ])
 }
 
-/// The model's state right after `Launch` — the candidate exists, the parent
-/// owns everything.
 fn launched(model: &Model) -> State {
     let mut s = model.init_state();
     assert!(model.fire("Launch", &mut s), "Launch at {s:?}");
@@ -70,23 +49,16 @@ fn every_invariant_holds(model: &Model, s: &State) -> bool {
         .all(|inv| model.check_invariant(inv.name, s))
 }
 
-/// Clears the discovery state this test sets (its own,
-/// `proxy::self_sock_test_guard`), even when an assertion fails: its queue
-/// drains while its mirror override still stands.
 struct ProcessDiscoveryReset;
 
 impl Drop for ProcessDiscoveryReset {
     fn drop(&mut self) {
         crate::proxy::clear_self_sock();
-        // A write queued against the test's socket lands while its mirror
-        // override still stands, never in the real control dir.
         let _ = crate::proxy::flush_publications(aterm_spec::wait::MUST_HAPPEN);
         crate::proxy::set_mirror_dir_override(None);
     }
 }
 
-/// A candidate booted with two carried ids, its root session's and one more in the
-/// store, each with the parent's entry already on disk, and its own socket bound.
 struct Candidate {
     _dir: aterm_tempfile::TempDir,
     _mirror: aterm_tempfile::TempDir,
@@ -131,11 +103,7 @@ fn candidate() -> Candidate {
         .write()
         .unwrap_or_else(|p| p.into_inner())
         .register(handle);
-    // The parent, listening: it still serves both ids (and the candidate's bind
-    // sweeps any entry whose socket does not answer, so a dead parent socket
-    // would leave nothing to observe).
     let parent = std::os::unix::net::UnixListener::bind(&parent_sock).expect("the parent's socket");
-    // The parent's entries: it published them, and it still owns both ids.
     for sid in [&root.0, &carried] {
         crate::proxy::write_graph_entry(&sock_dir, sid, &parent_sock, &LaunchNonce::generate());
     }
@@ -156,8 +124,6 @@ fn candidate() -> Candidate {
     }
 }
 
-/// The listener ends and the discovery state is reset ([`ProcessDiscoveryReset`])
-/// before the directories drop, so no queued write lands in a removed one.
 impl Drop for Candidate {
     fn drop(&mut self) {
         drop(self.bound.take());
@@ -171,10 +137,8 @@ impl Candidate {
     }
 }
 
-/// Through the whole pre-Commit window the carried ids' entries still name the
-/// parent and the `latest` alias does not move (`SuccessorPublishes` is disabled
-/// there). The Commit releases the gate, and the real publication is the model's
-/// `Commit` then `SuccessorPublishes`, into a state every invariant holds.
+/// Verifies that carried session entries stay on the parent and the `latest` symlink stays
+/// unwritten until the Commit gate releases, then transition via `Commit` and `SuccessorPublishes`.
 #[test]
 fn a_candidates_entries_name_it_only_after_the_commit() {
     let guard = crate::proxy::self_sock_test_guard();
@@ -207,9 +171,6 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         })
     };
 
-    // THE PRE-COMMIT WINDOW: once the publisher is parked on the closed gate
-    // (a fact, awaited by a hang detector — never a guessed window), every
-    // carried entry still names the parent, and nothing moved.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while gate.parked() == 0 {
         assert!(
@@ -240,7 +201,6 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         "the publication waits on the Commit"
     );
 
-    // The Commit: the gate opens, and the candidate publishes.
     gate.release();
     let listener = publisher
         .join()
@@ -275,10 +235,8 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
     drop(listener);
 }
 
-/// Negative control, from a real state: with no gate the publication names the
-/// candidate while the parent still owns the carried ids. The committed model rejects
-/// that step, `Early = 1` admits exactly it, and `CandidateNamedOnlyAfterCommit`
-/// refuses the state it reaches.
+/// Negative control: publishing without a gate before Commit reaches a state rejected by the
+/// committed model, admitted by `Early = 1`, and violating `CandidateNamedOnlyAfterCommit`.
 #[test]
 fn the_ungated_publication_is_the_caught_boot_time_step() {
     let _guard = crate::proxy::self_sock_test_guard();
@@ -286,7 +244,6 @@ fn the_ungated_publication_is_the_caught_boot_time_step() {
     let model = handoff_address_owner_model();
     let early = interp::with_consts(&model, &[("Early", 1)]);
     let mut c = candidate();
-    // The parent has not committed: its gate stays shut throughout.
     let gate = crate::spawn::DeferredReaderGate::closed();
     let before = launched(&model);
 

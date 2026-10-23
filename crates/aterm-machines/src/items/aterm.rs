@@ -71,7 +71,8 @@ pub struct Table {
 /// Expand the items requested by `table`.
 ///
 /// # Errors
-/// Returns a one-line message if the owner, account, version, or SHA-256 is invalid.
+/// One line naming what cannot be expanded: no owner, an account this Mac does not have,
+/// a malformed version or SHA-256.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     if let Some(v) = &table.version
         && !is_version(v)

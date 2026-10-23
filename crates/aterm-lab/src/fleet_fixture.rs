@@ -173,8 +173,17 @@ pub fn claude(args: &[String]) -> i32 {
         println!("2.1.300 (Claude Code fixture of aterm-lab fleet-sim)");
         return 0;
     }
+    if args.first().map(String::as_str) == Some("follow") {
+        let Some(file) = args.get(1) else {
+            eprintln!("claude (fleet-sim fixture): usage: claude follow <mode file>");
+            return 2;
+        };
+        return follow(std::path::Path::new(file));
+    }
     let Some(mode) = args.first().and_then(|w| Mode::of(w)) else {
-        eprintln!("claude (fleet-sim fixture): usage: claude busy|question|prompt|idle [<n>]");
+        eprintln!(
+            "claude (fleet-sim fixture): usage: claude busy|question|prompt|idle [<n>] | follow <mode file>"
+        );
         return 2;
     };
     let n = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -193,6 +202,25 @@ pub fn claude(args: &[String]) -> i32 {
     let _ = out.flush();
     drop(out);
     paint_until_gone(|tick, cols, rows| screen(mode, tick, cols, rows, &cwd, &prompt, &said))
+}
+
+/// `claude follow <file>`: one run that paints the screen of the mode word `<file>` holds (`busy`, `question`, `prompt` or `idle`; [`followed_mode`]), read again every tick, so a driver walks it through a turn, its box and its end (`seamless`).
+fn follow(file: &std::path::Path) -> i32 {
+    let (prompt, said, tool) = words(0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let _ = write_session(&cwd, Mode::Idle, &prompt, &said, tool);
+    paint_until_gone(|tick, cols, rows| {
+        screen(followed_mode(file), tick, cols, rows, &cwd, &prompt, &said)
+    })
+}
+
+/// The mode word `file` holds, trimmed; a missing, unreadable or unknown word is [`Mode::Idle`].
+#[must_use]
+pub fn followed_mode(file: &std::path::Path) -> Mode {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|word| Mode::of(word.trim()))
+        .unwrap_or(Mode::Idle)
 }
 
 /// Seed only a fresh lab home. A pre-existing profile is never overwritten.
@@ -549,6 +577,26 @@ mod tests {
         assert!(busy[29].contains("esc to interrupt"), "{busy:?}");
         let idle = screen(Mode::Idle, 7, 100, 30, cwd, "p", "s");
         assert!(!idle[29].contains("esc to interrupt"), "{idle:?}");
+    }
+
+    /// `claude follow <file>` paints the mode its file names, read again on
+    /// every tick, and at rest when the file names none.
+    #[test]
+    fn a_followed_mode_is_its_files_word_and_idle_without_one() {
+        let scratch = aterm_tempfile::tempdir().expect("exclusive mode file");
+        let file = scratch.path().join("mode");
+        assert_eq!(followed_mode(&file), Mode::Idle, "no file yet");
+        for (word, mode) in [
+            ("busy\n", Mode::Busy),
+            ("prompt", Mode::Prompt),
+            ("question\n", Mode::Question),
+            ("idle", Mode::Idle),
+            ("busy", Mode::Busy),
+            ("asleep", Mode::Idle),
+        ] {
+            std::fs::write(&file, word).expect("write the mode");
+            assert_eq!(followed_mode(&file), mode, "{word:?}");
+        }
     }
 
     #[test]

@@ -16,7 +16,8 @@ pub const DOMAIN: &str = "com.apple.SoftwareUpdate";
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// Check for updates (`softwareupdate --schedule`, see the module comment).
+    /// Check for updates, read and turned on with `softwareupdate --schedule` (macOS 27 keeps
+    /// no preference key for it); turning it off is blocked.
     pub automatic_check: Option<bool>,
     /// `AutomaticDownload`.
     pub automatic_download: Option<bool>,

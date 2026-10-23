@@ -102,6 +102,13 @@ fn a_task_from_an_unlisted_principal_arrives_demoted() {
 }
 
 /// Three shapes that never reach an inbox, each recorded instead:
+///
+/// * an eight-segment subject whose tail reads as a forged `<src>/<kind>`:
+///   `reason=malformed`, since the parse is by position and takes exactly seven segments;
+/// * a `<sid>` this node does not host: `reason=not-hosted`;
+/// * a record on the node's own lane under its own id at an offset the bridge never
+///   acked: `reason=forged-self`, plus a `cap-compromised` ev, since only a co-holder
+///   of the node cap could have written it.
 #[test]
 fn a_forged_subject_never_reaches_an_inbox_and_is_recorded() {
     let w = World::boot("forge", &[]);

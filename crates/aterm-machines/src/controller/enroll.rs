@@ -78,7 +78,7 @@ impl Args {
     }
 }
 
-/// Parse `enroll <address>… [--found] [--user <admin>] [--name <n>] [--fingerprint <fp>] [--parallel N]`.
+/// Parse `enroll <address>…` flags and positional host arguments.
 pub fn parse_args(sys: &dyn System, args: &[String]) -> Result<Args, String> {
     let mut addresses: Vec<String> = Vec::new();
     let mut found = false;
@@ -709,7 +709,7 @@ pub fn read_facts(sys: &dyn System, master: &Master) -> Result<Facts, String> {
     parse_facts(&ran.out())
 }
 
-/// The agent payload: one archive file (design §1.2).
+/// The agent payload archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Archive {
     pub path: PathBuf,
@@ -913,7 +913,7 @@ pub fn own_exe() -> Result<PathBuf, String> {
         .map_err(|e| format!("this aterm cannot name its executable: {e}"))
 }
 
-/// `aterm machines enroll …` (refuses without a terminal: a person types the password).
+/// Runs `aterm machines enroll`.
 #[must_use]
 pub fn main(sys: &dyn System, paths: &Paths, args: &[String], tty: bool) -> ExitCode {
     let args = match parse_args(sys, args) {
@@ -1622,7 +1622,7 @@ pub fn denied_methods(err: &str) -> Option<&str> {
     rest.find(')').and_then(|end| rest.get(..end))
 }
 
-/// Authenticate and open `master` using `password` (`password` method first, then `keyboard-interactive`).
+/// Authenticate and open `master` using `password`.
 #[must_use]
 pub fn log_in(
     sys: &dyn System,
@@ -1679,7 +1679,7 @@ pub enum Unscanned {
     Enrolled(String),
 }
 
-/// Scan `req`'s host key, verify trust, print its fingerprint, and write its temporary `known_hosts`.
+/// Scan `req`'s host key, verify trust, and write its temporary `known_hosts`.
 pub fn scan_one<'s>(
     sys: &'s dyn System,
     paths: &Paths,
@@ -2118,7 +2118,7 @@ pub fn report_of(stream: &str) -> Result<HostReport, String> {
     Err("the stream ended without a report".into())
 }
 
-/// `aterm machines unenroll <host> [--unreachable]`: revoke keys, uninstall the agent, and remove the host.
+/// `aterm machines unenroll <host> [--unreachable]`.
 pub fn unenroll(
     sys: &dyn System,
     paths: &Paths,

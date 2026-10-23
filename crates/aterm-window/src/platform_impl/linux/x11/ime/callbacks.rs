@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/callbacks.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM declarations,
+// where upstream used x11-dl's.)
+
 use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::ptr;

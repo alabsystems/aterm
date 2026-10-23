@@ -4286,6 +4286,10 @@ mod macos_coretext {
     const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
     const K_CF_URL_POSIX_PATH_STYLE: isize = 0;
 
+    // SAFETY (whole block): CoreFoundation / CoreText entry points with the signatures in Apple's
+    // headers. `font_path_for_char` upholds each contract: every `Create`/`Copy` result is released
+    // exactly once, pointers passed in are live objects it created, and the UTF-16 unit count
+    // handed to `CTFontCreateForString` matches the buffer.
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFStringCreateWithBytes(
@@ -4328,7 +4332,8 @@ mod macos_coretext {
         length: isize,
     }
 
-    /// SAFETY: see the extern block's block-level note.
+    /// SAFETY: see the extern block's block-level note; `s.as_ptr()`/`s.len()` describe a valid
+    /// UTF-8 buffer for the duration of the call.
     unsafe fn cfstring(s: &str) -> CFStringRef {
         unsafe {
             CFStringCreateWithBytes(
@@ -4365,7 +4370,9 @@ mod macos_coretext {
         let utf16 = ch.encode_utf16(&mut u16buf);
         let utf16_len = utf16.len() as isize;
         let s = ch.to_string();
-        // SAFETY: every Create/Copy below is released exactly once on all paths via the `release` helpers.
+        // SAFETY: every Create/Copy below is released exactly once on all paths via
+        // the `release` helpers; we never deref the opaque pointers. See the extern
+        // block's block-level SAFETY note.
         unsafe {
             let cf = cfstring(&s);
             if cf.is_null() {
@@ -4590,7 +4597,12 @@ mod macos_coretext {
                 deallocate: Some(release_face_bytes),
                 preferred_size: None,
             };
-            // SAFETY: `context` outlives the `CFAllocatorCreate` call, which copies it. The CFData retains `deallocator` for its lifetime, so our reference is released as soon as the data exists.
+            // SAFETY: `context` outlives the `CFAllocatorCreate` call, which
+            // copies it. The CFData retains `deallocator` for its lifetime, so
+            // our reference is released as soon as the data exists; if the data
+            // cannot be created the boxed handle is reclaimed here instead. The
+            // byte pointer stays valid for the data's whole life because the
+            // boxed handle (and `_keepalive`) pin the allocation or mapping.
             unsafe {
                 let deallocator = CFAllocatorCreate(std::ptr::null(), &raw mut context);
                 if deallocator.is_null() {
@@ -4636,7 +4648,10 @@ mod macos_coretext {
         _keepalive: FaceBytes,
     }
 
-    // SAFETY: `font` (CTFontRef) is an immutable Core Foundation object.
+    // SAFETY: `font` (CTFontRef) is an immutable Core Foundation object; CFRetain/CFRelease
+    // are atomic and reads thread-safe, and `FaceBytes` is `Send + Sync`, so a `CtFont` may
+    // be moved or shared across threads (`GpuRenderer::new_with_family` builds the CPU
+    // `Renderer` on a worker thread).
 
     unsafe impl Send for CtFont {}
 
@@ -4644,7 +4659,8 @@ mod macos_coretext {
 
     impl Drop for CtFont {
         fn drop(&mut self) {
-            // SAFETY: `font` is a live CT object we created.
+            // SAFETY: `font` is a live CT object we created; released exactly
+            // once. See the block-level SAFETY note above.
             unsafe {
                 if !self.font.is_null() {
                     CFRelease(self.font);
@@ -4672,7 +4688,9 @@ mod macos_coretext {
             px: f32,
             variations: &[(u32, f32)],
         ) -> Option<CtFont> {
-            // SAFETY: descriptors (base + each derived variation copy) are released after use.
+            // SAFETY: descriptors (base + each derived variation copy) are
+            // released after use; the created font is retained in `CtFont` and
+            // released once in `Drop`. Opaque pointers are never dereferenced.
             unsafe {
                 let descs_ref = descs.descs;
                 let count = CFArrayGetCount(descs_ref);
@@ -4721,7 +4739,9 @@ mod macos_coretext {
 
         /// Rasterize glyph `gid` to an 8-bit coverage mask via a grayscale CoreGraphics context (antialiased, font smoothing off: pure coverage, so the downstream linear-light blend does the gamma).
         pub fn rasterize(&self, gid: u16, thicken: bool) -> Option<RasterGlyph> {
-            // SAFETY: single-glyph CoreText/CoreGraphics calls with correctly sized buffers.
+            // SAFETY: single-glyph CoreText/CoreGraphics calls with correctly sized
+            // buffers; the bitmap context writes into `buf` (w*h bytes, 1 byte/px);
+            // context + colorspace are released once. See block-level SAFETY note.
             unsafe {
                 let glyphs = [gid];
                 let mut rect = CGRect {
@@ -4789,7 +4809,8 @@ mod macos_coretext {
         /// Test only: the raw CoreText ink rect for `gid` as `(x, y, w, h)` (baseline relative, y up), so the conformance test can bind [`Self::rasterize`]'s placement to [`super::ct_pen_and_bearing`] / [`super::ct_padded_extent`] on real fonts.
         #[cfg(test)]
         pub fn ink_rect(&self, gid: u16) -> (f64, f64, f64, f64) {
-            // SAFETY: a single-glyph query with a correctly sized out-buffer.
+            // SAFETY: a single-glyph query with a correctly sized out-buffer;
+            // see the extern block's block-level SAFETY note.
             unsafe {
                 let glyphs = [gid];
                 let mut rect = CGRect {
@@ -4834,6 +4855,10 @@ mod macos_coretext {
         equal: *const c_void,
     }
 
+    // SAFETY (whole block): CoreFoundation / CoreText entry points with the signatures in Apple's
+    // headers. `CtFont::shape` upholds each contract: every `Create` result is released exactly
+    // once, the `Get` results are borrowed from objects it keeps alive across their use, and every
+    // out-buffer holds the run's glyph count.
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFDictionaryCreate(
@@ -4888,7 +4913,11 @@ mod macos_coretext {
                 }
             }
             let mut out = Vec::new();
-            // SAFETY: see the extern blocks' notes. `string`, `attrs`, `attributed` and `line` are created here and released once each below, on every path.
+            // SAFETY: see the extern blocks' notes. `string`, `attrs`, `attributed`
+            // and `line` are created here and released once each below, on every
+            // path; `runs` and each run's attributes are borrowed from `line`,
+            // which outlives their use; each out-buffer is sized to the run's
+            // glyph count, which the range asks for in full.
             unsafe {
                 let string = cfstring(text);
                 if string.is_null() {

@@ -438,7 +438,9 @@ impl ColdTier {
     /// Remove the oldest `n` logical lines from the front of the cold tier.
     ///
     /// # Panics
-    /// Debug-asserts `n <= self.line_count` under `cfg(test)`.
+    ///
+    /// Debug-asserts `n <= self.line_count` under `cfg(test)`; other builds warn
+    /// and saturate.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_front_lines(&mut self, n: usize) {
         if n == 0 {

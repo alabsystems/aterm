@@ -215,7 +215,7 @@ impl aterm_converge::Activation for BoundActivation<'_> {
 /// Run a fleet baseline's `items`.
 ///
 /// # Errors
-/// The items cannot be ordered ([`aterm_converge::order`]).
+/// The items cannot be ordered ([`aterm_converge::order`]); nothing was probed.
 pub fn run_with(
     items: &[Box<dyn Item>],
     mode: Mode,

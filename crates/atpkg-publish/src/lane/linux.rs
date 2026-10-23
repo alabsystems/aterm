@@ -445,7 +445,8 @@ pub struct Outcome {
 /// One run of the Linux lane.
 ///
 /// # Errors
-/// Refused on downgrade, signing failure, or BLOCKED/ERROR rows.
+/// A refusal for a downgrade, a refused signing step, or a run that finished with
+/// BLOCKED/ERROR rows; a could-not-run when the channel head cannot be read.
 pub fn run(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> Result<Outcome> {
     let state = LaneState::of(LaneKind::Linux, &ctx.state_dir);
     state.ensure()?;

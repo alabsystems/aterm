@@ -8,14 +8,13 @@
 //!
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
-//! WC.8): the seats are first-party `aterm_wayland::seat::Seats`, which binds every `wl_seat` (at
-//! version 7, as smithay-client-toolkit did), makes and releases its devices as its capabilities
-//! come and go (in sctk's order) and records their events in the backend's one inbox as they
-//! are heard (`wire::Inbox::seat_sink`); this module keeps what winit keeps per seat and applies
-//! those events where the inbox has them, as sctk's `SeatHandler` and the device handlers did.
-//! CUT with sctk, each with no aterm caller: the relative pointer (`DeviceEvent::MouseMotion` and
-//! the motion axes) and pointer constraints.
+//! LOCAL PATCH (aterm): the seats are first-party `aterm_wayland::seat::Seats`, which binds every
+//! `wl_seat` (at version 7, as smithay-client-toolkit did), makes and releases its devices as its
+//! capabilities come and go (in sctk's order) and records their events in the backend's one inbox
+//! as they are heard (`wire::Inbox::seat_sink`); this module keeps what winit keeps per seat and
+//! applies those events where the inbox has them, as sctk's `SeatHandler` and the device handlers
+//! did. Cut with sctk, each with no aterm caller: the relative pointer (`DeviceEvent::MouseMotion`
+//! and the motion axes) and pointer constraints.
 
 use std::sync::Arc;
 
@@ -64,19 +63,13 @@ pub struct WinitSeatState {
     /// The keyboard bound on the seat.
     keyboard_state: Option<KeyboardState>,
 
-    /// The data device bound on the seat, driving drag-and-drop (and clipboard)
-    /// offers. `None` when the compositor has no `wl_data_device_manager`. Kept
-    /// alive here so its offer events keep flowing (see `data_device.rs`). Made
-    /// when the seat is first seen (see [`WinitState::sync_seats`]).
+    /// The data device bound on the seat, or `None` when the compositor has no `wl_data_device_manager`.
     pub(crate) data_device: Option<Device>,
 
-    /// The primary-selection device bound on the seat (see `clipboard.rs`).
-    /// `None` when the compositor has no `zwp_primary_selection_device_manager_v1`.
+    /// The primary-selection device bound on the seat, or `None` when unsupported.
     pub(crate) primary_device: Option<Device>,
 
-    /// Whether the seat's keyboard is currently ON one of this client's surfaces
-    /// — set by `wl_keyboard.enter`, cleared by `wl_keyboard.leave`. Read by
-    /// [`Self::holds_keyboard_focus`]; see `clipboard.rs` for why a copy needs it.
+    /// Whether the seat's keyboard focus is currently on one of this client's surfaces.
     keyboard_entered: bool,
 
     /// The current modifiers state on the seat.
@@ -87,8 +80,6 @@ pub struct WinitSeatState {
 }
 
 impl WinitSeatState {
-    /// A seat first seen (its registry name `id`): its data devices, where the compositor
-    /// offers their managers, their drags recorded in `inbox`.
     fn new(
         id: u32,
         seat: aterm_wayland::proxy::Proxy,
@@ -112,45 +103,28 @@ impl WinitSeatState {
         Self { data_device: device(data), primary_device: device(primary), ..Default::default() }
     }
 
-    /// Whether this client holds the seat's keyboard focus — the fact a clipboard
-    /// copy is gated on, because a compositor hands a selection only to the client
-    /// its keyboard is on (measured; see `clipboard.rs`).
-    ///
-    /// A seat that has bound NO keyboard answers `true`: there is no focus on it to
-    /// hold, and a gate that read `false` there would refuse every copy made on a
-    /// pointer-only seat.
+    /// Whether this client holds the seat's keyboard focus, or the seat has bound no keyboard.
     pub(crate) fn holds_keyboard_focus(&self) -> bool {
         self.keyboard_state.is_none() || self.keyboard_entered
     }
 
-    /// `wl_keyboard.enter` / `.leave` for this seat: the keyboard arrived on one of
-    /// our surfaces, or left them.
+    /// Record `wl_keyboard.enter` or `wl_keyboard.leave` for this seat.
     pub(crate) fn set_keyboard_entered(&mut self, entered: bool) {
         self.keyboard_entered = entered;
     }
 }
 
-/// A seat's pointer or text input after its capability (or its seat) went. A window keeps a weak
-/// reference to each and upgrades it for a request on whatever thread the application calls it
-/// from; were that thread's reference the last, the object would be destroyed, and its listener
-/// freed, there, while the loop's thread may be dispatching its events (wayland-rs kept an
-/// object's data alive across its dispatch; libwayland and aterm-wayland do not). So the loop
-/// keeps its reference here and lets go only once it is the last one
-/// ([`WinitState::reap_retired`]): the object is destroyed on the loop's thread, between
-/// dispatches.
+/// A seat's pointer or text input after its capability or seat was removed.
+/// Held on the event loop until [`WinitState::reap_retired`] sees the last strong reference.
 pub(crate) enum Retired {
     Pointer(Arc<WinitPointer>),
     TextInput(Arc<TextInput>),
 }
 
-/// The negative control of `retire_tests`: cleared, a pointer or text input whose capability
-/// went is let go at once, as before LW.7's fix (the object then dies with its last holder,
-/// on that holder's thread).
+/// Test toggle for `retire_tests`: when false, retired devices are dropped immediately.
 #[cfg(test)]
 pub(crate) static RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Keep `retired` on the loop's `list` until [`WinitState::reap_retired`] finds its reference
-/// the last.
 fn retire(list: &mut Vec<Retired>, retired: Retired) {
     #[cfg(test)]
     if !RETIRE.load(std::sync::atomic::Ordering::SeqCst) {
@@ -160,7 +134,6 @@ fn retire(list: &mut Vec<Retired>, retired: Retired) {
     list.push(retired);
 }
 
-/// One `wl_seat.capability` bit, in the order sctk 0.19.2 handled them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeatCapability {
     Keyboard,
@@ -182,9 +155,7 @@ impl SeatCapability {
 }
 
 impl WinitState {
-    /// Bring the seats up to the registry: a seat the registry no longer lists is torn down
-    /// here first (its devices before aterm-wayland releases it), then `Seats` binds the new
-    /// ones, and each seat first seen gets its data devices (sctk's `new_seat`).
+    /// Synchronize seat state with the current `wl_seat` globals in the registry.
     pub(crate) fn sync_seats(&mut self) {
         let listed: Vec<u32> = self
             .registry()
@@ -246,8 +217,6 @@ impl WinitState {
         }
     }
 
-    /// `wl_seat.capabilities`: each capability that came or went, as sctk 0.19.2 told
-    /// winit's `SeatHandler` (keyboard, pointer, touch).
     fn capabilities_changed(&mut self, seat: u32, capabilities: u32) {
         let Some(old) = self.seats.get(&seat).map(|s| s.capabilities) else {
             warn!("Received wl_seat::capabilities for unknown seat");
@@ -298,7 +267,6 @@ impl WinitState {
                 });
                 if let Some(pointer) = pointer {
                     let pointer = Arc::new(pointer);
-                    // Register cursor surface.
                     self.pointer_surfaces.insert(pointer.surface_id(), pointer.clone());
                     seat_state.pointer = Some(pointer);
                 } else {
@@ -325,8 +293,6 @@ impl WinitState {
             return;
         };
 
-        // The text input goes with any capability (a window keeps only a weak reference; it is
-        // destroyed on this thread once no window holds it).
         if let Some((text_input, _)) = seat_state.text_input.take() {
             retire(&mut self.retired, Retired::TextInput(text_input));
         }
@@ -343,27 +309,21 @@ impl WinitState {
             },
             SeatCapability::Keyboard => {
                 seat_state.keyboard_state = None;
-                // The keyboard is gone, so it is on none of our surfaces; a later
-                // one re-binds and re-enters before it hands out another serial.
                 seat_state.set_keyboard_entered(false);
                 self.on_keyboard_destroy(seat);
             },
         }
     }
 
-    /// A pointer whose capability or seat went: out of the cursor mapping, then retired.
     fn retire_pointer(&mut self, pointer: Arc<WinitPointer>) {
         let _ = self.pointer_surfaces.remove(&pointer.surface_id());
         let _ = self.surface_scales.remove(&pointer.surface_id());
         retire(&mut self.retired, Retired::Pointer(pointer));
     }
 
-    /// Destroy the retired objects no window holds any more (between dispatches, on the loop's
-    /// thread).
+    /// Destroy retired seat devices once no window holds a reference to them.
     pub(crate) fn reap_retired(&mut self) {
         for retired in std::mem::take(&mut self.retired) {
-            // `try_unwrap` succeeds only for the last reference, and a window's weak reference
-            // can no longer be upgraded once it has; the object is dropped here when it does.
             let kept = match retired {
                 Retired::Pointer(pointer) => Arc::try_unwrap(pointer).err().map(Retired::Pointer),
                 Retired::TextInput(text_input) => {

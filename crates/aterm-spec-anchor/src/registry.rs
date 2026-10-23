@@ -22,6 +22,26 @@ pub trait Collect: Sync + Sized + 'static {
 }
 
 /// The head of one type's list.
+///
+/// # Examples
+///
+/// ```
+/// use aterm_spec_anchor::registry::{Node, Registry};
+/// use std::sync::atomic::AtomicU32;
+/// static R: Registry<AtomicU32> = Registry::new();
+/// R.submit(Box::leak(Box::new(Node::new(AtomicU32::new(0)))));
+/// assert_eq!(R.iter().count(), 1);
+/// ```
+///
+/// `T: Sync` is part of the type, so a `static` registry of a `Cell` does not compile:
+///
+/// ```compile_fail,E0277
+/// use aterm_spec_anchor::registry::{Node, Registry};
+/// use std::cell::Cell;
+/// static R: Registry<Cell<u32>> = Registry::new();
+/// R.submit(Box::leak(Box::new(Node::new(Cell::new(0)))));
+/// assert_eq!(R.iter().count(), 1);
+/// ```
 pub struct Registry<T: Sync + 'static> {
     head: AtomicPtr<Node<T>>,
 }

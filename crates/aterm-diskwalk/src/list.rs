@@ -282,6 +282,8 @@ pub(crate) mod bulk {
     const VDIR: u32 = 2;
     const VLNK: u32 = 5;
 
+    // SAFETY (declaration): libSystem exports these with these C signatures on every supported
+    // macOS (`int` return, errno on failure).
     unsafe extern "C" {
         fn getattrlistbulk(
             dirfd: libc::c_int,

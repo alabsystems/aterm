@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An `NSException` raised inside a declared method is contained: every Rust `Drop` between the
-//! raise and the trampoline runs, the method answers its inert zero, the containment is reported
-//! against the selector, and the process continues. A Rust panic still aborts with the named
-//! message, an `@abort_on_exception` method still aborts on a raise, and `-dealloc` always does.
-//!
-//! The raise is a real one: `+[NSException exceptionWithName:reason:userInfo:]`
-//! then `-raise`, thrown by Foundation through `objc_exception_throw`, which is
-//! the same path AppKit's `NSInternalInconsistencyException` takes. No AppKit
-//! is needed for that, so this runs in the crate's own test binary; the AppKit
-//! shape — `-[NSEvent keyCode]` on a mouse event — is the gate in
-//! `crates/aterm-gui/examples/objc_event_drive.rs`.
-//!
-//! The abort cases re-run this binary on the one test as a child
-//! (`support/reexec.rs`) and read its exit and stderr.
+//! Objective-C `NSException` containment and Rust panic / `-dealloc` abort tests.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -55,12 +42,9 @@ fn record(e: &ContainedException<'_>) {
         call_stack: e.call_stack.to_owned(),
         ordinal: e.ordinal,
     });
-    // And the default line too, so a child's stderr carries it.
     aterm_objc::exception::default_sink(e);
 }
 
-/// Install the recording sink once per process. Tests in this binary run in
-/// parallel and all share it; each looks for its own selector's records.
 fn install_sink() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| aterm_objc::exception::set_sink(record));
@@ -72,8 +56,6 @@ fn mtm() -> MainThread {
     unsafe { MainThread::new_unchecked() }
 }
 
-/// A `Drop` that counts, for proving every frame between the raise and the
-/// trampoline was unwound.
 struct Tell(Arc<AtomicUsize>);
 impl Drop for Tell {
     fn drop(&mut self) {
@@ -81,7 +63,6 @@ impl Drop for Tell {
     }
 }
 
-/// Raise a real `NSException` named `name` with `reason`, through Foundation.
 fn raise(name: &str, reason: &str) -> ! {
     let n = ns_string(name).expect("NSString");
     let r = ns_string(reason).expect("NSString");
@@ -103,7 +84,6 @@ fn raise(name: &str, reason: &str) -> ! {
     unreachable!("-[NSException raise] returned")
 }
 
-/// Two frames deep, each with a `Drop`, then the raise.
 fn deep(drops: &Arc<AtomicUsize>, name: &str, reason: &str) -> i64 {
     let _outer = Tell(Arc::clone(drops));
     deeper(drops, name, reason)
@@ -122,47 +102,39 @@ aterm_objc::declare_class! {
         const NAME: &str = "ATermContainmentProbe";
         type Ivars = Ivars;
 
-        /// Raises after two frames of `Drop`; contained, answers `0`.
         @sel(raiseInteger)
         fn raise_integer(&self) -> i64 {
             let _local = Tell(Arc::clone(&self.ivars().drops));
             deep(&self.ivars().drops, "ATermProbeException", "raised on purpose") + 1
         }
 
-        /// A `BOOL` answer that would be `YES` if the raise did not happen.
         @sel(raiseBool)
         fn raise_bool(&self) -> Bool {
             let _local = Tell(Arc::clone(&self.ivars().drops));
             raise("ATermProbeBoolException", "the BOOL row raised");
         }
 
-        /// An object answer — inert is nil.
         @sel(raiseObject)
         fn raise_object(&self) -> Id {
             raise("ATermProbeObjectException", "the object row raised");
         }
 
-        /// A struct answer — inert is the empty range.
         @sel(raiseRange)
         fn raise_range(&self) -> NSRange {
             raise("ATermProbeRangeException", "the range row raised");
         }
 
-        /// The row that proves the process continues: answers 42.
         @sel(fortyTwo)
         fn forty_two(&self) -> i64 {
             42
         }
 
-        /// A Rust panic under containment still aborts with the named message: `@catch (id)`
-        /// does not swallow a Rust panic.
         @sel(rustPanic)
         fn rust_panic(&self) {
             let _local = Tell(Arc::clone(&self.ivars().drops));
             panic!("a Rust panic inside a contained method");
         }
 
-        /// Opted out of containment: a raise here aborts.
         @sel(raiseUncontained)
         @abort_on_exception
         fn raise_uncontained(&self) -> i64 {
@@ -208,11 +180,8 @@ fn a_raise_inside_a_declared_method_is_contained_and_every_drop_runs() {
         3,
         "the method's local and both deeper frames' locals were dropped by the unwind"
     );
-    // Other tests in this binary contain concurrently, so the global count is only known to
-    // have moved; the exact once-per-raise is the record's ordinal below.
     assert!(contained_count() > before, "the containment was counted");
 
-    // The process continues: the same object still answers.
     // SAFETY: `-fortyTwo` is `q@:`.
     let later = unsafe { send_i64(obj.as_id(), sel!(fortyTwo)) };
     assert_eq!(later, 42, "a later send on the same object works");
@@ -281,8 +250,6 @@ fn a_contained_method_dispatched_by_foundation_still_returns_to_foundation() {
     install_sink();
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = probe(&drops);
-    // Through `-performSelector:`, so a Foundation frame sits between the
-    // send and the trampoline — the responder-chain shape.
     // SAFETY: `-performSelector:` is `@@::`; `-raiseObject` answers an object.
     let answer = autoreleasepool(|_| unsafe {
         let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
@@ -339,10 +306,8 @@ fn a_block_contains_a_raise_and_answers_its_inert_zero() {
     assert_eq!(mine.method, "block invoke");
 }
 
-/// Set in a child so it performs the fatal send instead of re-spawning.
 const CHILD: &str = "ATERM_OBJC_CONTAINMENT_CHILD";
 
-/// Re-run `test` in a child with `CHILD=mode`; return `(exit code, stdout, stderr)`.
 fn child(test: &str, mode: &str) -> (Option<i32>, String, String) {
     let out = crate::reexec::rerun(module_path!(), test, &[(CHILD, mode)]);
     (
@@ -453,7 +418,6 @@ fn dealloc_keeps_the_abort_on_a_raise() {
 #[test]
 fn the_default_sink_writes_one_line_naming_method_and_exception() {
     if crate::reexec::is_child(CHILD) {
-        // No sink installed in this child: the default writes to stderr.
         let drops = Arc::new(AtomicUsize::new(0));
         let obj = probe(&drops);
         // SAFETY: `-raiseInteger` is `q@:`.

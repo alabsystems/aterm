@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows chain building and SSL policy verification over `crypt32`.
-//! Implements [`Verifier::verify`] and is tested by [`super::tests`].
 
 use std::ffi::c_void;
 use std::mem;
@@ -32,9 +31,7 @@ use super::{
     bad_encoding, eku_rejected, invalid_certificate, name_mismatch, revoked, unknown_issuer,
 };
 
-/// Seconds between 1601-01-01 (the Windows epoch) and 1970-01-01.
 const UNIX_TO_WINDOWS_SECS: u64 = 11_644_473_600;
-/// `FILETIME` counts 100-nanosecond intervals.
 const INTERVALS_PER_SEC: u64 = 10_000_000;
 
 const CERT_E_EXPIRED: i32 = -2146762495; // 0x800B0101
@@ -44,17 +41,17 @@ const CERT_E_WRONG_USAGE: i32 = -2146762480; // 0x800B0110
 const CERT_E_INVALID_NAME: i32 = -2146762476; // 0x800B0114
 const CRYPT_E_REVOKED: i32 = -2146885616; // 0x80092010
 
-/// The last OS error, as a rustls error.
 fn last_os_error(what: &str) -> rustls::Error {
     invalid_certificate(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
-/// An in-memory certificate store, closed exactly once on drop ([`CertContext`]).
 struct Store(HCERTSTORE);
 
 impl Store {
     fn new() -> Result<Self, rustls::Error> {
-        // SAFETY: `CERT_STORE_PROV_MEMORY` takes no provider and no `pvPara`.
+        // SAFETY: `CERT_STORE_PROV_MEMORY` takes no provider and no `pvPara`;
+        // the two zeroed arguments are the documented values for it. The result
+        // is checked for null before it is used.
         let handle = unsafe {
             CertOpenStore(
                 CERT_STORE_PROV_MEMORY,
@@ -70,11 +67,12 @@ impl Store {
         Ok(Self(handle))
     }
 
-    /// Add one DER certificate, returning its context.
     fn add(&self, der: &[u8]) -> Result<CertContext, rustls::Error> {
         let len = u32::try_from(der.len()).map_err(|_| bad_encoding())?;
         let mut context: *mut CERT_CONTEXT = ptr::null_mut();
-        // SAFETY: `self.0` is a live store.
+        // SAFETY: `self.0` is a live store; `der` is valid for `len` bytes for
+        // the duration of the call (crypt32 copies); `context` is a valid place
+        // to write one pointer.
         let ok = unsafe {
             CertAddEncodedCertificateToStore(
                 self.0,
@@ -95,11 +93,12 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         // SAFETY: `self.0` is a live store handle and this is its only close.
+        // Contexts handed out by `add` remain valid because of the
+        // `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG` this store was opened with.
         unsafe { CertCloseStore(self.0, 0) };
     }
 }
 
-/// A certificate context, freed exactly once on drop.
 struct CertContext(*mut CERT_CONTEXT);
 
 impl Drop for CertContext {
@@ -109,7 +108,6 @@ impl Drop for CertContext {
     }
 }
 
-/// A chain context, freed exactly once on drop.
 struct ChainContext(*mut CERT_CHAIN_CONTEXT);
 
 impl Drop for ChainContext {
@@ -119,7 +117,6 @@ impl Drop for ChainContext {
     }
 }
 
-/// A chain engine, freed exactly once on drop.
 struct ChainEngine(HCERTCHAINENGINE);
 
 impl Drop for ChainEngine {
@@ -129,7 +126,6 @@ impl Drop for ChainEngine {
     }
 }
 
-/// Build the chain for `cert` at `now`, optionally through a restricted engine.
 fn build_chain(
     store: &Store,
     cert: &CertContext,
@@ -146,7 +142,8 @@ fn build_chain(
     };
 
     let mut ekus: [PCSTR; 1] = [szOID_PKIX_KP_SERVER_AUTH];
-    // SAFETY: `CERT_CHAIN_PARA` is a plain integer/pointer aggregate.
+    // SAFETY: `CERT_CHAIN_PARA` is a plain integer/pointer aggregate; MSDN
+    // requires every unused field to be zero, which is exactly what this gives.
     let mut parameters: CERT_CHAIN_PARA = unsafe { mem::zeroed() };
     parameters.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_PARA>())
         .map_err(|_| invalid_certificate("CERT_CHAIN_PARA is impossibly large"))?;
@@ -164,7 +161,9 @@ fn build_chain(
         | CERT_CHAIN_CACHE_END_CERT;
 
     let mut chain: *mut CERT_CHAIN_CONTEXT = ptr::null_mut();
-    // SAFETY: `cert` and `store` are live.
+    // SAFETY: `cert` and `store` are live; `time` and `parameters` are valid for
+    // reads for the duration of the call, and `ekus` outlives `parameters`;
+    // `chain` is a valid place to write one pointer. `pvReserved` must be null.
     let ok = unsafe {
         CertGetCertificateChain(
             engine.map_or(ptr::null_mut(), |e| e.0),
@@ -190,7 +189,7 @@ pub(super) struct Verifier {
 }
 
 impl Verifier {
-    /// `extra_roots` is empty on every shipped path.
+    /// Creates a verifier with optional extra root certificates.
     pub(super) fn new(
         extra_roots: Vec<CertificateDer<'static>>,
         _provider: Arc<CryptoProvider>,
@@ -204,7 +203,6 @@ impl Verifier {
         })
     }
 
-    /// An engine whose only roots are `self.extra_roots`, plus a store holding them.
     fn exclusive_engine(&self) -> Result<(Store, ChainEngine), rustls::Error> {
         let roots = Store::new()?;
         for der in &self.extra_roots {
@@ -216,7 +214,8 @@ impl Verifier {
             .map_err(|_| invalid_certificate("CERT_CHAIN_ENGINE_CONFIG is impossibly large"))?;
         config.hExclusiveRoot = roots.0;
         let mut engine: HCERTCHAINENGINE = ptr::null_mut();
-        // SAFETY: `config` is valid for reads for the duration of the call and names a live store.
+        // SAFETY: `config` is valid for reads for the duration of the call and
+        // names a live store; `engine` is a valid place to write one handle.
         let ok = unsafe { CertCreateCertificateChainEngine(&config, &mut engine) };
         if ok != TRUE || engine.is_null() {
             return Err(last_os_error("CertCreateCertificateChainEngine failed"));
@@ -248,7 +247,9 @@ impl Verifier {
                 })?,
                 pbData: ocsp.as_ptr().cast_mut(),
             };
-            // SAFETY: `leaf` is a live context.
+            // SAFETY: `leaf` is a live context; `blob` matches the layout
+            // `CERT_OCSP_RESPONSE_PROP_ID` expects and is valid for reads for
+            // the duration of the call, as is the buffer it points at.
             let ok = unsafe {
                 CertSetCertificateContextProperty(
                     leaf.0,
@@ -278,7 +279,8 @@ impl Verifier {
 
         let mut server: Vec<u16> = server_text.encode_utf16().chain(Some(0)).collect();
 
-        // SAFETY: Plain aggregate containing a union of two `u32`s.
+        // SAFETY: plain aggregate containing a union of two `u32`s; zeroing is
+        // required by MSDN for the unused fields.
         let mut https: HTTPSPolicyCallbackData = unsafe { mem::zeroed() };
         https.Anonymous.cbSize = u32::try_from(mem::size_of::<HTTPSPolicyCallbackData>())
             .map_err(|_| invalid_certificate("HTTPSPolicyCallbackData is impossibly large"))?;
@@ -297,7 +299,9 @@ impl Verifier {
         status.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_POLICY_STATUS>())
             .map_err(|_| invalid_certificate("CERT_CHAIN_POLICY_STATUS is impossibly large"))?;
 
-        // SAFETY: `chain.0` is a live chain context.
+        // SAFETY: `chain.0` is a live chain context; `params` is valid for reads
+        // (and everything it points at outlives the call); `status` is a valid
+        // place to write one `CERT_CHAIN_POLICY_STATUS`.
         let ok = unsafe {
             CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain.0, &params, &mut status)
         };

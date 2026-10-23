@@ -3,12 +3,6 @@
 // Author: Andrew Yates
 
 //! Trigram-indexed search with Bloom filter acceleration.
-//!
-//! A Bloom filter rejects absent trigrams; intersecting per-trigram posting lists
-//! (delta + varint line ids) yields candidate lines, which are verified against the
-//! text.
-//!
-//! `tests/search_vs_bruteforce.rs` pins verified search against brute force.
 
 #![warn(missing_docs)]
 #![cfg_attr(
@@ -45,8 +39,7 @@ pub use types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchRes
 #[cfg(test)]
 mod tests;
 
-/// Search over a terminal's grid and scrollback. `Clone` copies the index
-/// ([`SearchIndex`] says when that is worth it).
+/// Search over a terminal's grid and scrollback ([`SearchIndex`]).
 #[derive(Clone, Debug)]
 pub struct TerminalSearch {
     /// Search index for all content.
@@ -68,9 +61,6 @@ impl TerminalSearch {
     /// Create with expected capacity.
     #[must_use]
     pub fn with_capacity(expected_lines: usize) -> Self {
-        // Both arms build the same index (`SearchIndex::with_capacity` clamps its
-        // hints far below this bound); the duplication lets the Trust L0 gate's
-        // allocation recognizer see the comparison dominate the allocating call.
         let index = if expected_lines > BloomFilter::MAX_EFFECTIVE_CAPACITY {
             SearchIndex::with_capacity(BloomFilter::MAX_EFFECTIVE_CAPACITY)
         } else {
@@ -82,8 +72,7 @@ impl TerminalSearch {
         }
     }
 
-    /// Create with expected capacity and a cap on retained lines (oldest evicted
-    /// first; see [`results_may_be_incomplete`](Self::results_may_be_incomplete)).
+    /// Create with expected capacity and a cap on retained lines.
     #[must_use]
     pub fn with_capacity_and_max(expected_lines: usize, max_cached_lines: usize) -> Self {
         Self {
@@ -92,8 +81,7 @@ impl TerminalSearch {
         }
     }
 
-    /// Measure match columns under the terminal's `ambiguous_width` policy
-    /// (see [`SearchIndex::set_ambiguous_width`]); a builder for a fresh index.
+    /// Measure match columns under the terminal's `ambiguous_width` policy.
     #[must_use]
     pub fn with_ambiguous_width(mut self, ambiguous: AmbiguousWidth) -> Self {
         self.index.set_ambiguous_width(ambiguous);
@@ -107,16 +95,14 @@ impl TerminalSearch {
         self.index.ambiguous_width()
     }
 
-    /// The oldest line still retained; the searchable range is
-    /// `[lowest_retained_line(), indexed_line_count())`.
+    /// The oldest line still retained.
     #[inline]
     #[must_use]
     pub const fn lowest_retained_line(&self) -> usize {
         self.index.lowest_retained_line()
     }
 
-    /// Whether results may be incomplete due to eviction; see
-    /// [`SearchIndex::results_may_be_incomplete`].
+    /// Whether results may be incomplete due to eviction.
     #[inline]
     #[must_use]
     pub const fn results_may_be_incomplete(&self) -> bool {
@@ -126,7 +112,6 @@ impl TerminalSearch {
     /// Index a line pushed to scrollback.
     pub fn index_scrollback_line(&mut self, text: &str) {
         self.index.push_line(text);
-        // Saturating only to carry the no-overflow proof for the Trust L0 gate.
         self.indexed_scrollback_lines = self.indexed_scrollback_lines.saturating_add(1);
     }
 
@@ -145,8 +130,6 @@ impl TerminalSearch {
         lines: impl IntoIterator<Item = impl AsRef<str>>,
     ) {
         for (offset, line) in lines.into_iter().enumerate() {
-            // Saturating only to carry the no-overflow proof for the Trust L0 gate.
-            // Rows past `u32::MAX` are fine: the index keys them from its own base.
             self.index.index_line_cow(
                 base_line.saturating_add(offset),
                 Cow::Borrowed(line.as_ref()),
@@ -166,10 +149,7 @@ impl TerminalSearch {
         }
     }
 
-    /// Index owned grid rows at absolute row numbers, each with the [`LineCells`] its
-    /// text was read from, so matches are reported in the cells that hold them. Text
-    /// alone cannot say what the grid did with it (two flag halves written apart stay
-    /// two cells; a VS16 base in the last column stays one).
+    /// Index owned grid rows at absolute row numbers ([`LineCells`]).
     pub fn index_numbered_cells_owned(
         &mut self,
         lines: impl IntoIterator<Item = (usize, String, LineCells)>,
@@ -180,15 +160,12 @@ impl TerminalSearch {
         }
     }
 
-    /// Record whether the bulk snapshot just built omitted an older history prefix:
-    /// `Some(oldest_indexed_row)` marks results incomplete from that row, `None` marks
-    /// them exhaustive. See [`SearchIndex::set_history_prefix_eviction`].
+    /// Record whether the bulk snapshot just built omitted an older history prefix.
     pub fn set_history_prefix_eviction(&mut self, lowest_retained_line: Option<usize>) {
         self.index.set_history_prefix_eviction(lowest_retained_line);
     }
 
-    /// Drop rows the terminal no longer retains, without eviction bookkeeping; see
-    /// [`SearchIndex::drop_history_below`].
+    /// Drop rows the terminal no longer retains ([`SearchIndex::drop_history_below`]).
     pub fn drop_history_below(&mut self, first_retained_line: usize) {
         self.index.drop_history_below(first_retained_line);
     }
@@ -205,8 +182,7 @@ impl TerminalSearch {
         self.index.search_with_positions(query)
     }
 
-    /// Search with options, returning absolute-row matches plus the eviction signal
-    /// (`incomplete`, oldest searchable line). See [`SearchIndex::search_results_opts`].
+    /// Search with options ([`SearchIndex::search_results_opts`]).
     pub fn search_results_opts(
         &self,
         query: &str,
@@ -217,8 +193,7 @@ impl TerminalSearch {
             .search_results_opts(query, case_sensitive, is_regex)
     }
 
-    /// Search with options, keeping the capped edge for `direction`: forward keeps the
-    /// oldest [`MAX_SEARCH_MATCHES`], backward the newest. Results stay ascending.
+    /// Search with options, keeping the capped edge for `direction` ([`MAX_SEARCH_MATCHES`]).
     pub fn search_results_opts_direction(
         &self,
         query: &str,
@@ -230,15 +205,13 @@ impl TerminalSearch {
             .search_results_opts_direction(query, case_sensitive, is_regex, direction)
     }
 
-    /// Cheap upper bound on the index's candidate count for a literal query; see
-    /// [`SearchIndex::literal_candidate_bound`].
+    /// Cheap upper bound on the index's candidate count for a literal query.
     #[must_use]
     pub fn literal_candidate_bound(&self, query: &str, case_sensitive: bool) -> Option<u64> {
         self.index.literal_candidate_bound(query, case_sensitive)
     }
 
-    /// One incremental-search narrowing step; see
-    /// [`SearchIndex::search_literal_narrowed`] for the contract.
+    /// One incremental-search narrowing step ([`SearchIndex::search_literal_narrowed`]).
     #[must_use]
     pub fn search_literal_narrowed(
         &self,
@@ -294,8 +267,6 @@ impl TerminalSearch {
         before_line: usize,
         before_col: usize,
     ) -> Option<SearchMatch> {
-        // Include `before_line` itself by using an exclusive upper bound.
-        // Saturate at `usize::MAX` to avoid overflow for sentinel/high-bound callers.
         let exclusive_upper = before_line.saturating_add(1);
         self.index
             .search_before_line(query, exclusive_upper)
@@ -325,9 +296,7 @@ impl TerminalSearch {
         )
     }
 
-    /// Find one match from an absolute anchor in `direction`, unaffected by
-    /// [`MAX_SEARCH_MATCHES`]. `inclusive` lets a match exactly at the anchor qualify;
-    /// `wrap` retries from the opposite edge when the directional side has no match.
+    /// Find one match from an absolute anchor in `direction`, unaffected by [`MAX_SEARCH_MATCHES`].
     pub fn find_direction_opts(
         &self,
         query: &str,
@@ -419,8 +388,7 @@ impl TerminalSearch {
     }
 
     /// Like [`clear`](Self::clear), but returns the grown map and vector capacity to
-    /// the allocator (idle eviction). Use `clear` when the index will be refilled at
-    /// once.
+    /// the allocator (idle eviction).
     pub fn release(&mut self) {
         self.index.release();
         self.indexed_scrollback_lines = 0;

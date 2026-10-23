@@ -378,7 +378,9 @@ impl DeviceHandle<'_> {
                     texture.width(),
                     texture.height()
                 );
-                // SAFETY: `LayerTexture::Metal` is minted only by this layer with shared storage.
+                // SAFETY: a `LayerTexture::Metal` comes only from this layer's mint, which creates
+                // Managed 2-D textures, so `replaceRegion:` is legal; the region lies in the
+                // texture and the band length is asserted above.
                 unsafe { texture.upload(region, bytes, bytes_per_row as usize) };
             }
             #[cfg(gl_arm)]
@@ -543,7 +545,8 @@ impl DeviceHandle<'_> {
                     bytes.len(),
                     mtl::buffer_length(obj)
                 );
-                // SAFETY: Length asserted above.
+                // SAFETY: length asserted above; exclusivity is the caller's
+                // documented precondition.
                 unsafe { mtl::buffer_write(obj, bytes) }
             }
             #[cfg(gl_arm)]
@@ -1426,7 +1429,9 @@ pub(crate) fn metal_try_read_back(
 ) -> Result<aterm_render::Frame, String> {
     let (w, h) = (width as usize, height as usize);
     let (readback, stride) = metal_stage_readback(session, mint, texture, w, h)?;
-    // SAFETY: `readback` is shared storage of `stride * h` bytes.
+    // SAFETY: `readback` is shared storage of `stride * h` bytes, and
+    // `metal_stage_readback` returned after the writing command buffer
+    // completed.
     let bytes = unsafe { mtl::buffer_bytes(&readback, stride * h) };
     Ok(crate::frame_from_padded_rgba(&bytes, w, h, stride))
 }
@@ -1486,7 +1491,8 @@ fn host_read_barrier(
 ) -> Option<wgpu::CommandBuffer> {
     use wgpu::hal::CommandEncoder as _;
     use wgpu::hal::api::Vulkan;
-    // SAFETY: The guard only asks which backend minted the buffer and is dropped at the end.
+    // SAFETY: The guard only asks which backend minted the buffer and is dropped at the end of the
+    // statement.
     let vulkan = readbacks
         .first()
         .is_some_and(|b| unsafe { b.as_hal::<Vulkan>() }.is_some());
@@ -1496,7 +1502,13 @@ fn host_read_barrier(
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("aterm-gpu host-read barrier"),
     });
-    // SAFETY: The encoder is fresh and nothing else touches it while the callback records into it.
+    // SAFETY: the encoder is fresh and nothing else touches it while the
+    // callback records into it, and the callback does not end it (`finish`
+    // does). One buffer guard is held at a time (each holds the device's
+    // snatch lock, which wgpu refuses to take twice), for its one barrier,
+    // which orders only that buffer's memory. The buffers outlive the
+    // barriers: they ride the submission their copies do, which their maps
+    // wait for.
     let recorded = unsafe {
         enc.as_hal_mut::<Vulkan, _, _>(|hal| {
             let Some(hal) = hal else {
@@ -1752,7 +1764,8 @@ mod tests {
             .try_create_instance_buffer("device-layer short-buffer probe", 4)
             .expect("a 4-byte MTLBuffer on a live Metal device");
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // SAFETY: No GPU work exists on this fresh buffer.
+            // SAFETY: no GPU work exists on this fresh buffer; the call must
+            // refuse on length before any copy.
             unsafe { handle.write_buffer_from_zero(&buf, &[0u8; 16]) };
         }))
         .expect_err("an oversized buffer write must refuse");
@@ -1765,6 +1778,12 @@ mod tests {
     }
 
     /// Padding bytes at widths 17 and 97:
+    ///
+    ///  * not written: the Metal copy lands each row at its padded base and
+    ///    leaves the poisoned tail untouched;
+    ///  * not consulted: `frame_from_padded_rgba` gives identical `Frame`s from
+    ///    a poisoned and a zeroed tail;
+    ///  * both arms' readbacks equal the expected packing.
     #[test]
     #[cfg(wgpu_arm)]
     fn the_padding_tail_is_neither_written_nor_consulted() {

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The commands that put text in at the carets: `newline`, `open-line`,
-//! `transpose-chars` and `indent-for-tab-command`. Each is one transaction,
-//! so one undo takes it back at every caret.
+//! Caret insertion commands: `newline`, `open-line`, `transpose-chars`, and `indent-for-tab-command`.
 
 use super::command::PrefixArgument;
 use super::projection::{document_line_break, editor_display_column, line_start, line_text_end};
@@ -14,19 +12,14 @@ use super::workspace::{
 };
 use crate::store::{DocumentStore, TextEdit, rebase_position};
 
-/// How many columns a tab stop `tab_width` wide is from `column`: the
-/// distance to the next multiple of `tab_width`, a whole stop when `column`
-/// is already on one. A zero width is taken as one column. (No contract:
-/// spec `tab-stop-columns` in SPECS.md records why E6 refuses one.)
+/// Distance in columns from `column` to the next multiple of `tab_width` (with zero treated as 1).
 pub(super) fn tab_stop_columns(column: usize, tab_width: usize) -> usize {
     let width = tab_width.max(1);
     width - column % width
 }
 
 impl EditorWorkspace {
-    /// `newline` (Enter): `count` newlines at every caret, each replacing its
-    /// selection as typing does. A newline is the document's own line
-    /// ending, so a CRLF file stays CRLF.
+    /// `newline` (Enter): inserts `count` document line breaks at every caret, replacing selections.
     pub(super) fn newline(
         &mut self,
         store: &mut DocumentStore,
@@ -41,9 +34,7 @@ impl EditorWorkspace {
         Ok(())
     }
 
-    /// `open-line` (C-o): `count` newlines (the document's line ending, as
-    /// for `newline`) after every caret, which stays where it was, so the
-    /// line breaks ahead of it.
+    /// `open-line` (C-o): inserts `count` document line breaks after every caret without moving it.
     pub(super) fn open_line(
         &mut self,
         store: &mut DocumentStore,
@@ -65,8 +56,6 @@ impl EditorWorkspace {
             })
             .collect();
         let (_, deltas) = self.apply_recorded(store, view, normalize_edits(edits)?)?;
-        // A caret rebases past the newlines put in at it; it belongs before
-        // them.
         for (selection, head) in view.selections.iter_mut().zip(heads) {
             selection.collapse(rebase_position(head, &deltas).saturating_sub(insert.len()));
         }
@@ -74,12 +63,7 @@ impl EditorWorkspace {
         Ok(())
     }
 
-    /// `transpose-chars` (C-t): the character before each caret moves past
-    /// the one after it (with an argument, past that many), and the caret
-    /// goes with it. At the end of a line with no argument the two
-    /// characters before the caret trade places instead, as in Emacs.
-    /// Characters are grapheme clusters, so a combining mark moves with its
-    /// base.
+    /// `transpose-chars` (C-t): moves the grapheme cluster before each caret past `count` after it (or swaps the two before line end when `argument` is `None`).
     pub(super) fn transpose_chars(
         &mut self,
         store: &mut DocumentStore,
@@ -119,8 +103,6 @@ impl EditorWorkspace {
             carets.push(after);
         }
         self.apply_recorded(store, view, normalize_edits(edits)?)?;
-        // Each edit keeps its length, so every caret's place after it is the
-        // place it was computed at.
         for (selection, caret) in view.selections.iter_mut().zip(carets) {
             selection.collapse(caret);
         }
@@ -128,11 +110,7 @@ impl EditorWorkspace {
         Ok(Vec::new())
     }
 
-    /// `indent-for-tab-command` (TAB): indent to the next tab stop at every
-    /// caret, never over a region: spaces up to the next multiple of the
-    /// tab width ([`super::EditorOptions`]), or a tab character when the
-    /// options indent with tabs. Until the Language table's indent rules
-    /// arrive (slice L1) it indents from the caret, not the line's start.
+    /// `indent-for-tab-command` (TAB): indents to the next tab stop at every caret.
     pub(super) fn indent_for_tab(
         &mut self,
         store: &mut DocumentStore,
@@ -144,10 +122,6 @@ impl EditorWorkspace {
             .iter()
             .map(|selection| selection.head)
             .collect::<Vec<_>>();
-        // Each caret's column is read off its line as the indents before it
-        // on that line leave it, so a second caret on one line lands on a tab
-        // stop too: the line up to each caret is rebuilt in document order,
-        // indents included.
         let mut order = heads.clone();
         order.sort_unstable();
         order.dedup();
@@ -177,8 +151,6 @@ impl EditorWorkspace {
             });
         }
         let (_, deltas) = self.apply_recorded(store, view, normalize_edits(edits)?)?;
-        // The indent goes in at each caret and never over a region: each
-        // selection becomes a caret after its own indent.
         for (selection, head) in view.selections.iter_mut().zip(heads) {
             *selection = Selection::caret(rebase_position(head, &deltas));
         }

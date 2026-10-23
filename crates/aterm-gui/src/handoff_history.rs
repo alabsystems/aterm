@@ -1469,7 +1469,10 @@ pub(crate) struct Joined {
     pub(crate) fallback: Option<Fallback>,
 }
 
-/// THE JOIN — see the module doc.
+/// THE JOIN: the sidecar's first `take` lines run up to where the checkpoint's last `carried` lines
+/// of `head` begin, `dropped` counts the older lines neither holds, and a [`Fallback`] names why
+/// the sidecar is unused (history beyond the carry not exported, the fence moved, or output outran
+/// the carry).
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),

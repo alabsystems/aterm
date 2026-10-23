@@ -13,9 +13,6 @@ use crate::harness;
 use aterm_link::broker_health::{FAULT_SEAM, POISONED_EXIT, POISONED_EXIT_WORDS};
 use harness::{FLEET, SECRET, World, id_at_off, kv, until};
 
-/// A real `aterm link broker` process, killed and reaped on every exit path, and
-/// ending itself with its lifeline if this process dies first
-/// ([`harness::spawn_broker`]).
 struct BrokerProcess {
     child: aterm_uds::spawnfd::Child,
     /// Held while it serves ([`harness::BrokerChild`]); taken, the broker ends itself at its
@@ -30,9 +27,6 @@ impl Drop for BrokerProcess {
     }
 }
 
-/// The world's broker, as a process the test supervises: the argv it starts
-/// it from, the fault seam it starts it under, and the `broker.err` its stderr
-/// is appended to (launchd's `StandardErrorPath`, systemd's `append:`).
 struct Supervised {
     secret: PathBuf,
     err: PathBuf,
@@ -40,7 +34,6 @@ struct Supervised {
 }
 
 impl Supervised {
-    /// The secret file beside the world's socket, mode 0600, and the seam.
     fn new(w: &World, fault: String) -> Self {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&w.tmp, std::fs::Permissions::from_mode(0o700))
@@ -56,8 +49,6 @@ impl Supervised {
         }
     }
 
-    /// Start `aterm link broker <sock> <log> --secret-file <secret>
-    /// --durability relaxed` and return it once it prints `listening`.
     fn start(&self, w: &World) -> BrokerProcess {
         let err = std::fs::OpenOptions::new()
             .create(true)
@@ -105,8 +96,6 @@ impl Supervised {
         broker
     }
 
-    /// The log identity (`<id hex>.<generation>`) the broker's `n`-th banner
-    /// names (the stderr line it writes once it serves), once it is there.
     fn identity(&self, n: usize) -> (String, u64) {
         let banner = until("the broker's banner on broker.err", || {
             read(&self.err)
@@ -132,14 +121,10 @@ impl Supervised {
     }
 }
 
-/// The text of `path`, or nothing.
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// A directory of the test's own for the broker it serves, short enough for a
-/// socket's `sun_path` and held for the test's life (declared before the world,
-/// so it goes after it).
 fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix(&format!("atl-{tag}-"))
@@ -147,15 +132,10 @@ fn sock_dir(tag: &str) -> aterm_tempfile::TempDir {
         .expect("the broker's socket dir")
 }
 
-/// The fault seam for a world whose sessions are `to` (the escalated one)
-/// and another: every full flush fails, and only `to`'s `note` lane owes one.
 fn fault(to: &str, also: &str) -> String {
     format!("sync escalate=/f/{FLEET}/in/*/{to}/*/note {also}")
 }
 
-/// How many records on `to`'s `note` lane from this node carry `text`, read
-/// by `Fetch` from zero: the authority a duplicate cannot hide behind (the
-/// endpoint ring dedups on `off=`, the log does not).
 fn on_lane(w: &World, to: &str, text: &str) -> usize {
     let lane = format!("/f/{FLEET}/in/{}/{to}/{}/note", w.node, w.node);
     let needle = format!("text={}", aterm_link::pct::encode(text));
@@ -165,8 +145,6 @@ fn on_lane(w: &World, to: &str, text: &str) -> usize {
         .count()
 }
 
-/// A post queued without waiting on its landing: the poison refuses it, and
-/// what becomes of it is the property.
 fn post(w: &World, from: &str, to: &str, text: &str) {
     let r = w.verb(&format!("@{from} post to=@{to} kind=note {text}"));
     assert!(
@@ -177,8 +155,6 @@ fn post(w: &World, from: &str, to: &str, text: &str) {
     );
 }
 
-/// **THE BROKER EXITS 75 OVER ITS POISONED LOG, ITS SUPERVISOR'S RESTART
-/// REOPENS IT, AND THE REFUSED POST LANDS ONCE.**
 #[test]
 fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
     let tag = "poison";
@@ -258,13 +234,6 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
     }
 }
 
-/// **NEGATIVE CONTROL: WITH THE EXIT SWITCHED OFF, THE POISON STAYS.** The
-/// same world under the seam's `stay`: the broker keeps serving its poisoned
-/// log, every post to it stays refused, and the bridge says so —
-/// `fabric=stalled reason=poisoned`, never `connected` — within the
-/// one-minute hang detector. The seam switches off that exit and no other:
-/// its launcher gone (the lifeline cut), the poisoned broker it kept serving
-/// still ends itself at its next wake, saying why.
 #[test]
 fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     let tag = "poistay";
@@ -309,8 +278,6 @@ fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     assert!(said.contains(&why), "it said why it ended:\n{said}");
 }
 
-/// How many records on `to`'s `kind` lane from this node carry `needle` in
-/// their body, read by `Fetch` from zero.
 fn on_kind_lane(w: &World, to: &str, kind: &str, needle: &str) -> usize {
     let lane = format!("/f/{FLEET}/in/{}/{to}/{}/{kind}", w.node, w.node);
     let (rows, _) = w.read(|c| c.fetch(0, &lane, 256)).expect("fetch the lane");
@@ -319,7 +286,6 @@ fn on_kind_lane(w: &World, to: &str, kind: &str, needle: &str) -> usize {
         .count()
 }
 
-/// The `msg` rows of `sid`'s inbox of `kind` that name `off` as their `re=`.
 fn replies_to(w: &World, sid: &str, off: u64, kind: &str) -> Vec<String> {
     w.inbox(sid)
         .into_iter()
@@ -327,9 +293,6 @@ fn replies_to(w: &World, sid: &str, off: u64, kind: &str) -> Vec<String> {
         .collect()
 }
 
-/// **A REPLY QUEUED AND A VERDICT GIVEN WHILE THE POISONED BROKER IS DOWN
-/// LAND ONCE IT IS BACK, THREADED TO THE ASK** — the lineage reaches the
-/// endpoint (bridge lane 3, `link log <id> continues=<f> was=<id>`).
 #[test]
 fn a_reply_and_a_verdict_made_while_the_poisoned_broker_is_down_land_after_its_restart() {
     let tag = "poisrep";

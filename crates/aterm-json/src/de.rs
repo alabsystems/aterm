@@ -823,7 +823,8 @@ impl<'de> de::VariantAccess<'de> for EnumAccess<'_, 'de> {
 /// Deserializes a `T` from JSON bytes, requiring the entire input to be a single value.
 ///
 /// # Errors
-/// Returns an error on invalid JSON, trailing tokens, or visitor refusal.
+/// Any syntax error, any `Deserialize` failure, nesting past
+/// [`RECURSION_LIMIT`], or trailing data after the value.
 #[inline]
 pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T> {
     let mut de = Deserializer::from_slice(input);

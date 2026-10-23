@@ -3003,8 +3003,8 @@ impl Bridge {
             // A forged record on our own lane means somebody else holds the node
             // cap; that is not a delivery problem, it is a compromise, and its
             // remedy is a new mint secret — every cap minted under the old one
-            // refused at attach (the module docs, `cap-compromised`; §9.2's
-            // "rotate the node cap" cuts nothing off). It is therefore only
+            // refused at attach (re-minting the node cap under the same secret
+            // cuts nothing off). It is therefore only
             // ever raised on EVIDENCE — see [`Bridge::is_forged_self`], which
             // fails open below the remembered window rather than accusing.
             self.publish_ev_for(sid, &format!("cap-compromised off={off}"));

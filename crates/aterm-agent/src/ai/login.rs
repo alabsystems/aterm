@@ -153,7 +153,11 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
             "accounts.toml is refused ({why}): fix it (`aterm harness accounts` says how), then run `aterm ai login claude`"
         ));
     }
-    if let Some(a) = f.accounts.as_ref().filter(|a| a.listed && !a.renews) {
+    if let Some(a) = f
+        .accounts
+        .as_ref()
+        .filter(|a| a.listed && !a.renews && a.next_sign_in.is_none())
+    {
         return Done::Refused(format!(
             "accounts.toml lists this machine's own login as `{}` with no email: add `email = \"…\"` to that row, then `aterm ai login claude` renews it",
             a.label

@@ -11,17 +11,21 @@ use aterm_time::Instant;
 /// How long a reader of whole frames waits on a program's unfinished DEC 2026 frame before it reads the frame as it stands ([`super::Terminal::frame_unfinished_at`]): a hang detector for a program that opened a frame and never closed it, never a latency budget.
 pub const FRAME_HANG: Duration = Duration::from_secs(60);
 
-/// How long a range must read clear before `RowsClear` (`await gone`) latches on a screen that is not a frame the program closed (module doc, property 4): a redraw the PTY's reads split, with no DEC 2026 bracket to say so, is finished by a later read, inside it.
+/// How long a range must read clear before `RowsClear` (`await gone`) latches on a screen that is
+/// not a frame the program closed: a redraw the PTY's reads split, with no DEC 2026 bracket to say
+/// so, is finished by a later read, inside it.
 pub const GONE_SETTLE: Duration = Duration::from_secs(1);
 
 /// Whether the program's frame is whole at one observation pass, and when its hang detector fires if it is not ([`WatcherSet::observe_screen`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
-    /// No row predicate may read the rows when `false` (module doc, property 3).
+    /// No row predicate may read the rows when `false`.
     pub whole: bool,
     /// The unfinished frame's hang detector ([`FRAME_HANG`] past the first batch of the run that ended inside a frame); `None` on a whole frame.
     pub hang: Option<Instant>,
-    /// The screen is a frame the program closed with nothing drawn since ([`super::Terminal::screen_is_closed_frame`]): whole by the program's own word, so `RowsClear` latches on it at once (module doc, property 4).
+    /// The screen is a frame the program closed with nothing drawn since
+    /// ([`super::Terminal::screen_is_closed_frame`]): whole by the program's own word, so
+    /// `RowsClear` latches on it at once.
     pub closed: bool,
     /// When the screen last changed ([`super::Terminal::drawn_at`]): a range clear at arm has been clear since then, and its [`GONE_SETTLE`] runs from there.
     pub drawn_at: Option<Instant>,
@@ -317,11 +321,11 @@ struct Watcher {
     /// already-matching row (or already-clear range) latches at arm.
     fresh: bool,
     /// A row scan this watcher was owed (an advance, or `fresh`) was held because the program's
-    /// frame was unfinished (module doc, property 3): it is owed at the first whole batch, which
+    /// frame was unfinished: it is owed at the first whole batch, which
     /// may carry no content (a lone `?2026l`), or at the frame's hang detector.
     deferred: bool,
     /// `RowsClear` on a screen no closed frame vouches for: since when every scan has read
-    /// the range clear (module doc, property 4).
+    /// the range clear.
     clear_since: Option<Instant>,
     /// Which grid this watcher was armed against: `SeqAdvanced`'s `after` is per grid, so
     /// crossing a buffer swap latches; otherwise `await seq` would starve on the alt screen and
@@ -342,7 +346,7 @@ impl Watcher {
     }
 }
 
-/// One whole-frame scan of a `RowsClear` (module doc, property 4) that found its range
+/// One whole-frame scan of a `RowsClear` that found its range
 /// `clear` or not: whether it latches at this scan, and `clear_since` after it.
 fn rows_clear_scan(
     clear: bool,
@@ -1286,7 +1290,7 @@ mod tests {
         );
     }
 
-    /// `RowsClear` on a screen no closed frame vouches for (module doc, property 4): the range
+    /// `RowsClear` on a screen no closed frame vouches for: the range
     /// must read clear at every scan for GONE_SETTLE, measured from the first clear scan; a
     /// scan showing the row again cancels it; the host's expiry latches at the computed
     /// deadline; `restart_idle` (the reader parked for an update) restarts it.

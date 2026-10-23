@@ -1178,6 +1178,135 @@ pub const NONE_SOON_S: i64 = DAY_S;
 /// The longest subscription word kept.
 const SUBSCRIPTION_MAX: usize = 32;
 
+/// Private evidence left only after a fresh staging sign-in passed its check.
+pub(super) const RENEWAL_CHECKPOINT_FILE: &str = ".aterm-renewal.json";
+const RENEWAL_CHECKPOINT_MAX: u64 = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RenewalCheckpoint {
+    pub label: String,
+    pub email: String,
+    pub dir: String,
+    pub checked_at: i64,
+    pub subscription: Option<String>,
+}
+
+impl RenewalCheckpoint {
+    fn valid(&self) -> bool {
+        admissible_label(&self.label)
+            && email_refusal(&self.email).is_none()
+            && dir_refusal(&self.dir).is_none()
+            && self.checked_at > 0
+            && self.subscription.as_ref().is_none_or(|s| {
+                !s.is_empty() && s.len() <= SUBSCRIPTION_MAX && one_line(s, SUBSCRIPTION_MAX) == *s
+            })
+    }
+}
+
+/// Saves the bounded, private result of a successful fresh sign-in check before binding it.
+/// Callers must have checked the sign-in's exit and `status_facts(...).renews()`.
+///
+/// # Errors
+/// The scope is invalid, staging cannot be canonicalized, the reserved name already exists,
+/// or writing, publishing or flushing the private checkpoint fails.
+pub(super) fn write_renewal_checkpoint(
+    label: &str,
+    email: &str,
+    staging_text: &str,
+    subscription: Option<&str>,
+    checked_at: i64,
+) -> io::Result<()> {
+    let staging = Path::new(staging_text);
+    std::fs::canonicalize(staging)?;
+    let checkpoint = RenewalCheckpoint {
+        label: label.to_owned(),
+        email: email.to_owned(),
+        // The vendor's login identity hashes this exact spelling, even when
+        // another path reaches the same filesystem directory.
+        dir: staging_text.to_owned(),
+        checked_at,
+        subscription: subscription.map(str::to_owned),
+    };
+    if !checkpoint.valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid renewal checkpoint scope",
+        ));
+    }
+    let mut doc = Map::new();
+    doc.insert("schema".into(), Value::from(1));
+    doc.insert("program".into(), Value::from("claude"));
+    doc.insert("label".into(), Value::from(checkpoint.label));
+    doc.insert("email".into(), Value::from(checkpoint.email));
+    doc.insert("dir".into(), Value::from(checkpoint.dir));
+    doc.insert("checked_at".into(), Value::from(checkpoint.checked_at));
+    doc.insert(
+        "subscription".into(),
+        checkpoint.subscription.map_or(Value::Null, Value::from),
+    );
+    let text = Value::Object(doc).to_string();
+    if text.len() as u64 > RENEWAL_CHECKPOINT_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "renewal checkpoint exceeds the byte limit",
+        ));
+    }
+    let stage = aterm_tempfile::Builder::new()
+        .prefix(".renewal-check-")
+        .tempdir_in(staging)?;
+    let candidate = stage.path().join("result");
+    super::upgrade_models::write_atomic_mode(&candidate, &text, Some(0o600))?;
+    // A link publishes complete bytes exclusively, preserving every existing
+    // file, symlink or other obstruction at the reserved name.
+    std::fs::hard_link(&candidate, staging.join(RENEWAL_CHECKPOINT_FILE))?;
+    aterm_durable::durable_dir(staging)
+}
+
+/// Reads a bounded regular checkpoint without following a link or waiting on a FIFO.
+/// An absent, unknown, malformed, out-of-scope or future result grants no renewal.
+#[must_use]
+pub(super) fn read_renewal_checkpoint(
+    staging: &Path,
+    actual_dir: &Path,
+    now: i64,
+) -> Option<RenewalCheckpoint> {
+    use std::io::Read as _;
+    let file = astream_sys::open_nonblocking(
+        &staging.join(RENEWAL_CHECKPOINT_FILE),
+        astream_sys::Links::Refuse,
+    )
+    .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > RENEWAL_CHECKPOINT_MAX {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(RENEWAL_CHECKPOINT_MAX + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > RENEWAL_CHECKPOINT_MAX {
+        return None;
+    }
+    let doc: Value = aterm_json::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+    if doc.get("schema")?.as_u64()? != 1 || doc.get("program")?.as_str()? != "claude" {
+        return None;
+    }
+    let checkpoint = RenewalCheckpoint {
+        label: doc.get("label")?.as_str()?.to_owned(),
+        email: doc.get("email")?.as_str()?.to_owned(),
+        dir: doc.get("dir")?.as_str()?.to_owned(),
+        checked_at: doc.get("checked_at")?.as_i64()?,
+        subscription: match doc.get("subscription")? {
+            Value::Null => None,
+            value => Some(value.as_str()?.to_owned()),
+        },
+    };
+    (checkpoint.valid()
+        && checkpoint.checked_at <= now
+        && std::fs::canonicalize(&checkpoint.dir).ok()?.as_path() == actual_dir)
+        .then_some(checkpoint)
+}
+
 /// Machine-local login binding and learned renewal lifetime for one roster account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {

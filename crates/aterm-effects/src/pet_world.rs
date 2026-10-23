@@ -403,19 +403,19 @@ pub struct PetWorld {
 impl Default for PetWorld {
     fn default() -> Self {
         Self {
-            cells: vec![PetCell::Unknown; MAX_WORLD_CELLS],
-            glyphs: vec![None; MAX_WORLD_CELLS],
-            letters: vec![false; MAX_WORLD_CELLS],
-            blocked_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
-            protected_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
-            inked: vec![true; MAX_WORLD_CELLS],
-            ground_cells: vec![PetCell::Unknown; MAX_WORLD_CELLS],
-            ground_blocked_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
-            ground_protected_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
+            cells: Vec::new(),
+            glyphs: Vec::new(),
+            letters: Vec::new(),
+            blocked_prefix: Vec::new(),
+            protected_prefix: Vec::new(),
+            inked: Vec::new(),
+            ground_cells: Vec::new(),
+            ground_blocked_prefix: Vec::new(),
+            ground_protected_prefix: Vec::new(),
             ground_split: false,
             ground_caret_cells: [CaretCell::default(); 9],
             ground_caret_cells_len: 0,
-            hull: vec![(0, 0); MAX_WORLD_ROWS],
+            hull: Vec::new(),
             coverage: PetPane::default(),
             caret_cells: [CaretCell::default(); 9],
             caret_cells_len: 0,
@@ -626,6 +626,19 @@ impl PetWorld {
         };
         let any_selection = input.any_selection();
         let track_ground = any_selection || !overlays.is_empty();
+        const PREFIX_LEN: usize = (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1);
+        if self.cells.is_empty() {
+            self.cells.resize(MAX_WORLD_CELLS, PetCell::Unknown);
+            self.glyphs.resize(MAX_WORLD_CELLS, None);
+            self.letters.resize(MAX_WORLD_CELLS, false);
+            self.blocked_prefix.resize(PREFIX_LEN, 0);
+            self.protected_prefix.resize(PREFIX_LEN, 0);
+            self.inked.resize(MAX_WORLD_CELLS, true);
+            self.hull.resize(MAX_WORLD_ROWS, (0, 0));
+        }
+        if track_ground && self.ground_cells.is_empty() {
+            self.ground_cells.resize(MAX_WORLD_CELLS, PetCell::Unknown);
+        }
         let stride = MAX_WORLD_COLS + 1;
         self.blocked_prefix[..=cols].fill(0);
         self.protected_prefix[..=cols].fill(0);
@@ -842,6 +855,10 @@ impl PetWorld {
         self.caret_cells_len = n_caret_cells as u8;
         self.ground_caret_cells_len = n_ground_caret_cells as u8;
         if self.ground_split {
+            if self.ground_blocked_prefix.is_empty() {
+                self.ground_blocked_prefix.resize(PREFIX_LEN, 0);
+                self.ground_protected_prefix.resize(PREFIX_LEN, 0);
+            }
             self.ground_blocked_prefix[..=cols].fill(0);
             self.ground_protected_prefix[..=cols].fill(0);
             for r in 0..rows {
@@ -1000,9 +1017,16 @@ impl PetWorld {
     }
 
     /// Three-valued clearance:
+    ///
+    /// * `Some(true)`: every cell the rectangle and margin touch was examined by
+    ///   this snapshot and is free.
+    /// * `Some(false)`: a touched cell is not free (ink, protected, or unknown inside
+    ///   the coverage window), or the query is degenerate (an invalid rectangle or margin).
+    /// * `None`: unknown. There is no coherent snapshot, or the rectangle leaves
+    ///   the coverage window, which is centred on the caret while it shows at live
+    ///   and slides as the user types. Collapsing this to `false` invents ink.
     #[inline]
     #[must_use]
-    /// Three-valued clearance (`Some(true)` clear, `Some(false)` occupied, `None` unobserved).
     pub fn clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.blocked_prefix, Forgive::Nothing, rect, margin)
     }
@@ -1047,9 +1071,14 @@ impl PetWorld {
 
     /// [`Self::under_text_clearance_past_caret`] over the part of `rect` this map sees, for a
     /// body already on glass before this map judged it (a crossfade ghost):
+    ///
+    /// * `Some(false)`: a covered cell under it is protected, or the query is degenerate,
+    ///   however much of it lies outside the coverage window;
+    /// * `Some(true)`: it lies wholly inside the window and nothing there is protected;
+    /// * `None`: the map has no stamp yet, or the covered part, if any, is clear and the rest
+    ///   is outside; the caller keeps the verdict the body came with.
     #[inline]
     #[must_use]
-    /// [`Self::under_text_clearance_past_caret`] restricted to the observed portion of `rect`.
     pub fn seen_under_text_clearance_past_caret(&self, rect: PetRect) -> Option<bool> {
         self.stamp?;
         let whole = self.under_text_clearance_past_caret(rect, 0.0);
@@ -3546,5 +3575,58 @@ mod tests {
             .nearest_perch(body, 0.1, 8.0)
             .expect("perch inside coverage");
         assert!(world.clear(perch, 0.1));
+    }
+
+    #[test]
+    fn default_world_allocates_buffers_lazily_on_demand() {
+        let mut world = PetWorld::default();
+        assert_eq!(world.cells.capacity(), 0);
+        assert_eq!(world.glyphs.capacity(), 0);
+        assert_eq!(world.letters.capacity(), 0);
+        assert_eq!(world.blocked_prefix.capacity(), 0);
+        assert_eq!(world.protected_prefix.capacity(), 0);
+        assert_eq!(world.inked.capacity(), 0);
+        assert_eq!(world.hull.capacity(), 0);
+        assert_eq!(world.ground_cells.capacity(), 0);
+        assert_eq!(world.ground_blocked_prefix.capacity(), 0);
+        assert_eq!(world.ground_protected_prefix.capacity(), 0);
+
+        let mut term = Terminal::new(10, 40);
+        let (input, mut stale_facts) = snapshot(&mut term);
+        stale_facts.stamp.content_seq = stale_facts.stamp.content_seq.wrapping_add(1);
+        assert!(!world.observe(&input, &stale_facts, PetPane::full(&input)));
+        assert_eq!(
+            world.cells.capacity(),
+            0,
+            "incoherent snapshot must not allocate buffers"
+        );
+
+        let (input, facts) = snapshot(&mut term);
+        assert!(world.observe(&input, &facts, PetPane::full(&input)));
+        assert!(world.cells.len() == MAX_WORLD_CELLS);
+        assert_eq!(
+            world.ground_cells.capacity(),
+            0,
+            "ground plane stays unallocated without selection or transient overlay"
+        );
+        assert_eq!(world.ground_blocked_prefix.capacity(), 0);
+        assert_eq!(world.ground_protected_prefix.capacity(), 0);
+
+        let overlay = [PetRect::new(1.0, 2.0, 2.0, 4.0)];
+        assert!(world.observe_with_overlays(&input, &facts, PetPane::full(&input), &[], &overlay));
+        assert_eq!(world.ground_cells.len(), MAX_WORLD_CELLS);
+        assert_eq!(
+            world.ground_blocked_prefix.len(),
+            (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)
+        );
+        assert_eq!(
+            world.ground_protected_prefix.len(),
+            (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)
+        );
+        let cells_ptr = world.cells.as_ptr();
+        let ground_ptr = world.ground_blocked_prefix.as_ptr();
+        world.retire();
+        assert_eq!(world.cells.as_ptr(), cells_ptr);
+        assert_eq!(world.ground_blocked_prefix.as_ptr(), ground_ptr);
     }
 }

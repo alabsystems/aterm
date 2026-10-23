@@ -1,35 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The font oracle's recorder (TF.1 of docs/AUDIT-third-party-2026-10-15.md),
-//! built outside the aterm workspace (see Cargo.toml).
-//!
-//!   replay <aterm-render dir>        re-answer every `shape` and `read` line of
-//!                                    the committed corpora with the registry
-//!                                    crates (no aterm facades) and diff
-//!   hint <aterm-render dir> <out>    record skrifa's grid-fitted masks,
-//!                                    keeping the lines of faces this host
-//!                                    lacks
-//!   shape <aterm-render dir> <out>   record rustybuzz's `shape` lines for
-//!                                    the colour faces this host has (the
-//!                                    `EMOJI` faces), keeping every other line
-//!   gvar-alloc <aterm-render dir> <out>
-//!                                    record ttf-parser's `read` answers for
-//!                                    `GVAR_ALLOC_FACES`
-//!   differential <aterm-render dir> [runs]
-//!                                    shape seeded random runs with rustybuzz
-//!                                    and aterm-font and compare (TF.6)
-//!   hint-differential <aterm-render dir> [font dir...]
-//!                                    hint every face this host has with
-//!                                    skrifa and aterm-font and compare (TF.4)
-//!   budgets <aterm-render dir> [font dir...]
-//!                                    every glyph's outline steps and paint
-//!                                    tables against aterm-font's work
-//!                                    budgets, each glyph held to ttf-parser
-//!                                    (TF.5)
+//! Standalone font oracle recorder and differential runner against `ttf-parser`, `rustybuzz`, and `skrifa`.
 
-// Paths are relative to this file: tests/font_oracle/probe.rs, reader.rs,
-// shaper.rs and aterm-render's src/raster.rs.
 /// Reads aterm-font's per-thread spend, which a release build of aterm-font
 /// does not count, so `budgets` exists only in a debug build.
 #[cfg(debug_assertions)]
@@ -44,8 +17,6 @@ mod hint_raster;
 #[path = "../../probe.rs"]
 #[allow(dead_code)]
 mod probe;
-/// The reader `reader.rs` answers with here: the registry ttf-parser, the
-/// one the TF.1 corpus was recorded from.
 mod font {
     pub(crate) use ttf_parser::*;
 }
@@ -175,10 +146,6 @@ fn hint_lines(dir: &str) -> Vec<Line> {
             .is_variable();
         let mut instances: Vec<probe::Coords> = vec![Vec::new()];
         if variable {
-            // aterm's resolved instance of a variable primary (Cinzel's
-            // `Regular`, wght 400, which is also its `fvar` default, so
-            // those lines equal the default's) and the real-bold overlay
-            // (wght 700).
             instances.push(vec![(*b"wght", 400.0)]);
             instances.push(vec![(*b"wght", 700.0)]);
         }
@@ -205,9 +172,7 @@ fn hint_lines(dir: &str) -> Vec<Line> {
     out
 }
 
-/// rustybuzz's answers for the colour faces this host has (`EMOJI`): each
-/// of [`probe::EMOJI_CASES`] shaped as `Renderer::shape_cluster` shapes it,
-/// with no features and no coordinates.
+/// Records `rustybuzz` answers for [`probe::EMOJI_CASES`] across colour faces present on this host.
 fn emoji_lines(dir: &str) -> (BTreeSet<String>, Vec<Line>) {
     let mut keys = BTreeSet::new();
     let mut out = Vec::new();
@@ -235,10 +200,7 @@ fn emoji_lines(dir: &str) -> (BTreeSet<String>, Vec<Line>) {
     (keys, out)
 }
 
-/// The corpus at `path` with `fresh` merged in, sorted by id: every line of
-/// a face file not in `rerecorded` is kept, so a record on one host never
-/// drops another host's lines. The file's own leading comments stay unless
-/// `header` replaces them.
+/// Merges `fresh` into the corpus at `path`, preserving lines for faces not in `rerecorded`.
 fn merged(
     path: &str,
     header: Option<&str>,
@@ -344,8 +306,7 @@ const GVAR_ALLOC_HEADER: &str = "\
 # at its minimum, every axis at its maximum, and wght 700 alone.
 ";
 
-/// ttf-parser's `read` answers for [`GVAR_ALLOC_FACES`]: none set, all axes
-/// at their minimum, all at their maximum, and `wght` 700 alone.
+/// Records `ttf-parser` `read` answers for [`GVAR_ALLOC_FACES`].
 fn gvar_alloc_lines(dir: &str) -> Vec<Line> {
     let mut out = Vec::new();
     for l in load(dir) {

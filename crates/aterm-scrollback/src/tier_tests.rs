@@ -34,9 +34,6 @@ impl WarmTier {
     }
 }
 
-/// A configured block_size above the disk-decode line-count cap is clamped, so
-/// no promoted block holds more lines than the decoder will reconstruct (a
-/// legitimate oversized block would decode short and fail its count check).
 #[test]
 fn block_size_clamped_to_decode_page_cap() {
     let cap = crate::line::MAX_DECODE_PAGE_LINES;
@@ -49,7 +46,6 @@ fn block_size_clamped_to_decode_page_cap() {
     );
 }
 
-/// `memory_used()` includes the decompression cache (`last_block_cache`).
 #[test]
 fn warm_tier_memory_used_includes_cache() {
     let mut warm = WarmTier::new();
@@ -60,7 +56,6 @@ fn warm_tier_memory_used_includes_cache() {
     warm.push_block(&lines);
 
     let mem_before_access = warm.memory_used();
-    // Trigger decompression cache by accessing a line.
     let line = warm
         .get_line(0)
         .expect("no error")
@@ -74,7 +69,6 @@ fn warm_tier_memory_used_includes_cache() {
     );
 }
 
-/// Warm-tier block lookup scales logarithmically with block count.
 #[test]
 fn warm_tier_find_block_logarithmic_scaling() {
     fn measure_find_block_steps(block_count: usize) -> usize {
@@ -86,7 +80,6 @@ fn warm_tier_find_block_logarithmic_scaling() {
         assert_eq!(warm.block_count(), block_count);
         assert_eq!(warm.line_count(), block_count);
 
-        // Clear any prior counter state from earlier tests.
         let _ = take_warm_find_block_steps();
 
         let found = warm.find_block(block_count - 1);
@@ -112,7 +105,6 @@ fn warm_tier_find_block_logarithmic_scaling() {
     );
 }
 
-/// push_front restores a popped block to the front.
 #[test]
 fn warm_tier_push_front_restores_popped_block() {
     let mut warm = WarmTier::new();
@@ -129,7 +121,6 @@ fn warm_tier_push_front_restores_popped_block() {
     assert_eq!(warm.line_count(), 10);
     assert_eq!(warm.block_count(), 2);
 
-    // Pop then push_front should restore the tier to its original state.
     let block = warm.pop_front().unwrap();
     assert_eq!(warm.line_count(), 5);
     assert_eq!(warm.block_count(), 1);
@@ -138,7 +129,6 @@ fn warm_tier_push_front_restores_popped_block() {
     assert_eq!(warm.line_count(), 10);
     assert_eq!(warm.block_count(), 2);
 
-    // Verify data integrity — block0 should be at the front again.
     assert_eq!(
         warm.get_line(0)
             .expect("no error")
@@ -169,19 +159,12 @@ fn warm_tier_push_front_restores_popped_block() {
     );
 }
 
-/// WarmTier's amortized cumulative index (`cum_start` + `cumulative_base`)
-/// answers `line_count()`, `get_line`, `locate` and `segment_len_at` exactly as
-/// a fresh `rebuild_cumulative()` across mixed `push_block`, `push_front`,
-/// `pop_front` and `truncate_front_lines`, including across the 64-block
-/// compaction threshold.
 #[test]
 fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
     fn assert_matches_rebuilt(warm: &WarmTier) {
         assert_eq!(warm.live_cumulative().len(), warm.block_count());
         assert_eq!(warm.memory_used(), warm.recompute_memory_used());
 
-        // Clone the live blocks and front_offset into a reference tier that
-        // rebuilds its cumulative index from scratch.
         let mut rebuilt = WarmTier::new();
         for block in &warm.blocks {
             rebuilt.push_front(WarmBlock {
@@ -190,7 +173,6 @@ fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
                 decompress_failures: Cell::new(block.decompress_failures.get()),
             });
         }
-        // `push_front` in loop order reversed `blocks`; restore exact order.
         rebuilt.blocks.make_contiguous().reverse();
         rebuilt.front_offset = warm.front_offset;
         rebuilt.line_count = warm.line_count;
@@ -224,7 +206,6 @@ fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
     }
 
     let mut warm = WarmTier::new();
-    // 1. Push 90 variable-sized blocks (crosses the 64-block compaction floor).
     for b in 0..90usize {
         let count = (b % 5) + 1;
         let lines: Vec<Line> = (0..count)
@@ -234,12 +215,9 @@ fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
     }
     assert_matches_rebuilt(&warm);
 
-    // 2. Pop 70 blocks from the front (triggers amortized dead-prefix compaction
-    //    once `cum_start >= 64` and `cum_start > live`).
     for step in 0..70usize {
         let popped = warm.pop_front().expect("block present");
         if step % 17 == 0 {
-            // Interleave push_front restoration and re-pop.
             warm.push_front(popped);
             assert_matches_rebuilt(&warm);
             let _ = warm.pop_front().expect("restored block present");
@@ -249,7 +227,6 @@ fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
         }
     }
 
-    // 3. Interleave partial and multi-block front truncations with new pushes.
     warm.truncate_front_lines(2).expect("partial truncate");
     assert_matches_rebuilt(&warm);
 
@@ -260,17 +237,14 @@ fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
     warm.truncate_front_lines(11).expect("multi-block truncate");
     assert_matches_rebuilt(&warm);
 
-    // 4. Pop after partial front_offset (materializes front_offset first).
     let popped = warm.pop_front().expect("pop after partial offset");
     assert_matches_rebuilt(&warm);
     warm.push_front(popped);
     assert_matches_rebuilt(&warm);
 }
 
-/// WarmBlock rejects LZ4 data with a forged oversized size prefix.
 #[test]
 fn warm_block_decompress_rejects_oversized_lz4_prefix() {
-    // Forge LZ4 data with a size prefix claiming 128MB output
     let mut forged = Vec::new();
     let huge_size: u32 = 128 * 1024 * 1024;
     forged.extend_from_slice(&huge_size.to_le_bytes());
@@ -291,7 +265,6 @@ fn warm_block_decompress_rejects_oversized_lz4_prefix() {
     );
 }
 
-/// to_cold_compressed rejects forged LZ4 data.
 #[test]
 fn warm_block_to_cold_rejects_oversized_lz4_prefix() {
     let mut forged = Vec::new();
@@ -312,8 +285,6 @@ fn warm_block_to_cold_rejects_oversized_lz4_prefix() {
     );
 }
 
-/// A row whose every cell is its own OSC 8 link, alternating two URLs at the
-/// 8 KiB ingestion cap: the most bytes an honest row of `cols` cells carries.
 fn row_of_links(text: &str, cols: u16, urls: &[std::sync::Arc<str>; 2]) -> Line {
     let spans = (0..cols)
         .map(|col| HyperlinkSpan::new(col, col + 1, urls[usize::from(col % 2)].clone()))
@@ -321,12 +292,6 @@ fn row_of_links(text: &str, cols: u16, urls: &[std::sync::Arc<str>; 2]) -> Line 
     Line::with_hyperlinks(text, crate::Rle::new(), spans)
 }
 
-/// No warm block is stored past what its reader decodes (SB1,
-/// docs/AUDIT-persisted-state-2026-10-07.md). Seventy 320-column rows of links
-/// (~184 MB serialized, three pages) share a promotion batch with thirty plain
-/// lines; aged through the warm tier into the cold one, every line must still
-/// be there, readable at its index, links intact, and the warm tier must never
-/// hold more than its limit while the batch's blocks leave it.
 #[test]
 fn rows_of_links_past_the_page_cap_age_out_whole() {
     const COLS: u16 = 320;
@@ -336,8 +301,6 @@ fn rows_of_links_past_the_page_cap_age_out_whole() {
         std::sync::Arc::from(url)
     });
     let linked = |i: usize| i % 10 >= 3 && i < 100;
-    // Enough after the batch for its block to reach the front of the warm
-    // tier and be evicted past the quarantine threshold's retries.
     let total = 1_100 + crate::codec::DEFAULT_HOT_LIMIT + crate::codec::DEFAULT_WARM_LIMIT;
     let mut sb = Scrollback::with_defaults();
     for i in 0..total {

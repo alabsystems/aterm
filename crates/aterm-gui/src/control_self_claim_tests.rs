@@ -1361,7 +1361,9 @@ fn claimant(sock: &std::path::Path, mode: &str) -> Claimant {
         .stdin(stdio())
         .stdout(stdio())
         .stderr(stdio());
-    // SAFETY: Runs in the forked child before exec, after stdio is in place.
+    // SAFETY: Runs in the forked child before exec, after stdio is in place:
+    // `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and touch nothing
+    // of the parent's.
     unsafe {
         program.pre_exec(|| {
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
@@ -1389,7 +1391,8 @@ fn read_until_done(master: i32) -> String {
         aterm_spec::wait::MUST_HAPPEN,
         "the claimant reports DONE",
         || {
-            // SAFETY: Reads into a local buffer from this fixture's open, nonblocking master.
+            // SAFETY: reads into a local buffer from this fixture's open,
+            // nonblocking master, so the outer hang detector can always run.
             let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 text.extend_from_slice(&buf[..usize::try_from(n).unwrap_or(0)]);

@@ -248,6 +248,8 @@ mod acl {
     }
 
     /// Copy a LocalAlloc'd wide C string into an owned `String`.
+    /// # Safety
+    /// `p` is non-null and points at a NUL-terminated UTF-16 string.
     unsafe fn wide_ptr_to_string(p: *const u16) -> String {
         let mut len = 0isize;
         // SAFETY: caller guarantees a NUL terminator within the allocation.
@@ -495,7 +497,9 @@ mod acl {
         pub(super) fn owner_of_path(wide: &[u16]) -> io::Result<Self> {
             let mut owner: *mut c_void = null_mut();
             let mut psd: *mut c_void = null_mut();
-            // SAFETY: `wide` is a NUL-terminated path; out-pointers we don't request (group/DACL/SACL) are null, matching the single OWNER info bit.
+            // SAFETY: `wide` is a NUL-terminated path; out-pointers we don't request
+            // (group/DACL/SACL) are null, matching the single OWNER info bit. On
+            // success the descriptor is LocalAlloc'd and owned by the result.
             let rc = unsafe {
                 GetNamedSecurityInfoW(
                     wide.as_ptr(),

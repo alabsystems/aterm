@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unicode facts the engine needs, as compact sorted range tables.
-//!
-//! * `\s`: [`is_space`], `White_Space`, which is exactly `char::is_whitespace`.
-//! * `\d`: [`is_digit`], General_Category `Nd` ([`ND`]). `std` does not expose it, and
-//!   `char::is_numeric` (`Nd | Nl | No`) would admit `½` and `①`.
-//! * `\w`: [`is_word`], and so `\b`, `\B`, `\<` and `\>`: `Alphabetic | M | Nd | Pc |
-//!   Join_Control`. `char::is_alphabetic` covers the first term; [`MARK`] and [`PC`] the
-//!   two `std` withholds.
-//! * `(?i)`: [`fold_orbit`] and [`fold_range`]. Simple case folding groups code points
-//!   into orbits (`k`, `K` and KELVIN SIGN `\u{212A}`; `σ`, `ς` and `Σ`), and [`FOLD`] is
-//!   those orbits, cycle-linked.
-//!
-//! [`FOLD`] is derived, not transcribed: the orbits are the connected components of the
-//! graph of `std`'s single-code-point `to_lowercase`/`to_uppercase` mappings, minus the
-//! Turkic-only `\u{131}` → `I` (`T` in `CaseFolding.txt`), plus three `C` edges no
-//! single-code-point mapping expresses (`\u{1fd3}`–`\u{390}`, `\u{1fe3}`–`\u{3b0}`,
-//! `\u{fb05}`–`\u{fb06}`). `fold_table_matches_std` recomputes the derivation and asserts
-//! the baked table equals it, so newer Unicode in the toolchain cannot silently
-//! desynchronise it. `perl_classes_are_pinned` in `tests/differential.rs` pins `\d`, `\s`
-//! and the non-alphabetic part of `\w` over every code point; the crate docs describe how
-//! `\w` diverges from `regex`.
+//! Unicode character-class tables (`\s`, `\d`, `\w`) and simple case-folding orbits (`(?i)`).
 
 /// Membership test for a sorted, disjoint, inclusive range table.
 #[inline]
@@ -95,13 +75,7 @@ fn fold_next(c: char) -> char {
     }
 }
 
-/// Push, onto `out`, every code point outside the inclusive range `lo..=hi` that
-/// shares a fold orbit with some code point inside it.
-///
-/// Folding a *range* only has to visit the cased code points within it, never
-/// the range itself: orbits are symmetric, so any code point outside `lo..=hi`
-/// that folds into it is reachable from the member that is inside. That is what
-/// keeps `(?i)[\x00-\u{10FFFF}]` a binary search instead of a million-step scan.
+/// Push onto `out` every code point outside `lo..=hi` that shares a fold orbit with a code point inside it.
 pub(crate) fn fold_range(lo: char, hi: char, out: &mut Vec<(char, char)>) {
     let (lo, hi) = (lo as u32, hi as u32);
     let mut i = FOLD.partition_point(|&(k, _)| k < lo);
@@ -121,10 +95,7 @@ pub(crate) fn fold_range(lo: char, hi: char, out: &mut Vec<(char, char)>) {
     }
 }
 
-/// Simple-case-folding orbits, cycle-linked: `FOLD[i] = (code point, next code
-/// point in its orbit)`, sorted by the first element. 2994 code points in 1482
-/// orbits. Derived from `std` plus the three `CaseFolding.txt` `C` edges no
-/// single-code-point mapping expresses; see the module docs.
+/// Cycle-linked simple-case-folding orbits (`(code_point, next_in_orbit)`), sorted by code point.
 static FOLD: &[(u32, u32)] = &[
     (0x00041, 0x00061),
     (0x00042, 0x00062),
@@ -3537,15 +3508,10 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// The one Turkic-only mapping (`T` in `CaseFolding.txt`): `std` maps `\u{131}` to
-    /// `I`, but default simple folding leaves DOTLESS I alone, so `(?i)i` must not match
-    /// it.
+    /// The one Turkic-only mapping (`T` in `CaseFolding.txt`), excluded from default simple folding.
     const TURKIC_ONLY: &[char] = &['\u{131}'];
 
-    /// The three fold edges `std` cannot express: `CaseFolding.txt` joins each pair with a
-    /// `C` entry, but the case mappings between them are multi-code-point
-    /// (`to_uppercase('\u{fb05}')` is `"ST"`), so the single-code-point derivation never
-    /// sees the link.
+    /// The three `CaseFolding.txt` `C` edges whose `std` case mappings are multi-code-point.
     const NON_DERIVABLE: &[(char, char)] = &[
         ('\u{0390}', '\u{1fd3}'),
         ('\u{03b0}', '\u{1fe3}'),
@@ -3564,11 +3530,9 @@ mod tests {
         it.next().is_none().then_some(first)
     }
 
-    /// Re-derive every fold orbit from `std`'s case mappings and assert [`FOLD`] is that
-    /// derivation exactly, so a toolchain Unicode bump fails here instead of mis-folding.
+    /// Re-derive every fold orbit from `std` and assert [`FOLD`] matches.
     #[test]
     fn fold_table_matches_std() {
-        // Union-find over the undirected single-code-point case-mapping graph.
         let mut parent: BTreeMap<char, char> = BTreeMap::new();
         fn root(parent: &mut BTreeMap<char, char>, x: char) -> char {
             let mut r = x;
@@ -3601,8 +3565,6 @@ mod tests {
                 }
             }
         }
-        // The three `C`-entry edges, which no single-code-point mapping reaches.
-        // `case_folding_is_pinned` holds `(?i)\u{390}` to matching `\u{1fd3}`, as `regex`.
         for &(a, b) in NON_DERIVABLE {
             join(&mut parent, a, b);
         }
@@ -3628,7 +3590,6 @@ mod tests {
              mappings plus the three non-derivable CaseFolding.txt edges"
         );
 
-        // Each non-derivable pair must be an orbit link in the baked table.
         for &(a, b) in NON_DERIVABLE {
             let orbit: BTreeSet<char> = fold_orbit(a).collect();
             assert!(
@@ -3640,8 +3601,7 @@ mod tests {
         }
     }
 
-    /// Every orbit is symmetric and closed: walking from any member returns the
-    /// same set. A one-way link would make `(?i)K` and `(?i)k` disagree.
+    /// Every fold orbit is symmetric and closed.
     #[test]
     fn fold_orbits_are_symmetric() {
         for &(cp, _) in FOLD {
@@ -3655,8 +3615,7 @@ mod tests {
         }
     }
 
-    /// Orbits the built-in patterns and the search verb rely on, spelled out so a table
-    /// regeneration cannot drop them.
+    /// Spot-checks fold orbits used by built-in patterns and search.
     #[test]
     fn named_orbits() {
         let orbit = |c: char| -> Vec<char> {
@@ -3678,8 +3637,7 @@ mod tests {
         assert_eq!(orbit('7'), vec!['7'], "uncased code points are singletons");
     }
 
-    /// Range folding must pull in the exotic members that live far outside the
-    /// range — `(?i)[a-z]` has to match KELVIN SIGN, as `regex` does.
+    /// Range folding includes orbit members outside the range.
     #[test]
     fn range_folding_reaches_outside_the_range() {
         let mut out = Vec::new();
@@ -3700,8 +3658,7 @@ mod tests {
         assert!(is_space(' ') && is_space('\u{00a0}') && !is_space('x'));
     }
 
-    /// The range tables must be sorted, disjoint and non-adjacent, or
-    /// [`in_ranges`]'s binary search is unsound.
+    /// Range tables are sorted, disjoint, and non-adjacent.
     #[test]
     fn range_tables_are_well_formed() {
         for (name, table) in [("ND", ND), ("MARK", MARK), ("PC", PC)] {

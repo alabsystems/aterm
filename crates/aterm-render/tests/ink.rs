@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Animated-ink fg overrides (Sparkle Words v2, `RenderInput.ink`) on the CPU renderer. The
-// empty-ink no-op is the `ink` row of `tests/empty_channels.rs`. Pinned here: ink
-// substitutes for the cell fg at every consult site; it applies before the min-contrast and
-// selection floors; an explicit SGR 58 underline colour wins; a wide glyph follows its lead
-// cell's InkCell; the dirty gate.
+
+//! Animated-ink foreground override tests on the CPU renderer.
 
 use aterm_core::render::InkCell;
 use aterm_core::terminal::Terminal;
@@ -17,8 +13,6 @@ use aterm_render::{
 pub(crate) fn renderer() -> Renderer {
     Renderer::from_system(18.0, Theme::default())
         .map(|mut r| {
-            // A lazy fallback parse landing between two renders would break the
-            // byte comparisons.
             r.debug_block_on_lazy_fallbacks();
             r
         })
@@ -35,20 +29,12 @@ fn cell_pixels(f: &Frame, cw: usize, ch: usize, row: usize, col: usize) -> Vec<u
     out
 }
 
-/// Inking a cell is byte-identical to recolouring the same text via SGR truecolor fg, at
-/// all five CPU consult sites: glyph blit, combining blit (é as e + U+0301), pass 3's
-/// underline colour, pass 3's strike/overline colour and pass 3b's AA undercurl, plus a
-/// lead-governed wide CJK cell. The curly cell is needed because `\x1b[4m` never reaches
-/// pass 3b. The GPU twin is `ink_gpu_matches_cpu`; this one runs without a wgpu device.
 #[test]
 fn ink_renders_byte_identically_to_sgr_fg_recolor() {
     let mut rend = renderer();
     let ink: [u8; 3] = [0x7C, 0xC8, 0xFF];
     let (rows, cols) = (2usize, 16usize);
 
-    // Plain text, default fg, ink overrides on every lead cell.
-    // Row 0: "e<combining acute> x<SGR4 underline> s<SGR9 strike> w<SGR 4:3 curl>";
-    // row 1: 猫 (wide).
     let mut term_a = Terminal::new(rows as u16, cols as u16);
     term_a.process(
         "\x1b[?25le\u{0301} \x1b[4mx\x1b[24m \x1b[9ms\x1b[29m \x1b[4:3mw\x1b[24m\r\n猫".as_bytes(),
@@ -82,7 +68,6 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
         }, // 猫's LEAD cell
     ];
 
-    // The same text recoloured with SGR 38;2 truecolor fg — no ink.
     let mut term_b = Terminal::new(rows as u16, cols as u16);
     term_b.process(
         "\x1b[?25l\x1b[38;2;124;200;255me\u{0301}\x1b[39m \x1b[38;2;124;200;255m\x1b[4mx\x1b[24m\
@@ -100,15 +85,11 @@ fn ink_renders_byte_identically_to_sgr_fg_recolor() {
          combining, straight underline, strike, AA undercurl, wide lead)"
     );
 
-    // Non-vacuous: the recolour actually changed pixels vs the un-inked frame.
     let mut plain = term_a.cell_frame(rows, cols);
     plain.ink.clear();
     assert_ne!(fa, rend.render_input(&plain).pixels);
 }
 
-/// Ink applies before the selection fg floor on selected cells: with an ink colour
-/// illegible on the selection band, the drawn colour is exactly
-/// `floor_selection_fg(ink, sel_bg)` and the raw ink bytes never reach the frame.
 #[test]
 fn ink_then_selection_floor_applies_in_that_order() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -122,7 +103,6 @@ fn ink_then_selection_floor_applies_in_that_order() {
         sel.update_selection(0, 0, SelectionSide::Right);
         sel.complete_selection();
     }
-    // The default selection band colour (0x33415E): under the 4.5:1 floor, so it moves.
     let ink: [u8; 3] = [0x33, 0x41, 0x5E];
     let sel_bg = rend.effective_selection_bg();
     let expected = floor_selection_fg(rgb_to_u32(ink), sel_bg);
@@ -150,15 +130,12 @@ fn ink_then_selection_floor_applies_in_that_order() {
     );
 }
 
-/// Ink applies before the per-cell minimum-contrast floor on unselected cells, so the floor
-/// sees the final ink colour.
 #[test]
 fn ink_then_min_contrast_floor_applies_in_that_order() {
     let mut rend = renderer();
     let (cw, ch) = rend.cell_size();
     let mut term = Terminal::new(1, 4);
     term.process("\x1b[?25l█".as_bytes());
-    // Dark ink on the dark default bg (0x111318): illegible until floored.
     let ink: [u8; 3] = [0x16, 0x18, 0x1D];
     let bg = Theme::default().bg;
     let expected = floor_min_contrast_fg(rgb_to_u32(ink), bg, 4.5);
@@ -187,9 +164,6 @@ fn ink_then_min_contrast_floor_applies_in_that_order() {
     );
 }
 
-/// An explicit SGR 58 underline colour wins over ink: on an underlined space (the underline
-/// is its only fg consumer) two frames differing only in ink are byte-identical; without
-/// SGR 58 the underline is the exact ink bytes.
 #[test]
 fn sgr58_explicit_underline_color_wins_over_ink() {
     let mut rend = renderer();
@@ -197,7 +171,6 @@ fn sgr58_explicit_underline_color_wins_over_ink() {
     let ink_a: [u8; 3] = [0xFF, 0x00, 0x00];
     let ink_b: [u8; 3] = [0x00, 0xFF, 0x00];
 
-    // SGR 58 explicit underline colour on an underlined space.
     let mut term = Terminal::new(1, 4);
     term.process(b"\x1b[?25l\x1b[4m\x1b[58;2;10;20;30m \x1b[0m");
     let mut input = term.cell_frame(1, 4);
@@ -215,7 +188,6 @@ fn sgr58_explicit_underline_color_wins_over_ink() {
     let fb = rend.render_input(&input).pixels.clone();
     assert_eq!(fa, fb, "SGR 58 must win over ink: ink colour is irrelevant");
 
-    // Control (non-vacuous): without SGR 58 the underline follows ink.
     let mut term = Terminal::new(1, 4);
     term.process(b"\x1b[?25l\x1b[4m \x1b[0m");
     let mut input = term.cell_frame(1, 4);
@@ -241,8 +213,6 @@ fn sgr58_explicit_underline_color_wins_over_ink() {
     );
 }
 
-/// The lead cell's InkCell governs a wide glyph; an entry on the continuation
-/// column alone is inert (that column carries no glyph and no decoration).
 #[test]
 fn wide_cjk_continuation_only_ink_is_inert() {
     let mut rend = renderer();
@@ -262,8 +232,6 @@ fn wide_cjk_continuation_only_ink_is_inert() {
     );
 }
 
-/// Settled ink (non-empty but equal between frames) gate-hits; changed ink marks exactly
-/// the prev∪cur ink rows and does not gate-hit.
 #[test]
 fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     let mut term = Terminal::new(4, 8);
@@ -281,7 +249,6 @@ fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
         },
     ];
 
-    // Settled: equal non-empty ink on both frames ⇒ gate hit, nothing marked.
     let mut prev = term.cell_frame(4, 8);
     let mut cur = term.cell_frame(4, 8);
     prev.ink = settled.clone();
@@ -306,7 +273,6 @@ fn ink_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     );
     assert!(dirty.iter().all(|&b| !b), "settled ink must mark no rows");
 
-    // Changed: ink moves row 1 → row 3 ⇒ exactly rows {1, 3} marked, no gate.
     cur.ink = vec![InkCell {
         row: 3,
         col: 2,

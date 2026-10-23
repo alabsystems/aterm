@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typing click is delivered on the keypress, so its event is built by
-//! the same code the frame drain uses and names the same instrument.
+//! Key-time click sound event and drain timestamp tests.
 use super::{TrailSoundPolicy, trail_sound_event};
 
 fn cue(col: u16) -> aterm_effects::cursor_glow::SoundCue {
@@ -25,9 +24,6 @@ fn policy() -> TrailSoundPolicy {
     }
 }
 
-/// Every policy axis rides the event, and the pan is normalized against the
-/// terminal width exactly as the drain does it, so a key-time click lands at
-/// the same stereo position as its echo.
 #[test]
 fn the_event_carries_the_whole_policy_and_the_drain_pan() {
     let p = policy();
@@ -46,16 +42,12 @@ fn the_event_carries_the_whole_policy_and_the_drain_pan() {
     ));
     let right = trail_sound_event(&cue(79), crate::cursor_glow::GlowStyle::Fire, 80, &p, 0.4);
     assert!((right.pan - 1.0).abs() < 1e-6, "the last column pans right");
-    // Past the last column clamps rather than panning outside the field.
     let past = trail_sound_event(&cue(999), crate::cursor_glow::GlowStyle::Fire, 80, &p, 0.4);
     assert!((past.pan - 1.0).abs() < 1e-6);
-    // A degenerate one-column terminal never divides by zero.
     let narrow = trail_sound_event(&cue(0), crate::cursor_glow::GlowStyle::Fire, 1, &p, 0.4);
     assert!((narrow.pan - 0.0).abs() < 1e-6);
 }
 
-/// The bare Space key's key-time click carries [`SoundKind::Space`], end to
-/// end from physical press to captured synth event.
 #[test]
 fn a_spacebar_reaches_the_audio_host_as_the_comma() {
     use crate::input::{InputEvent, Source};
@@ -100,9 +92,6 @@ fn a_spacebar_reaches_the_audio_host_as_the_comma() {
     );
 }
 
-/// A first-landing bare shift cues [`SoundKind::Shift`] at the key with no
-/// echo, credit or repeat; auto-repeat and release stay silent, and the next
-/// typed click still speaks.
 #[test]
 fn a_bare_shift_reaches_the_audio_host_as_the_lift() {
     use crate::input::{InputEvent, Source};
@@ -147,8 +136,6 @@ fn a_bare_shift_reaches_the_audio_host_as_the_lift() {
         app.trail_audio.take_captured_for_test().is_empty(),
         "a held shift's auto-repeat and its key-up cue nothing",
     );
-    // The capital right behind it still clicks: the lift banked no
-    // echo-muting credit.
     let _ = app.input(
         wid,
         InputEvent::Key {
@@ -169,11 +156,6 @@ fn a_bare_shift_reaches_the_audio_host_as_the_lift() {
     );
 }
 
-/// The keyed seam's `Typed` `shifted` flag agrees with `typed_class_for`, which asks the
-/// glyph: `A` with no SHIFT bit (Caps Lock) is shifted; `a` and `7` are not; `a` under
-/// SHIFT is. (The visual flag still reads the modifier; Caps Lock mints no Shift cue.)
-/// Also pins that a keypress reaches the audio host with no render tick between key and
-/// capture.
 #[test]
 fn a_caps_lock_capital_is_a_shifted_click() {
     use crate::input::{InputEvent, Source};
@@ -232,9 +214,6 @@ fn a_caps_lock_capital_is_a_shifted_click() {
         shifted_of('a', Modifiers::SHIFT),
         "`a` under Shift is the capital it always was"
     );
-    // Every way a shifted glyph can reach the seam: a shifted mark (`?` is `/` under
-    // Shift; `Key::Character` holds the base), a capital under Shift and Caps Lock, and
-    // the literal-text path, which carries no modifier bits.
     assert!(
         shifted_of('/', Modifiers::SHIFT),
         "`?` — `/` under Shift — is a shifted click"
@@ -267,10 +246,6 @@ fn a_caps_lock_capital_is_a_shifted_click() {
     );
 }
 
-/// Three echo-born cues drained in one frame reach the host with three
-/// distinct, strictly increasing, non-zero `at_ms`, not one frame-level
-/// stamp. The cues are queued on the engine's backlog between frames, so
-/// this tests the frame drain's stamp, not the keyed seam's.
 #[test]
 fn the_drain_stamps_each_echo_cue_at_its_own_instant() {
     use aterm_effects::trail_sound::{SoundGesture, SoundKind};
@@ -283,7 +258,6 @@ fn the_drain_stamps_each_echo_cue_at_its_own_instant() {
     let wid = crate::WindowId(0);
     app.windows.get_mut(&wid).expect("window").focused = true;
     let t0 = Instant::now();
-    // One drawing tick arms the engine's silence law (`sound_live`).
     app.cursor_frame(wid, super::CursorFxInputs::sample_for_test(t0))
         .expect("the fixture window ticks");
     let _ = app.trail_audio.take_captured_with_meta_for_test();
@@ -328,15 +302,11 @@ fn the_drain_stamps_each_echo_cue_at_its_own_instant() {
         stamps.windows(2).all(|w| w[1] > w[0]),
         "three cues in one frame carry three distinct, increasing stamps: {stamps:?}"
     );
-    // And an echo-born cue still carries no glyph: class 0, rank 0.
     for (_, meta) in &spoken {
         assert_eq!((meta.glyph_class, meta.rank), (0, 0));
     }
 }
 
-/// The key seam's [`crate::App::glow_style`] and the frame drain's
-/// `glow_config().style` agree, so a keystroke sounds the same instrument
-/// whether the click rides the key or the echo.
 #[test]
 fn glow_style_matches_glow_config() {
     let app = crate::App::headless_for_test();

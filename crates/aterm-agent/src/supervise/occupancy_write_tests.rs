@@ -29,6 +29,8 @@ struct DoorHost {
     upgrade_due: AtomicBool,
     pace: Mutex<Option<PaceGrant>>,
     board: Mutex<OccupancyReading>,
+    /// The board as the host re-reads it for a slot rule's write; `None`, its board.
+    reread: Mutex<Option<OccupancyReading>>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -64,15 +66,26 @@ impl IdleHost for DoorHost {
         self.taskless.load(Ordering::SeqCst)
     }
     fn occupancy(&self) -> OccupancyReading {
-        self.board.lock().expect("board").clone()
+        *self.board.lock().expect("board")
     }
     fn upgrade_due(&self) -> bool {
         self.called("upgrade_due".to_string());
         self.upgrade_due.load(Ordering::SeqCst)
     }
+    /// The answer the test set; else, as the window's board answers, a slot rule's line the board
+    /// re-read for it, and any other the session's own pace.
     fn occupancy_pace(&self, rule: RuleId, _: i64) -> PaceGrant {
         self.called(format!("occupancy_pace {}", rule.name()));
-        self.pace.lock().expect("pace").unwrap_or(PaceGrant::Local)
+        let reread = self
+            .reread
+            .lock()
+            .expect("reread")
+            .unwrap_or_else(|| *self.board.lock().expect("board"));
+        self.pace.lock().expect("pace").unwrap_or(if rule.slot() {
+            PaceGrant::Room(reread)
+        } else {
+            PaceGrant::Local
+        })
     }
     fn break_taken(&self) {
         self.called("break_taken".to_string());
@@ -507,6 +520,33 @@ fn a_workflows_break_types_the_nudge() {
     observe_types_nothing(&run);
 }
 
+/// THE SETUP'S WAIT IS THE DOOR'S: a session whose setup carries the lab seam's 1 min wait
+/// (`occupancy_nudge_after`, taped, so a tape recorded under the seam replays under it) types the
+/// nudge at a break 61 s into its hold. NEGATIVE CONTROL: the shipped setup at the same break
+/// types nothing.
+#[test]
+fn the_setups_nudge_wait_reaches_the_door() {
+    let run = |after: Option<Duration>| {
+        Script::new("write-seam", Occupancy::Prompt, &[0, 61]).run(&mut |s, i| {
+            if let (0, Some(after)) = (i, after) {
+                s.setup.occupancy_nudge_after = after;
+            }
+        })
+    };
+    let short = run(Some(Duration::from_secs(60)));
+    assert_eq!(wrote(&short.noted), [said(NUDGE, "typed")]);
+    let writes = short.writes();
+    assert_eq!(writes.len(), 2, "{writes:#?}");
+    let line = templates::wait_nudge(61_000);
+    assert!(
+        writes[0].ends_with(&format!(" -- {}", line.text())),
+        "{writes:#?}"
+    );
+    let shipped = run(None);
+    assert!(shipped.writes().is_empty(), "{:?}", shipped.writes());
+    assert!(shipped.rows.is_empty(), "{:?}", shipped.rows);
+}
+
 /// ONLY A DRAWN BREAK IS A DOOR: the same 31 min read as a live turn or an idle point judges
 /// nothing and writes nothing; the next drawn break of a hold that stood is where it goes.
 #[test]
@@ -768,6 +808,18 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
         );
         assert!(ran.writes().is_empty(), "{}: {:?}", case.tag, ran.writes());
         assert!(ran.rows.is_empty(), "{}: {:?}", case.tag, ran.rows);
+        let booked: Vec<(String, String)> = case
+            .words
+            .strip_prefix("held:")
+            .map(|guard| held_by(NUDGE, guard))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            held_rows_of(&ran.ledger),
+            booked,
+            "{}: a held verdict's row, a pace's none",
+            case.tag
+        );
         assert_eq!(
             ran.requests().iter().any(|r| r == "status"),
             case.at_write,
@@ -920,6 +972,65 @@ fn an_unfenced_read_is_skipped_never_submitted_guarded() {
         !guarded.writes().is_empty(),
         "the fallback writes: {:?}",
         guarded.requests()
+    );
+}
+
+/// A LINE WRITTEN BUT NOT SUBMITTED IS SAID SO: where the write takes and the Enter after it is
+/// skipped (a person keyed first), the line stands in the composer, and the outcome row and the
+/// journal say `skipped why=not-submitted`. NEGATIVE CONTROL: a write the server skips at its
+/// fence (the screen moved) wrote nothing, and says `why=not-written`.
+#[test]
+fn a_line_left_in_the_composer_is_not_said_unwritten() {
+    let run = |set: &dyn Fn(&mut Mock)| {
+        Script {
+            set,
+            ..Script::new("write-left", Occupancy::Prompt, &[0, 31 * 60])
+        }
+        .run(&mut nothing)
+    };
+    let left = run(&|m| {
+        m.key_replies
+            .push_back(ok("OK skipped reason=person seq=101\n"));
+    });
+    assert_eq!(
+        wrote(&left.noted),
+        [said(NUDGE, "skipped why=not-submitted")]
+    );
+    let writes = left.writes();
+    assert!(
+        writes.first().is_some_and(|w| w.starts_with("send "))
+            && writes.get(1).is_some_and(|w| w.ends_with(" enter")),
+        "the line written, its Enter skipped: {writes:#?}"
+    );
+    assert_eq!(
+        left.kinds(),
+        [
+            (INTENT.to_string(), "waiting".to_string()),
+            (HOLD.to_string(), "skipped".to_string()),
+        ]
+    );
+    assert!(
+        left.rows[1].3.ends_with(" why=not-submitted"),
+        "{:?}",
+        left.rows
+    );
+    let unwritten = run(&|m| {
+        m.send_replies
+            .push_back(ok("OK skipped reason=changed seq=101\n"));
+    });
+    assert_eq!(
+        wrote(&unwritten.noted),
+        [said(NUDGE, "skipped why=not-written")]
+    );
+    assert!(
+        !unwritten.writes().iter().any(|w| w.starts_with("key ")),
+        "{:?}",
+        unwritten.writes()
+    );
+    assert!(
+        unwritten.rows[1].3.ends_with(" why=not-written"),
+        "{:?}",
+        unwritten.rows
     );
 }
 
@@ -1172,18 +1283,321 @@ fn a_nudge_at_thirty_minutes_then_room_at_two_hours_and_no_second_nudge() {
     );
 }
 
-/// `body` with every row stamped `ts`, in its order: the scripted clock's time, where the rows a
-/// test's ledger stamps are the machine's.
-fn stamped(body: &str, ts: i64) -> String {
-    body.lines()
-        .map(|line| {
-            let rest = line
-                .strip_prefix("{\"ts\":")
-                .and_then(|r| r.split_once(','))
-                .map_or(line, |(_, rest)| rest);
-            format!("{{\"ts\":{ts},{rest}\n")
+// THE FIGURES TYPED ARE RE-READ AT THE WRITE (design §3.1): `hold-room`'s line types the board
+// its host re-read for the write, judged again there.
+
+/// A RUN TO `hold-room`'S LINE under `occupancy` (§8 row 1's script): the nudge at 30 min, the
+/// agent's answer declaring the hold, a read every ten minutes to two hours, then a read at each
+/// of `after` (minutes); before each read `reread` sets the host's answer for a slot rule's
+/// write, given the read's index and its wall ms (the host re-reads its board where it sets
+/// none). Its last read before `after` is the first `hold-room` is due at.
+fn room_run(
+    tag: &str,
+    occupancy: Occupancy,
+    after: &[i64],
+    reread: &dyn Fn(&DoorHost, usize, i64),
+) -> Ran {
+    let mut at_s = vec![0, 30 * 60, 31 * 60];
+    at_s.extend((40..=120).step_by(10).map(|m| m * 60));
+    at_s.extend(after.iter().map(|m| m * 60));
+    let host = Arc::new(DoorHost::default());
+    *host.board.lock().expect("board") = room_at(T0);
+    let seen = Arc::clone(&host);
+    let at = at_s.clone();
+    Script {
+        drawn: &|i| {
+            if i >= 2 {
+                waiting_break()
+            } else {
+                break_screen()
+            }
+        },
+        host,
+        ..Script::new(tag, occupancy, &at_s)
+    }
+    .run(&mut |s, i| {
+        if i == 2 {
+            s.took(7, Some(&policy(occupancy)), &mut Heard::default());
+        }
+        reread(&seen, i, T0 + at[i] * 1000);
+    })
+}
+
+/// What a test sets on the host for the write at two hours, given that read's wall ms.
+type AtRoom<'a> = &'a dyn Fn(&DoorHost, i64);
+
+/// The index of [`room_run`]'s read at two hours, the first `hold-room` is due at.
+const ROOM_DUE: usize = 11;
+
+/// `room_at(at_ms)` with `usable` of its three slots free.
+fn room_with(at_ms: i64, usable: u16) -> OccupancyReading {
+    OccupancyReading {
+        slots: Some(SlotsSeen { usable, n: 3 }),
+        ..room_at(at_ms)
+    }
+}
+
+/// The `hold-room` lines `ran` typed: each outcome row's `(held_ms, command)`.
+fn rooms_typed(ran: &Ran) -> Vec<(i64, String)> {
+    ran.rows
+        .iter()
+        .filter(|(rule, decision, _, reason)| {
+            rule == HOLD && decision == "typed" && reason.contains(ROOM)
+        })
+        .map(|(_, _, command, reason)| {
+            let held = reason
+                .split(' ')
+                .find_map(|w| w.strip_prefix("held_ms=")?.parse().ok())
+                .expect("held_ms");
+            (held, command.clone())
         })
         .collect()
+}
+
+/// `ran`'s `OCCUPANCY` words of `hold-room`'s write.
+fn room_said(ran: &Ran) -> Vec<String> {
+    wrote(&ran.noted)
+        .into_iter()
+        .filter(|(rule, _)| rule == ROOM)
+        .map(|(_, words)| words)
+        .collect()
+}
+
+/// A SLOT TAKEN BETWEEN THE DECISION AND THE WRITE HOLDS THE LINE: at two hours the decider sees
+/// a free slot on the board's look, but the board the host re-reads for the write has none (or
+/// the host says so itself, `unmet`), so nothing is booked or written and the line is `paced
+/// why=unmet`; it stays due, and at the next look, the slot free again, it is typed. NEGATIVE
+/// CONTROL: the slot still free at the re-read, the line is typed at two hours.
+#[test]
+fn a_slot_taken_between_decide_and_write_holds_the_line() {
+    let line = |held_ms: i64| templates::hold_room(held_ms, 1, 3, 20 * 60_000, 96 * 1024);
+    let taken: [AtRoom<'_>; 2] = [
+        &|h, at| *h.reread.lock().expect("reread") = Some(room_with(at, 0)),
+        &|h, _| *h.pace.lock().expect("pace") = Some(PaceGrant::Unmet),
+    ];
+    for (n, take) in taken.into_iter().enumerate() {
+        let ran = room_run(
+            &format!("write-room-taken-{n}"),
+            Occupancy::Prompt,
+            &[121],
+            &|h, i, at| {
+                *h.reread.lock().expect("reread") = None;
+                *h.pace.lock().expect("pace") = None;
+                if i == ROOM_DUE {
+                    take(h, at);
+                }
+            },
+        );
+        assert_eq!(
+            room_said(&ran),
+            ["paced why=unmet", "typed"],
+            "{n}: {:#?}",
+            ran.noted
+        );
+        assert_eq!(
+            rooms_typed(&ran),
+            [(121 * MIN, line(121 * MIN).text().to_string())],
+            "{n}"
+        );
+        let intents = ran
+            .rows
+            .iter()
+            .filter(|r| r.0 == INTENT && r.3.contains(ROOM))
+            .count();
+        assert_eq!(intents, 1, "{n}: no intent was booked for the held write");
+        assert_eq!(
+            ran.writes()
+                .iter()
+                .filter(|w| w.starts_with("send "))
+                .count(),
+            2,
+            "{n}: the nudge and one room line"
+        );
+    }
+    let ran = room_run("write-room-free", Occupancy::Prompt, &[121], &|_, _, _| {});
+    assert_eq!(room_said(&ran), ["typed"], "{:#?}", ran.noted);
+    assert_eq!(
+        rooms_typed(&ran),
+        [(120 * MIN, line(120 * MIN).text().to_string())]
+    );
+}
+
+/// A STALE RE-READ REFUSES: figures the host re-read more than `FACT_FRESH_MS` before the break,
+/// or a host with no board to re-read (`local`), hold the line `paced why=stale`, nothing booked
+/// or written; at the next look, fresh, it is typed. NEGATIVE CONTROL: a re-read at the edge of
+/// `FACT_FRESH_MS` types at two hours.
+#[test]
+fn a_stale_reread_refuses_the_line() {
+    use crate::supervise::facts::FACT_FRESH_MS;
+    let stale: [AtRoom<'_>; 2] = [
+        &|h, at| *h.reread.lock().expect("reread") = Some(room_at(at - FACT_FRESH_MS - 1)),
+        &|h, _| *h.pace.lock().expect("pace") = Some(PaceGrant::Local),
+    ];
+    for (n, old) in stale.into_iter().enumerate() {
+        let ran = room_run(
+            &format!("write-room-stale-{n}"),
+            Occupancy::Prompt,
+            &[121],
+            &|h, i, at| {
+                *h.reread.lock().expect("reread") = None;
+                *h.pace.lock().expect("pace") = None;
+                if i == ROOM_DUE {
+                    old(h, at);
+                }
+            },
+        );
+        assert_eq!(
+            room_said(&ran),
+            ["paced why=stale", "typed"],
+            "{n}: {:#?}",
+            ran.noted
+        );
+        assert_eq!(rooms_typed(&ran).len(), 1, "{n}");
+        assert_eq!(rooms_typed(&ran)[0].0, 121 * MIN, "{n}");
+    }
+    let ran = room_run("write-room-edge", Occupancy::Prompt, &[121], &|h, i, at| {
+        *h.reread.lock().expect("reread") = (i == ROOM_DUE).then(|| room_at(at - FACT_FRESH_MS));
+    });
+    assert_eq!(room_said(&ran), ["typed"], "{:#?}", ran.noted);
+    assert_eq!(rooms_typed(&ran)[0].0, 120 * MIN);
+}
+
+/// THE TYPED NUMBERS ARE THE RE-READ BOARD'S: the decider judged one of three slots free for 20
+/// min and 96 GiB; the board the host re-read for the write says two free for 25 min and 64
+/// GiB, and that is the line written, booked and told the host. NEGATIVE CONTROL: the decided
+/// line says other numbers. Under observe and off nothing is asked or written.
+#[test]
+fn the_typed_numbers_are_the_reread_boards() {
+    let reread = |h: &DoorHost, i: usize, at: i64| {
+        *h.reread.lock().expect("reread") = (i == ROOM_DUE).then(|| OccupancyReading {
+            slots_free_ms: Some(25 * 60_000),
+            avail_mib: Some(64 * 1024),
+            ..room_with(at, 2)
+        });
+    };
+    observe_types_nothing(&|occupancy| room_run("write-room-numbers", occupancy, &[], &reread));
+    let ran = room_run("write-room-numbers", Occupancy::Prompt, &[], &reread);
+    let typed = templates::hold_room(120 * MIN, 2, 3, 25 * 60_000, 64 * 1024);
+    let decided = templates::hold_room(120 * MIN, 1, 3, 20 * 60_000, 96 * 1024);
+    assert_ne!(typed.text(), decided.text(), "the control: other numbers");
+    assert_eq!(rooms_typed(&ran), [(120 * MIN, typed.text().to_string())]);
+    let sent = ran.writes();
+    assert!(
+        sent.iter()
+            .any(|w| w.starts_with("send ") && w.ends_with(typed.text())),
+        "{sent:#?}"
+    );
+    assert!(
+        !sent.iter().any(|w| w.contains(decided.text())),
+        "{sent:#?}"
+    );
+    assert!(
+        ran.calls.contains(&format!("inform {}", typed.text())),
+        "{:#?}",
+        ran.calls
+    );
+}
+
+/// AN OLDER BUILD'S TAPE (slice 1's pace re-read nothing): its bare `granted` to a slot rule
+/// types the line as it was decided, as that build typed it, so the tape replays as recorded —
+/// whatever this build's host would have re-read. NEGATIVE CONTROL: the re-read board's answer
+/// types the re-read figures.
+#[test]
+fn an_older_builds_bare_grant_types_the_line_as_decided() {
+    let reread = |grant: bool| {
+        move |h: &DoorHost, i: usize, at: i64| {
+            *h.reread.lock().expect("reread") = (i == ROOM_DUE).then(|| room_with(at, 2));
+            *h.pace.lock().expect("pace") = grant.then_some(PaceGrant::Granted);
+        }
+    };
+    let decided = templates::hold_room(120 * MIN, 1, 3, 20 * 60_000, 96 * 1024);
+    let ran = room_run("write-room-bare", Occupancy::Prompt, &[], &reread(true));
+    assert_eq!(rooms_typed(&ran), [(120 * MIN, decided.text().to_string())]);
+    let ran = room_run("write-room-reread", Occupancy::Prompt, &[], &reread(false));
+    let typed = templates::hold_room(120 * MIN, 2, 3, 20 * 60_000, 96 * 1024);
+    assert_eq!(rooms_typed(&ran), [(120 * MIN, typed.text().to_string())]);
+}
+
+/// The `held_ms` of each line the door typed, by its rule, as its outcome rows say.
+fn typed_lines(ran: &Ran) -> Vec<(String, String)> {
+    ran.rows
+        .iter()
+        .filter(|(rule, decision, _, _)| rule == HOLD && decision == "typed")
+        .map(|(_, _, _, reason)| {
+            let word = |key: &str| {
+                reason
+                    .split(' ')
+                    .find_map(|w| w.strip_prefix(key))
+                    .unwrap_or("")
+                    .to_string()
+            };
+            (word("rule="), word("held_ms="))
+        })
+        .collect()
+}
+
+/// §8 ROW 1, A PERSON'S EXCHANGE OVER A 3 H SHELL: the task done and left to the person (their
+/// own exchange), a shell left running under it for three hours, read every ten minutes on a
+/// board with room. The nudge from 30 min and `hold-room` from 2 h are each held by the
+/// exchange, said once and booked once; no `status` read, no intent row, nothing written.
+/// Under observe and off: nothing written. NEGATIVE CONTROL: the same session out of the
+/// exchange types the nudge at 30 min and, once the agent took it, `hold-room` at 2 h.
+#[test]
+fn a_persons_exchange_over_a_three_hour_shell_types_nothing() {
+    let at_s: Vec<i64> = (0..=18).map(|i| i * 10 * 60).collect();
+    let run = |occupancy, left: bool| {
+        let host = Arc::new(DoorHost::default());
+        *host.board.lock().expect("board") = room_at(T0);
+        Script {
+            host,
+            ..Script::new("write-exchange-3h", occupancy, &at_s)
+        }
+        .run(&mut |s, i| {
+            if left && !s.turn_end.left_to_person() {
+                let mut reading =
+                    s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
+                reading.left_record = true;
+                s.turn_end.observe(&reading, s.fx.mono());
+                assert!(s.turn_end.left_to_person());
+            }
+            if !left && i == 4 {
+                s.took(7, Some(&policy(occupancy)), &mut Heard::default());
+            }
+        })
+    };
+    let ran = run(Occupancy::Prompt, true);
+    assert_eq!(
+        wrote(&ran.noted),
+        [said(NUDGE, "held:exchange"), said(ROOM, "held:exchange")],
+        "{:#?}",
+        ran.noted
+    );
+    assert!(ran.writes().is_empty(), "{:?}", ran.writes());
+    assert!(ran.rows.is_empty(), "{:?}", ran.rows);
+    assert!(!ran.requests().iter().any(|r| r == "status"));
+    assert!(!ran.calls.iter().any(|c| c.starts_with("occupancy_pace")));
+    assert_eq!(
+        held_rows_of(&ran.ledger),
+        [held_by(NUDGE, "exchange"), held_by(ROOM, "exchange")]
+    );
+    assert!(
+        !ran.noted
+            .iter()
+            .any(|l| l.starts_with("OCCUPANCY ") && l.contains(" hold closed")),
+        "the shell's hold stood three hours: {:#?}",
+        ran.noted
+    );
+    observe_types_nothing(&|occupancy| run(occupancy, true));
+    let control = run(Occupancy::Prompt, false);
+    assert_eq!(
+        typed_lines(&control),
+        [
+            (NUDGE.to_string(), (30 * MIN).to_string()),
+            (ROOM.to_string(), (120 * MIN).to_string()),
+        ],
+        "{:#?}",
+        control.noted
+    );
 }
 
 /// A CRASH AFTER THE INTENT ROW IS RETOLD ONCE (`OccupancyDoor`'s `Crash`): a loop that booked
@@ -1296,6 +1710,12 @@ fn a_write_held_after_its_reads_waits_a_look() {
         let ran = run(Occupancy::Prompt);
         assert_eq!(wrote(&ran.noted), [said(NUDGE, words)], "{tag}");
         assert!(ran.writes().is_empty(), "{tag}");
+        let booked: Vec<(String, String)> = words
+            .strip_prefix("held:")
+            .map(|guard| held_by(NUDGE, guard))
+            .into_iter()
+            .collect();
+        assert_eq!(held_rows_of(&ran.ledger), booked, "{tag}: booked once");
         assert_eq!(
             count(&ran),
             2,

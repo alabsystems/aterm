@@ -12,7 +12,9 @@
 
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
-use crate::cat_baker::{CatColorKey, ResolvedFills, paint_outline_halo, resolve_layer};
+use crate::cat_baker::{
+    CatColorKey, ResolvedFills, paint_outline_halo, resolve_layer, take_or_new_tile,
+};
 use crate::cat_glyphs_gen::GlyphRole;
 use crate::dog_glyphs_gen::{DOG_GLYPHS, DogGlyphId};
 use crate::pet_baker::{ExactTileBaker, ExactTileKey, host_tile_id};
@@ -84,8 +86,13 @@ impl DogBakeKey {
 #[must_use]
 pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     let mut tile = Tile::new(w, h);
+    paint_breed_onto(&mut tile, breed, fills, w, h);
+    tile
+}
+
+fn paint_breed_onto(tile: &mut Tile, breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) {
     if w == 0 || h == 0 {
-        return tile;
+        return;
     }
     let xform = PathTransform::fit(w, h);
     for layer in DOG_GLYPHS[breed as usize].layers {
@@ -95,11 +102,10 @@ pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> T
             resolve_layer(layer, fills)
         };
         if matches!(layer.role, GlyphRole::Outline) {
-            paint_outline_halo(&mut tile, layer, fills, alpha, xform);
+            paint_outline_halo(tile, layer, fills, alpha, xform);
         }
-        fill_path_fixed(&mut tile, layer.paths, col, alpha, xform);
+        fill_path_fixed(tile, layer.paths, col, alpha, xform);
     }
-    tile
 }
 
 impl ExactTileKey for DogBakeKey {
@@ -111,6 +117,14 @@ impl ExactTileKey for DogBakeKey {
     #[inline]
     fn bake_tile(&self) -> Tile {
         self.bake()
+    }
+
+    #[inline]
+    fn bake_tile_with(&self, recycled: Option<Tile>, _mask_scratch: &mut Option<Tile>) -> Tile {
+        let (w, h) = (u32::from(self.w), u32::from(self.h));
+        let mut tile = take_or_new_tile(recycled, w, h);
+        paint_breed_onto(&mut tile, self.breed, &self.fills(), w, h);
+        tile
     }
 }
 

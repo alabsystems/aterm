@@ -23,19 +23,13 @@ impl Grid {
             self.assert_scroll_region_valid();
             self.assert_ring_buffer_valid();
             self.assert_keys_cover_retained_rows();
-            // The history byte sums the link budget and `memory_used` read
-            // are running sums: each equals a fresh walk of its rows.
             self.storage.ring_extras.assert_running_sums();
             self.storage.lazy_buffer.assert_running_sums();
         }
     }
 
-    /// Assert the O(1) grid invariants (`CursorInBounds`, `ScrollRegionValid` +
-    /// `DisplayOffsetValid`, the ring-buffer structure and `KeysCoverRetained`):
-    /// the subset of [`Self::assert_invariants`] cheap enough that debug builds
-    /// run it after every `Terminal::process` batch and resize. The O(cells)
-    /// `WideCharConsistent` walk is [`Self::assert_wide_char_consistent`], which
-    /// the no-panic fuzzers run after every step.
+    /// Assert the O(1) structural grid invariants (`CursorInBounds`, `ScrollRegionValid`,
+    /// `DisplayOffsetValid`, ring buffer, and `KeysCoverRetained`).
     #[cfg(any(debug_assertions, test))]
     pub fn assert_structural_invariants(&self) {
         self.assert_cursor_in_bounds();
@@ -75,11 +69,7 @@ impl Grid {
         );
     }
 
-    /// WideCharConsistent + WideCharNotAtEnd: wide chars have continuations and
-    /// never sit in the last column. The writers clear orphaned halves at both
-    /// edges of what they overwrite (`fixup_wide_char_write`,
-    /// `fixup_wide_chars_in_range`). O(cells), so not part of
-    /// [`Self::assert_structural_invariants`].
+    /// Assert `WideCharConsistent` and `WideCharNotAtEnd` across all visible cells.
     ///
     /// # Panics
     ///
@@ -87,16 +77,11 @@ impl Grid {
     /// last column.
     #[cfg(any(debug_assertions, test))]
     pub fn assert_wide_char_consistent(&self) {
-        // One walk of each row's cell slice (`Row::get` re-derives the slice
-        // from its page per call), over pairs (col, col + 1) with col + 1 < cols.
         let cols = usize::from(self.storage.cols);
         for row_idx in 0..self.storage.visible_rows {
             if let Some(row) = self.row(row_idx) {
                 let cells = row.as_slice();
                 let walked = &cells[..cells.len().min(cols)];
-                // A plain index loop: slice indexing is a MIR primitive, where
-                // a range or slice iterator costs calls per cell in a debug
-                // build (this runs after every fuzz step).
                 let mut col = 0;
                 while col + 1 < walked.len() {
                     if walked[col].is_wide() {
@@ -119,16 +104,8 @@ impl Grid {
         }
     }
 
-    /// ExtrasClaimed: every extras-map entry keyed to a visible cell is claimed
-    /// by that cell's HAS_EXTRAS bit, or holds only truecolor fg/bg bytes (which
-    /// a BCE blank owns through its RGB marker, without the bit).
-    ///
-    /// An unclaimed entry is invisible to readers that gate on the bit, but a
-    /// later extras-style write there adopts it, and `cell_extra`,
-    /// `hyperlink_at` and checkpoint serialization read it directly: an old
-    /// combining mark, skin tone or link resurfaces on new text. Every operation
-    /// that blanks or replaces cells calls [`Self::drop_unclaimed_extras`]; the
-    /// no-panic fuzzers run this after every step. O(entries).
+    /// Assert `ExtrasClaimed`: every visible extras-map entry is claimed by its cell's `HAS_EXTRAS`
+    /// bit or holds only truecolor fg/bg bytes.
     ///
     /// # Panics
     ///
@@ -180,8 +157,6 @@ impl Grid {
     /// RingExtrasAligned: ring buffer structural invariants.
     #[cfg(any(debug_assertions, test))]
     fn assert_ring_buffer_valid(&self) {
-        // The ring always has a row (the constructor enforces rows.max(1));
-        // every `% rows.len()` depends on it.
         assert!(
             !self.storage.rows.is_empty(),
             "RowsNonEmpty violated: ring buffer has zero rows"
@@ -192,7 +167,6 @@ impl Grid {
             self.storage.ring_head,
             self.storage.rows.len()
         );
-        // visible_rows <= total_lines <= allocated rows.
         assert!(
             self.storage.total_lines <= self.storage.rows.len(),
             "TotalLinesValid violated: total_lines ({}) > rows.len() ({})",
@@ -205,12 +179,6 @@ impl Grid {
             self.storage.total_lines,
             self.storage.visible_rows
         );
-        // ring_head advances only when scroll_up reuses rows at capacity;
-        // reflow and erase_scrollback reset it. So ring_head > 0 implies every
-        // allocated row is retained, but not that the ring is at its cap: a
-        // rows-only grow's reveal or a ring-only limit raise lifts the cap under
-        // a wrapped ring, which is why every ring append linearizes first
-        // (`GridStorage::linearize_ring`).
         assert!(
             self.storage.ring_head == 0 || self.storage.total_lines == self.storage.rows.len(),
             "RingHeadCapacity violated: ring_head={} but total_lines ({}) != rows.len() ({})",
@@ -218,8 +186,6 @@ impl Grid {
             self.storage.total_lines,
             self.storage.rows.len()
         );
-        // One extras slot per ring history row, oldest first: a slot missing or
-        // left over moves history rows' links and graphemes onto their neighbours.
         assert_eq!(
             self.storage.ring_extras.len(),
             self.storage.ring_buffer_scrollback(),

@@ -77,7 +77,7 @@ fn copy_wait_left_at(
 mod silent;
 #[cfg(any(test, debug_assertions))]
 pub use silent::{
-    CODESIGN_HANG, ECHO_HANG, KeptUntilRan, ad_hoc_copy, require_disk_image_service,
+    CODESIGN_HANG, ECHO_HANG, KeptUntilRan, ad_hoc_copy, held_words, require_disk_image_service,
     require_trust_service, sign_ad_hoc, stand_in, trust_service_silent,
 };
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -602,6 +602,12 @@ fn end(child: &mut Child) {
     #[cfg(not(unix))]
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// `SIGKILL` `child` and reap it within `hang`, waiting on its exit as the kernel reports it. One still there at `hang` is left to its handle's drop, which hands it to the reaper: whether a program macOS's program check holds takes its signal is unmeasured.
+pub fn kill_within(child: &mut Child, hang: Duration) {
+    let _ = child.kill();
+    reap_within(child, None, Instant::now() + hang);
 }
 
 /// Reap a killed `child` by `by`, waiting on its exit as the kernel reports

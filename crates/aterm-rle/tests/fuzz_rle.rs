@@ -1,20 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Robustness fuzz for the RLE attribute container. Cell-attribute runs are
-// derived from untrusted terminal output (a program emitting `set_range` /
-// `extend_with` patterns that exercise run merging near `u32::MAX`), so the
-// container must NEVER panic on adversarial input — a panic is a
-// denial-of-service. The single highest-value internal overflow site is
-// `Rle::checked_run_length_sum`, whose saturation must never fire: summed run
-// lengths never exceed `u32::MAX`. This fuzz proves that invariant across every
-// public mutator, including starting states seeded near the `u32::MAX` boundary
-// via `with_value`, where overflow would be most likely to surface.
+// Robustness fuzz for the RLE attribute container near the `u32::MAX` length boundary.
 
 use aterm_rle::{Rle, Run};
 
-/// Deterministic LCG: same generator shape as the parser fuzz so runs are
-/// fully reproducible from a fixed seed.
 struct Lcg {
     state: u64,
 }
@@ -32,8 +22,6 @@ impl Lcg {
         (self.state >> 33) as u32
     }
 
-    /// A value biased toward the `u32::MAX` boundary so overflow-prone code
-    /// paths (run merging, run-length accumulation) are hit hard.
     fn next_boundary_len(&mut self) -> u32 {
         match self.next_u32() % 8 {
             0 => 0,
@@ -48,16 +36,11 @@ impl Lcg {
     }
 
     fn next_small_value(&mut self) -> u8 {
-        // A tiny value alphabet maximises run merging (adjacent equal values),
-        // which is exactly what drives length summation toward overflow.
         (self.next_u32() % 4) as u8
     }
 }
 
-/// Assert the core invariant the panic site relies on: the cached
-/// `total_length` equals the sum of every run length, computed in a wider type
-/// so the check itself can never overflow, and that sum never exceeds
-/// `u32::MAX`.
+/// Assert that cached `total_length` matches the 64-bit run-length sum and never exceeds `u32::MAX`.
 fn assert_invariant(rle: &Rle<u8>) {
     let sum: u64 = rle
         .runs()
@@ -73,8 +56,6 @@ fn assert_invariant(rle: &Rle<u8>) {
         sum,
         "total_length cache diverged from actual run length sum"
     );
-    // No zero-length runs should accumulate (they would still be invariant-safe
-    // but indicate a correctness drift).
     assert_eq!(
         rle.remaining_capacity(),
         u32::MAX - rle.len(),
@@ -82,17 +63,10 @@ fn assert_invariant(rle: &Rle<u8>) {
     );
 }
 
-/// Drive every public mutating entry point with crafted boundary-heavy inputs.
-/// Each operation is followed by an invariant check; any panic (from an
-/// `.expect()` inside the container, an arithmetic overflow, or an out-of-bounds
-/// index) aborts the test.
 #[test]
 fn fuzz_rle_mutators_never_panic() {
     let mut lcg = Lcg::new(0x9E37_79B9_7F4A_7C15);
 
-    // Pool of long-lived containers, including ones seeded right at the
-    // `u32::MAX` boundary so that subsequent `extend_with` / `set_range` /
-    // `resize` operations stress the overflow guard from a near-full state.
     let mut pool: Vec<Rle<u8>> = vec![
         Rle::new(),
         Rle::with_value(0, u32::MAX),
@@ -144,7 +118,6 @@ fn fuzz_rle_mutators_never_panic() {
                 rle.resize_with(new_len, value);
             }
             9 => {
-                // Exercise read paths that walk the runs.
                 let mut taken = 0u32;
                 for v in rle.iter() {
                     std::hint::black_box(v);
@@ -160,8 +133,6 @@ fn fuzz_rle_mutators_never_panic() {
                 rle.clear();
             }
             _ => {
-                // Re-seed this slot with a fresh boundary-state container so the
-                // pool keeps cycling through near-overflow starting points.
                 *rle = match lcg.next_u32() % 4 {
                     0 => Rle::new(),
                     1 => Rle::with_value(value, u32::MAX),

@@ -7,9 +7,7 @@
 // `emit_cache_add`, `emit_cache_remove`), and rewritten by the aterm project
 // in 2026 to build aterm-dbus signals.
 
-//! The signals a tree change sends: AT-SPI's `Event.Object` and
-//! `Event.Window` events and the `Cache` object's additions and removals,
-//! each as accesskit_unix sent it.
+//! AT-SPI `Event.Object`, `Event.Window`, and `Cache` signals.
 
 use aterm_dbus::{Message, Value};
 
@@ -20,8 +18,6 @@ const OBJECT: &str = "org.a11y.atspi.Event.Object";
 const WINDOW: &str = "org.a11y.atspi.Event.Window";
 const CACHE: &str = "org.a11y.atspi.Cache";
 
-/// `interface.member` from `path`. Every name here is a constant and every
-/// path the publisher builds is valid, so building one cannot fail.
 fn signal(path: &str, interface: &str, member: &str, body: Vec<Value>) -> Message {
     Message::signal(path, interface, member)
         .expect("constant names and generated paths are valid")

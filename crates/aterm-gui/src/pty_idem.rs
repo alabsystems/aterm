@@ -312,7 +312,7 @@ impl Drop for Claim<'_> {
 /// deliberately: widening it is how a silent duplicate gets in.
 fn refused_before_any_write(reply: &str) -> bool {
     // `ERR busy` (the drive lease, or a sink that accepted zero bytes) and
-    // `ERR denied` (authority) are decided before any byte moves; see the module doc.
+    // `ERR denied` (authority) are decided before any byte moves.
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
 }
 

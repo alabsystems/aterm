@@ -554,7 +554,8 @@ mod tests {
 
     #[allow(unsafe_code, reason = "the test build is its own trusted launcher")]
     fn authority() -> aterm_cap::Authority {
-        // SAFETY: a test process that handles no untrusted input is its own trusted launcher.
+        // SAFETY: a test process that handles no untrusted input is its own
+        // trusted launcher, which is `root_authority`'s whole contract.
         unsafe { aterm_cap::Authority::root_authority() }
     }
 

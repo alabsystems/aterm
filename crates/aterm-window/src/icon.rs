@@ -22,13 +22,11 @@ pub(crate) const PIXEL_SIZE: usize = mem::size_of::<Pixel>();
 #[derive(Debug)]
 /// An error produced when using [`Icon::from_rgba`] with invalid arguments.
 pub enum BadIcon {
-    /// Produced when the length of the `rgba` argument isn't divisible by 4, thus `rgba` can't be
-    /// safely interpreted as 32bpp RGBA pixels.
+    /// Byte count is not divisible by 4.
     ByteCountNotDivisibleBy4 { byte_count: usize },
-    /// Produced when the number of pixels (`rgba.len() / 4`) isn't equal to `width * height`.
-    /// At least one of your arguments is incorrect.
+    /// Pixel count (`rgba.len() / 4`) does not match `width * height`.
     DimensionsVsPixelCount { width: u32, height: u32, width_x_height: usize, pixel_count: usize },
-    /// Produced when underlying OS functionality failed to create the icon
+    /// Underlying OS icon creation failed.
     OsError(io::Error),
 }
 
@@ -91,7 +89,6 @@ mod constructors {
 
     impl NoIcon {
         pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Result<Self, BadIcon> {
-            // Create the rgba icon anyway to validate the input
             let _ = RgbaIcon::from_rgba(rgba, width, height)?;
             Ok(NoIcon)
         }
@@ -112,9 +109,6 @@ impl fmt::Debug for Icon {
 
 impl Icon {
     /// Creates an icon from 32bpp RGBA data.
-    ///
-    /// The length of `rgba` must be divisible by 4, and `width * height` must equal
-    /// `rgba.len() / 4`. Otherwise, this will return a `BadIcon` error.
     pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Result<Self, BadIcon> {
         let _span = tracing::debug_span!("aterm_window::Icon::from_rgba", width, height).entered();
 

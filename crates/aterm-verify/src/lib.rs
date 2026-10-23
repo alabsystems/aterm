@@ -381,7 +381,10 @@ impl Ctx {
             measure_artifact: None,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: pinned_threads,
-            test_recorder: None,
+            // Named now: a stage that rebuilds this binary (the test stage, for aterm-verify's
+            // own tests) leaves Linux's `current_exe` reading `… (deleted)`, which no later
+            // stage can run.
+            test_recorder: std::env::current_exe().ok(),
             timing_lock: None,
             runs: None,
         }

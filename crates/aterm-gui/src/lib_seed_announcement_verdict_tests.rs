@@ -6,15 +6,11 @@ use super::{
     read_pass_stderr, read_seed_markers, seed_retire, seed_retire_event,
 };
 
-/// Run a real child under the marker loop and report what the stream said plus how
-/// the child ended — the two inputs the verdict is built from.
 fn drive(script: &str) -> (SeedMarkers, bool, Vec<Wake>) {
     let (seen, code, posted) = drive_code(script);
     (seen, code == Some(0), posted)
 }
 
-/// [`drive`], reporting the child's exit code rather than pass/fail: the input
-/// [`classify_pass_exit`] keys the contention verdict on.
 fn drive_code(script: &str) -> (SeedMarkers, Option<i32>, Vec<Wake>) {
     let mut child = aterm_uds::spawnfd::command("/bin/sh")
         .arg("-c")
@@ -32,8 +28,6 @@ fn drive_code(script: &str) -> (SeedMarkers, Option<i32>, Vec<Wake>) {
     (seen, code, posted)
 }
 
-/// Announced, exited 0, no terminal marker, a stocked store: the pass finished, and no
-/// failure card is raised.
 #[test]
 fn an_announced_pass_that_exits_zero_is_not_a_failure() {
     let (seen, ok, posted) = drive(
@@ -47,7 +41,6 @@ fn an_announced_pass_that_exits_zero_is_not_a_failure() {
         matches!(posted.as_slice(), [Wake::PkgSeedStarted { .. }]),
         "the stream itself raises only the announcement: {posted:?}"
     );
-    // The store is stocked: this machine's toolchain is fine.
     let verdict = seed_retire(seen, ok, true);
     assert_eq!(
         verdict,
@@ -63,8 +56,6 @@ fn an_announced_pass_that_exits_zero_is_not_a_failure() {
     );
 }
 
-/// A child that dies right after announcing has not answered; its non-zero exit names
-/// the outcome.
 #[test]
 fn a_child_that_dies_after_announcing_still_reports_a_failure() {
     let (seen, ok, _) = drive("echo 'atpkg: net-starting: installing 9 program(s)'; exit 7");
@@ -77,8 +68,6 @@ fn a_child_that_dies_after_announcing_still_reports_a_failure() {
     ));
 }
 
-/// Steady state: a provisioned Mac's `atpkg seed` announces nothing and exits 0, and
-/// nothing goes on screen.
 #[test]
 fn the_quiet_steady_state_raises_nothing() {
     let (seen, ok, posted) =
@@ -99,8 +88,6 @@ fn the_quiet_steady_state_raises_nothing() {
     }
 }
 
-/// The positive terminals (`seed-done:`, `net-installed:`) retire the announcement
-/// themselves, and the verdict adds nothing.
 #[test]
 fn the_positive_terminal_answers_the_announcement() {
     let (seen, ok, posted) = drive(
@@ -133,8 +120,6 @@ fn the_positive_terminal_answers_the_announcement() {
     assert_eq!(seed_retire(seen, ok, true), SeedRetire::Nothing);
 }
 
-/// `managed-current:` / `machine-settings:` are not answers: the announcement stays
-/// open and the exit decides.
 #[test]
 fn an_informational_row_does_not_answer_an_announcement() {
     let (seen, ok, posted) = drive(
@@ -150,9 +135,6 @@ fn an_informational_row_does_not_answer_an_announcement() {
     assert_eq!(seed_retire(seen, ok, true), SeedRetire::Finished);
 }
 
-/// A child that lost the store lock to another process stands aside (`seed-busy:`,
-/// exit 75); [`classify_pass_exit`] reads the code before the marker, so both lanes see
-/// `Busy` and no failure card appears. The line is kept for the lane's log.
 #[test]
 fn a_contended_pass_is_not_a_failed_install() {
     let (seen, code, posted) = drive_code(&format!(
@@ -173,14 +155,11 @@ fn a_contended_pass_is_not_a_failed_install() {
         posted.is_empty(),
         "the line is the lane's to log, not an event: {posted:?}"
     );
-    // The classifier both lanes match on, fed what they feed it; `Busy` raises no card.
     assert_eq!(
         classify_pass_exit(code, seen.saw_start, seen.saw_terminal),
         PassVerdict::Busy,
         "a contended pass is deferred, never a failed install"
     );
-    // …while a markerless refusal with any other code (an unwritable prefix, an atpkg
-    // that cannot exec) still reaches the card.
     let (bare, bare_code, bare_posted) =
         drive_code("echo 'atpkg: the prefix is not writable' >&2; exit 1");
     assert_eq!(bare_code, Some(1));
@@ -195,13 +174,10 @@ fn a_contended_pass_is_not_a_failed_install() {
     );
 }
 
-/// Exit 0, announced, markerless, and an empty store: neither failure nor success, but
-/// its own words.
 #[test]
 fn an_announced_pass_that_installs_nothing_says_so() {
     let (seen, ok, _) = drive("echo 'atpkg: net-starting: installing 2 program(s)'; exit 0");
     assert_eq!(seed_retire(seen, ok, false), SeedRetire::FinishedEmpty);
-    // Silent atpkg: no words to repeat under the title, so none are made up.
     assert!(matches!(
         seed_retire_event(SeedRetire::FinishedEmpty, ""),
         Some(Wake::PkgSeedNothing { detail }) if detail.is_empty()
@@ -210,15 +186,12 @@ fn an_announced_pass_that_installs_nothing_says_so() {
         seed_retire_event(SeedRetire::FinishedEmpty, "  ay: no build for this Mac\n"),
         Some(Wake::PkgSeedNothing { detail }) if detail == "ay: no build for this Mac"
     ));
-    // A pass that ended well says nothing past its title ("ALab tools checked").
     assert!(matches!(
         seed_retire_event(SeedRetire::Finished, ""),
         Some(Wake::PkgSeedDone { detail }) if detail.is_empty()
     ));
 }
 
-/// The reader stays attached to EOF whatever bytes arrive: a non-UTF-8 line must not end
-/// the read (losing later markers) or drop the pipe under a running child.
 #[test]
 fn a_non_utf8_stdout_line_does_not_end_the_marker_reader() {
     let (seen, code, posted) = drive_code(
@@ -245,9 +218,6 @@ fn a_non_utf8_stdout_line_does_not_end_the_marker_reader() {
     );
 }
 
-/// The stderr twin: a raw byte on stderr must not discard the stream. `read_to_string`
-/// leaves its buffer empty on `InvalidData`, so a refusal printed in full would read as
-/// silence.
 #[test]
 fn a_non_utf8_stderr_byte_does_not_drop_the_refusal() {
     let mut child = aterm_uds::spawnfd::command("/bin/sh")

@@ -1827,6 +1827,9 @@ fn cold_exec_hand_over() -> Option<crate::lifeline::InheritedAcrossExec> {
     crate::lifeline::inherit_across_exec()
 }
 
+/// # Safety
+/// Only in a forked child, before its `exec`: it makes only async-signal-safe
+/// calls (`setpgid`, `fcntl`, `InheritStrip::apply`) over plain integers.
 #[cfg(unix)]
 unsafe fn fork_lane_child_holds(
     strip: aterm_uds::spawnfd::InheritStrip,
@@ -1962,7 +1965,8 @@ fn run_handoff_worker(
     child_inherit.push(commit_rd.as_raw_fd());
     let handed = child_inherit.clone();
     let strip = aterm_uds::spawnfd::InheritStrip::prepare();
-    // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`) on captured integers.
+    // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`,
+    // `InheritStrip::apply`) on captured integers.
     unsafe {
         job.command
             .pre_exec(move || fork_lane_child_holds(strip, &child_inherit));

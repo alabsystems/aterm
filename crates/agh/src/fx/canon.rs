@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The canonical bytes of a GitHub round trip on a tape (design §21.2): what was asked, never
-//! the credential; what came back, a large body by its digest.
+//! Canonical tape encoding and decoding for GitHub HTTP requests, responses, and wire failures.
 
 use std::io::Cursor;
 
@@ -14,8 +13,7 @@ use crate::wire::{
     door,
 };
 
-/// The answer headers kept in every mode, lowercase and sorted. A header not here never
-/// reaches agh's code, so a live run cannot depend on one its tape would drop.
+/// Lowercase sorted response headers retained across live, record, and replay modes.
 pub const KEPT_HEADERS: [&str; 15] = [
     "content-type",
     "etag",
@@ -66,8 +64,7 @@ pub fn kept(name: &str) -> bool {
     KEPT_HEADERS.iter().any(|k| k.eq_ignore_ascii_case(name))
 }
 
-/// `headers` cut to the kept names, lowercased, in received order, with no value rewritten:
-/// `keep` without its `location` rule, for `Fx::gh_stream`, which is handed no `Endpoints`.
+/// Filters `headers` to [`KEPT_HEADERS`] in received order with lowercased names and unmodified values.
 pub(super) fn cut(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
@@ -76,10 +73,7 @@ pub(super) fn cut(headers: Vec<(String, String)>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `headers` cut to the kept names, lowercased, in received order. A `location` value whose
-/// origin is one of `endpoints.asset_hosts()` has its query rewritten to `signed=redacted`, as
-/// the request side writes a CDN query (a signed URL is a bearer secret with an expiry).
-/// Replay is unaffected: `public().probe` reads only the status, and a hop is never taped.
+/// Filters `headers` to [`KEPT_HEADERS`] with lowercased names, redacting queries on `location` URLs targeting `endpoints.asset_hosts()`.
 #[must_use]
 pub fn keep(endpoints: &Endpoints, headers: Vec<(String, String)>) -> Vec<(String, String)> {
     cut(headers)
@@ -94,8 +88,7 @@ pub fn keep(endpoints: &Endpoints, headers: Vec<(String, String)>) -> Vec<(Strin
         .collect()
 }
 
-/// `url` with its query written `signed=redacted`, when its origin is an asset host and it has
-/// a query.
+/// Replaces `url`'s query with `signed=redacted` when its origin is an asset host.
 fn signed_redacted(endpoints: &Endpoints, url: &str) -> Option<String> {
     let (origin, path_and_query) = Origin::parse(url)?;
     if !endpoints.asset_hosts().contains(&origin) {
@@ -115,8 +108,7 @@ const fn role_word(role: OriginRole) -> &'static str {
     }
 }
 
-/// `query`'s `name=value` pairs, sorted by name and then by value (bytes, never decoded), and
-/// joined by `&` again. A pair with no `=` sorts before the same name with one.
+/// Sorts `query`'s `&`-separated parameters by raw name and value bytes.
 fn sorted_query(query: &str) -> String {
     let mut pairs: Vec<(&str, Option<&str>, &str)> = query
         .split('&')
@@ -141,15 +133,7 @@ fn sorted_query(query: &str) -> String {
 const ANONYMOUS_READS: &str =
     "run it without --record or --replay: M1's tapes hold anonymous reads alone";
 
-/// The request's canonical bytes, its lines joined by `\n`, with no final newline:
-/// 1. `{METHOD} {path}`, then, when there is a query, `?` and its `name=value` pairs sorted by
-///    name, then by value (the bytes as sent, never decoded). An `AssetCdn` origin's query is
-///    written `signed=redacted`, because it is a bearer secret with an expiry;
-/// 2. `origin api`, `origin uploads`, `origin web` or `origin cdn` (`Endpoints::role_of`);
-/// 3. one `{name} {value}` line per request header, the name lowercased, sorted by name and
-///    then value, with `user-agent` left out (it names the build and the caller);
-/// 4. `as anonymous` (M2 writes `as {profile}`; never a token, a fingerprint or the header);
-/// 5. `body none`.
+/// Encodes `req` into canonical tape request bytes (method, path and sorted or redacted query, origin role, sorted headers excluding `user-agent`, `as anonymous`, and `body none`).
 ///
 /// # Errors
 ///
@@ -223,10 +207,7 @@ pub fn request(req: &WireRequest<'_>, endpoints: &Endpoints) -> Result<Vec<u8>> 
     Ok(text.into_bytes())
 }
 
-/// A whole answer's canonical bytes: `status {code}`; one `{name} {value}` line per header
-/// (already `keep`'s), in order; an empty line; then the body, exactly. A body over
-/// `BODY_TAPE_MAX` is written as the line `body-digest sha256:{hex} {size}` before the empty
-/// line, with nothing after it.
+/// Encodes `status`, `headers`, and `body` into canonical tape reply bytes, replacing bodies over [`BODY_TAPE_MAX`] with a `body-digest` header.
 #[must_use]
 pub fn reply(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
     let mut text = format!("status {status}\n");
@@ -260,8 +241,7 @@ const fn phase_word(phase: Phase) -> &'static str {
     }
 }
 
-/// A failed exchange's canonical bytes: one line, `failed {not_sent|sent|answered} {kind slug}
-/// {detail}`, the detail through `Redactor::shapes`.
+/// Encodes `error` as a `failed {phase} {kind} {detail}` line with shape-redacted detail.
 #[must_use]
 pub fn failure(error: &WireError) -> Vec<u8> {
     format!(
@@ -338,8 +318,6 @@ pub fn decode(bytes: &[u8]) -> Result<std::result::Result<Reply, WireError>> {
     let status = lines
         .next()
         .and_then(|line| line.strip_prefix(b"status "))
-        // ASCII digits alone, with no leading zero, as `reply` writes them: `u16::from_str`
-        // would also read `+200` and `0200`.
         .filter(|code| {
             !code.is_empty()
                 && code.iter().all(u8::is_ascii_digit)

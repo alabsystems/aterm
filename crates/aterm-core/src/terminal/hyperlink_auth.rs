@@ -2,33 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The host's OSC 8 hyperlink decision: which URI schemes the grid may carry.
-//!
-//! OSC 8 acceptance depends on the URI alone (in [`super::handler_osc`]: the
-//! byte cap, control-character and BiDi-override scans, and the scheme
-//! allowlist); this module holds the extra schemes a host minted through
-//! [`HyperlinkAuth::authorize_scheme`]. There is no on/off switch for OSC 8.
-//! Tagging a cell is not following a link: at click time `aterm-gui`'s
-//! `is_safe_url` re-checks the scheme before `open_url_external`, and
-//! `aterm_gui::link_target`'s caption discloses the destination.
+//! Host-authorized extra URI schemes for OSC 8 hyperlinks.
 
-/// Hard cap on host-minted extra schemes; a host mints one or two app schemes
-/// (`orca`). Abstract twin: `Cap` in `aterm_models_misc::hyperlink_scheme_cap_model`.
+/// Maximum number of host-authorized extra URI schemes.
 pub(crate) const MAX_EXTRA_SCHEMES: usize = 4;
 
-/// Hard cap on one extra scheme's length. Real schemes are short; this bounds
-/// the per-URI `eq_ignore_ascii_case` comparisons in the OSC-8 hot path.
+/// Maximum byte length of a single extra URI scheme.
 pub(crate) const MAX_EXTRA_SCHEME_LEN: usize = 32;
 
-/// Schemes refused even when the host asks: execution/exfiltration primitives.
-/// Matching is case-insensitive and also refuses `+`/`-`/`.`-suffixed spellings
-/// (`javascript.`), which some URL parsers normalize away.
 const NEVER_ALLOW_SCHEMES: &[&str] = &["javascript", "data", "file", "vbscript", "about", "blob"];
 
-/// Whether `scheme` (without the trailing `:`) has the RFC 3986 §3.1 shape
-/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`. Shared by the OSC 8 URI parse
-/// and [`HyperlinkAuth::authorize_scheme`] so a minted scheme is always
-/// reachable by the gate and vice versa.
+/// Returns whether `scheme` matches RFC 3986 §3.1 `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
 #[must_use]
 #[inline]
 pub(crate) fn is_rfc3986_scheme_shape(scheme: &str) -> bool {
@@ -50,17 +34,9 @@ fn is_never_allowed(lowered: &str) -> bool {
     NEVER_ALLOW_SCHEMES.contains(&trimmed)
 }
 
-/// The host-minted extra-scheme set for OSC 8 URIs.
-///
-/// Forwarded to [`super::TerminalHandler`] so the OSC 8 handler can read it;
-/// [`authorize_scheme`][Self::authorize_scheme] /
-/// [`revoke_scheme`][Self::revoke_scheme] are reachable only through the
-/// host-facing `Terminal` API.
+/// Host-authorized extra URI scheme set for OSC 8 hyperlinks.
 #[derive(Debug)]
 pub(crate) struct HyperlinkAuth {
-    /// Extra schemes accepted beyond the built-in safe allowlist, stored
-    /// ASCII-lowercased and bounded by [`MAX_EXTRA_SCHEMES`]. Abstract twin:
-    /// `hyperlink_scheme_cap_model` (aterm-spec).
     extra_schemes: Vec<Box<str>>,
 }
 
@@ -72,8 +48,7 @@ impl Default for HyperlinkAuth {
 }
 
 impl HyperlinkAuth {
-    /// Construct the empty scheme set: OSC 8 URIs are admitted on the
-    /// built-in safe allowlist alone until a host mints an extra scheme.
+    /// Creates an empty extra-scheme set.
     #[inline]
     #[must_use]
     pub(crate) const fn new() -> Self {
@@ -82,11 +57,7 @@ impl HyperlinkAuth {
         }
     }
 
-    /// Mint `scheme` into the extra allowlist. Returns `false`, state
-    /// unchanged, when the scheme is over-long, not RFC 3986 scheme-shaped, in
-    /// the never-allow set, or the set is full; `true` when stored (re-minting
-    /// a live scheme is `true` and takes no slot). Stored lowercased; matching
-    /// is case-insensitive.
+    /// Authorizes `scheme` (lowercased), returning `false` if invalid, forbidden, or full.
     pub(crate) fn authorize_scheme(&mut self, scheme: &str) -> bool {
         if scheme.len() > MAX_EXTRA_SCHEME_LEN || !is_rfc3986_scheme_shape(scheme) {
             return false;
@@ -105,16 +76,14 @@ impl HyperlinkAuth {
         true
     }
 
-    /// Remove `scheme` from the extra allowlist (case-insensitive), restoring
-    /// the default posture for it. Removing an absent scheme is a no-op.
+    /// Removes `scheme` from the extra allowlist (case-insensitive).
     #[inline]
     pub(crate) fn revoke_scheme(&mut self, scheme: &str) {
         self.extra_schemes
             .retain(|s| !s.eq_ignore_ascii_case(scheme));
     }
 
-    /// The live host-minted extra schemes (lowercased), for the OSC-8 gate and
-    /// host introspection.
+    /// Returns the active host-authorized extra schemes (lowercased).
     #[inline]
     #[must_use]
     pub(crate) fn extra_schemes(&self) -> &[Box<str>] {
@@ -126,15 +95,12 @@ impl HyperlinkAuth {
 mod tests {
     use super::*;
 
-    // ---- host-minted extra schemes ----------------------
-
     #[test]
     fn authorize_scheme_stores_lowercased_and_is_idempotent() {
         let mut auth = HyperlinkAuth::new();
         assert!(auth.authorize_scheme("Orca"));
         assert_eq!(auth.extra_schemes().len(), 1);
         assert_eq!(&*auth.extra_schemes()[0], "orca");
-        // Re-minting (any case) succeeds without consuming a slot.
         assert!(auth.authorize_scheme("ORCA"));
         assert_eq!(auth.extra_schemes().len(), 1);
     }
@@ -150,7 +116,6 @@ mod tests {
             "slot {MAX_EXTRA_SCHEMES}+1 must be refused"
         );
         assert_eq!(auth.extra_schemes().len(), MAX_EXTRA_SCHEMES);
-        // A refused mint changes nothing; revoking frees the slot again.
         auth.revoke_scheme("a1");
         assert!(auth.authorize_scheme("e5"));
     }
@@ -173,7 +138,6 @@ mod tests {
             assert!(!auth.authorize_scheme(s), "never-allow must refuse {s:?}");
         }
         assert!(auth.extra_schemes().is_empty());
-        // A genuinely different scheme sharing the prefix is not blocked.
         assert!(auth.authorize_scheme("javascriptx"));
     }
 
@@ -188,7 +152,6 @@ mod tests {
         }
         assert!(!auth.authorize_scheme(&"a".repeat(MAX_EXTRA_SCHEME_LEN + 1)));
         assert!(auth.extra_schemes().is_empty());
-        // `+`/`-`/`.` are legal NON-LEADING scheme chars (RFC 3986).
         assert!(auth.authorize_scheme("web+orca"));
     }
 

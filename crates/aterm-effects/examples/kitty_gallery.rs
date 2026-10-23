@@ -1,29 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `kitty_gallery`: cat-art v4 contact sheets (design §6).
-//!
-//! Bakes every roster glyph through the real v4 bake path
-//! ([`aterm_effects::cat_baker::bake_variant_with`], as `CatBaker::get_v4` does) into
-//! labelled montages for visual QA, each on a light and a dark ground:
-//!
-//!   * `heads_{light,dark}.png` — all 25 [`HEADS`] at the reference art height.
-//!   * `heads_small_{light,dark}.png` — the same 25 at 16 px and 26 px art height
-//!     side by side (the terminal-legibility check).
-//!   * `specials_accessories_{light,dark}.png` — the 8 authored specials, then
-//!     each of the 3 overlay accessories bare and seated on a plain head.
-//!   * `coats_{light,dark}.png` — one recolorable silhouette (S100) across the
-//!     16-stop `COAT_RAMP`, then the reachable `EYE_RAMP` iris stops.
-//!   * `context_{light,dark}.png` — the hero head + cursor companion across all
-//!     12 local-text hue families and the neutral context key.
-//!
-//! Widths come from the asset viewbox aspect (the const drawlists are normalized
-//! to a unit square), so a wide stretch-cat is not squished to a head's box.
-//!
-//! ```text
-//! targo --unverified run -q -p aterm-effects --example kitty_gallery -- [out_dir]
-//! (default out_dir: target/kitty_gallery)
-//! ```
+//! Cat-art v4 contact-sheet generator for visual QA across light and dark grounds.
 
 use std::path::Path;
 
@@ -33,18 +11,11 @@ use aterm_effects::cat_baker::{
 use aterm_effects::cat_glyphs_gen::{CatGlyphId, GLYPHS, HEADS};
 use aterm_scene::Tile;
 
-// ─────────────────────────── grounds & ink ───────────────────────────
-
-/// Tokyo-Night-ish dark ground.
 const DARK_BG: [u8; 3] = [0x1A, 0x1B, 0x26];
-/// Warm paper light ground (the light theme bg).
 const LIGHT_BG: [u8; 3] = [0xFA, 0xFA, 0xF4];
-/// Pale ink on the dark ground.
 const DARK_FG: [u8; 3] = [0xC0, 0xCA, 0xF5];
-/// Near-black ink on the light ground.
 const LIGHT_FG: [u8; 3] = [0x24, 0x29, 0x2F];
 
-/// The eight authored whole-cat specials, in roster order.
 const SPECIALS: [CatGlyphId; 8] = [
     CatGlyphId::SpecFluffy,
     CatGlyphId::SpecManeki,
@@ -56,7 +27,6 @@ const SPECIALS: [CatGlyphId; 8] = [
     CatGlyphId::SpecYarn,
 ];
 
-/// The three overlay accessories.
 const ACCESSORIES: [CatGlyphId; 3] = [
     CatGlyphId::AccBow,
     CatGlyphId::AccCrown,
@@ -82,9 +52,6 @@ fn main() {
     );
 }
 
-// ─────────────────────────── pages ───────────────────────────
-
-/// All 25 heads at the reference art height, 5 across.
 fn page_heads(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     const H: u32 = 120;
     let items: Vec<Cell> = HEADS
@@ -104,7 +71,6 @@ fn page_heads(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     .save(&format!("{dir}/heads_{tag}.png"));
 }
 
-/// The legibility check: every head at 16 px and 26 px art height, paired.
 fn page_heads_small(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     let items: Vec<Cell> = HEADS
         .iter()
@@ -121,7 +87,6 @@ fn page_heads_small(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) 
         .save(&format!("{dir}/heads_small_{tag}.png"));
 }
 
-/// The 8 specials, then each accessory bare and seated on a plain head.
 fn page_specials_accessories(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     const H: u32 = 120;
     let mut items: Vec<Cell> = SPECIALS
@@ -136,7 +101,6 @@ fn page_specials_accessories(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dar
             tile: bake(acc, None, 8, 4, dark, H),
             label: short(acc),
         });
-        // Seated on a plain head (S100), as the emit path overlays it.
         items.push(Cell {
             tile: bake(CatGlyphId::S100, Some(acc), 8, 4, dark, H),
             label: format!("{}+S100", short(acc)),
@@ -152,7 +116,6 @@ fn page_specials_accessories(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dar
     .save(&format!("{dir}/specials_accessories_{tag}.png"));
 }
 
-/// One recolorable silhouette (S100) across the coat ramp, then the iris ramp.
 fn page_coats(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     const H: u32 = 96;
     let head = CatGlyphId::S100;
@@ -162,7 +125,6 @@ fn page_coats(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
             label: format!("COAT {c:02}"),
         })
         .collect();
-    // The genome iris field is 3 bits → the first 8 EYE_RAMP stops are reachable.
     for i in 0..8u8 {
         items.push(Cell {
             tile: bake(head, None, 8, i, dark, H),
@@ -180,8 +142,6 @@ fn page_coats(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     .save(&format!("{dir}/coats_{tag}.png"));
 }
 
-/// Hero art across every bounded local-text hue family plus neutral: the visual
-/// counterpart to the `CatColorKey` contrast/quantization tests.
 fn page_context(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     const H: u32 = 64;
     let items: Vec<Cell> = (0..=12u8)
@@ -212,10 +172,6 @@ fn page_context(dir: &str, tag: &str, bg: [u8; 3], fg: [u8; 3], dark: bool) {
     .save(&format!("{dir}/context_{tag}.png"));
 }
 
-// ─────────────────────────── bake helpers ───────────────────────────
-
-/// Bake one glyph through the real v4 path at art height `h`, its width taken
-/// from the asset viewbox aspect (unit-square drawlist → true proportions).
 fn bake(id: CatGlyphId, acc: Option<CatGlyphId>, coat: u8, iris: u8, dark: bool, h: u32) -> Tile {
     let aspect = viewbox_aspect(GLYPHS[id as usize].id);
     let w = ((h as f32) * aspect).round().max(1.0) as u32;
@@ -230,7 +186,6 @@ fn bake_context(id: CatGlyphId, coat: u8, iris: u8, colors: CatColorKey, h: u32)
     bake_variant_with(id, None, &fills, w, h, EyesFrame::Open)
 }
 
-/// The `[w, h]` aspect (w/h) of a glyph's authored asset viewbox; `1.0` if absent.
 fn viewbox_aspect(id: &str) -> f32 {
     let path = format!("{}/art/glyphs/{id}.toml", env!("CARGO_MANIFEST_DIR"));
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -256,12 +211,9 @@ fn viewbox_aspect(id: &str) -> f32 {
     }
 }
 
-/// The debug name of a glyph id (e.g. `S100`, `SpecWitch`, `AccBow`) — the label.
 fn short(id: CatGlyphId) -> String {
     format!("{id:?}")
 }
-
-// ─────────────────────────── canvas ───────────────────────────
 
 struct Canvas {
     w: usize,
@@ -269,7 +221,6 @@ struct Canvas {
     rgb: Vec<u8>,
 }
 
-/// One montage cell: a baked tile and its caption.
 struct Cell {
     tile: Tile,
     label: String,
@@ -291,8 +242,6 @@ impl Canvas {
         }
     }
 
-    /// Composite a baked tile's ART region (excluding the `PATCH_STRIP`
-    /// catch-light column) straight-alpha over the canvas at `(x, y)`.
     fn blit(&mut self, tile: &Tile, x0: usize, y0: usize) {
         let art_w = tile.width().saturating_sub(u32::from(PATCH_STRIP)) as usize;
         let th = tile.height() as usize;
@@ -319,7 +268,6 @@ impl Canvas {
         }
     }
 
-    /// Draw a string with the built-in 5×7 font at integer `scale`.
     fn text(&mut self, x0: usize, y0: usize, s: &str, scale: usize, c: [u8; 3]) {
         let mut cx = x0;
         for ch in s.chars() {
@@ -344,8 +292,6 @@ impl Canvas {
     }
 }
 
-/// Lay `items` out in a `cols`-wide grid under a title, each cell sized to the
-/// widest tile, captioned beneath.
 fn sheet(title: &str, items: &[Cell], cols: usize, bg: [u8; 3], fg: [u8; 3]) -> Canvas {
     const MARGIN: usize = 10;
     const LABEL_H: usize = 12;
@@ -384,8 +330,6 @@ fn sheet(title: &str, items: &[Cell], cols: usize, bg: [u8; 3], fg: [u8; 3]) -> 
     cv
 }
 
-/// Composite several tiles horizontally (baseline-bottom aligned) onto a fresh
-/// opaque tile over `bg`, returning it as a single tile for a montage cell.
 fn hstack(tiles: &[&Tile], bg: [u8; 3], _dark: bool) -> Tile {
     const GAP: u32 = 6;
     let art_ws: Vec<u32> = tiles
@@ -395,7 +339,6 @@ fn hstack(tiles: &[&Tile], bg: [u8; 3], _dark: bool) -> Tile {
     let total_w: u32 = art_ws.iter().sum::<u32>() + GAP * (tiles.len() as u32).saturating_sub(1);
     let max_h = tiles.iter().map(|t| t.height()).max().unwrap_or(1);
     let mut out = Tile::new(total_w + u32::from(PATCH_STRIP), max_h);
-    // Opaque bg, so the paired glyphs share a ground inside the cell.
     {
         let px = out.pixels_mut();
         for p in px.as_chunks_mut::<4>().0 {
@@ -411,7 +354,6 @@ fn hstack(tiles: &[&Tile], bg: [u8; 3], _dark: bool) -> Tile {
     out
 }
 
-/// Straight-alpha composite tile `src`'s art region onto opaque tile `dst`.
 fn blit_tile_onto(dst: &mut Tile, src: &Tile, x0: u32, y0: u32) {
     let art_w = src.width().saturating_sub(u32::from(PATCH_STRIP));
     let (sw, sh) = (src.width(), src.height());
@@ -440,8 +382,6 @@ fn blit_tile_onto(dst: &mut Tile, src: &Tile, x0: u32, y0: u32) {
     }
 }
 
-// ─────────────────────────── PNG + font ───────────────────────────
-
 fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
     let mut enc = aterm_png::Encoder::new(std::io::BufWriter::new(file), w, h);
@@ -452,8 +392,6 @@ fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
         .map_err(std::io::Error::other)
 }
 
-/// A compact 5×7 bitmap font (uppercase, digits, a few punctuation) for cell
-/// captions — self-contained so the gallery needs no font asset.
 fn font5x7(c: char) -> [&'static str; 7] {
     match c.to_ascii_uppercase() {
         'A' => [

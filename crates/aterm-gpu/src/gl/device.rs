@@ -50,9 +50,8 @@ pub(crate) struct GlShared {
     /// for the context's life.
     #[cfg(target_arch = "wasm32")]
     _canvas: aterm_wasm_abi::js::JsObject,
-    /// Latched when the device is lost (the module header's "Loss"); the
-    /// device is then dead, and `GpuRenderer::device_lost` reports it to the
-    /// frontend's CPU fallback.
+    /// Latched when the device is lost; the device is then dead, and
+    /// `GpuRenderer::device_lost` reports it to the frontend's CPU fallback.
     lost: AtomicBool,
     /// The first latched loss's cause, for the frontend's downgrade line.
     #[cfg(not(target_arch = "wasm32"))]
@@ -75,6 +74,10 @@ pub(crate) struct GlShared {
     pub(crate) gl: GlFns,
     pub(crate) caps: GlCaps,
     lock: Mutex<()>,
+    /// The texture and framebuffer names of textures a resize replaced
+    /// ([`super::resources::GlTexture::retire`]), deleted once the frame is
+    /// out ([`GlDevice::free_retired`]).
+    pub(crate) retired: Mutex<Vec<[ffi::GLuint; 2]>>,
 }
 
 /// The native display a windowed device was opened on, as raw handles carry it (addresses, so the type stays `Send`).
@@ -150,7 +153,7 @@ impl std::fmt::Debug for GlDevice {
     }
 }
 
-/// The context made current on this thread; released on drop (see the module header).
+/// The context made current on this thread; released on drop.
 pub(crate) struct Current<'a> {
     shared: &'a GlShared,
     /// `None` for a nested guard, which releases nothing.
@@ -396,7 +399,8 @@ impl GlShared {
         self.reset_status.is_some()
     }
 
-    /// Make the context current on this thread (see the module header).
+    /// Make the context current on this thread under the device's lock; on a thread that already
+    /// holds it, return a nested guard that releases nothing.
     pub(crate) fn enter(&self) -> Result<Current<'_>, String> {
         // First, so a nested guard refuses too: a present holds one guard
         // throughout, and a loss latched in it ends the present at its next
@@ -726,6 +730,7 @@ impl GlDevice {
             gl,
             caps,
             lock: Mutex::new(()),
+            retired: Mutex::new(Vec::new()),
         };
         let dev = GlDevice(Arc::new(shared));
         dev.init_state()?;
@@ -938,6 +943,7 @@ impl GlDevice {
             gl,
             caps,
             lock: Mutex::new(()),
+            retired: Mutex::new(Vec::new()),
         };
         let dev = GlDevice(Arc::new(shared));
         dev.init_state()?;
@@ -1012,7 +1018,7 @@ fn reset_query(version: &str, has: impl Fn(&str) -> bool) -> Option<&'static CSt
 
 #[cfg(target_arch = "wasm32")]
 impl GlDevice {
-    /// A device on `canvas`'s WebGL2 context (see the module header).
+    /// A device on `canvas`'s WebGL2 context.
     pub(crate) fn on_canvas(canvas: aterm_wasm_abi::js::JsObject) -> Result<Self, String> {
         if !HELD.with(Cell::get).is_null() {
             return Err(
@@ -1039,6 +1045,7 @@ impl GlDevice {
             gl,
             caps,
             lock: Mutex::new(()),
+            retired: Mutex::new(Vec::new()),
         };
         let dev = GlDevice(Arc::new(shared));
         dev.init_state()?;

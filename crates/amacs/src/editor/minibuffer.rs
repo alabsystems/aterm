@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The minibuffer: the typed modal queries (M-x, isearch, switch-to-buffer,
-//! goto-line, and a command's own prompts) that take input in place of the
-//! document, and how each is typed into, navigated and accepted.
+//! Modal minibuffer queries (`M-x`, `isearch`, `switch-to-buffer`, `goto-line`, and prompts).
 
 use super::command::{EditorCommand, EditorCompletionAction, Invocation, command_completions};
 use super::projection::byte_of_line;
@@ -11,9 +9,6 @@ use super::view::{EditorBufferView, Selection, previous_boundary};
 use super::workspace::{EditorEffect, EditorError, EditorWorkspace, snapshot_for_view};
 use crate::store::DocumentStore;
 
-/// A minibuffer is UI state, not an unbounded document.  This cap bounds paste,
-/// IME commit, command lookup, and incremental-search work per interaction while
-/// still leaving ample room for canonical file URIs and editor command names.
 const MINIBUFFER_QUERY_LIMIT: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -35,11 +30,7 @@ pub enum Minibuffer {
         query: String,
         origin: usize,
     },
-    /// A command's prompt ([`super::EditorCommand::prompts`]): `query` is the
-    /// answer being typed, and `invocation` the command with the answers it
-    /// has so far. Enter adds `query` to them and runs the command once the
-    /// last is in. A prompt only ever collects text: the document is left
-    /// alone until the command runs.
+    /// Active prompt for a command's typed arguments ([`super::EditorCommand::prompts`]).
     Prompt {
         invocation: Invocation,
         query: String,
@@ -47,8 +38,7 @@ pub enum Minibuffer {
 }
 
 impl Minibuffer {
-    /// The label of a command prompt's line (`Kill buffer (default this
-    /// buffer): `), or `None` for the other kinds, which a face labels itself.
+    /// Returns the prompt label for a command prompt, or `None` for other minibuffer modes.
     pub fn prompt_label(&self) -> Option<&'static str> {
         match self {
             Self::Prompt { invocation, .. } => {
@@ -60,8 +50,7 @@ impl Minibuffer {
 }
 
 impl EditorWorkspace {
-    /// Route one committed text span exclusively into the active minibuffer.
-    /// Pasted/IME text is bounded and truncated only at UTF-8 boundaries.
+    /// Routes committed text into the active minibuffer, bounded at UTF-8 char boundaries.
     pub fn insert_minibuffer_text(
         &mut self,
         store: &DocumentStore,
@@ -104,8 +93,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// Delete the previous complete grapheme from a modal query. This never
-    /// enters the canonical document transaction lane.
+    /// Deletes the previous complete grapheme from the active minibuffer query.
     pub fn minibuffer_backspace(
         &mut self,
         store: &DocumentStore,
@@ -134,10 +122,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// Accept the active minibuffer. M-x resolves only the selected member of
-    /// the current bounded typed completion projection; a query with no match
-    /// remains editable and cannot mutate the document. Buffer resolution is a
-    /// host effect because tabs/windows own that authority.
+    /// Accepts and executes the active minibuffer query.
     pub fn submit_minibuffer(
         &mut self,
         store: &mut DocumentStore,
@@ -157,8 +142,6 @@ impl EditorWorkspace {
                 };
                 self.execute(store, view, command)
             }
-            // Recheck the selected match against current bytes before accepting
-            // it; another view may have changed them since the last search.
             Minibuffer::Search { query, origin } => {
                 let status = if query.is_empty() {
                     "Search cancelled"
@@ -169,13 +152,10 @@ impl EditorWorkspace {
                 };
                 Ok(vec![EditorEffect::Status(status.to_string())])
             }
-            // A macro being defined keeps each answer with the command its
-            // key recorded, as for a command prompt below.
             Minibuffer::Buffer { query } => {
                 self.record_answers(EditorCommand::SwitchBuffer, std::slice::from_ref(&query));
                 Ok(vec![EditorEffect::SwitchBuffer { query }])
             }
-            // An invalid line number keeps the minibuffer open to be fixed.
             Minibuffer::GotoLine { query, origin } => match self.goto_line(store, view, &query)? {
                 Ok(effects) => {
                     self.record_answers(EditorCommand::GotoLine, std::slice::from_ref(&query));
@@ -186,8 +166,6 @@ impl EditorWorkspace {
                     Ok(vec![EditorEffect::Status(refusal)])
                 }
             },
-            // The answer joins the command's; the next prompt asks for the
-            // next one, and the last runs the command.
             Minibuffer::Prompt {
                 mut invocation,
                 query,
@@ -206,9 +184,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// `goto-line` to the line `query` names, from 1: past the end the caret
-    /// lands on the last line. A query that names no line is refused with
-    /// the reason, and nothing moves.
+    /// Moves the caret to the 1-based line named by `query`, clamping past the last line.
     pub(super) fn goto_line(
         &mut self,
         store: &DocumentStore,
@@ -238,9 +214,7 @@ impl EditorWorkspace {
         })]))
     }
 
-    /// Navigate, complete, or activate the one semantic M-x result list. This
-    /// same reducer is driven by arrows/Tab, pointer buttons, accessibility,
-    /// and control-socket actions.
+    /// Navigates, completes, or activates the `M-x` command completion list.
     pub fn command_completion_action(
         &mut self,
         store: &mut DocumentStore,
@@ -252,8 +226,6 @@ impl EditorWorkspace {
             _ => return Ok(vec![EditorEffect::Bell]),
         };
         let candidates = command_completions(&query);
-        // The guard is on the local count, so the wrap's `%` and `count - 1`
-        // below are provably panic-free (Trust does not see through `is_empty`).
         let count = candidates.len();
         if count == 0 {
             return Ok(vec![EditorEffect::Status(format!(
@@ -299,9 +271,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// Consume a non-text editing gesture while a minibuffer owns input. The
-    /// query is intentionally append/backspace based for this milestone; the
-    /// important contract is that navigation/delete/undo never leaks into bytes.
+    /// Blocks non-text document editing gestures while a minibuffer owns input.
     pub fn minibuffer_blocks_document_input(
         &self,
         view: &EditorBufferView,
@@ -314,8 +284,6 @@ impl EditorWorkspace {
     }
 }
 
-/// Append as much as fits while preserving UTF-8 addressability. Returns true
-/// only when the complete input was accepted.
 fn push_bounded(target: &mut String, input: &str, limit: usize) -> bool {
     let remaining = limit.saturating_sub(target.len());
     if input.len() <= remaining {
@@ -454,7 +422,6 @@ mod tests {
             view.primary_selection(),
             &Selection::caret(byte_of_line(&store.snapshot(document).unwrap().text, 1))
         );
-        // Past the end the caret lands on the last line.
         workspace
             .execute(&mut store, &mut view, EditorCommand::GotoLine)
             .unwrap();
@@ -500,9 +467,6 @@ mod tests {
         assert!(matches!(view.minibuffer, Minibuffer::Inactive));
     }
 
-    /// A modal return point belongs to the shared document, like its selection.
-    /// Edits from another view move it before Cancel restores it, including an
-    /// insertion at the origin and replacement that removes it altogether.
     #[test]
     fn external_edits_rebase_search_and_goto_line_cancel_origins() {
         use crate::store::DocumentViewId;

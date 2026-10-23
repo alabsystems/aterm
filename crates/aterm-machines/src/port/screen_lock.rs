@@ -21,7 +21,8 @@ unsafe extern "C" {
 /// # Errors
 /// One line: the framework or the symbol is missing, or `SACLockScreenImmediate` answered nonzero.
 pub(super) fn lock_screen_immediate() -> Result<(), String> {
-    // SAFETY: A NUL-terminated path and a valid mode.
+    // SAFETY: A NUL-terminated path and a valid mode. The handle is never closed: the
+    // framework stays loaded for the rest of this short-lived process.
     let handle = unsafe { dlopen(LOGIN_FRAMEWORK.as_ptr(), RTLD_LAZY | RTLD_LOCAL) };
     if handle.is_null() {
         return Err(format!(
@@ -40,7 +41,8 @@ pub(super) fn lock_screen_immediate() -> Result<(), String> {
             last_error()
         ));
     }
-    // SAFETY: The address of `SACLockScreenImmediate`.
+    // SAFETY: The address of `SACLockScreenImmediate`, which takes no argument and returns
+    // an `int` (ScreensharingAgent's use; on 27 it answered 0 and 22, measured).
     let lock =
         unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> c_int>(symbol) };
     // SAFETY: The C call above; it only sends loginwindow a request.

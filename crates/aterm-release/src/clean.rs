@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one clean-tree judge of a release: the paths of a checkout whose working tree
-//! differs from its `HEAD`, as a compiler reads them. `ship release` judges its clone with
-//! it, the cut its tree and its operator's checkout, so no step calls a tree clean that
-//! another calls dirty.
-//!
-//! What counts:
-//! - tracked changes, staged or not (`git diff HEAD`, renames off so a moved file is
-//!   listed at both ends, submodules never ignored whatever the config says);
-//! - untracked files the tree's own `.gitignore` files do not ignore — never
-//!   `.git/info/exclude` or `core.excludesFile`, which are one checkout's config — and an
-//!   untracked `.gitignore` those rules ignore, since it hides what it names;
-//! - edits an assume-unchanged or skip-worktree flag hides from every git listing;
-//! - beneath each submodule, its own such paths (`<gitlink>/<path>`), the gitlink itself
-//!   dirty with them; a submodule whose checkout is not there is [`Dirt::Unpopulated`],
-//!   and a file or link where one belongs is [`Dirt::Changed`], never followed.
+//! Clean-tree verification for release cuts.
 
 use aterm_uds::spawnfd::command;
 use std::collections::BTreeMap;
@@ -26,13 +12,12 @@ use std::path::Path;
 pub enum Dirt {
     /// Its working tree is not what `HEAD` records.
     Changed,
-    /// A submodule `HEAD` records whose checkout is not there (never initialised, or its
-    /// `.git` broken): no build of this tree can read that source.
+    /// A submodule `HEAD` records whose checkout is not there (never initialised, or its `.git`
+    /// broken): no build of this tree can read that source.
     Unpopulated,
 }
 
-/// Every path of the checkout at `root` that differs from its `HEAD` (the module's
-/// rule). `None` when git cannot answer.
+/// Every path of the checkout at `root` that differs from its `HEAD`, submodules' own included.
 #[must_use]
 pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
     let index = index_entries(root)?;
@@ -84,8 +69,6 @@ pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
         match std::fs::symlink_metadata(&full) {
             Ok(m) if m.is_dir() && is_toplevel(&full) => {}
             Ok(m) if !m.is_dir() => {
-                // A file or link where a submodule belongs is dirt as it is, never
-                // followed: a link to an ancestor would recurse without end.
                 dirty.entry(link.clone()).or_insert(Dirt::Changed);
                 continue;
             }
@@ -105,22 +88,13 @@ pub fn dirty_against_head(root: &Path) -> Option<BTreeMap<String, Dirt>> {
     Some(dirty)
 }
 
-/// The strict judge, for a run that files proofs under `HEAD`'s tree: nothing
-/// [`dirty_against_head`] lists, and nothing [`raw_differences`] lists. `None` when git
-/// cannot answer.
+/// The strict judge, for a run that files proofs under `HEAD`'s tree.
 #[must_use]
 pub fn strictly_clean(root: &Path) -> Option<bool> {
     Some(dirty_against_head(root)?.is_empty() && raw_differences(root)?.is_empty())
 }
 
-/// Every path of `HEAD`'s tree whose working copy is not the blob it records, by
-/// identity: a regular file hashed raw (`hash-object --no-filters`) with the kind and
-/// exec bit `HEAD` records, a link by the hash of its target, any other mode, and every
-/// assume-unchanged or skip-worktree entry (a proof of the whole tree reads every file);
-/// beneath each submodule too. `git diff` misses some of these: it trusts the index's
-/// stat cache, which `core.checkStat`, `core.trustctime` and `core.fsmonitor` loosen,
-/// and compares bytes after the clean filters `core.autocrlf` and attributes apply,
-/// where a compiler reads them raw. `None` when git cannot answer.
+/// Every path of `HEAD`'s tree whose working copy is not the blob it records, by identity.
 #[must_use]
 pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
     let listing = out(root, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"])?;
@@ -129,7 +103,6 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
         .filter(|e| e.tag.is_ascii_lowercase() || e.tag == 'S')
         .map(|e| e.path)
         .collect();
-    // (path, blob) of each regular file, hashed in one call below.
     let mut files: Vec<(String, String)> = Vec::new();
     for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let tab = rec.iter().position(|b| *b == b'\t')?;
@@ -162,8 +135,6 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
             _ => differ.push(path),
         }
     }
-    // `--stdin-paths` reads one path a line and C-unquotes one that starts with a
-    // quote: a path it would misread is hashed alone.
     let (odd, plain): (Vec<_>, Vec<_>) = files
         .into_iter()
         .partition(|(p, _)| p.contains('\n') || p.starts_with('"'));
@@ -192,20 +163,15 @@ pub fn raw_differences(root: &Path) -> Option<Vec<String>> {
     Some(differ)
 }
 
-/// The index mode of a gitlink: a submodule's recorded commit.
 const GITLINK_MODE: &str = "160000";
 
-/// One index entry, as `git ls-files -v -s` prints it.
 struct IndexEntry {
-    /// The `-v` tag: lowercase for assume-unchanged, `S` for skip-worktree.
     tag: char,
     mode: String,
     blob: String,
     path: String,
 }
 
-/// Git's variables that point a call at another repository, index or work tree: a
-/// caller started from a git hook carries them, and the judge reads the root it is given.
 const GIT_REDIRECTS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -217,8 +183,6 @@ const GIT_REDIRECTS: [&str; 8] = [
     "GIT_PREFIX",
 ];
 
-/// `git -C <root> --no-optional-locks <args>` fed `input`, [`GIT_REDIRECTS`] removed: its
-/// stdout on exit 0. Checking never rewrites the index under a caller who is using it.
 fn git(root: &Path, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
     let mut cmd = command("git");
     cmd.arg("-C").arg(root).arg("--no-optional-locks");
@@ -245,7 +209,6 @@ fn out_z(root: &Path, args: &[&str]) -> Option<Vec<String>> {
     )
 }
 
-/// Every index entry: `<tag> <mode> <blob> <stage>\t<path>`.
 fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
     let listing = out(root, &["ls-files", "-v", "-s", "-z"])?;
     listing
@@ -265,9 +228,6 @@ fn index_entries(root: &Path) -> Option<Vec<IndexEntry>> {
         .collect()
 }
 
-/// The flagged (assume-unchanged or skip-worktree) entries whose working tree is not
-/// their index entry: `git status` and `git diff` take the entry as the working tree, a
-/// compiler does not.
 fn flag_hidden_edits(root: &Path, index: &[IndexEntry]) -> Option<Vec<String>> {
     let flagged: Vec<&IndexEntry> = index
         .iter()
@@ -303,7 +263,6 @@ fn flag_hidden_edits(root: &Path, index: &[IndexEntry]) -> Option<Vec<String>> {
     Some(edited)
 }
 
-/// A blob id git prints for `args` fed `input`.
 fn hash(root: &Path, args: &[&str], input: &[u8]) -> Option<String> {
     let id = git(root, args, input)?;
     Some(String::from_utf8_lossy(&id).trim().to_string())
@@ -320,8 +279,6 @@ fn is_exec(_: &std::fs::Metadata) -> bool {
     false
 }
 
-/// Whether `dir` is the top of a git checkout of its own (a populated submodule), not a
-/// directory inside the superproject.
 fn is_toplevel(dir: &Path) -> bool {
     let Some(top) = out(dir, &["rev-parse", "--show-toplevel"]) else {
         return false;
@@ -372,8 +329,6 @@ mod tests {
         dirty_against_head(root).unwrap().into_keys().collect()
     }
 
-    /// Each kind of dirt the judge counts is listed; a clean checkout lists nothing, and
-    /// what only the tree's own `.gitignore` files ignore stays out.
     #[test]
     fn every_kind_of_dirt_is_listed_and_a_clean_tree_lists_none() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -391,10 +346,6 @@ mod tests {
         assert_eq!(keys(&root), ["a.rs", "flagged.rs", "local.rs"]);
     }
 
-    /// The strict judge reads the bytes: a CRLF copy of an LF file under
-    /// `core.autocrlf=input`, and a same-size edit that kept its mtime under
-    /// `core.checkStat=minimal`, read clean to `git diff` and differ raw; a flag, a lost
-    /// exec bit and a retargeted link differ too.
     #[test]
     fn the_strict_judge_reads_the_bytes_git_diff_trusts() {
         use std::time::{Duration, SystemTime};
@@ -425,7 +376,6 @@ mod tests {
         run(&root, &["commit", "-q", "-m", "more"]);
         assert_eq!(strictly_clean(&root), Some(true));
 
-        // autocrlf: the CRLF copy reads unchanged to the diff.
         run(&root, &["config", "core.autocrlf", "input"]);
         std::fs::write(root.join("lf.txt"), "a\r\nb\r\n").unwrap();
         assert!(keys(&root).is_empty(), "the case: {:?}", keys(&root));
@@ -434,7 +384,6 @@ mod tests {
         std::fs::write(root.join("lf.txt"), "a\nb\n").unwrap();
         assert_eq!(strictly_clean(&root), Some(true));
 
-        // checkStat=minimal: a same-size edit that kept its mtime.
         run(&root, &["config", "core.checkStat", "minimal"]);
         run(&root, &["config", "core.trustctime", "false"]);
         std::fs::write(root.join("same.rs"), "bbbb").unwrap();
@@ -444,7 +393,6 @@ mod tests {
         std::fs::write(root.join("same.rs"), "aaaa").unwrap();
         assert_eq!(strictly_clean(&root), Some(true));
 
-        // any flag, even over HEAD's own bytes
         run(&root, &["update-index", "--assume-unchanged", "a.rs"]);
         assert_eq!(raw_differences(&root).unwrap(), ["a.rs"]);
         run(&root, &["update-index", "--no-assume-unchanged", "a.rs"]);
@@ -464,9 +412,6 @@ mod tests {
         }
     }
 
-    /// A submodule the index records but nobody checked out is Unpopulated; one checked
-    /// out with an edit inside lists the edit beneath its gitlink, and the gitlink; a file
-    /// or a link (even to an ancestor) where it belongs is Changed and never followed.
     #[test]
     fn a_submodule_is_judged_by_its_own_checkout() {
         let dir = aterm_tempfile::tempdir().unwrap();

@@ -118,7 +118,8 @@ pub trait ReleaseHost {
     ///
     /// # Errors
     ///
-    /// [`HostError::NotFound`] when absent, or [`HostError::Unreachable`] on failure.
+    /// [`HostError::NotFound`] when there is none — an answer, unlike
+    /// [`HostError::Unreachable`]; otherwise why it failed.
     fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError>;
 
     /// Downloads `assets` of release `tag` into `dir`.

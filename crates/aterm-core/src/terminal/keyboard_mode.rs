@@ -167,9 +167,6 @@ mod shift_enter_e2e_tests {
         assert!(!term.kitty_suppresses_predictive_echo());
     }
 
-    /// `kitty_reports_functional_keys` is true in exactly the modes where a key
-    /// with no legacy form (the Menu key, `57363`) reaches the app, else host
-    /// chrome steals a negotiated key or refuses one nobody receives.
     #[test]
     fn functional_key_reporting_tracks_what_the_encoder_actually_emits() {
         let menu = |term: &Terminal| {
@@ -259,16 +256,12 @@ mod shift_enter_e2e_tests {
         );
     }
 
-    /// A session behind a console host: the posture aterm-gui applies to a
-    /// ConPTY session (`spawn::apply_pty_keyboard_posture`).
     fn conpty_term() -> Terminal {
         let mut term = Terminal::new(24, 80);
         term.set_win32_input_enabled(true);
         term
     }
 
-    /// The win32 key-record pair for `VK_RETURN`, spelled from the spec
-    /// (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`), not from the encoder.
     fn win32_enter_pair(uc: u32, cs: u32) -> Vec<u8> {
         format!("\x1b[13;28;{uc};1;{cs};1_\x1b[13;28;{uc};0;{cs};1_").into_bytes()
     }
@@ -415,8 +408,6 @@ mod shift_enter_e2e_tests {
         assert_eq!(key(&term, Key::Character('['), Modifiers::ALT), b"\x1b[");
     }
 
-    /// DEC 9001 is a negotiation with a Windows console host, and only a
-    /// session a host put behind ConPTY has one.
     #[test]
     fn program_output_cannot_turn_on_win32_records_without_a_console_host() {
         let key = |term: &Terminal, key: Key, mods: Modifiers| {
@@ -448,8 +439,6 @@ mod shift_enter_e2e_tests {
         assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;0$y");
     }
 
-    /// The console-host posture is a function of the resize seam policy, both
-    /// ways.
     #[test]
     fn the_console_host_posture_follows_the_resize_policy_both_ways() {
         use crate::grid::ResizePolicy;
@@ -487,10 +476,6 @@ mod shift_enter_e2e_tests {
         assert_eq!(native.take_response().unwrap_or_default(), b"\x1b[?0u");
     }
 
-    /// Which console host asked for 9001 rides with it: `OPENCONSOLE_HOST` is
-    /// set exactly while win32-input-mode is active and the embedder said the
-    /// host is OpenConsole, survives a program's RIS (host policy), reaches the
-    /// lock-free word, and goes when the embedder says conhost.
     #[test]
     fn the_openconsole_host_bit_rides_with_win32_input_mode() {
         let oc = |t: &Terminal| {
@@ -530,7 +515,6 @@ mod kitty_capability_toggle_tests {
     use crate::terminal::Terminal;
     use aterm_types::keyboard::{KeyboardMode, Modifiers};
 
-    /// All kitty-derived bits of `KeyboardMode`.
     const KITTY_BITS: KeyboardMode = KeyboardMode::DISAMBIGUATE_ESC_CODES
         .union(KeyboardMode::REPORT_EVENT_TYPES)
         .union(KeyboardMode::REPORT_ALTERNATE_KEYS)
@@ -619,8 +603,6 @@ mod console_host_modify_other_keys_tests {
     use crate::terminal::program_evidence;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_layout};
 
-    /// The chords the measurement lost, as the GUI's input seam encodes them
-    /// (the lock-free word).
     fn chords(term: &Terminal) -> Vec<Vec<u8>> {
         let c = |k: char| Key::Character(k);
         let n = Key::Named;
@@ -718,7 +700,6 @@ mod control_chord_tests {
     use crate::terminal::Terminal;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, encode_key_with_layout};
 
-    /// The bytes Ctrl plus `c` sends under `term`'s keyboard mode.
     fn chord(term: &Terminal, c: char) -> Vec<u8> {
         encode_key_with_layout(
             &Key::Character(c),
@@ -729,9 +710,6 @@ mod control_chord_tests {
         )
     }
 
-    /// The legacy encoder, Kitty's two modes that report functional keys, its
-    /// modes that do not, and modifyOtherKeys at each level: escaped exactly
-    /// where the encoder escapes (`CSI 97;5u`, `CSI 27;5;97~`).
     #[test]
     fn control_chords_escaped_is_what_the_encoder_sends() {
         let negotiations: [(&str, &[u8], bool); 7] = [

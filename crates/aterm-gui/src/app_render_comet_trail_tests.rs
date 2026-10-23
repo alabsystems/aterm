@@ -5,18 +5,6 @@ use crate::App;
 use crate::cursor_glow::GlowStyle;
 use aterm_effects::cursor_fx::forge_cursor_fill;
 
-/// Each trail-style spelling's `glow_config()` / `trail_config()` (a config contract); a row
-/// asserts only the fields its case is about (`None`: not asserted).
-///
-/// * "comet": the additive crown (bloom + landing ring), the beam along the swept path, and
-///   the `TrailCell` ember bed's config (capped by `READABLE_ALPHA_CAP`), with its own `Comet`
-///   aurora and glacial default hue. A frame runs no cell bed beside the comet's own streak
-///   (`comet_tail_is_its_streak`): the streak is the tail.
-/// * "beam": the steady tube (`GlowStyle::Beam`, ice-blue default): radius 0, ring off and no
-///   trail body even when crown and ring are configured; an explicit trail colour still wins.
-/// * The additive-only styles (lumen, rainbow, …) keep crown, ring and beam with no trail
-///   body; water drops the beam, laser keeps it.
-/// * "off", and `cursor_trail = false` for any style, disable both layers.
 #[test]
 fn trail_style_spellings_map_to_their_layers() {
     #[derive(Default)]
@@ -44,7 +32,6 @@ fn trail_style_spellings_map_to_their_layers() {
             style: "comet",
             want_enabled: Some(true),
             want_style: Some(GlowStyle::Comet),
-            // No pinned trail colour: the comet defaults to glacial blue.
             want_color: Some(crate::cursor_glow::COMET_DEFAULT_COLOR),
             want_crown: Some(true),
             want_ring: Some(true),
@@ -64,7 +51,6 @@ fn trail_style_spellings_map_to_their_layers() {
             want_color: Some(crate::cursor_glow::BEAM_DEFAULT_COLOR),
             want_crown: Some(false),
             want_ring: Some(false),
-            // The beam style is the pure additive beam.
             want_beam: Some(true),
             want_trail: Some(false),
             want_comet: Some(false),
@@ -219,24 +205,14 @@ fn forge_cursor_fill_obeys_body_master_and_style_gates() {
     );
 }
 
-/// The colour the FRAME hands the engines (`cursor_frame`'s folded config and
-/// comet colour), not the pre-frame `glow_config()` the table above reads: the
-/// per-frame fold is where the live cursor colour lands, and where it once
-/// overwrote every canonical hue with the theme's seed. One row per case of
-/// the one colour law (`aterm_effects::cursor_fx::automatic_glow_color`); each
-/// asserts the aurora colour, the comet body's colour and the automatic
-/// accent, so crown, nucleus and trail cannot disagree in hue.
 #[test]
 fn the_frame_colour_follows_the_one_colour_law() {
     use crate::cursor_glow::{
         BEAM_DEFAULT_COLOR, COMET_DEFAULT_COLOR, LASER_DEFAULT_COLOR, SPARKLE_DEFAULT_COLOR,
     };
-    // A program's OSC 12, and the live foreground an unpinned caret falls
-    // back to (no OSC 12: the theme's seed, or OSC 10).
     const OSC12: [u8; 3] = [0xFF, 0x40, 0xC0];
     const LIVE_FG: [u8; 3] = [0xC8, 0xD3, 0xF5];
     let rgb = aterm_render::rgb_to_u32;
-    // (case, style, cursor_trail_color, live cursor, pinned, the colour).
     type Row<'a> = (&'a str, &'a str, Option<&'a str>, [u8; 3], bool, u32);
     let rows: [Row<'_>; 10] = [
         (
@@ -281,7 +257,6 @@ fn the_frame_colour_follows_the_one_colour_law() {
             true,
             rgb(OSC12),
         ),
-        // The negative control: a pin never recolours the lightning.
         (
             "laser under OSC 12",
             "laser",
@@ -290,8 +265,6 @@ fn the_frame_colour_follows_the_one_colour_law() {
             true,
             LASER_DEFAULT_COLOR,
         ),
-        // …and a style with no hue of its own follows the live colour pinned
-        // or not, which is today's lumen behaviour.
         (
             "lumen, nothing pinned",
             "lumen",
@@ -318,7 +291,6 @@ fn the_frame_colour_follows_the_one_colour_law() {
             )
             .expect("fixture window");
         assert_eq!(fx.glow_cfg.color, want, "{label}: aurora colour");
-        // No keystroke, so no ignition heat: the comet's colour is its base.
         assert_eq!(fx.trail_color, want, "{label}: comet body colour");
         assert_eq!(
             fx.glow_cfg.accent,

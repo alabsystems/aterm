@@ -4,13 +4,6 @@
 use super::*;
 use std::path::PathBuf;
 
-/// A probe's deadline in these tests: a one-minute hang detector, never
-/// [`PROBE_LIMIT`]'s latency budget — on a loaded host a scratch
-/// repository's reads outrun ten seconds, and a probe cut short reads as
-/// less work than the repository holds.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const HANG: Duration = Duration::from_secs(60);
-
 /// `git <args>` in `dir`, hermetic: no system or global config, a fixed
 /// author.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -66,7 +59,7 @@ fn repo(tmp: &Path, remote: bool) -> PathBuf {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn found(dir: &Path) -> Option<RepoWork> {
-    probe(dir, Some(dir), HANG)
+    probe(dir, Some(dir), PROBE_LIMIT)
 }
 
 /// THE READS' OUTPUT, PARSED ([`RepoWork::of_git`]): a tracked change
@@ -180,6 +173,36 @@ fn the_probe_finds_uncommitted_unpushed_and_stashed_work_and_nothing_once_pushed
     assert_eq!(found(plain.path()), None, "no repository");
 }
 
+/// A PROBE OF A STARVED `git` STILL READS THE WHOLE WORK ([`PROBE_LIMIT`], the
+/// one-minute hang detector): its first read starved 11 s, past the ten
+/// seconds the probe had before (on the probe's clock: the time is taken as
+/// gone, with no sleep), the probe finds the one commit no remote has.
+/// NEGATIVE CONTROL: the same starved read under those ten seconds does not
+/// start, and the probe finds nothing, the reading Land took as a clean
+/// repository.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_probe_whose_reads_are_starved_still_finds_the_unpushed_commit() {
+    assert_eq!(
+        PROBE_LIMIT,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the probe's limit is the one-minute hang detector"
+    );
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let work = repo(tmp.path(), true);
+    std::fs::write(work.join("b.txt"), "two\n").expect("b.txt");
+    scratch_git(&work, &["add", "b.txt"]);
+    scratch_git(&work, &["commit", "-q", "-m", "two"]);
+    read_stall::set(11_000);
+    let whole = probe(&work, Some(&work), PROBE_LIMIT);
+    read_stall::set(11_000);
+    let cut = probe(&work, Some(&work), Duration::from_secs(10));
+    read_stall::set(0);
+    let w = whole.expect("the unpushed commit, found by the starved probe");
+    assert_eq!((w.unpushed, w.unlanded, w.changed), (1, 1, 0), "{w:?}");
+    assert_eq!(cut, None, "the starved probe cut at ten seconds");
+}
+
 /// ONE BRANCH'S STASH ENTRIES ([`stashes_on`], over `git stash list
 /// --format=%gs`): those Git wrote on the branch, a message given or not;
 /// on a detached `HEAD`, those written with no branch.
@@ -232,7 +255,8 @@ fn the_persons_global_excludes_hold() {
     std::fs::write(work.join(".DS_Store"), "x").expect("ds");
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
-    let probe_at = |xdg: Option<&Path>| probe_with(&work, Some(&home), xdg, HANG);
+    let probe_at = |xdg: Option<&Path>| probe_with(&work, Some(&home), xdg, PROBE_LIMIT);
+    // NEGATIVE CONTROL: no excludes.
     let w = probe_at(None).expect("untracked");
     assert_eq!(
         (w.untracked, w.paths.as_slice()),
@@ -285,7 +309,7 @@ fn the_repositorys_own_excludes_win_over_the_persons() {
     let own = tmp.path().join("repo-ignore");
     std::fs::write(&own, "local.tmp\n").expect("own ignore");
     let untracked = || {
-        probe_with(&work, Some(&home), None, HANG)
+        probe_with(&work, Some(&home), None, PROBE_LIMIT)
             .map(|w| w.paths)
             .unwrap_or_default()
     };
@@ -313,7 +337,7 @@ fn the_persons_excludes_set_through_an_include_hold() {
         "[core]\n\texcludesFile = ~/my-ignore\n",
     )
     .expect("extra");
-    let probe_at = || probe_with(&work, Some(&home), None, HANG);
+    let probe_at = || probe_with(&work, Some(&home), None, PROBE_LIMIT);
     std::fs::write(
         home.join(".gitconfig"),
         "[include]\n\tpath = ~/extra.gitconfig\n",
@@ -354,7 +378,7 @@ fn the_persons_excludes_set_for_this_repository_by_an_include_if_hold() {
         )
     };
     std::fs::write(home.join(".gitconfig"), gitdir(&work)).expect("gitconfig");
-    let probe_at = || probe_with(&work, Some(&home), None, HANG);
+    let probe_at = || probe_with(&work, Some(&home), None, PROBE_LIMIT);
     assert_eq!(probe_at(), None, "the conditional excludes hold");
     std::fs::write(home.join(".gitconfig"), gitdir(&home)).expect("gitconfig");
     assert_eq!(
@@ -379,14 +403,14 @@ fn a_repositorys_own_home_relative_path_is_read_under_the_persons_home() {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::write(home.join("repo-ignore"), "local.tmp\n").expect("ignore");
     scratch_git(&work, &["config", "core.excludesFile", "~/repo-ignore"]);
-    let w = probe_with(&work, Some(&home), None, HANG).expect("the untracked file");
+    let w = probe_with(&work, Some(&home), None, PROBE_LIMIT).expect("the untracked file");
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
     std::fs::write(
         home.join(".gitconfig"),
         "[core]\n\texcludesFile = ~/no-such-file\n[status]\n\tshowUntrackedFiles = no\n",
     )
     .expect("gitconfig");
-    let w = probe_with(&work, Some(&home), None, HANG).expect("still read");
+    let w = probe_with(&work, Some(&home), None, PROBE_LIMIT).expect("still read");
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
 }
 
@@ -510,10 +534,13 @@ fn a_guarded_folder_is_never_probed() {
         Some(work.clone())
     );
     assert_eq!(unattended_dir(&docs, Some(&home), &table), None);
-    assert_eq!(probe(&docs, Some(&home), HANG), None);
+    assert_eq!(probe(&docs, Some(&home), PROBE_LIMIT), None);
     assert_eq!(unattended_dir(&work, None, &table), None);
-    assert_eq!(probe(&work, None, HANG), None);
-    assert_eq!(probe(Path::new("/Volumes/unasked"), None, HANG), None);
+    assert_eq!(probe(&work, None, PROBE_LIMIT), None);
+    assert_eq!(
+        probe(Path::new("/Volumes/unasked"), None, PROBE_LIMIT),
+        None
+    );
     assert_eq!(
         unattended_dir(
             &home.join("Developer/../Documents/work"),

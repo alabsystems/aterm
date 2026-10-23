@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Peeking-cat sprite (`cat_quads` + `cat_atlas`) CPU/GPU parity. The cat is a NEAREST 1:1
-// regime (bake == dest size, shared RGBA texels), so its effect-only delta is held to target
-// <= 1, hard bar <= 2. Also: an opaque sixel hides the sprite, a moved cat repaints without
-// ghosting and a settled one takes the dirty gate, and malformed quads are refused.
-//
-// No GPU or no font: COULD NOT RUN.
 
 use crate::common;
 use std::sync::Arc;
@@ -16,9 +9,6 @@ use aterm_render::{SceneAtlas, SpriteQuad, Theme};
 
 use crate::common::{backends, max_channel_delta};
 
-/// A patterned RGBA cat atlas: distinct per-texel colours (a wrong NEAREST
-/// index shows), mixed alpha in the bottom half (real src-over). Power-of-two
-/// dims keep the GPU's NEAREST UV math exact at texel centres.
 fn cat_atlas(version: u64) -> SceneAtlas {
     let (w, h) = (64u32, 64u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -45,8 +35,6 @@ fn cat_atlas(version: u64) -> SceneAtlas {
     }
 }
 
-/// 1:1 quad — `dest = [x, y, w, h]`, source origin `[ax, ay]`; `aw/ah == w/h`
-/// (bake == dest: the NEAREST 1:1 contract).
 fn quad_1to1(row: u16, dest: [u16; 4], src_xy: [u16; 2], alpha: u8) -> SpriteQuad {
     let [x, y, w, h] = dest;
     let [ax, ay] = src_xy;
@@ -66,9 +54,6 @@ fn quad_1to1(row: u16, dest: [u16; 4], src_xy: [u16; 2], alpha: u8) -> SpriteQua
     }
 }
 
-/// The base frame (full-block glyphs + bg) is byte-exact CPU==GPU, so the measured delta is the
-/// cat's alone: 1:1 quads over blank bg (opaque and partial-alpha texels) and over text, a
-/// quad-level alpha multiplier and a flipped quad.
 #[test]
 fn cat_effect_only_parity_pinned_over_bg_and_text() {
     let theme = Theme::default();
@@ -79,7 +64,6 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process("\x1b[?25l████████".as_bytes()); // procedural: byte-exact base
 
-    // Base (no cat): the effect-only premise — CPU==GPU exactly.
     let base_input = term.cell_frame(rows, cols);
     let cpu_base = cpu.render_input(&base_input);
     let gpu_base = gpu.render_input(&mut win, &base_input, None);
@@ -93,18 +77,14 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
     let mut input = term.cell_frame(rows, cols);
     input.cat_atlas = Some(Arc::new(cat_atlas(1)));
     input.cat_quads = vec![
-        // Over blank bg, opaque texels (atlas top half).
         quad_1to1(3, [4, (3 * ch) as u16, 40, hh], [2, 0], 255),
-        // Over the block text, opaque texels.
         quad_1to1(0, [2, 0, 48, hh], [8, 0], 255),
-        // Over blank bg, partial-alpha texels (atlas bottom half): real blending.
         quad_1to1(
             4,
             [8, (4 * ch) as u16, 32, (ch as u16).min(30)],
             [0, 33],
             255,
         ),
-        // Quad-level alpha multiplier + horizontal flip.
         SpriteQuad {
             flip_x: true,
             ..quad_1to1(
@@ -131,9 +111,6 @@ fn cat_effect_only_parity_pinned_over_bg_and_text() {
     );
 }
 
-/// An opaque sixel image hides the cat on both backends (each draws sprites before inline
-/// images), so with-cat and without-cat frames are byte-identical per backend. Full coverage
-/// of the quad is checked, so the equality cannot pass on a frame that draws nothing.
 #[test]
 fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let theme = Theme::default();
@@ -142,10 +119,6 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let (cw, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 8usize);
 
-    // A real sixel DCS: an opaque red raster 2*cw x ch px filling the 2x1-cell footprint
-    // (images paint at their own pixel size, so it is built to the live cell height). Sixel
-    // writes six pixel rows per data char: `ch / 6` full bands (`~`) plus, when `ch` is not a
-    // multiple of six, one partial band with the low `ch % 6` bits set (`?` + (2^rem - 1)).
     let mut dcs: Vec<u8> = Vec::new();
     dcs.extend_from_slice(format!("\x1bP0;0;8q\"1;1;{};{ch}#1;2;100;0;0#1", 2 * cw).as_bytes());
     for _ in 0..ch / 6 {
@@ -170,14 +143,11 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     let base_input = term.cell_frame(rows, cols);
     let mut input = term.cell_frame(rows, cols);
     input.cat_atlas = Some(Arc::new(cat_atlas(1)));
-    // The quad sits fully inside the image's 2-cell footprint (opaque cover).
     let hh = (ch as u16).min(32);
     input.cat_quads = vec![quad_1to1(0, [2, 0, (cw as u16) * 2 - 4, hh], [0, 0], 255)];
 
     let cpu_base = cpu.render_input(&base_input);
     let cpu_cat = cpu.render_input(&input);
-    // `assert_eq!(base, cat)` also holds when nothing is drawn, so check that
-    // the opaque red fills exactly the 2x1-cell footprint.
     let red_px = |f: &aterm_render::Frame| {
         f.pixels
             .iter()
@@ -203,7 +173,6 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
         "GPU: an opaque sixel must hide the cat sprite (cat draws before images)"
     );
 
-    // Control (non-vacuous): the same quad outside the image footprint paints on both backends.
     let mut moved = term.cell_frame(rows, cols);
     moved.cat_atlas = Some(Arc::new(cat_atlas(1)));
     moved.cat_quads = vec![quad_1to1(
@@ -224,18 +193,12 @@ fn cat_under_opaque_sixel_is_hidden_on_both_backends() {
     );
 }
 
-/// Cached-path no-ghosting and the dirty gate on both backends: frame A
-/// primes caches with a cat at row 1; frame B moves it to row 2 (gate misses,
-/// cached repaints equal a fresh render); frame C repeats B (equal quads, same
-/// atlas version) and takes the dirty gate.
 #[test]
 fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let (_, ch) = cpu.cell_size();
     let (rows, cols) = (4usize, 12usize);
-    // Glyph-free terminal: glyph AA overhang across a band boundary is an
-    // unrelated damaged-vs-full divergence.
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(cat_atlas(3));
@@ -251,7 +214,6 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
         )];
         input
     };
-    // Cat at row 1, moved to row 2, then row 2 again (equal quads, same atlas).
     let (in_a, in_b, in_c) = (make(1), make(2), make(2));
     common::assert_moved_then_settled(
         (&mut cpu, &mut gpu),
@@ -262,11 +224,6 @@ fn damaged_path_cat_no_ghosting_and_settled_gate_hit() {
     );
 }
 
-/// A source rect overrunning the atlas is refused, and a quad tagged past the grid's last row
-/// dropped, on both backends. The CPU skips both naturally (`stamp_cat_quad`'s bounds check,
-/// per-row stamping); the GPU needs explicit guards, since its ClampToEdge samplers would smear
-/// the atlas edge across the quad. `cat_quads` and `rain_quads` share the GPU builder; each
-/// arm's in-bounds control must paint, the same on both backends.
 #[test]
 fn a_malformed_sprite_quad_is_refused_on_both_backends() {
     let theme = Theme::default();
@@ -286,8 +243,6 @@ fn a_malformed_sprite_quad_is_refused_on_both_backends() {
         "blank base must be byte-exact so the sprite delta is effect-only"
     );
 
-    // `[ax, ay, aw, ah]` against the 64x64 fixture atlas: the control is legal,
-    // the other two overrun the bottom edge and the right edge.
     let cases: [(&str, [u16; 4], u16, bool); 4] = [
         ("in-bounds control", [2, 0, 40, 20], 3, true),
         (

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `strip_method_offsets` against every instance-method row in the live runtime.
-//!
-//! [`aterm_objc::strip_method_offsets`] is the normaliser every encoding check here runs its
-//! inputs through (the winit seam census, `objc_live_class_audit`, `toolbar_drive`,
-//! `SwizzleSite::install`'s refusal); if it erased a difference, each would accept two encodings
-//! that are different types. Bitfield widths, digits in type names, array counts and quoted class
-//! names are not offsets, and a rule written as a list of exceptions misses spellings, so the
-//! property is computed from the input: stripping may delete offsets and nothing else. The corpus
-//! is the runtime's, so it grows when Apple's does.
+//! Live runtime tests for [`aterm_objc::strip_method_offsets`].
 
 #![cfg(target_os = "macos")]
 
@@ -17,9 +9,6 @@ use std::ffi::{CStr, c_char, c_void};
 
 use aterm_objc::{ClassPtr, strip_method_offsets};
 
-// AppKit, so the corpus is the one the auditors run against (a system framework, not a crate
-// dependency).
-//
 // SAFETY: the block declares no symbol; its only job is the link line.
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
@@ -31,9 +20,6 @@ unsafe extern "C" {
     fn free(ptr: *mut c_void);
 }
 
-/// Everything in an encoding that is not an offset, in order: struct, union and template tags,
-/// bitfield widths, array counts and quoted class names. A reading independent of the function
-/// under test: equal token lists may still differ in offsets; different lists are different types.
 fn significant_tokens(enc: &str) -> Vec<String> {
     let b: Vec<char> = enc.chars().collect();
     let mut out = Vec::new();
@@ -43,7 +29,6 @@ fn significant_tokens(enc: &str) -> Vec<String> {
     while i < b.len() {
         let c = b[i];
         if c == '"' {
-            // A quoted class name, kept whole.
             let start = i;
             i += 1;
             while i < b.len() && b[i] != '"' {
@@ -63,7 +48,6 @@ fn significant_tokens(enc: &str) -> Vec<String> {
         }
         match c {
             '{' | '(' => {
-                // The tag runs to the `=` (or to the close, for `{CGRect}`).
                 depth += 1;
                 let start = i + 1;
                 let mut j = start;
@@ -105,7 +89,6 @@ fn significant_tokens(enc: &str) -> Vec<String> {
     out
 }
 
-/// Every instance-method type encoding registered in this process.
 fn every_registered_encoding() -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut n_classes: u32 = 0;
@@ -153,8 +136,6 @@ fn every_registered_encoding() -> Vec<(String, String)> {
     out
 }
 
-/// Stripping deletes offsets and nothing else, over every row in the process. The corpus floors
-/// keep the survey from passing vacuously: a runtime with no row of a kind fails loudly.
 #[test]
 fn stripping_deletes_offsets_and_nothing_else_over_every_row_in_the_process() {
     let rows = every_registered_encoding();

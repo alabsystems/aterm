@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE JOURNAL'S SIDE OF A LOG (design §5.3, §5.4; phase 2B): what the
-//! host's journal writer restates of a live log, the closes a clean quit
-//! writes for it, and the read-only log a journal read rebuilds.
-//!
-//! - [`Log::open_path_records`]: the session's open and each open node's
-//!   open record, outermost first (all pinned, so a restatement never lacks
-//!   one): a segment's snap block, so every segment holds every session's
-//!   open path by itself.
-//! - [`Log::quit_closes`]: the records a clean quit would close the session
-//!   with (`out=gone` innermost first, then `close - out=app-quit by=aterm`),
-//!   computed on a copy: the live log is unchanged.
-//! - [`Log::from_journal`]: a log from the records a journal read gathered,
-//!   deduplicated and in seq order ([`JournalImage`]). Every seq it accounts
-//!   for and holds no record of is a loss its reads say (`gap lost=`), and
-//!   every range it never held says why (an update's overlap, segments
-//!   pruned or left unread). Its ring is sized to the image, so it holds
-//!   every record the read decoded (the read's byte budget bounds them): a
-//!   record on disk is never reported lost because a reply's own ring was
-//!   small, and `since=` and `n=` reach all of them.
+//! Journal snapshot, clean-quit close generation, and read-only log reconstruction.
 
 use super::{CarryError, GapWhy, Limits, Log, MAX_HOLES, MAX_OPEN, OpenEntry, Rollup, level_slot};
 use crate::Close;
@@ -28,12 +10,10 @@ use crate::rec::{Rec, Stamp};
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
 use crate::words::{Out, SessionOut};
 
-/// The most records a [`JournalImage`] may hand [`Log::from_journal`]: a
-/// journal read's byte budget holds fewer.
+/// Maximum records a [`JournalImage`] may pass to [`Log::from_journal`].
 pub const JOURNAL_IMAGE_MAX_RECORDS: usize = 1 << 20;
 
-/// What a journal read gathered of one session's seq space, for
-/// [`Log::from_journal`].
+/// Gathered records and gap metadata for one session's seq space (`Log::from_journal`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JournalImage {
     /// The newest epoch the journal names for the space.
@@ -42,21 +22,16 @@ pub struct JournalImage {
     pub base: u32,
     /// The first seq the space accounts for (`Log::first_seq`).
     pub first: u64,
-    /// The newest seq the journal accounts for: its records', its gap
-    /// frames' and its overlaps'.
+    /// Newest seq accounted for by records, gap frames, and overlaps.
     pub head: u64,
     /// The records, each seq once, in seq order.
     pub recs: Vec<Rec>,
-    /// The seq ranges (inclusive) the space never held, or this read could
-    /// not account for, in order and disjoint, each with its why.
+    /// Disjoint inclusive seq ranges not held by the image, in order, with their [`GapWhy`].
     pub holes: Vec<(u64, u64, GapWhy)>,
 }
 
 impl Log {
-    /// The session's open record and each open node's, outermost first: what
-    /// a journal segment restates of this log (its snap block). Each is
-    /// pinned while its node is open, so none is missing but a session open
-    /// this log never wrote (a log that has not opened its session yet).
+    /// Returns the session's open record and each open node's open record, outermost first.
     #[must_use]
     pub fn open_path_records(&self) -> Vec<Rec> {
         let mut out: Vec<Rec> = self
@@ -82,10 +57,7 @@ impl Log {
         out
     }
 
-    /// The records a clean quit closes this session with, at `at`: every open
-    /// node `out=gone`, innermost first, then `close - out=app-quit
-    /// by=aterm`, numbered after [`Log::last_seq`]. Computed on a copy: this
-    /// log is unchanged. Empty for a session already closed.
+    /// Returns the close records a clean quit at `at` would emit, without mutating `self`.
     #[must_use]
     pub fn quit_closes(&self, at: Stamp) -> Vec<Rec> {
         if self.session_closed {
@@ -107,14 +79,9 @@ impl Log {
             .collect()
     }
 
-    /// Record a loss whose last known seq is `after` (`gap - gap why=<why>
-    /// after=<seq>`): a crash's, which a journal read says of a process that
-    /// died (design §5.4), or a read's that did not reach all of the journal
-    /// (`why=unread`). Returns its seq.
+    /// Appends a `gap` record whose last known seq is `after` (`why=<why> after=<seq>`), returning its seq.
     pub fn gap_after(&mut self, why: GapWhy, after: u64, at: Stamp) -> u64 {
         let mut f = Fields::new();
-        // Both values are of their keys' shapes and the record is far under
-        // the byte bound: neither can be refused.
         let _ = f.set(Key::Why, Val::Word(why.word()));
         let _ = f.set(Key::After, Val::U(after));
         self.push(
@@ -134,14 +101,7 @@ impl Log {
         )
     }
 
-    /// The read-only log of a journal read's image (module docs): its
-    /// records replayed in seq order (each open node opened, each close
-    /// closing its node and anything the journal still had open under it,
-    /// every record applied to the fold), its overlaps and the ranges it
-    /// could not account for kept with their whys, and every other seq it
-    /// accounts for and holds no record of counted lost. Every open node
-    /// measures the wall clock, so a close a reader adds later
-    /// ([`Log::close`], [`Log::gap_after`]) says `dur=wall`.
+    /// Rebuilds a read-only [`Log`] by replaying `img`'s records and recording its gaps and losses.
     ///
     /// # Errors
     ///
@@ -177,9 +137,6 @@ impl Log {
         }) {
             return Err(CarryError::Record("a journal record in a range never held"));
         }
-        // Room for every record of the image and the closes a reader adds
-        // (each at most one largest record's bytes): nothing it read is
-        // evicted.
         let room = img.recs.len().saturating_add(MAX_OPEN + 8);
         let limits = Limits::new(
             room.max(Limits::SESSION.records),
@@ -207,8 +164,7 @@ impl Log {
         Ok(log)
     }
 
-    /// Count the seqs in `(lo, hi]` this log accounts for as lost: a journal
-    /// read holds no record of them.
+    /// Counts seqs in `(lo, hi]` accounted for by this log that have no record.
     fn count_missing(&mut self, lo: u64, hi: u64) {
         let missing = self.held_between(lo, hi);
         if missing > 0 {
@@ -217,10 +173,7 @@ impl Log {
         }
     }
 
-    /// One journaled record into a rebuilt log: the open set and the index
-    /// moved as the live log moved them, then the record appended at its own
-    /// seq (the fold applies it, and the ring's batch evicts past its
-    /// bounds).
+    /// Replays one journaled record into the rebuilt log.
     fn replay(&mut self, rec: Rec) {
         for n in [Some(rec.node), rec.par].into_iter().flatten() {
             if let Some(i) = level_slot(n.lvl) {
@@ -284,14 +237,10 @@ impl Log {
             _ => {}
         }
         self.last_seq = rec.seq.saturating_sub(1);
-        // A journal holds no process-clock reading (6F-1): a record read back
-        // from one was appended by a process whose clock this one cannot read.
         self.push(rec, 0);
     }
 
-    /// `n` leaves the open set at the close record `seq` (its own, or an
-    /// ancestor's whose cascade the journal no longer holds), its parent
-    /// remembered as a close remembers it.
+    /// Removes `n` from the open set at close record `seq` and records its parent and close index.
     fn forget_open(&mut self, n: Node, seq: u64) {
         let Some(i) = self.open.iter().position(|e| e.node == n) else {
             return;

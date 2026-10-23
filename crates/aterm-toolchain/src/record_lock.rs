@@ -18,7 +18,7 @@ impl RecordLock {
     /// Take `file`'s exclusive lock without blocking.
     ///
     /// # Errors
-    /// `WouldBlock` while another handle holds it.
+    /// `WouldBlock` while another handle holds it; the OS error otherwise.
     pub fn try_lock(file: File, record: u64) -> Result<Self, std::fs::TryLockError> {
         let file: std::fs::File = file;
         #[cfg(windows)]

@@ -361,7 +361,7 @@ impl Host {
         s
     }
 
-    /// Assert that no hole stands for [`HOLE_FRAMES_MAX`] or more frames.
+    /// Assert that no hole stands for more than [`HOLE_FRAMES_MAX`] frames.
     fn assert_no_standing_hole(&self, what: &str) {
         let runs = self.hole_runs();
         if let Some((a, b, cols)) = runs.iter().max_by_key(|(a, b, _)| b - a) {

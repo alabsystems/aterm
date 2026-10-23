@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0 date-times: the spec's four shapes, as plain data plus their lexical form. No
-//! calendar arithmetic, time zones or leap-second handling: a config date-time only has to
-//! round-trip and compare.
-//!
-//! `Datetime` crosses serde as a struct with one reserved private name (the protocol `toml`
-//! uses), so a `Datetime` field can reach a `Deserializer` whose data model has no date-time
-//! type. The name is matched exactly.
+//! TOML 1.0 date-times across the spec's four shapes, serialized through serde under a
+//! private struct name compatible with `toml`.
 
 use core::fmt;
 use core::str::FromStr;
@@ -17,27 +12,19 @@ pub(crate) const DATETIME_STRUCT: &str = "$__aterm_toml_private_Datetime";
 /// The reserved field name inside [`DATETIME_STRUCT`].
 pub(crate) const DATETIME_FIELD: &str = "$__aterm_toml_private_datetime";
 
-/// A TOML date-time in any of the spec's four shapes.
-///
-/// The shape is encoded by which parts are present:
-///
-/// | `date` | `time` | `offset` | TOML kind        |
-/// |--------|--------|----------|------------------|
-/// | yes    | yes    | yes      | offset date-time |
-/// | yes    | yes    | no       | local date-time  |
-/// | yes    | no     | no       | local date       |
-/// | no     | yes    | no       | local time       |
+/// A TOML date-time in any of the spec's four shapes (offset date-time, local date-time,
+/// local date, or local time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Datetime {
-    /// The calendar date, absent only for a local time.
+    /// Calendar date, absent only for a local time.
     pub date: Option<Date>,
-    /// The wall-clock time, absent only for a local date.
+    /// Wall-clock time, absent only for a local date.
     pub time: Option<Time>,
-    /// The UTC offset, present only for an offset date-time.
+    /// UTC offset, present only for an offset date-time.
     pub offset: Option<Offset>,
 }
 
-/// A proleptic-Gregorian calendar date, range-checked against the month's length.
+/// Proleptic-Gregorian calendar date, range-checked against the month's length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Date {
     /// Four-digit year.
@@ -48,25 +35,25 @@ pub struct Date {
     pub day: u8,
 }
 
-/// A wall-clock time with nanosecond resolution.
+/// Wall-clock time with nanosecond resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Time {
     /// 0..=23.
     pub hour: u8,
     /// 0..=59.
     pub minute: u8,
-    /// 0..=60; 60 is a leap second.
+    /// `0..=60` (`60` is a leap second).
     pub second: u8,
-    /// 0..=999_999_999. Digits past nanosecond resolution are truncated.
+    /// `0..=999_999_999` (digits past nanosecond resolution are truncated).
     pub nanosecond: u32,
 }
 
-/// A UTC offset.
+/// UTC offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Offset {
-    /// `Z`: UTC.
+    /// UTC (`Z`).
     Z,
-    /// A numeric offset in minutes east of UTC.
+    /// Offset in minutes east of UTC (`-1439..=1439`).
     Custom {
         /// Minutes east of UTC, `-1439..=1439`.
         minutes: i16,
@@ -101,8 +88,6 @@ impl fmt::Display for Time {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:02}:{:02}:{:02}", self.hour, self.minute, self.second)?;
         if self.nanosecond != 0 {
-            // The shortest fraction that keeps the value, so a parsed `.5` does not
-            // re-serialize as `.500000000`.
             let mut frac = format!("{:09}", self.nanosecond);
             while frac.ends_with('0') {
                 frac.pop();
@@ -126,8 +111,7 @@ impl fmt::Display for Offset {
     }
 }
 
-/// The failure of [`Datetime::from_str`]; the parser proper reports its own
-/// spanned errors and never surfaces this type.
+/// Error returned by [`Datetime::from_str`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatetimeParseError {
     pub(crate) reason: &'static str,
@@ -184,9 +168,7 @@ const fn days_in_month(year: u16, month: u8) -> u8 {
     }
 }
 
-/// Parse a date-time prefix of `b`, returning the value and how many bytes it
-/// consumed. `None` means "this is not a date-time at all", which is how the
-/// value parser distinguishes `1979-05-27` from the integer `1979`.
+/// Parses a date-time prefix of `b` and returns `(datetime, consumed_bytes)`.
 pub(crate) fn parse_datetime(b: &[u8]) -> Option<(Datetime, usize)> {
     // Local time: hh:mm:ss[.frac]
     if b.len() >= 3 && b[2] == b':' {
@@ -201,7 +183,6 @@ pub(crate) fn parse_datetime(b: &[u8]) -> Option<(Datetime, usize)> {
         ));
     }
 
-    // Everything else starts with a full date.
     if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
         return None;
     }
@@ -214,9 +195,7 @@ pub(crate) fn parse_datetime(b: &[u8]) -> Option<(Datetime, usize)> {
     let date = Date { year, month, day };
     let mut pos = 10;
 
-    // The date/time separator is `T`, `t`, or a single space — and a space only
-    // counts when a time actually follows, so `date = 1979-05-27 # note` stays
-    // a local date.
+    // A space separator only counts when `hh:` follows, so `1979-05-27 # comment` stays a local date.
     let sep = match b.get(pos) {
         Some(b'T' | b't') => true,
         Some(b' ') => {
@@ -297,7 +276,6 @@ fn parse_time(b: &[u8], mut pos: usize) -> Option<(Time, usize)> {
         if end == start {
             return None;
         }
-        // Truncate past nanoseconds; pad short fractions out to nine digits.
         let mut scale = 100_000_000u32;
         for &c in &b[start..end.min(start + 9)] {
             nanosecond += u32::from(c - b'0') * scale;
@@ -358,8 +336,6 @@ impl<'de> serde::Deserialize<'de> for Datetime {
     }
 }
 
-/// Matches only the one reserved field name, so a user map that happens to have
-/// one key cannot masquerade as a date-time.
 struct DatetimeKey;
 
 impl<'de> serde::Deserialize<'de> for DatetimeKey {

@@ -5,11 +5,6 @@ use crate::App;
 use crate::app_config::{LaunchFont, successor_font_px};
 use crate::session_store::SessionHandoff;
 
-/// A Retina window drawing the default 12 px at 24 device px and zoomed to 13 (Cmd-=, 26
-/// device px) hands over the zoom and the Cmd-0 size in px at 1×, and in device px for an
-/// older successor: the successor (config: the 12 px default) comes up at 13, with Cmd-0
-/// returning to 12, and carries it on. An unzoomed window writes no key; an older producer's
-/// device pair is read as device px; a producer with no pair keeps the config's font.
 #[test]
 fn a_zoomed_font_crosses_the_handoff() {
     let mut parent = App::headless_for_test();
@@ -50,7 +45,6 @@ fn a_zoomed_font_crosses_the_handoff() {
     let wire = handoff(unzoomed).to_toml().expect("serializes");
     assert!(!wire.contains("font_"), "no key for no zoom: {wire}");
 
-    // Cmd-= (the rebuild seam standing in for the renderer): one step is one point.
     assert!(parent.set_font_size_with(12.0 + crate::FONT_ZOOM_STEP, |_| true));
     assert_eq!(parent.font_px, 26.0, "a step at 2x is two device px");
     let zoomed = parent.handoff_window_carry(0).expect("a window");
@@ -68,7 +62,6 @@ fn a_zoomed_font_crosses_the_handoff() {
     let carried = read.window.expect("the window carry");
     assert_eq!(carried, zoomed, "the pairs round-trip");
 
-    // The successor, whose config asks for the 12 px default.
     let launch = successor_font_px(12.0, Some(&carried));
     assert_eq!(
         launch,
@@ -86,7 +79,6 @@ fn a_zoomed_font_crosses_the_handoff() {
         Some((13_000, 12_000)),
         "and the next handoff carries it on"
     );
-    // Cmd-0.
     assert!(successor.set_font_size_with(successor.default_font_size, |_| true));
     assert!((successor.font_size - 12.0).abs() < f32::EPSILON);
     assert_eq!(
@@ -95,8 +87,6 @@ fn a_zoomed_font_crosses_the_handoff() {
         "a font back at its reset size is no zoom"
     );
 
-    // An older producer wrote device px alone: taken as device px, which the first
-    // window's scale turns into sizes (`App::font_size_from_device`).
     let mut older = carried.clone();
     older.font_size_milli = None;
     older.font_reset_size_milli = None;
@@ -113,7 +103,6 @@ fn a_zoomed_font_crosses_the_handoff() {
         13.0,
         "the device pair reads back as the size it drew"
     );
-    // No pair at all, and a fresh launch: the config's font.
     let mut bare = older.clone();
     bare.font_px_milli = None;
     bare.font_reset_px_milli = None;
@@ -124,8 +113,6 @@ fn a_zoomed_font_crosses_the_handoff() {
     };
     assert_eq!(successor_font_px(14.0, Some(&bare)), config);
     assert_eq!(successor_font_px(14.0, None), config);
-    // Negative controls: a pair with a half missing or out of bounds is ignored
-    // whole, never clamped.
     for (px, reset) in [
         (Some(13_000), None),
         (None, Some(12_000)),
@@ -143,7 +130,6 @@ fn a_zoomed_font_crosses_the_handoff() {
             "{px:?} {reset:?}"
         );
     }
-    // The bounds themselves are admitted.
     let mut edge = bare;
     edge.font_size_milli = Some(200_000);
     edge.font_reset_size_milli = Some(6_000);
@@ -157,18 +143,12 @@ fn a_zoomed_font_crosses_the_handoff() {
     );
 }
 
-/// The successor's window 0 attaches at the parent's raw inner size, holding exactly the
-/// carried zoomed grid, so zooming back out fits the pre-zoom grid and window. Negative
-/// controls: an older carry (no size) and a size that is not a remainder of this grid both get
-/// the exact frame.
 #[test]
 fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     use crate::WindowId;
     use aterm_window::dpi::PhysicalSize;
     let w0 = WindowId(0);
     let grid = |app: &App| (app.windows[&w0].rows, app.windows[&w0].cols);
-    // The windowed zoom's re-grid, which `rebuild_backend` runs only for a
-    // window with an OS surface.
     let zoom = |app: &mut App, px: f32, window: PhysicalSize<u32>| {
         app.set_font_size(px);
         app.windows.get_mut(&w0).expect("window 0").win_px = Some(window);
@@ -216,7 +196,6 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
         .inner_px
         .map(|[width, height]| PhysicalSize::new(width, height));
 
-    // The successor: the carried font and grid, window 0 attached.
     let mut successor = App::headless_for_test();
     let launch = successor_font_px(base, Some(&carried));
     successor.set_font_size(launch.size);
@@ -226,7 +205,6 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     zoom(&mut successor, launch.size, frame);
     assert_eq!(grid(&successor), zoomed, "and holds its parent's grid");
 
-    // Cmd--.
     zoom(&mut successor, launch.size - crate::FONT_ZOOM_STEP, frame);
     assert_eq!(
         grid(&successor),
@@ -235,7 +213,6 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     );
     assert_eq!(successor.window_frame_px_for(w0, 29, 100), window);
 
-    // Negative controls: the exact frame of the carried grid.
     let exact = parent.window_frame_px_for(w0, zoomed.0, zoomed.1);
     assert_eq!(parent.attach_frame_px(w0, zoomed.0, zoomed.1, None), exact);
     for foreign in [
@@ -251,9 +228,6 @@ fn a_zoom_out_after_a_handoff_restores_the_window_it_zoomed_in() {
     }
 }
 
-/// Every window crosses whole: the layout row carries window 1's raw size across the
-/// sidecar's TOML, so the successor recreates it at its parent's size and zooming out fits the
-/// former grid. A drag inside one cell changes the row's size but not the Commit's topology.
 #[test]
 fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
     use crate::WindowId;
@@ -261,8 +235,6 @@ fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
     use aterm_window::dpi::PhysicalSize;
     let (w0, w1) = (WindowId(0), WindowId(1));
     let grid = |app: &App, wid: WindowId| (app.windows[&wid].rows, app.windows[&wid].cols);
-    // The windowed zoom's re-grid of every window inside its own size,
-    // which `rebuild_backend` runs only for windows with an OS surface.
     let zoom = |app: &mut App, px: f32, windows: &[(WindowId, PhysicalSize<u32>)]| {
         app.set_font_size(px);
         for &(wid, size) in windows {
@@ -271,7 +243,6 @@ fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
         }
     };
 
-    // The parent: window 0 at 29×100, window 1 at 40×120.
     let mut parent = App::headless_for_test();
     let base = parent.font_size;
     parent.default_font_size = base;
@@ -301,15 +272,12 @@ fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
         "the zoomed grid leaves a remainder in window 1"
     );
 
-    // The layout the update carries, across the sidecar's wire.
     let pending = parent.capture_handoff_layout();
     let wire = pending.to_toml().expect("the parent serializes its layout");
     let layout = crate::restore::RestoreManifest::from_toml(&wire).expect("the child parses it");
     assert_eq!(layout, pending, "the size round-trips the wire");
     assert_eq!((layout.windows[1].rows, layout.windows[1].cols), zoomed);
 
-    // The successor: the carried font; window 0, the bootstrap, at its carried grid; window 1
-    // created from its row.
     let carry = parent.handoff_window_carry(0).expect("the window carry");
     let mut successor = App::headless_for_test();
     let launch = successor_font_px(base, Some(&carry));
@@ -329,7 +297,6 @@ fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
     zoom(&mut successor, launch.size, &[(w1, frame)]);
     assert_eq!(grid(&successor, w1), zoomed, "and holds its parent's grid");
 
-    // Cmd--.
     zoom(
         &mut successor,
         launch.size - crate::FONT_ZOOM_STEP,
@@ -342,8 +309,6 @@ fn a_zoom_out_after_a_handoff_restores_every_window_it_zoomed_in() {
     );
     assert_eq!(successor.window_frame_px_for(w1, 40, 120), desk[1].1);
 
-    // A drag of the parent's window 1 inside one cell while the successor
-    // boots moves the row's size and not the Commit's topology.
     let dragged = PhysicalSize::new(desk[1].1.width + 1, desk[1].1.height);
     zoom(&mut parent, base + crate::FONT_ZOOM_STEP, &[(w1, dragged)]);
     assert_eq!(grid(&parent, w1), zoomed, "PRECONDITION: inside one cell");

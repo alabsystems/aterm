@@ -3,7 +3,7 @@
 
 //! `defaults` reads and writes, and the raw `[[defaults]]` rows (design §5.1).
 
-use super::{Ctx, Item};
+use super::{Activation, Ctx, Item};
 use crate::baseline::fill_str;
 use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::plist::{self, Entries};
@@ -11,7 +11,7 @@ use crate::port::{Cmd, Stat, System};
 use serde::Deserialize;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The one tool every preference read and write goes through.
 pub const DEFAULTS: &str = "/usr/bin/defaults";
@@ -415,6 +415,9 @@ pub struct Pref {
     pub provenance: String,
     /// What the probe that planned the change read: the value the revert line restores.
     before: Mutex<Option<Read<PValue>>>,
+    /// The relaunch of [`Pref::restart`] that makes the change felt: the row's own, or the
+    /// run's one for its account and process ([`Pref::shared`]).
+    relaunch: Option<Arc<Relaunch>>,
 }
 
 impl Pref {
@@ -442,14 +445,36 @@ impl Pref {
             effect,
             provenance: String::new(),
             before: Mutex::new(None),
+            relaunch: None,
         }
     }
 
-    /// Relaunch `process` in the user's session after a change.
+    /// Relaunch `process` in the user's session after a change, once the engine applied
+    /// it ([`Relaunch`]): this row's own relaunch, until [`Pref::shared`] makes it the
+    /// run's one.
     #[must_use]
     pub fn restart(mut self, process: impl Into<String>) -> Self {
-        self.restart = Some(process.into());
+        let process = process.into();
+        self.relaunch = self.target.user.as_ref().map(|user| {
+            Arc::new(Relaunch::new(
+                format!("{}.relaunch", self.id),
+                user,
+                &process,
+            ))
+        });
+        self.restart = Some(process);
         self.effect = Effect::Relaunch;
+        self
+    }
+
+    /// Relaunch this row's process with every other row of the run whose writes it reads:
+    /// `relaunches`' one for the row's account and process, so a run that changes several
+    /// of them relaunches it once, after the last.
+    #[must_use]
+    pub fn shared(mut self, relaunches: &Relaunches) -> Self {
+        if let (Some(process), Some(user)) = (&self.restart, &self.target.user) {
+            self.relaunch = Some(relaunches.of(user, process));
+        }
         self
     }
 
@@ -470,19 +495,122 @@ impl Pref {
     /// Why a change must wait: it relaunches a process of the user at the console while
     /// the Mac is in use (design §5.3).
     fn deferred(&self, ctx: &Ctx) -> Option<String> {
-        let process = self.restart.as_ref()?;
-        let user = self.target.user.as_ref()?;
-        if ctx.disrupt {
-            return None;
+        disrupts(self.restart.as_deref()?, self.target.user.as_ref()?, ctx)
+    }
+}
+
+/// Why a change that relaunches `user`'s `process` must wait: `user` is at the console
+/// while the Mac is in use (design §5.3).
+#[must_use]
+pub fn disrupts(process: &str, user: &User, ctx: &Ctx) -> Option<String> {
+    if ctx.disrupt {
+        return None;
+    }
+    let at_console = ctx.console.as_ref().is_some_and(|c| c.name == user.name)
+        || ctx.facts.console_user.as_deref() == Some(user.name.as_str());
+    at_console.then(|| {
+        format!(
+            "relaunches {process} for {}, who is at the console; waits for the Mac to be idle (or --now)",
+            user.name
+        )
+    })
+}
+
+/// The one relaunch of a process in a user's session that makes felt the writes of every
+/// row it activates (design §3.3 of docs/DESIGN-init-system-2026-10-20.md): the engine
+/// applies each of those rows, runs it once after the last, and reads them back only once
+/// the process is up again and what it reads of their keys is still
+/// ([`crate::init_activation::relaunch_reading`]). Relaunching after each row's write
+/// relaunched it once per row, and read each row back while the process was starting.
+#[derive(Debug)]
+pub struct Relaunch {
+    id: String,
+    user: User,
+    process: String,
+    /// The rows that wrote in this run, each by its id and key, in run order.
+    owed: Mutex<Vec<(String, Target)>>,
+}
+
+impl Relaunch {
+    fn new(id: String, user: &User, process: &str) -> Self {
+        Self {
+            id,
+            user: user.clone(),
+            process: process.to_owned(),
+            owed: Mutex::new(Vec::new()),
         }
-        let at_console = ctx.console.as_ref().is_some_and(|c| c.name == user.name)
-            || ctx.facts.console_user.as_deref() == Some(user.name.as_str());
-        at_console.then(|| {
+    }
+
+    /// The row `id` wrote `target`: this run relaunches the process for it.
+    pub fn owe(&self, id: &str, target: &Target) {
+        let mut owed = self.owed.lock().unwrap_or_else(PoisonError::into_inner);
+        if !owed.iter().any(|(seen, _)| seen == id) {
+            owed.push((id.to_owned(), target.clone()));
+        }
+    }
+}
+
+impl Activation for Relaunch {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn pending(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<Option<(String, String)>, String> {
+        let owed = self.owed.lock().unwrap_or_else(PoisonError::into_inner);
+        if owed.is_empty() {
+            return Ok(None);
+        }
+        let rows: Vec<&str> = owed.iter().map(|(id, _)| id.as_str()).collect();
+        Ok(Some((
             format!(
-                "relaunches {process} for {}, who is at the console; waits for the Mac to be idle (or --now)",
-                user.name
-            )
-        })
+                "{} running with the preferences it read at its start",
+                self.process
+            ),
+            format!(
+                "{} relaunched once for {}, after {} wrote, and up again",
+                self.process,
+                self.user.name,
+                rows.join(", ")
+            ),
+        )))
+    }
+
+    /// Relaunch the process once and wait for it; each row it was to activate fails with
+    /// why when it is not up again.
+    fn activate(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
+        let owed = std::mem::take(&mut *self.owed.lock().unwrap_or_else(PoisonError::into_inner));
+        let keys: Vec<Target> = owed.iter().map(|(_, target)| target.clone()).collect();
+        Ok(
+            match crate::init_activation::relaunch_reading(sys, &self.user, &self.process, &keys) {
+                Ok(()) => Vec::new(),
+                Err(why) => owed.into_iter().map(|(id, _)| (id, why.clone())).collect(),
+            },
+        )
+    }
+}
+
+/// The relaunches of one run, one per account and process ([`Pref::shared`]).
+#[derive(Debug, Default)]
+pub struct Relaunches(Mutex<Vec<Arc<Relaunch>>>);
+
+impl Relaunches {
+    /// The run's relaunch of `user`'s `process`.
+    #[must_use]
+    pub fn of(&self, user: &User, process: &str) -> Arc<Relaunch> {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = all
+            .iter()
+            .find(|relaunch| relaunch.user.name == user.name && relaunch.process == process)
+        {
+            return Arc::clone(found);
+        }
+        let relaunch = Arc::new(Relaunch::new(
+            format!("relaunch.{process}@{}", user.name),
+            user,
+            process,
+        ));
+        all.push(Arc::clone(&relaunch));
+        relaunch
     }
 }
 
@@ -552,8 +680,8 @@ impl Item for Pref {
         if let Some((path, was)) = kept {
             keep_owner_and_mode(sys, &path, was)?;
         }
-        if let (Some(process), Some(user)) = (&self.restart, &self.target.user) {
-            relaunch(sys, user, process)?;
+        if let Some(relaunch) = &self.relaunch {
+            relaunch.owe(&self.id, &self.target);
         }
         Ok(())
     }
@@ -569,6 +697,12 @@ impl Item for Pref {
 
     fn effect(&self) -> Effect {
         self.effect
+    }
+
+    fn activation(&self) -> Option<Arc<dyn Activation>> {
+        self.relaunch
+            .as_ref()
+            .map(|relaunch| Arc::clone(relaunch) as Arc<dyn Activation>)
     }
 }
 
@@ -611,38 +745,42 @@ fn keep_owner_and_mode(sys: &dyn System, path: &Path, was: Stat) -> Result<(), S
     }
 }
 
-/// Relaunch `process` in `user`'s login session, if there is one.
+/// What [`relaunch`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signalled {
+    /// `killall` signalled every one of `user`'s processes of that name.
+    Every,
+    /// `killall` exited 1: it matched none, or one of them refused the signal. Whether the
+    /// old processes are gone is the caller's to see, never this answer's to vouch for.
+    NotEvery,
+    /// `user` has no login session: nothing was signalled, and nothing would start again.
+    NoSession,
+}
+
+/// Relaunch `process` in `user`'s login session, if there is one, saying what was
+/// signalled.
 ///
 /// # Errors
 /// One line when the session check or the relaunch did not work.
-pub fn relaunch(sys: &dyn System, user: &User, process: &str) -> Result<(), String> {
+pub fn relaunch(sys: &dyn System, user: &User, process: &str) -> Result<Signalled, String> {
     let session = Cmd::new(LAUNCHCTL)
         .arg("print")
         .arg(format!("gui/{}", user.uid));
     match sys.run(&session) {
         Ok(ran) if ran.success() => {}
-        Ok(ran) if ran.status == Some(NO_SESSION) => return Ok(()),
-        Ok(ran) => {
-            return Err(format!(
-                "written, but {}: {}",
-                session.display(),
-                ran.describe()
-            ));
-        }
-        Err(e) => return Err(format!("written, but {}: {e}", session.display())),
+        Ok(ran) if ran.status == Some(NO_SESSION) => return Ok(Signalled::NoSession),
+        Ok(ran) => return Err(format!("{}: {}", session.display(), ran.describe())),
+        Err(e) => return Err(format!("{}: {e}", session.display())),
     }
     let kill = Cmd::new(KILLALL)
         .args(["-u", user.name.as_str(), process])
         .as_user(user)
         .in_session();
     match sys.run(&kill) {
-        Ok(ran) if ran.success() || ran.status == Some(1) => Ok(()),
-        Ok(ran) => Err(format!(
-            "written, but {}: {}",
-            kill.display(),
-            ran.describe()
-        )),
-        Err(e) => Err(format!("written, but {}: {e}", kill.display())),
+        Ok(ran) if ran.success() => Ok(Signalled::Every),
+        Ok(ran) if ran.status == Some(1) => Ok(Signalled::NotEvery),
+        Ok(ran) => Err(format!("{}: {}", kill.display(), ran.describe())),
+        Err(e) => Err(format!("{}: {e}", kill.display())),
     }
 }
 
@@ -727,11 +865,24 @@ fn plain_process_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
 }
 
-/// The items `rows` ask for.
+/// The items `rows` ask for, each relaunch its rows share their own.
 ///
 /// # Errors
 /// One line naming the row that cannot be expanded.
 pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    expand_rows_with(rows, ctx, &Relaunches::default())
+}
+
+/// The items `rows` ask for, each process a row restarts relaunched once per account with
+/// every other row of the run in `relaunches` that restarts it ([`Pref::shared`]).
+///
+/// # Errors
+/// One line naming the row that cannot be expanded.
+pub fn expand_rows_with(
+    rows: &[Row],
+    ctx: &Ctx,
+    relaunches: &Relaunches,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let mut items: Vec<Box<dyn Item>> = Vec::new();
     for (n, row) in rows.iter().enumerate() {
         let at = format!("[[defaults]] row {} ({} {})", n + 1, row.domain, row.key);
@@ -815,7 +966,7 @@ pub fn expand_rows(rows: &[Row], ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String
                     }
                     let mut pref = Pref::new("defaults", id, title, target, want);
                     if let Some(p) = &row.restart {
-                        pref = pref.restart(p.as_str());
+                        pref = pref.restart(p.as_str()).shared(relaunches);
                     }
                     items.push(Box::new(pref));
                 }
@@ -1366,33 +1517,144 @@ pub(crate) mod tests {
         .restart("sharingd")
     }
 
-    fn script_airdrop(sys: &Fake) {
-        let key = "admin$ /usr/bin/defaults export com.apple.sharingd -";
-        sys.on(key, missing());
-        sys.on(
-            key,
-            export("<dict>\n\t<key>DiscoverableMode</key>\n\t<string>Off</string>\n</dict>"),
-        );
-        sys.on(
-            "admin$ /usr/bin/defaults write com.apple.sharingd DiscoverableMode -string Off",
-            Ran::ok(""),
-        );
+    /// A login session the [`Fake`] runs ([`Fake::simulate`]): `defaults` reads and writes
+    /// one store, `launchctl print` answers as `session` says, and `pgrep`, `killall` and
+    /// `sleep` act on its processes, each started again at once under a new pid when it is
+    /// killed, as launchd does.
+    pub(crate) struct Session {
+        prefs: Vec<(String, String, PValue)>,
+        running: Vec<(String, u32)>,
+        next_pid: u32,
+        /// What `launchctl print gui/<uid>` answers.
+        session: Ran,
+        /// What happened, in order: `write <domain> <key>`, `kill <process>`.
+        pub(crate) events: Vec<String>,
+    }
+
+    impl Session {
+        /// A session running `processes`, with no preference set.
+        pub(crate) fn running(processes: &[&str]) -> Self {
+            Self {
+                prefs: Vec::new(),
+                running: processes
+                    .iter()
+                    .zip(400..)
+                    .map(|(name, pid)| ((*name).to_owned(), pid))
+                    .collect(),
+                next_pid: 1000,
+                session: Ran::ok("gui/501 = {\n"),
+                events: Vec::new(),
+            }
+        }
+
+        /// How many times `process` was killed.
+        pub(crate) fn kills(&self, process: &str) -> usize {
+            let event = format!("kill {process}");
+            self.events.iter().filter(|e| **e == event).count()
+        }
+
+        fn answer(&mut self, fake: &Fake, cmd: &Cmd) -> Option<Ran> {
+            let args: Vec<String> = cmd
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            match (cmd.program.to_str()?, args.as_slice()) {
+                (DEFAULTS, ["export", domain, "-"]) => {
+                    let entries = self
+                        .prefs
+                        .iter()
+                        .filter(|(d, _, _)| d == domain)
+                        .map(|(_, key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    Some(Ran::ok(&plist::document(&PValue::Dict(entries))))
+                }
+                (DEFAULTS, ["write", domain, key, value @ ..]) => {
+                    let value = match value {
+                        ["-bool", b] => PValue::Bool(*b == "true"),
+                        ["-int", i] => PValue::Int(i.parse().ok()?),
+                        ["-string", text] => PValue::Str((*text).into()),
+                        [fragment] => plist::parse(fragment.as_bytes()).ok()?,
+                        _ => return None,
+                    };
+                    self.events.push(format!("write {domain} {key}"));
+                    self.prefs.retain(|(d, k, _)| !(d == domain && k == key));
+                    self.prefs.push(((*domain).into(), (*key).into(), value));
+                    Some(Ran::ok(""))
+                }
+                ("/usr/bin/pgrep", ["-u", _, "-x", process]) => {
+                    let pids: String = self
+                        .running
+                        .iter()
+                        .filter(|(name, _)| name == process)
+                        .map(|(_, pid)| format!("{pid}\n"))
+                        .collect();
+                    Some(if pids.is_empty() {
+                        Ran {
+                            status: Some(1),
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        }
+                    } else {
+                        Ran::ok(&pids)
+                    })
+                }
+                (LAUNCHCTL, ["print", _]) => Some(self.session.clone()),
+                (KILLALL, ["-u", _, process]) => {
+                    if !self.running.iter().any(|(name, _)| name == process) {
+                        return Some(Ran::exit(
+                            1,
+                            "No matching processes belonging to you were found",
+                        ));
+                    }
+                    for (name, pid) in &mut self.running {
+                        if name == process {
+                            fake.exited(*pid);
+                            *pid = self.next_pid;
+                            self.next_pid += 1;
+                            fake.alive(*pid);
+                        }
+                    }
+                    self.events.push(format!("kill {process}"));
+                    Some(Ran::ok(""))
+                }
+                ("/bin/sleep", ["1"]) => Some(Ran::ok("")),
+                _ => None,
+            }
+        }
+    }
+
+    /// `session`, run by a fake acting as root over it.
+    pub(crate) fn session_of(session: Session) -> (Fake, Arc<Mutex<Session>>) {
+        let sys = Fake::root();
+        for (_, pid) in &session.running {
+            sys.alive(*pid);
+        }
+        let session = Arc::new(Mutex::new(session));
+        let model = Arc::clone(&session);
+        sys.simulate(move |fake, cmd| model.lock().unwrap().answer(fake, cmd));
+        (sys, session)
     }
 
     #[test]
     fn a_change_relaunches_its_process_in_the_users_session_after_the_write() {
         let admin = user("admin", 501);
-        let sys = Fake::root();
-        script_airdrop(&sys);
-        sys.on("/bin/launchctl print gui/501", Ran::ok("gui/501 = {\n"));
-        sys.on("admin@gui$ /usr/bin/killall -u admin sharingd", Ran::ok(""));
+        let (sys, session) = session_of(Session::running(&["sharingd"]));
         let rows = run(&one(sharingd(&admin)), &sys, &ctx(&[admin]), Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0].why);
         assert_eq!(rows[0].effect, Effect::Relaunch);
+        assert_eq!(
+            session.lock().unwrap().events,
+            ["write com.apple.sharingd DiscoverableMode", "kill sharingd"]
+        );
         let calls = sys.calls();
-        let write = calls.iter().position(|c| c.contains(" write ")).unwrap();
         let kill = calls.iter().position(|c| c.contains("killall")).unwrap();
-        assert!(write < kill, "{calls:?}");
+        let read_back = calls
+            .iter()
+            .rposition(|c| c.contains("export com.apple.sharingd"))
+            .unwrap();
+        assert!(kill < read_back, "{calls:?}");
         assert!(
             rows[0]
                 .revert
@@ -1405,47 +1667,138 @@ pub(crate) mod tests {
     #[test]
     fn without_a_login_session_nothing_is_relaunched() {
         let admin = user("admin", 501);
-        let sys = Fake::root();
-        script_airdrop(&sys);
-        sys.on(
-            "/bin/launchctl print gui/501",
-            Ran::exit(112, "Bad request.\nCould not find domain for user gui: 501"),
-        );
+        let mut nobody = Session::running(&["sharingd"]);
+        nobody.session = Ran::exit(112, "Bad request.\nCould not find domain for user gui: 501");
+        let (sys, session) = session_of(nobody);
         let rows = run(&one(sharingd(&admin)), &sys, &ctx(&[admin]), Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0].why);
         assert!(!sys.calls().iter().any(|c| c.contains("killall")));
+        assert!(!sys.calls().iter().any(|c| c.contains("/bin/sleep")));
+        assert_eq!(session.lock().unwrap().kills("sharingd"), 0);
     }
 
     #[test]
     fn a_process_that_is_not_running_needs_no_relaunch() {
         let admin = user("admin", 501);
-        let sys = Fake::root();
-        script_airdrop(&sys);
-        sys.on("/bin/launchctl print gui/501", Ran::ok(""));
-        sys.on(
-            "admin@gui$ /usr/bin/killall -u admin sharingd",
-            Ran::exit(1, "No matching processes belonging to you were found"),
-        );
+        let (sys, _session) = session_of(Session::running(&[]));
         let rows = run(&one(sharingd(&admin)), &sys, &ctx(&[admin]), Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Changed, "{:?}", rows[0].why);
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|c| c.contains("killall") || c.contains("launchctl"))
+        );
     }
 
     #[test]
     fn a_session_check_that_fails_for_another_reason_is_a_failure_not_no_session() {
         let admin = user("admin", 501);
-        let sys = Fake::root();
-        script_airdrop(&sys);
-        sys.on(
-            "/bin/launchctl print gui/501",
-            Ran::exit(64, "Unrecognized target specifier."),
-        );
+        let mut broken = Session::running(&["sharingd"]);
+        broken.session = Ran::exit(64, "Unrecognized target specifier.");
+        let (sys, _session) = session_of(broken);
         let rows = run(&one(sharingd(&admin)), &sys, &ctx(&[admin]), Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Failed);
+        let why = rows[0].why.as_deref().unwrap();
         assert!(
-            rows[0].why.as_deref().unwrap().contains("exit 64"),
-            "{:?}",
-            rows[0].why
+            why.starts_with("applied, but not activated: ") && why.contains("exit 64"),
+            "{why}"
         );
+    }
+
+    /// Rows whose writes one process reads share its relaunch: the engine writes every one,
+    /// relaunches the process once after the last, journaled as one line, and reads each
+    /// back only after it is up again. Negative control: each row with a relaunch of its
+    /// own relaunches the process once per row.
+    #[test]
+    fn rows_one_process_reads_relaunch_it_once_after_the_last() {
+        let admin = user("admin", 501);
+        let keys = ["autohide", "autohide-delay", "orientation"];
+        let text: String = keys
+            .iter()
+            .map(|key| {
+                format!(
+                    "[[defaults]]\ndomain = \"com.example.bar\"\nkey = \"{key}\"\nvalue = true\n\
+                     scope = \"user\"\nrestart = \"SystemUIServer\"\n"
+                )
+            })
+            .collect();
+        let c = ctx(std::slice::from_ref(&admin));
+        let shared = expand_rows(&row(&text), &c).unwrap();
+        let own: Vec<Box<dyn Item>> = keys
+            .iter()
+            .map(|key| {
+                Box::new(
+                    Pref::new(
+                        "defaults",
+                        format!("defaults.com.example.bar.{key}@admin"),
+                        (*key).into(),
+                        Target::user("com.example.bar", key, &admin),
+                        Want::Value(PValue::Bool(true)),
+                    )
+                    .restart("SystemUIServer"),
+                ) as Box<dyn Item>
+            })
+            .collect();
+        for (items, relaunches) in [(shared, 1), (own, keys.len())] {
+            let (sys, session) = session_of(Session::running(&["SystemUIServer"]));
+            let mut journal = Lines::default();
+            let rows = engine::run(&items, Mode::Apply, &sys, &c, &mut journal);
+            assert!(
+                rows.iter().all(|row| row.outcome == Outcome::Changed),
+                "{rows:?}"
+            );
+            let session = session.lock().unwrap();
+            assert_eq!(
+                session.kills("SystemUIServer"),
+                relaunches,
+                "{:?}",
+                session.events
+            );
+            let relaunch_lines = journal
+                .0
+                .iter()
+                .filter(|id| id.contains("relaunch"))
+                .count();
+            assert_eq!(relaunch_lines, relaunches, "{:?}", journal.0);
+            if relaunches == 1 {
+                let last_write = session
+                    .events
+                    .iter()
+                    .rposition(|e| e.starts_with("write "))
+                    .unwrap();
+                let kill = session
+                    .events
+                    .iter()
+                    .position(|e| e.starts_with("kill "))
+                    .unwrap();
+                assert!(last_write < kill, "{:?}", session.events);
+                let calls = sys.calls();
+                let killed = calls.iter().position(|c| c.contains("killall")).unwrap();
+                let read_backs = calls[killed..]
+                    .iter()
+                    .filter(|c| c.contains("export com.example.bar"))
+                    .count();
+                // Two looks of the relaunched process, then one read-back per row.
+                assert_eq!(read_backs, 2 + keys.len(), "{calls:#?}");
+            }
+        }
+    }
+
+    /// The ids a journal was handed, in order.
+    #[derive(Default)]
+    struct Lines(Vec<String>);
+
+    impl aterm_converge::Journal for Lines {
+        fn before_change(
+            &mut self,
+            id: &str,
+            _from: &str,
+            _to: &str,
+            _revert: Option<&str>,
+        ) -> Result<(), String> {
+            self.0.push(id.into());
+            Ok(())
+        }
     }
 
     #[test]

@@ -78,7 +78,8 @@ fn search_path_with_ext(name: &str, ext: &str) -> Option<OsString> {
     let ext_w = wide_nul(OsStr::new(ext));
     let mut buf: Vec<u16> = vec![0; 260];
     loop {
-        // SAFETY: `name_w`/`ext_w` are NUL-terminated wide strings live for the call.
+        // SAFETY: `name_w`/`ext_w` are NUL-terminated wide strings live for the
+        // call; `buf` is a writable buffer of the advertised length.
         let n = unsafe {
             ffi::SearchPathW(
                 std::ptr::null(),
@@ -276,7 +277,9 @@ mod tests {
     /// resolved shell in.
     fn create_process_verdict(program: &str) -> Result<(), u32> {
         let app_w = wide_nul(OsStr::new(program));
-        // SAFETY: Zeroed startupinfow is valid once `cb` is set.
+        // SAFETY: zeroed STARTUPINFOW is valid once `cb` is set; PROCESS_INFORMATION
+        // is POD out-memory; `app_w` is a NUL-terminated wide string alive across
+        // the call and every other pointer is NULL.
         unsafe {
             let mut si: ffi::STARTUPINFOW = std::mem::zeroed();
             si.cb = u32::try_from(std::mem::size_of::<ffi::STARTUPINFOW>()).unwrap();

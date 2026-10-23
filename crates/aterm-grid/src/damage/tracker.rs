@@ -11,11 +11,6 @@ pub struct DamageTracker {
     /// Per-row column damage bounds: (min_col, max_col) if damaged.
     row_bounds: Vec<RowDamageBounds>,
     /// Monotone count of mark calls, including marks that set no new bit.
-    ///
-    /// `GridPresentationState::fold_row_revisions` uses it to tell a row written
-    /// again since the last fold from one merely still marked (the bitset is the
-    /// same). It survives `clear`: a rewind would make a later mark compare equal
-    /// to a pre-reset fold.
     pub(crate) mark_seq: u64,
 }
 

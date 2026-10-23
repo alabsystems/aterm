@@ -5,6 +5,12 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! LOCAL PATCH (aterm): libwayland-client is always opened at run time through first-party
+//! `aterm-wayland` (upstream's `wayland-dlopen` chose). No client-side frame is drawn: where the
+//! compositor settles on client-side decorations the application draws its own header
+//! ([`WindowExtWayland::client_decorations`], [`Window::drag_window`],
+//! [`Window::drag_resize_window`], [`Window::show_window_menu`]).
 
 use crate::event_loop::{ActiveEventLoop, EventLoop};
 use crate::window::{Window, WindowAttributes};

@@ -811,6 +811,7 @@ pub fn emit(
         cell.triple,
         decls.set.len()
     ));
+    out.push(aterm_census::seal::line("//", super::GENERATOR));
     out.push("#![allow(non_upper_case_globals, non_camel_case_types, unused_parens)]".into());
     out.push("#![allow(deprecated)]".into());
     out.push(String::new());

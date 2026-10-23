@@ -240,7 +240,8 @@ fn restored_titles(world: &World, proc: &Proc) -> Vec<String> {
     session_titles(proc)
 }
 
-/// The module doc's first world.
+/// A is SIGKILLed with its build held, L boots meanwhile and leaves A's take alone, and B
+/// brings back both layouts' tabs.
 #[test]
 fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_next() {
     let world = World::new("kill");
@@ -293,7 +294,8 @@ fn a_launch_killed_inside_its_event_loop_build_leaves_the_quit_layout_to_the_nex
     assert!(!world.quit_layout().exists(), "B took L's layout too");
 }
 
-/// THE BRAKE (the module doc's second world).
+/// THE BRAKE: A, then B (which took A's layout again), die inside their builds, and C sets
+/// the twice-lost layout aside.
 #[test]
 fn a_layout_taken_again_and_lost_again_is_not_taken_a_third_time() {
     let world = World::new("brake");

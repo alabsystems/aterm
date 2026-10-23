@@ -137,7 +137,8 @@ fn param_type(p: &str) -> String {
     }
 }
 
-/// `fn NAME(params) -> ret` (also an `extern "C" fn(params) -> ret` type).
+/// `fn NAME(params) -> ret` (also an `extern "C" fn(params) -> ret` type):
+/// `(params, ret)`, `ret` being `()` when absent.
 fn signature(s: &str) -> (Vec<String>, String) {
     let open = s.find('(').expect("a parameter list");
     let mut depth = 0;
@@ -244,7 +245,7 @@ fn subjects(files: &[&str]) -> Decls {
     all
 }
 
-/// The C type-name for a Rust type, by the rules in the module doc.
+/// The C type-name for a Rust type.
 fn c_type(rust: &str, d: &Decls) -> String {
     let t = rust.trim();
     let typeof_ = |c: String| {

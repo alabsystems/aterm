@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Layout typing through the shipping `on_key`: a press builds its key from the
-//! layout's unshifted key, yet must type what the layout typed (Caps Lock, Shift
-//! on a non-US layout), hold that character across auto-repeat, send Ctrl's
-//! control byte on a non-Latin layout, and keep Option on the named keys when
-//! `option_as_meta = false`.
+//! Verifies layout-aware keyboard text and chord handling in `App::on_key`.
 
 use crate::{App, WindowId, term_lock};
 use aterm_window::event::{ElementState, KeyEvent};
@@ -13,7 +9,6 @@ use aterm_window::keyboard::{
     Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
 };
 
-/// An App whose session writes to an observer pipe (nonblocking read end).
 fn app_observing_pty() -> (App, i32) {
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::Arc;
@@ -44,8 +39,6 @@ fn drain(pipe: i32) -> Vec<u8> {
     bytes[..read as usize].to_vec()
 }
 
-/// A press as the macOS backend builds it: `base` is `key_without_modifiers()`
-/// (UCKeyTranslate with no modifiers), `logical`/`text` are `-characters`.
 fn mac_press(code: KeyCode, logical: Key, base: &str, text: &str) -> KeyEvent {
     KeyEvent::synthetic_for_test_with_base(
         PhysicalKey::Code(code),
@@ -71,9 +64,6 @@ fn push_kitty(app: &App, wid: WindowId, push: &[u8]) {
     term_lock(&term).process(push);
 }
 
-/// German Shift+2 types '"' and keeps typing it while held: the press record
-/// carries the layout's character, so an auto-repeat replays it rather than
-/// the US table's '@'. AZERTY Shift+& types '1' and Russian Shift+ф 'Ф'.
 #[test]
 fn a_held_layout_character_repeats_as_typed() {
     let (mut app, pipe) = app_observing_pty();
@@ -94,8 +84,6 @@ fn a_held_layout_character_repeats_as_typed() {
     unsafe { libc::close(pipe) };
 }
 
-/// Caps Lock + A with no lock state from the platform (the Linux backends
-/// report none): the layout's 'A' is what reaches the PTY.
 #[test]
 fn caps_lock_letter_types_the_capital() {
     let (mut app, pipe) = app_observing_pty();
@@ -105,8 +93,6 @@ fn caps_lock_letter_types_the_capital() {
     unsafe { libc::close(pipe) };
 }
 
-/// Russian Ctrl+С interrupts (ETX) and Ctrl+В is EOF; kitty keeps the
-/// layout's key.
 #[test]
 fn ctrl_on_a_cyrillic_layout_writes_the_control_byte() {
     let (mut app, pipe) = app_observing_pty();
@@ -126,14 +112,6 @@ fn ctrl_on_a_cyrillic_layout_writes_the_control_byte() {
     unsafe { libc::close(pipe) };
 }
 
-/// A chord on a non-US layout sends the layout's character through the shipping
-/// `on_key`. German Ctrl+Shift+ß reads '?' without Ctrl, so it
-/// sends the DEL of '?', not the US position's Ctrl+_ (0x1f); German
-/// Option+Shift+2, as the window hands it over with Option as an Alt (text '"';
-/// the sync below is what the event loop runs as every callback ends), is
-/// ESC '"', not the US table's ESC '@'. Russian Ctrl+х, whose character has no
-/// control byte, takes the physical key's US '[' (ESC), as xterm, kitty and
-/// ghostty do.
 #[test]
 fn a_chord_on_a_non_us_layout_sends_the_layouts_character() {
     let (mut app, pipe) = app_observing_pty();
@@ -158,14 +136,6 @@ fn a_chord_on_a_non_us_layout_sends_the_layouts_character() {
     unsafe { libc::close(pipe) };
 }
 
-/// review: a chord under Caps Lock sends the bytes it sent
-/// before chords carried the layout's character. A chord's text that differs
-/// from what the unshifted key derives only by letter case is the lock's, and
-/// the chord keeps the key's own case, as kitty's legacy encoding drops the
-/// lock modifiers: Caps Lock + Alt+b is ESC b (not ESC B), Russian Caps Lock +
-/// Alt+и is ESC и, and Ctrl+c under modifyOtherKeys level 2 (vim's default)
-/// reports 'c' (99), not 'C' (67). The presses are shaped as Caps Lock makes
-/// them, with no lock state from the platform (the Linux backends report none).
 #[test]
 fn a_chord_under_caps_lock_keeps_the_keys_own_case() {
     let (mut app, pipe) = app_observing_pty();
@@ -187,13 +157,6 @@ fn a_chord_under_caps_lock_keeps_the_keys_own_case() {
     unsafe { libc::close(pipe) };
 }
 
-/// review: a chord's letter takes Shift's case, never the
-/// lock's, for every case pair a layout types. Turkish Q's dotless key (the
-/// US I key) types 'I' under Caps Lock, and its dotted key (the US ' key)
-/// 'İ'; neither pair round-trips through Unicode's default lowercase, so
-/// Caps Lock + Alt+ı went out as ESC I and Caps Lock + Alt+i as ESC İ.
-/// Russian Alt+Shift+и is Shift's capital, which the US table cannot derive
-/// for a non-Latin letter, so it went out as ESC и.
 #[test]
 fn a_chords_letter_takes_shifts_case_for_every_case_pair() {
     let (mut app, pipe) = app_observing_pty();
@@ -216,11 +179,6 @@ fn a_chords_letter_takes_shifts_case_for_every_case_pair() {
     unsafe { libc::close(pipe) };
 }
 
-/// A shortcut on a Russian layout is its US key's shortcut, as Ctrl's byte is
-/// its US key's byte: Ctrl+Shift+'а' (the F key) opens find instead of writing
-/// ^F, and inside the field Ctrl+'ф' (the A key) is ^A, the move to the start.
-/// The press is shaped as X11/Wayland build it: the base key is the active
-/// layout's level-0 keysym.
 #[test]
 fn a_shortcut_on_a_cyrillic_layout_is_its_us_keys_shortcut() {
     let (mut app, pipe) = app_observing_pty();
@@ -257,11 +215,6 @@ fn a_shortcut_on_a_cyrillic_layout_is_its_us_keys_shortcut() {
     unsafe { libc::close(pipe) };
 }
 
-/// `option_as_meta = false` lets Option type the layout's characters, but winit
-/// gives the named keys a text too ("\x08", "\r", "\t", "\x1b"); they keep Option
-/// through the encoder, legacy and kitty. Only printable text takes the text
-/// path: Option+a types 'å', and Option+Space a space, not Meta+Space (`ESC SP`
-/// mid-word for a German or Nordic typist still holding Option from `|`).
 #[test]
 fn option_as_meta_off_keeps_option_on_the_named_keys() {
     let named = |name, code, text: &str| {
@@ -311,9 +264,6 @@ fn option_as_meta_off_keeps_option_on_the_named_keys() {
     unsafe { libc::close(pipe) };
 }
 
-/// A native page's text field types what the terminal would (Shift+a 'A',
-/// German Shift+2 '"'), though the press's key is the layout's unshifted key. A
-/// keypad digit is its own glyph under Shift ('5'), never the main row's '%'.
 #[test]
 fn a_native_text_field_types_the_shifted_and_layout_character() {
     use crate::native_settings::SettingsRoute;

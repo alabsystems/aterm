@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! DOM [`KeyboardEvent.key`] → engine [`Key`]/[`NamedKey`] mapping: the web sibling of
+//! DOM `KeyboardEvent.key` → engine [`Key`]/[`NamedKey`] mapping: the web sibling of
 //! `aterm-winit-keymap`, here so the wasm bindings (`aterm-wasm`, `aterm-gpu-web`) share one
 //! table. Pure `&str` matching, so no feature gate.
 
@@ -73,7 +73,7 @@ fn unshifted_dom_key(
     }
 }
 
-/// Map a DOM [`KeyboardEvent.key`] value into the engine's [`Key`]. `None` for values the
+/// Map a DOM `KeyboardEvent.key` value into the engine's [`Key`]. `None` for values the
 /// engine must not guess an encoding for: IME/composition values (`"Dead"`, `"Process"`,
 /// `"Compose"`, multi-codepoint strings), `"Unidentified"`, and named keys no terminal sequence
 /// covers.

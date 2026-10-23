@@ -13,9 +13,7 @@ pub struct ObjectPath(String);
 
 impl ObjectPath {
     /// Validates `path` as a D-Bus object path.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] unless `path` is an object path.
     pub fn new(path: impl Into<String>) -> Result<Self> {
         let path = path.into();
@@ -45,9 +43,7 @@ pub struct Signature(String);
 
 impl Signature {
     /// Validates `sig` as a D-Bus data signature.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] for a signature the specification forbids.
     pub fn new(sig: impl Into<String>) -> Result<Self> {
         let sig = sig.into();
@@ -94,7 +90,7 @@ impl Array {
     }
 }
 
-/// A dict (`a{kv}`): its key and value types and the entries, in wire order.
+/// A dict (`a{kv}`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dict {
     key: Type,
@@ -160,7 +156,7 @@ pub enum Value {
     Variant(Box<Value>),
     Array(Box<Array>),
     Dict(Box<Dict>),
-    /// One or more fields; the encoder refuses an empty struct.
+    /// One or more fields.
     Struct(Vec<Value>),
 }
 
@@ -173,9 +169,7 @@ impl Value {
     }
 
     /// An array of `elem` values.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] when an item is not of type `elem`.
     pub fn array(elem: Type, items: Vec<Value>) -> Result<Self> {
         if items.iter().any(|item| !item.is(&elem)) {
@@ -185,9 +179,7 @@ impl Value {
     }
 
     /// A dict from `key` to `value` values, entries kept in the order given.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] when `key` is not a basic type or an entry does not match `(key, value)`.
     pub fn dict(key: Type, value: Type, entries: Vec<(Value, Value)>) -> Result<Self> {
         if !key.is_basic() {
@@ -213,9 +205,7 @@ impl Value {
     }
 
     /// An object path value.
-    ///
     /// # Errors
-    ///
     /// [`Error::Invalid`] unless `path` is an object path.
     #[inline]
     pub fn path(path: &str) -> Result<Self> {

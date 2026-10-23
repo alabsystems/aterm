@@ -74,7 +74,9 @@ pub(crate) enum Edge {
     },
 }
 
-/// What a bottom push left at its seams, under the current law ([`ResizeLaw::Rewrap`]; see the module doc), owed back with the pushed rows.
+/// What a bottom push left at its seams under the current law ([`ResizeLaw::Rewrap`]), owed back
+/// with the pushed rows: how many blank rows it left under the cursor (`gap`), and whether it cut
+/// the wrap of the first pushed row (`bottom`) and of the screen's new top row (`top`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seams {
     pub(super) gap: u16,

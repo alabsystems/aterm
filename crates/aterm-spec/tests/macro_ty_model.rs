@@ -1,24 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! The `ty_model!` light-annotation surface is pure sugar: each macro-built
-//! model below derives byte-identical TLA+ to the `derive::*`-constructor model
-//! it should desugar to, over the shapes real models use:
-//!
-//!   * the bounded ring (`aterm_models_core::ring_model`, written out as `ring_hand`), cfg
-//!     and open-Init transition form too
-//!   * an action with NO `when` guard          -> the `guard: None` branch
-//!   * two actions with partial updates        -> disjunctive `Next` + `UNCHANGED`
-//!   * a nested `if/else` (else-arm is an `if`) -> `tr_else` over `Expr::If`
-//!   * the `>` operator, and `-`/`+` arithmetic in updates.
+//! Desugaring equivalence tests for the `ty_model!` macro.
 
 use aterm_spec::derive::{
     Action, Invariant, Model, StateVar, Update, add, and_, cst, eq, gt, if_, le, or_, sub, var,
 };
 use aterm_spec::ty_model;
-
-// Two actions with partial updates, one unguarded: each emits `UNCHANGED` for the other's
-// variable and `Next` is their disjunction.
 
 fn cursor_unguarded_hand() -> Model {
     Model {
@@ -61,7 +48,6 @@ fn cursor_unguarded_hand() -> Model {
     }
 }
 
-// `MaxSeq` is a `const` in the macro, so the hand-built models spell it `cst(..)`.
 fn int_lit(i: i64) -> aterm_spec::derive::Expr {
     aterm_spec::derive::int(i)
 }
@@ -82,8 +68,6 @@ fn cursor_unguarded_macro() -> Model {
         }
     }
 }
-
-// A nested if/else (the else arm is an `if`, not a block) exercises `tr_else` over `Expr::If`.
 
 fn tiered_hand() -> Model {
     Model {
@@ -143,10 +127,6 @@ fn tiered_macro() -> Model {
     }
 }
 
-// ── The bounded ring ─────────────────────────────────────────────────────────
-
-/// `aterm_models_core::ring_model`, written out with the builders: that model lives in a crate
-/// that depends on this one, so the hand-built twin is spelled here like the others.
 fn ring_hand() -> Model {
     Model {
         name: "Ring",
@@ -191,7 +171,6 @@ fn ring_hand() -> Model {
     }
 }
 
-/// The bounded event-log ring, written in the light-annotation surface.
 fn ring_macro() -> Model {
     ty_model! {
         Ring {
@@ -230,14 +209,6 @@ fn ty_model_desugars_to_the_hand_built_model() {
         );
     }
 }
-
-// ── Grouping: an expression reads as Rust reads it ───────────────────────────
-// `ty_model!` reads its expressions itself (aterm-macro-support, no syn; SP.8 of
-// docs/AUDIT-third-party-2026-10-15.md), so how it groups one is pinned here
-// against the builders written out: `+`/`-` fold left, `&&` binds tighter than
-// `||`, a comparison tighter than both, parentheses regroup (a parenthesized
-// comparison may be compared again), an `if` is an operand, and integers may be
-// written in any base, with `_`, and negative where a constant is declared.
 
 fn grouping_macro() -> Model {
     ty_model! {
@@ -311,8 +282,6 @@ fn grouping_hand() -> Model {
 
 #[test]
 fn macro_groups_an_expression_as_rust_does() {
-    // Debug, not TLA+: the rendering parenthesizes for TLA+'s own grouping, and
-    // two trees can render alike; the trees themselves must be equal.
     assert_eq!(
         format!("{:#?}", grouping_macro()),
         format!("{:#?}", grouping_hand())
@@ -321,10 +290,6 @@ fn macro_groups_an_expression_as_rust_does() {
 
 #[test]
 fn macro_reads_compiler_lexed_unicode_integer_suffixes() {
-    // U+0315 is a valid identifier continuation, but not alphanumeric. These
-    // are compiler-lexed literal tokens; a second ASCII-like suffix check
-    // must not reject them. Ordinary suffixes and the signed boundary remain
-    // controls for the numeric decoding shared by declarations/expressions.
     let actual = ty_model! {
         UnicodeIntegerSuffix {
             const Limit = 2u̕;
@@ -366,11 +331,6 @@ fn macro_reads_compiler_lexed_unicode_integer_suffixes() {
     );
 }
 
-// ── Writing a model registers it ─────────────────────────────────────────────
-// `ty_model!` submits what it writes, `#[model]` a hand-built model and
-// `#[liveness(model)]` an obligation with its model, so the sweeps reach each
-// one without a list to keep.
-
 #[aterm_spec::model]
 fn registered_by_attribute() -> Model {
     let mut m = cursor_unguarded_hand();
@@ -389,7 +349,6 @@ fn registered_obligation() -> aterm_spec::derive::Liveness {
     }
 }
 
-/// A model only an obligation names: stating the obligation registers it.
 fn stated_over_only() -> Model {
     let mut m = cursor_unguarded_hand();
     m.name = "StatedOverOnly";
@@ -423,7 +382,6 @@ fn writing_a_model_registers_it() {
         assert_eq!(found.len(), 1, "{name} is registered once");
         assert_eq!(found[0].to_tla(), tla, "{name} is registered as written");
     }
-    // A scenario is a configuration swept beside the committed one.
     let capped = ty_model! {
         RegisteredWithScenario {
             const Buggy = 0;

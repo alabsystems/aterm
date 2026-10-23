@@ -25,6 +25,17 @@ impl Tile {
         }
     }
 
+    /// Reset this tile to a transparent `w`×`h` surface, reusing its existing
+    /// pixel buffer capacity whenever `w * h * 4` fits.
+    #[inline]
+    pub fn reset(&mut self, w: u32, h: u32) {
+        self.w = w;
+        self.h = h;
+        let len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        self.px.clear();
+        self.px.resize(len, 0);
+    }
+
     /// Tile width in texels.
     #[inline]
     #[must_use]

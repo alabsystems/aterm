@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless check of transcript steps,
-//! driven through the one `aterm` binary against a real
-//! headless instance and its real control socket.
-//!
-//! * A CLAUDE-SHAPED STAND-IN: a POSIX `sh` script run as `claude` via
-//!   `exec -a`, with `CLAUDE_CONFIG_DIR` in its own environment (the lifted
-//!   Claude home, addendum A25). On macOS the interpreter is the kept
-//!   stand-in of `/bin/bash`, signed ad hoc and run in place: the kernel
-//!   hides a platform binary's environment from another process, so
-//!   `/bin/sh` itself would hide the home the footer reads. It writes its
-//!   registry row under that home and draws Claude Code's idle screen, or
-//!   its busy one (ticking) while the test's `busy` file exists. The test
-//!   writes the transcript itself: synthetic rows in Claude Code's shape,
-//!   every value made up.
-//! * HISTORY IS NEVER REPLAYED (S1): the transcript holds 20 turns before the
-//!   stand-in starts; the log says so once (`source field=transcript …
-//!   skipped=<its length>`) and holds no turn of them.
-//! * A LIVE TURN: the screen's busy opens the turn, the transcript's prompt
-//!   names it (`amend … vref=`, exactly one turn per vref, S30), its Bash
-//!   step opens and closes (`await log kind=tool` returns), and the idle
-//!   screen's settle closes the turn (`await log close=turn` returns).
-//! * THE CLAUSE (plan §5; on by default since D6, so the config
-//!   names no `[session_log]`; the in-grid strip, whose menu `open tab-menu`
-//!   reads headless): the tab's menu says `now: running shell` while the
-//!   step is open, and a `ctl` client's label shows in `log`, never in the
-//!   menu.
-//! * NO TRANSCRIPT TEXT (S6, D5 decision B): no prompt, reply, tool input or
-//!   result word reaches `log` at either tier, `brief`, the menu, or any file
-//!   under the instance's scratch world outside the Claude home.
-//!
-//! ISOLATION: scratch HOME/XDG roots, a private control socket, every
-//! automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance opens no window.
+//! Live-headless integration test for session-log transcript steps.
 
 #![cfg(unix)]
 
@@ -47,10 +15,8 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, boot_session, ctl_ok, field, process_tree, status, type_line};
 
-/// The registry row's session id: the transcript's file stem.
 const SESSION_ID: &str = "00000000-0000-4000-8000-0000000003b0";
 
-/// The words the transcript's text carries: none may leave it.
 const SECRETS: &[&str] = &[
     "QZHISTORYPROMPT",
     "QZHISTORYINPUT",
@@ -60,13 +26,9 @@ const SECRETS: &[&str] = &[
     "QZLIVERESULT",
 ];
 
-/// The hang detector (AGENTS.md): a wait for what must happen.
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 const HANG_MS: &str = "timeout=60000";
 
-/// The stand-in (module doc): `$1` the screens' directory (`ready.scr`,
-/// `busy.scr`, and the `busy` flag), `$2` its working directory, `$3` the
-/// session id. Answers `--version` at once.
 const STANDIN: &str = r#"#!/bin/sh
 [ "$1" = --version ] && { echo 2.1.300; exit 0; }
 dir="$1"; work="$2"; sid="$3"
@@ -87,13 +49,10 @@ while :; do
 done
 "#;
 
-/// Rows as the stand-in draws them, `\r\n` between (the stand-in puts the
-/// cursor on the caret row, the sixth, after them).
 fn render(rows: &[String]) -> String {
     rows.join("\r\n")
 }
 
-/// Claude Code at rest after a turn.
 fn ready() -> Vec<String> {
     let mut r = vec![
         "⏺ Ready.".to_string(),
@@ -105,7 +64,6 @@ fn ready() -> Vec<String> {
     r
 }
 
-/// Claude Code mid-turn (its spinner row ticked by the stand-in).
 fn busy() -> Vec<String> {
     let mut r = vec![
         "⏺ On it.".to_string(),
@@ -117,10 +75,6 @@ fn busy() -> Vec<String> {
     r
 }
 
-/// The stand-in's interpreter: on macOS the kept stand-in of `/bin/bash`,
-/// signed ad hoc and run in place (module doc, `aterm_uds::deadline::stand_in`:
-/// nothing removes it, so no instance's teardown can unlink it while macOS
-/// still assesses its first exec), elsewhere `/bin/sh`.
 fn interpreter() -> PathBuf {
     if !cfg!(target_os = "macos") {
         return PathBuf::from("/bin/sh");
@@ -128,8 +82,6 @@ fn interpreter() -> PathBuf {
     aterm_uds::deadline::stand_in(Path::new("/bin/bash"))
 }
 
-/// The tab menu's rows as `controls tab-menu` reads them after `open
-/// tab-menu`, the card closed again.
 fn menu(inst: &Instance) -> Vec<String> {
     ctl_ok(inst, &["open", "tab-menu"]);
     let rows = ctl_ok(inst, &["controls", "tab-menu"])
@@ -143,7 +95,6 @@ fn menu(inst: &Instance) -> Vec<String> {
     rows
 }
 
-/// Wall ms now.
 fn wall_ms() -> u64 {
     u64::try_from(
         SystemTime::now()
@@ -154,7 +105,6 @@ fn wall_ms() -> u64 {
     .expect("ms fit")
 }
 
-/// Claude Code's RFC 3339 spelling of wall ms `ms`.
 fn iso(ms: u64) -> String {
     let mut s = aterm_types::rfc3339::format_rfc3339(ms / 1000);
     s.pop();
@@ -200,7 +150,6 @@ fn append(path: &Path, rows: &[String]) {
     }
 }
 
-/// `log`'s records for `sid` at `tier` (`host` or `content`).
 fn log(inst: &Instance, sid: &str, tier: &str) -> Vec<String> {
     ctl_ok(
         inst,
@@ -211,7 +160,6 @@ fn log(inst: &Instance, sid: &str, tier: &str) -> Vec<String> {
     .collect()
 }
 
-/// The reader's cursor: `(log_seq, log_ep)` off `status`.
 fn cursor(inst: &Instance, sid: &str) -> (String, String) {
     let st = status(inst, sid);
     (
@@ -220,7 +168,6 @@ fn cursor(inst: &Instance, sid: &str) -> (String, String) {
     )
 }
 
-/// `await log <what>` from the cursor `at`, a hang detector: its answer.
 fn await_log(inst: &Instance, sid: &str, what: &str, at: &(String, String)) -> String {
     let reply = ctl_ok(
         inst,
@@ -246,7 +193,6 @@ fn having<'a>(lines: &'a [String], needle: &str) -> Vec<&'a String> {
     lines.iter().filter(|l| l.contains(needle)).collect()
 }
 
-/// Every file under `root` but those under `skip`, read whole.
 fn files_under(root: &Path, skip: &[PathBuf], out: &mut Vec<(PathBuf, Vec<u8>)>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
@@ -269,14 +215,11 @@ fn files_under(root: &Path, skip: &[PathBuf], out: &mut Vec<(PathBuf, Vec<u8>)>)
     }
 }
 
-/// The module doc, end to end.
 #[test]
 fn session_log_transcript_live_headless() {
     let inst = headless_boot::boot_with(
         "atslt",
         |root, cmd| {
-            // The in-grid strip (its menu is what `open tab-menu` reads
-            // headless), at the config's top; the clause is the default's.
             let path = root.join("cfg/aterm/aterm.toml");
             let base = std::fs::read_to_string(&path).expect("the scratch config");
             assert!(!base.contains("[session_log]"), "the clause's default");
@@ -304,7 +247,6 @@ fn session_log_transcript_live_headless() {
     std::fs::create_dir_all(&projects).expect("the project dir");
     let transcript = projects.join(format!("{SESSION_ID}.jsonl"));
 
-    // HISTORY: twenty turns before the stand-in starts.
     let t0 = wall_ms().saturating_sub(3_600_000);
     let mut history = Vec::new();
     for i in 0..20u64 {
@@ -350,7 +292,6 @@ fn session_log_transcript_live_headless() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // S1: the history said once, as skipped, and no turn of it.
     let source = await_log(&inst, &sid, "kind=source", &start);
     assert!(
         source.contains(" source ") && source.contains(" field=transcript "),
@@ -372,7 +313,6 @@ fn session_log_transcript_live_headless() {
         "no past turn is replayed (S1): {got:#?}"
     );
 
-    // A LIVE TURN: busy opens it; its rows name it and its step.
     let before_turn = cursor(&inst, &sid);
     std::fs::write(dir.join("busy"), b"").expect("busy");
     let opened = await_log(&inst, &sid, "open=turn", &before_turn);
@@ -382,8 +322,6 @@ fn session_log_transcript_live_headless() {
         .nth(1)
         .expect("the turn's node")
         .to_string();
-    // Its rows are dated at the turn's open as the log said it (S30: what
-    // holds however long the calls above took, never a latency budget).
     let t_open: u64 = opened
         .split_whitespace()
         .skip_while(|t| *t != "open")
@@ -411,8 +349,6 @@ fn session_log_transcript_live_headless() {
             && step.contains(" cls=shell "),
         "{step}"
     );
-    // THE CLAUSE (S11): the open step is the menu's `now:` row; a `ctl`
-    // client's label is the log's alone and hides nothing.
     let label = ctl_ok(
         &inst,
         &[
@@ -476,7 +412,6 @@ fn session_log_transcript_live_headless() {
         "exactly one turn (S30): {got:#?}"
     );
 
-    // NO TRANSCRIPT TEXT anywhere aterm keeps or answers.
     let mut answered = log(&inst, &sid, "content");
     answered.extend(got);
     answered.extend(menu(&inst));

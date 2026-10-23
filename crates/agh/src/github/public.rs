@@ -79,8 +79,11 @@ impl<'a> Public<'a> {
     /// A GET of the asset's web path into `dest`, at most `cap` bytes.
     ///
     /// # Errors
-    /// Usage for an invalid tag or asset path, before any request; Invalid over `cap`; NotFound
-    /// for a 404; the call's or the write's error.
+    ///
+    /// Usage, before any request, for a tag `path::refuse_bad_tag` refuses (empty, an empty
+    /// `/`-part, or a `.` or `..` part) or an asset with a `.` or `..` `/`-part
+    /// (`web_path`); Invalid over `cap` (the part file deleted); NotFound for a 404; the
+    /// call's or the write's error.
     pub fn fetch(
         &self,
         slug: &Slug,

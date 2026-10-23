@@ -323,25 +323,46 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
             None => return unread("warming"),
         }
     }
-    let aterm = snap.aterm.as_ref().and_then(|a| a.footprint).unwrap_or(0);
-    let rest = i64::try_from(aterm).unwrap_or(i64::MAX) - fig;
-    let outside = snap
-        .why
-        .as_deref()
-        .filter(|f| f.lane == CoalLane::On)
-        .and_then(|f| {
-            f.split
-                .rows
-                .iter()
-                .filter(|r| r.part != super::Part::Aterm)
-                .try_fold(0, |most: i64, r| {
-                    Some(most.max(i64::try_from(r.footprint?).unwrap_or(i64::MAX)))
-                })
-        });
-    let largest = outside.is_some_and(|o| fig >= o && fig >= rest);
+    let bytes = |b: u64| i64::try_from(b).unwrap_or(i64::MAX);
+    // The parts beside the tab: the rest of aterm, and each coalition outside
+    // it where the lane reads them (with it off, none is read).
+    let rest = snap
+        .aterm
+        .as_ref()
+        .and_then(|a| a.footprint)
+        .map(|b| bytes(b) - fig);
+    let outside: Vec<Option<i64>> = match snap.why.as_deref().filter(|f| f.lane == CoalLane::On) {
+        Some(f) => f
+            .split
+            .rows
+            .iter()
+            .filter(|r| r.part != super::Part::Aterm)
+            .map(|r| r.footprint.map(bytes))
+            .collect(),
+        None => vec![None],
+    };
+    let beside: Vec<Option<i64>> = std::iter::once(rest).chain(outside).collect();
+    // No part larger: not once one read is, and unknown while one is unread.
+    let largest = if beside.iter().flatten().any(|&p| p > fig) {
+        Some(false)
+    } else {
+        beside.iter().all(Option::is_some).then_some(true)
+    };
     let above =
         u64::try_from(fig).is_ok_and(|b| b >= MEM_FLOOR_BYTES) && fig * 1000 >= whole * FLOOR_PM;
-    let (role, calm) = you_role(fig, whole, largest, above);
+    let (mut role, mut calm) = you_role(fig, whole, largest.unwrap_or(false), above);
+    // A role that turns on a comparison not read is not read either: the
+    // lane's word where it is off, warming before its first window, as the
+    // CPU's ([`cpu_you`]), else not sampled.
+    if largest.is_none() && you_role(fig, whole, true, above).0 != role {
+        let lane = snap.why.as_deref().map_or(snap.coal_lane, |f| f.lane);
+        let word = match lane.word() {
+            Some(off) => off,
+            None if snap.why.is_none() => "warming",
+            None => "not_sampled",
+        };
+        (role, calm) = (Role::Unavailable(word), false);
+    }
     You {
         tab,
         role,

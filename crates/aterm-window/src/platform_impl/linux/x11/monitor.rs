@@ -11,12 +11,10 @@ use super::{util, IgnoreError as _, X11Error, XConnection};
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use aterm_x11::proto::{randr, xproto};
 
-// Used for testing. This should always be committed as false.
 const DISABLE_MONITOR_LIST_CACHING: bool = false;
 
 impl XConnection {
     pub fn invalidate_cached_monitor_list(&self) -> Option<Vec<MonitorHandle>> {
-        // We update this lazily.
         self.monitor_handles.lock().unwrap().take()
     }
 }
@@ -90,7 +88,6 @@ impl MonitorHandle {
         let dimensions = (crtc.width as u32, crtc.height as u32);
         let position = (crtc.x as i32, crtc.y as i32);
 
-        // Get the refresh rate of the current video mode.
         let current_mode = crtc.mode;
         let screen_modes = resources.modes();
         let refresh_rate_millihertz = screen_modes
@@ -126,7 +123,6 @@ impl MonitorHandle {
     }
 
     pub(crate) fn is_dummy(&self) -> bool {
-        // Zero is an invalid XID value; no real monitor will have it
         self.id == 0
     }
 
@@ -156,7 +152,6 @@ impl XConnection {
         let monitors = self.available_monitors()?;
 
         if monitors.is_empty() {
-            // Return a dummy monitor to avoid panicking
             return Ok(MonitorHandle::dummy());
         }
 
@@ -185,7 +180,6 @@ impl XConnection {
         let major = self.randr_major();
         let resources = ScreenResources::from_connection(self, root, self.randr_version())?;
 
-        // Pipeline all of the get-crtc requests.
         let mut crtc_cookies = Vec::with_capacity(resources.crtcs().len());
         for &crtc in resources.crtcs() {
             crtc_cookies.push(self.xcb_connection().send(randr::get_crtc_info(
@@ -195,7 +189,6 @@ impl XConnection {
             ))?);
         }
 
-        // Do this here so we do all of our requests in one shot.
         let primary = self.request(randr::get_output_primary(major, root.root))?.output;
 
         let mut crtc_infos = Vec::with_capacity(crtc_cookies.len());
@@ -217,10 +210,8 @@ impl XConnection {
             available_monitors.extend(monitor);
         }
 
-        // If we don't have a primary monitor, just pick one ourselves!
         if !has_primary {
             if let Some(ref mut fallback) = available_monitors.first_mut() {
-                // Setting this here will come in handy if we ever add an `is_primary` method.
                 fallback.primary = true;
             }
         }
@@ -254,13 +245,11 @@ impl XConnection {
     pub fn select_xrandr_input(&self, root: xproto::Window) -> Result<u8, X11Error> {
         use randr::notify_mask;
 
-        // Get extension info.
         let info = self
             .xcb_connection()
             .extension(randr::NAME)?
             .ok_or(X11Error::MissingExtension("RANDR"))?;
 
-        // Select input data.
         let event_mask =
             notify_mask::CRTC_CHANGE | notify_mask::OUTPUT_PROPERTY | notify_mask::SCREEN_CHANGE;
         self.send_void(randr::select_input(info.major_opcode, root, event_mask))?.ignore_error();
@@ -272,7 +261,6 @@ impl XConnection {
 pub struct ScreenResources {
     /// List of attached modes.
     modes: Vec<randr::ModeInfo>,
-
     /// List of attached CRTCs.
     crtcs: Vec<randr::Crtc>,
 }

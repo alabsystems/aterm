@@ -621,8 +621,8 @@ fn a_host_the_tape_never_answered_diverges_at_its_first_call() {
     assert!(report.requests.is_empty(), "nothing asked past it");
 }
 
-/// THE APPROVAL POLICY'S HOME IS A VALUE, AND ITS LOOKS THERE ARE THE TAPE'S
-/// (`tape::header`'s module docs).
+/// THE APPROVAL POLICY'S HOME IS A VALUE, AND ITS LOOKS THERE ARE THE TAPE'S: each probe asks by
+/// its path under the `@home` root, and a replay answers it from the tape with the home gone.
 #[cfg(unix)]
 #[test]
 fn the_policys_home_is_a_value_and_its_looks_there_are_the_tapes() {

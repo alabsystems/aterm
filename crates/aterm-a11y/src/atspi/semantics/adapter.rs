@@ -3,17 +3,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from accesskit_atspi_common 0.19.0 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/adapter.rs, and changed by the aterm project in 2026: the
-// nodes whose selection changed are visited in node order, and a poisoned
-// lock is recovered rather than unwound.
+// Apache-2.0) src/adapter.rs, and changed by the aterm project in 2026.
 //
 // Derived from Chromium's accessibility abstraction.
 // Copyright 2017 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-CHROMIUM file.
 
-//! A window's tree as AT-SPI sees it: its registrations, and the events an
-//! update, a focus change or the window's own focus sends.
+//! Window accessibility tree adapter for AT-SPI.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Formatter};
@@ -298,7 +295,6 @@ impl ChangeHandler for AdapterChangeHandler<'_> {
         {
             self.remove_node(old_node);
             self.add_node(new_node);
-            // A surviving container must replace its cached child reference too.
             if let Some(parent) = old_node.filtered_parent(&filter) {
                 self.adapter.emit_object_event(
                     NodeIdentity::of(&parent),
@@ -581,8 +577,6 @@ impl Adapter {
     }
 }
 
-/// The tree's root when it is a window or a dialog: what the window events
-/// name.
 fn root_window(current_state: &TreeState) -> Option<Node<'_>> {
     let root = current_state.root();
     matches!(root.role(), Role::AlertDialog | Role::Window).then_some(root)
@@ -592,9 +586,6 @@ impl Drop for Adapter {
     fn drop(&mut self) {
         let root_id = NodeIdentity::of(&self.context.tree.read().state().root());
         self.window_destroyed(root_id);
-        // Note: We deliberately do the following here, not in a Drop
-        // implementation on context, because AppContext owns a second
-        // strong reference to Context, and we need that to be released.
         self.context.app_context.write().remove_adapter(self.id);
     }
 }

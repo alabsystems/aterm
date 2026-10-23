@@ -25,9 +25,10 @@ pub struct SlotsSeen {
 }
 
 /// The board as one session's host reads it ([module docs](self)).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OccupancyReading {
-    /// When the board was taken, unix ms; 0 for none (the empty reading).
+    /// When the board was taken, unix ms; 0 for none (the empty reading). A board re-read for a
+    /// line's write (`PaceGrant::Room`) is stamped when its oldest figure was read.
     pub taken_ms: i64,
     /// The board's snapshot is older than two looks, or there is none.
     pub stale: bool,
@@ -61,6 +62,19 @@ impl OccupancyReading {
     #[must_use]
     pub const fn fresh(&self) -> bool {
         self.taken_ms > 0 && !self.stale
+    }
+
+    /// Whether the reading's figures may be typed at `at_ms` (unix): it speaks for now, and it
+    /// was read no more than [`FACT_FRESH_MS`] before `at_ms` (a reading stamped after it is no
+    /// older). `None`, a clock that cannot be read: never.
+    ///
+    /// [`FACT_FRESH_MS`]: crate::supervise::facts::FACT_FRESH_MS
+    #[must_use]
+    pub fn typeable_at(&self, at_ms: Option<i64>) -> bool {
+        self.fresh()
+            && at_ms.is_some_and(|at| {
+                at.saturating_sub(self.taken_ms) <= crate::supervise::facts::FACT_FRESH_MS
+            })
     }
 
     /// Whether a slot holder of this session's was seen within the last `held_ms` before the board

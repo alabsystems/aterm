@@ -3,8 +3,6 @@
 
 use super::*;
 
-/// Feed a real OSC 7 cwd report through the engine — the genuine
-/// `title_epoch` bump path, not a test back door.
 fn report_cwd(app: &App, session: u64, dir: &str) {
     let term = app.pool.get(session).expect("session").term.clone();
     term.lock()
@@ -20,14 +18,10 @@ fn timeline_events(app: &App, session: u64) -> Vec<(&'static str, String)> {
         .collect()
 }
 
-/// A single `cd` flushes on the observing wake, and the refreshed tooltip already shows
-/// the new cwd (the record precedes `refresh_window_tabs`; the label is pinned by a user
-/// title).
 #[test]
 fn quiet_cwd_change_flushes_instantly_and_records_before_the_refresh() {
     let mut app = App::headless_for_test();
     let t0 = Instant::now();
-    // Pin the label so a cwd change can never move the cache's label key.
     app.pool
         .get(0)
         .unwrap()
@@ -36,12 +30,9 @@ fn quiet_cwd_change_flushes_instantly_and_records_before_the_refresh() {
         .lock()
         .unwrap()
         .set("title", Some("pinned".into()));
-    // Consume the initial epoch, then warm the chrome cache (the tab-switch
-    // analog): composed at the current high id, fresh, label "pinned".
     app.observe_title_drift(0, t0);
     app.refresh_window_tabs(WindowId(0));
     report_cwd(&app, 0, "/tmp/one");
-    // Past the debounce window ⇒ the onset flushes immediately.
     app.observe_title_drift(
         0,
         t0 + DRIFT_REFRESH_MIN_INTERVAL + Duration::from_millis(1),
@@ -65,16 +56,12 @@ fn quiet_cwd_change_flushes_instantly_and_records_before_the_refresh() {
     );
 }
 
-/// A flood of title/cwd changes flushes the first instantly, marks the rest pending, and
-/// the next due wake absorbs them in one flush of the final value. A no-drift wake then
-/// does nothing.
 #[test]
 fn title_cwd_flood_coalesces_to_the_debounce_interval() {
     let mut app = App::headless_for_test();
     let t0 = Instant::now();
     app.observe_title_drift(0, t0); // consume the initial epoch
     let base = timeline_events(&app, 0).len();
-    // Onset (quiet ⇒ instant).
     let t1 = t0 + DRIFT_REFRESH_MIN_INTERVAL + Duration::from_millis(1);
     report_cwd(&app, 0, "/flood/0");
     app.observe_title_drift(0, t1);
@@ -83,7 +70,6 @@ fn title_cwd_flood_coalesces_to_the_debounce_interval() {
         base + 1,
         "the FIRST change of a flood flushes instantly"
     );
-    // Flood: 50 distinct changes, all observed inside one debounce window.
     for i in 1..=50u64 {
         report_cwd(&app, 0, &format!("/flood/{i}"));
         app.observe_title_drift(0, t1 + Duration::from_millis(i));
@@ -97,7 +83,6 @@ fn title_cwd_flood_coalesces_to_the_debounce_interval() {
         app.title_drift.pending.contains(&0),
         "the tail flush is scheduled (about_to_wait owns its deadline)"
     );
-    // The next due wake: one flush absorbs the backlog with the final cwd.
     let t2 = t1 + DRIFT_REFRESH_MIN_INTERVAL;
     app.observe_title_drift(0, t2);
     let events = timeline_events(&app, 0);
@@ -107,14 +92,11 @@ fn title_cwd_flood_coalesces_to_the_debounce_interval() {
         "the coalesced flush records the LIVE value: {events:?}"
     );
     assert!(!app.title_drift.pending.contains(&0), "backlog consumed");
-    // Steady state (epoch unmoved): a further wake records/flushes nothing.
     app.observe_title_drift(0, t2 + Duration::from_millis(1));
     assert_eq!(timeline_events(&app, 0).len(), base + 2);
     assert!(!app.title_drift.pending.contains(&0));
 }
 
-/// A session labelling no tab still records `cwd-change`, and a session closing with
-/// drift pending is forgotten.
 #[test]
 fn unlabeled_sessions_record_cwd_changes_and_closed_sessions_are_forgotten() {
     let mut app = App::headless_for_test();
@@ -130,7 +112,6 @@ fn unlabeled_sessions_record_cwd_changes_and_closed_sessions_are_forgotten() {
             .any(|(k, p)| *k == "cwd-change" && p.contains("/pane/b")),
         "a session labeling no tab still records its cd: {events:?}"
     );
-    // Close it with a drift pending: the flush drops every trace.
     app.title_drift.pending.insert(sid);
     assert!(app.pool.detach(sid), "sole view ⇒ session dropped");
     assert!(
@@ -142,15 +123,9 @@ fn unlabeled_sessions_record_cwd_changes_and_closed_sessions_are_forgotten() {
     assert!(!app.title_drift.last_flush.contains_key(&sid));
 }
 
-/// Every production close path uses `detach_session_view`: one of multiple
-/// views must preserve both the PTY and its per-session chrome state, while
-/// the final detach retires it (presented labels, chrome, drift) before the id
-/// can be reused.
 #[test]
 fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
     let mut app = App::headless_for_test();
-    // A title the clean fast path declines (a spinner glyph), so the refresh
-    // below fills the per-session label cache.
     let term = app.pool.get(0).expect("session 0").term.clone();
     term.lock()
         .unwrap()
@@ -247,7 +222,6 @@ fn an_8_3_cwd_change_reaches_the_disk_boards_speller() {
     let short = aterm_sysprobe::paths::plain(&short).into_owned();
     let reported = short.to_str().expect("text").replace('\\', "/");
     let mut app = App::headless_for_test();
-    // A session id no other test reports to the process's board with.
     let sid = 0x83_0000_0001;
     app.pool.insert(stub_session(sid));
     let term = app.pool.get(sid).expect("session").term.clone();

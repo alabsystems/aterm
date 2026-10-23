@@ -487,7 +487,12 @@ impl Github {
     ///
     /// # Errors
     ///
-    /// Returns the routed, classified error, or refuses non-GET/HEAD or hopped calls.
+    /// The routed, classified error. In M1, a `call.method` other than GET and HEAD is Refused
+    /// `policy.method_not_read` before anything is routed, loaded or sent (plan §8, step 0). A call
+    /// with `hop` set is CouldNotRun `Protocol`, why `a hop is followed only by a streamed
+    /// call`, also before anything is routed: `Fx::gh` rewrites a CDN `Location`, so the hop
+    /// could only fail. The rate book is read and written for api-origin calls only (step
+    /// 2): the web and CDN origins do not spend the API budget.
     pub fn call(&self, call: &Call) -> Result<Answered> {
         method_gate(call)?;
         if call.hop {

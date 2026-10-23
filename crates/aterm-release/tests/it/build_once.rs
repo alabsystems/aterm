@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Build once: a release builds its universal bundle once, under the number it reserved
-//! (`artifact.rs`); `verify release` judges those bytes and records the pass under R's tree
-//! with the executable's SHA-256; the cut signs a byte copy of them, never a rebuild. These
-//! tests hold the release cache, the copy and the judges to that against real files and real
-//! git. The release's step machine is tested in release_flow.rs, the ledger half in
-//! ledger_race.rs.
+//! Tests for single-build release artifact caching, bundle digest verification, and `verify release` tree records.
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -24,8 +19,7 @@ fn scratch() -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
-/// git with nothing of this machine's own configuration in it
-/// ([`crate::ledger::testing::git`]).
+/// Runs hermetic `git` ([`crate::ledger::testing::git`]) in `dir`.
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = crate::ledger::testing::git()
         .arg("-C")
@@ -54,8 +48,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-/// A bundle shaped like the release's: the executable (mode 0755), its plist, a
-/// resource, and an argv0 alias that is a symlink onto the executable.
+/// Writes a fake app bundle with an executable (`0755`), `aterm-ctl` symlink, `Info.plist`, and help resource.
 fn fake_bundle(app: &Path, exe: &[u8]) {
     let macos = app.join("Contents/MacOS");
     fs::create_dir_all(&macos).unwrap();
@@ -122,9 +115,7 @@ fn complete_entry(store: &Path, identity: &Identity, exe: &[u8]) -> Complete {
     complete
 }
 
-/// The cut's copy is re-proved against the build's recorded digest, with every file, link and
-/// mode, before anything signs it; a copy with any byte changed is refused, and a copy goes only
-/// into a fresh place.
+/// `artifact::copy_bundle` and `artifact::prove` verify the bundle's executable digest, files, symlinks, and permissions.
 #[test]
 fn the_cut_signs_a_byte_copy_of_exactly_the_measured_bytes() {
     let dir = scratch();
@@ -162,7 +153,6 @@ fn the_cut_signs_a_byte_copy_of_exactly_the_measured_bytes() {
     );
     artifact::copy_bundle(&read, &read.app(&store), &staged).unwrap_err();
 
-    // Negative controls: other bytes are never the verified ones.
     fs::write(staged.join("Contents/Resources/Help.html"), "edited\n").unwrap();
     artifact::prove(&complete, &staged).unwrap_err();
     fs::write(staged.join("Contents/MacOS/aterm"), b"another executable").unwrap();
@@ -182,8 +172,7 @@ fn the_cut_signs_a_byte_copy_of_exactly_the_measured_bytes() {
     );
 }
 
-/// Bytes that change in the store after the build are refused on every read — never
-/// reused by a resumed release, never copied for a signature.
+/// `artifact::read` rejects a store entry whose bundle bytes changed after completion.
 #[test]
 fn bytes_changed_in_the_store_after_the_build_are_never_reused_or_signed() {
     let dir = scratch();
@@ -197,8 +186,7 @@ fn bytes_changed_in_the_store_after_the_build_are_never_reused_or_signed() {
     artifact::read(&store, &complete.key).unwrap_err();
 }
 
-/// The record is written last: an entry without it is no build, and a record naming another
-/// key is no record of this one.
+/// A store entry without its completion record returns `None`, and a mismatched key returns an error.
 #[test]
 fn an_entry_without_its_record_is_no_build() {
     let dir = scratch();
@@ -213,8 +201,7 @@ fn an_entry_without_its_record_is_no_build() {
     artifact::read(&store, &complete.key).unwrap_err();
 }
 
-/// The key is the version, reserved build number, release commit and both compilers: any one
-/// changed is another build.
+/// `artifact::key` changes whenever the version, build number, commit, or compiler hashes change.
 #[test]
 fn the_key_is_what_the_bytes_were_built_as() {
     let base = artifact::key(&identity(7), &compilers());
@@ -257,8 +244,7 @@ fn the_key_is_what_the_bytes_were_built_as() {
     assert_eq!(others.len(), 5);
 }
 
-/// The build's records replace what `dist/` held under their names; one the build did not make
-/// is removed there.
+/// `artifact::place_records` replaces existing `dist/` records and removes absent ones.
 #[test]
 fn the_records_beside_the_bundle_replace_dists() {
     let dir = scratch();
@@ -283,14 +269,12 @@ fn the_records_beside_the_bundle_replace_dists() {
     let probe = crate::buildplan::x86_64_probe_asset_name(VERSION);
     assert_eq!(fs::read(dist.join(&probe)).unwrap(), b"probe");
 
-    // dsymutil failed for this build: no dSYM is faked, and the old one goes.
     fs::remove_dir_all(complete.dir(&store).join("aterm.dSYM")).unwrap();
     artifact::place_records(&complete.dir(&store), &dist, VERSION).unwrap();
     assert!(!dist.join("aterm.dSYM").exists());
 }
 
-/// The verified judge reads the record filed under the commit's tree and passes only one naming
-/// exactly these bytes.
+/// `gates::verified` checks the verification record stored for the commit's tree against the executable SHA-256.
 #[test]
 fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     let dir = scratch();
@@ -301,7 +285,6 @@ fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     git(&repo, &["add", "README"]);
     git(&repo, &["commit", "-q", "-m", "R"]);
     let r = git(&repo, &["rev-parse", "HEAD"]);
-    // a commit with the same tree: the record is about the tree
     git(&repo, &["commit", "-q", "--allow-empty", "-m", "same tree"]);
     let twin = git(&repo, &["rev-parse", "HEAD"]);
     fs::write(repo.join("README"), "another tree\n").unwrap();
@@ -328,9 +311,7 @@ fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     assert!(!yes, "another tree: {why}");
 }
 
-/// A clone with a published commit S, its release journal reserving build `n` of
-/// [`VERSION`] as release commit C, and the bundle built under that reservation complete in
-/// its release cache.
+/// Scratch git clone with a published commit, release journal reservation, and completed artifact store entry.
 struct Clone {
     _dir: aterm_tempfile::TempDir,
     repo: PathBuf,
@@ -369,7 +350,6 @@ impl Clone {
                 macho_sha256: complete.macho_sha256.clone(),
                 build: reserved.build,
             }),
-            // the release judged R's commit-only gates at its step 4
             done: vec![crate::release::COMMIT_GATES.to_string()],
             ..crate::release::Journal::default()
         }
@@ -411,23 +391,18 @@ impl Clone {
     }
 }
 
-/// A cut signs only its release's verified bundle, decided before its claim: the published
-/// commit's journal and reservation, the bundle complete under it, re-proved and compiled by the
-/// cut's own prover, and the `verify release` pass for R's tree on that executable. Every
-/// refusal says nothing was claimed.
+/// `publish::verified_release_bundle` requires a matching commit, compiler, commit-gate record, reservation, and unmodified store bundle.
 #[test]
 fn a_cut_signs_only_its_releases_verified_bundle() {
     let c = Clone::new();
     c.bundle().err().expect("nothing verified");
 
-    // Verified: the bundle, its reservation and the judge's words.
     c.verify(&c.complete.macho_sha256);
     let bundle = c.bundle().unwrap();
     assert_eq!(bundle.reserved.build, 1_791_600_000);
     assert_eq!(bundle.reserved.commit, "e".repeat(40));
     assert_eq!(bundle.complete, c.complete);
 
-    // Another release's journal (another published commit): nothing to sign.
     crate::publish::verified_release_bundle(
         &Git::new(&c.repo),
         &c.repo,
@@ -438,13 +413,10 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
     .err()
     .expect("another commit's release");
 
-    // One compiler: a prover other than the trustc that compiled the bytes is refused.
     c.bundle_for(&format!("/other/bin trustc {}", "f".repeat(40)))
         .err()
         .expect("another prover");
 
-    // What depends only on R's tree is read from the journal, never re-derived: a journal that
-    // never judged R's commit-only gates fails closed.
     let path = Clone::journal_path(&c.repo);
     let mut j = crate::release::Journal::load(&path).unwrap().unwrap();
     let kept = j.clone();
@@ -454,14 +426,12 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
     kept.save(&path).unwrap();
     assert!(c.bundle().is_ok(), "the facts back: the bundle again");
 
-    // A journal whose bundle is not its reservation's (built under another number).
     let mut j = crate::release::Journal::load(&path).unwrap().unwrap();
     j.reserved.as_mut().unwrap().build += 1;
     j.save(&path).unwrap();
     c.bundle().err().expect("another reservation");
     kept.save(&path).unwrap();
 
-    // The store's bytes changed after the build (and after `verify release`): refused.
     let store = artifact::store(&c.repo).unwrap();
     fs::write(
         c.complete.app(&store).join("Contents/Resources/Help.html"),
@@ -474,7 +444,6 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
 /// A journal that has not signed yet must name the measured bytes it will sign.
 #[test]
 fn an_unsigned_journal_names_the_bytes_it_will_sign() {
-    // A journal that has not signed yet must name the measured bytes it will sign.
     let dir = scratch();
     let path = dir.path().join("cut-state.toml");
     let mut j = crate::publish::Journal {
@@ -500,15 +469,13 @@ fn an_unsigned_journal_names_the_bytes_it_will_sign() {
     j.artifact = Some("aa".repeat(32));
     j.macho_sha256 = Some("bb".repeat(32));
     j.save(&path).unwrap();
-    // Signed: nothing is left to sign, so nothing need be named (a recovery's journal).
     j.done.push("sign".to_string());
     j.artifact = None;
     j.macho_sha256 = None;
     j.save(&path).unwrap();
 }
 
-/// Between releases `ship build` builds HEAD from HEAD's objects: the workspace version and a
-/// provisional number `max(ledger tail + 1, now)`, claimed nowhere.
+/// `artifact::provisional_identity` reads the committed `HEAD` version and assigns `max(ledger_tail + 1, now)`.
 #[test]
 fn between_releases_ship_build_builds_head_under_a_provisional_number() {
     let dir = scratch();
@@ -520,7 +487,6 @@ fn between_releases_ship_build_builds_head_under_a_provisional_number() {
         "[workspace.package]\nversion = \"0.102.0\"\n",
     )
     .unwrap();
-    // A tail ahead of any clock: the number follows the ledger.
     fs::write(
         repo.join("RELEASES.ledger"),
         "# ledger\n9999999990 0.101.0\n",
@@ -529,7 +495,6 @@ fn between_releases_ship_build_builds_head_under_a_provisional_number() {
     git(&repo, &["add", "Cargo.toml", "RELEASES.ledger"]);
     git(&repo, &["commit", "-q", "-m", "head"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
-    // The worktree is not what is built: an edit there changes nothing.
     fs::write(
         repo.join("Cargo.toml"),
         "[workspace.package]\nversion = \"9.9.0\"\n",

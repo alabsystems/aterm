@@ -308,7 +308,8 @@ extern "C" fn on_signal(sig: libc::c_int) {
     let fd = SIGNAL_WR.load(Ordering::Relaxed);
     if fd >= 0 {
         let b = u8::try_from(sig).unwrap_or(0);
-        // SAFETY: `write(2)` is async-signal-safe.
+        // SAFETY: `write(2)` is async-signal-safe; errno is saved and restored
+        // around it so the interrupted code never sees it change.
         unsafe {
             let saved = *libc::__error();
             let _ = libc::write(fd, (&raw const b).cast(), 1);
@@ -365,7 +366,8 @@ impl SignalPipe {
             if disposition(sig)? == libc::SIG_IGN {
                 continue;
             }
-            // SAFETY: a zeroed `sigaction` is a valid starting value.
+            // SAFETY: a zeroed `sigaction` is a valid starting value; the handler
+            // is an `extern "C" fn(c_int)` that only calls async-signal-safe code.
             unsafe {
                 let mut sa: libc::sigaction = std::mem::zeroed();
                 sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
@@ -476,7 +478,9 @@ pub fn own_fd(fd: RawFd) -> std::os::fd::OwnedFd {
 /// Configure `cmd` to call `setsid` in the child before `exec`.
 pub fn in_own_session(cmd: &mut aterm_uds::spawnfd::StdCommand) {
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: the hook runs in the forked child before its exec and makes one async-signal-safe call.
+    // SAFETY: the hook runs in the forked child before its exec and makes one
+    // async-signal-safe call; `last_os_error` reads `errno` and allocates
+    // nothing.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -625,7 +629,8 @@ unsafe extern "C" {
 pub fn mach_look_up(name: &str) -> i32 {
     let Ok(c) = CString::new(name) else { return -1 };
     let mut port: libc::c_uint = 0;
-    // SAFETY: `bootstrap_port` is the task's bootstrap port, set by the runtime before `main`.
+    // SAFETY: `bootstrap_port` is the task's bootstrap port, set by the runtime
+    // before `main`; `c` is a valid C string and `port` a valid out-pointer.
     unsafe { bootstrap_look_up(bootstrap_port, c.as_ptr(), &raw mut port) }
 }
 
@@ -730,7 +735,9 @@ pub fn exec_as_app(
     };
     let (argp, envp) = (ptrs(&args), ptrs(&vars));
     let mut attr: SpawnAttr = std::ptr::null_mut();
-    // SAFETY: `attr` is initialized before use and destroyed after.
+    // SAFETY: `attr` is initialized before use and destroyed after; every
+    // pointer passed (path, argv, envp: NULL-terminated arrays of C strings
+    // that outlive the call) is valid; on success the call does not return.
     unsafe {
         let rc = posix_spawnattr_init(&raw mut attr);
         if rc != 0 {
@@ -773,7 +780,8 @@ pub fn dup_onto(fd: RawFd, target: RawFd) -> io::Result<()> {
 pub fn darwin_role(pid: i32) -> io::Result<i32> {
     let who =
         libc::id_t::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: `errno` is this thread's.
+    // SAFETY: `errno` is this thread's; `getpriority` takes no pointers. Its
+    // answer can be -1 legitimately, so errno (cleared first) tells a failure.
     unsafe {
         *libc::__error() = 0;
         let role = libc::getpriority(PRIO_DARWIN_ROLE, who);
@@ -1265,7 +1273,8 @@ fn put_with_nonce(
                 .ok()
                 .is_some_and(|inode| put_inode_at(d, &tmp) == Some(inode))
         }) {
-            // SAFETY: `d` is the pinned parent.
+            // SAFETY: `d` is the pinned parent; `tmp` is one name, inspected
+            // without following links. It names the retained stage at the check.
             unsafe { libc::unlinkat(d, tmp.as_ptr(), 0) };
         }
     };
@@ -1308,7 +1317,8 @@ fn put_inode(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
 fn put_inode_at(dir: RawFd, name: &CString) -> Option<(libc::dev_t, libc::ino_t)> {
     // SAFETY: `stat` is plain data; `fstatat` fills this live value.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: the pinned directory and one NUL-terminated name are live.
+    // SAFETY: the pinned directory and one NUL-terminated name are live;
+    // AT_SYMLINK_NOFOLLOW inspects an entry rather than its target.
     (unsafe { libc::fstatat(dir, name.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0)
         .then_some((st.st_dev, st.st_ino))
 }
@@ -1390,7 +1400,8 @@ fn open_parent(path: &std::path::Path) -> io::Result<Option<(std::os::fd::OwnedF
 fn stat_at(dir: RawFd, name: &CString) -> io::Result<Option<EntryStat>> {
     // SAFETY: `stat` is plain data; all-zero is a valid value for `fstatat` to fill.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `dir` is an open directory, `name` a valid C string, `st` a live `stat`.
+    // SAFETY: `dir` is an open directory, `name` a valid C string, `st` a live `stat`;
+    // AT_SYMLINK_NOFOLLOW reads the entry, never what a link there points at.
     if unsafe { libc::fstatat(dir, name.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         let e = io::Error::last_os_error();
         return if e.raw_os_error() == Some(libc::ENOENT) {
@@ -1430,7 +1441,8 @@ pub fn touch_now(path: &std::path::Path, which: Touch) -> io::Result<bool> {
         Touch::Accessed => [at(libc::UTIME_NOW), at(libc::UTIME_OMIT)],
         Touch::Modified => [at(libc::UTIME_OMIT), at(libc::UTIME_NOW)],
     };
-    // SAFETY: `dir` is an open directory, `name` a valid C string and `times` two live timespecs.
+    // SAFETY: `dir` is an open directory, `name` a valid C string and `times` two live timespecs;
+    // AT_SYMLINK_NOFOLLOW sets the entry's own times, never a link's target's.
     let rc = unsafe {
         libc::utimensat(
             std::os::fd::AsRawFd::as_raw_fd(&dir),
@@ -1502,7 +1514,8 @@ pub fn phys_footprint(pid: i32) -> Option<u64> {
         return None;
     }
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4` fills.
+    // SAFETY: `info` is a zeroed `rusage_info_v4`, the struct `RUSAGE_INFO_V4`
+    // fills; the kernel writes at most its size, and it is read only on success.
     let rc = unsafe {
         libc::proc_pid_rusage(
             pid,
@@ -1528,7 +1541,8 @@ impl WholeMap {
         if len == 0 {
             return Ok(None);
         }
-        // SAFETY: a fresh read-only shared mapping of an open file.
+        // SAFETY: a fresh read-only shared mapping of an open file; the
+        // descriptor may close once it exists. Unmapped in `drop`.
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1636,7 +1650,8 @@ pub fn read_named_shm(name: &str) -> io::Result<()> {
     if addr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the successful one-byte mapping is still live.
+    // SAFETY: the successful one-byte mapping is still live; volatile loads
+    // read this externally backed memory without creating a Rust reference.
     let byte = unsafe { addr.cast::<u8>().read_volatile() };
     // SAFETY: exactly the one mapping made above, unmapped once.
     if unsafe { libc::munmap(addr, 1) } != 0 {
@@ -1684,7 +1699,8 @@ impl NamedShm {
             name,
             fd: own_fd(fd),
         };
-        // SAFETY: our exclusively owned descriptor.
+        // SAFETY: our exclusively owned descriptor; no writable alias is
+        // handed to the child, by either exec inheritance or spawnfd custody.
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1923,7 +1939,8 @@ pub mod tis {
         if s.is_null() {
             return None;
         }
-        // SAFETY: `CFGetTypeID` reads any live CF object.
+        // SAFETY: `CFGetTypeID` reads any live CF object; a non-string is refused
+        // before it is read as one, and the buffer holds the string's whole length.
         unsafe {
             if CFGetTypeID(s) != CFStringGetTypeID() {
                 return None;
@@ -1969,7 +1986,8 @@ pub mod tis {
                 else {
                     return Ok(((*key).to_string(), None));
                 };
-                // SAFETY: `value` is a live property list.
+                // SAFETY: `value` is a live property list; the data follows the Create
+                // rule, and its bytes are copied while it lives.
                 let data = Owned::new(unsafe {
                     CFPropertyListCreateData(
                         std::ptr::null(),
@@ -2033,17 +2051,20 @@ pub mod tis {
     }
 
     fn id_of(source: CfRef) -> Option<String> {
-        // SAFETY: `source` is a live input source.
+        // SAFETY: `source` is a live input source; the property is a Get-rule CFString that
+        // `string` checks before reading.
         string(unsafe { TISGetInputSourceProperty(source, kTISPropertyInputSourceID) })
     }
 
     fn list(all: bool) -> Option<Owned> {
-        // SAFETY: a null property dictionary asks for every source.
+        // SAFETY: a null property dictionary asks for every source; the list
+        // follows the Create rule, so the owner releases it.
         Owned::new(unsafe { TISCreateInputSourceList(std::ptr::null(), u8::from(all)) })
     }
 
     fn find<T>(list: &Owned, mut f: impl FnMut(CfRef, String) -> Option<T>) -> Option<T> {
-        // SAFETY: `list` is a live CFArray of input sources, read in bounds.
+        // SAFETY: `list` is a live CFArray of input sources, read in bounds; each
+        // element is a Get-rule source the list keeps alive while `f` runs.
         let n = unsafe { CFArrayGetCount(list.0) };
         (0..n).find_map(|i| {
             // SAFETY: as above.
@@ -2115,7 +2136,8 @@ pub mod tis {
                 if sid != id {
                     return None;
                 }
-                // SAFETY: `source` is live.
+                // SAFETY: `source` is live; the property is a Get-rule CFData (checked by type
+                // before it is kept), retained here so it outlives the list.
                 unsafe {
                     let d = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
                     (!d.is_null() && CFGetTypeID(d) == CFDataGetTypeID())
@@ -2140,7 +2162,9 @@ pub mod tis {
         pub fn press(&self, key_code: u16, modifiers: u32, dead: &mut u32) -> Option<String> {
             let mut buf = [0u16; 8];
             let mut len = 0usize;
-            // SAFETY: the layout bytes live while `self.data` holds the CFData.
+            // SAFETY: the layout bytes live while `self.data` holds the CFData; the
+            // output buffer and its length, the state and the count are valid
+            // for the call.
             let status = unsafe {
                 UCKeyTranslate(
                     CFDataGetBytePtr(self.data.0),

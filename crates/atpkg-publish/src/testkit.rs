@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared test fixtures: a paper master, a machine and a roster minted in-process with
-//! the shipping signer (`atpkg_keys`), and a channel on a [`crate::host::fake::FakeHost`],
-//! so every test verifies through the client's real chain with no key literal and no
-//! network. It lives in the library (never shipped) so unit and integration tests share it.
+//! Shared test fixtures for in-process key minting, roster signing, and fake-host channels.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,9 +13,7 @@ use crate::host::fake::FakeHost;
 use crate::host::{Hosts, Slug};
 use crate::quad::{QUAD_FILES, index_tag};
 
-/// `git` for a fixture or the [`FakeHost`]: [`aterm_uds::fixture_git::git`], with
-/// automatic maintenance off, which every commit and fetch would otherwise start for nothing
-/// in a repository this small.
+/// Fixture `git` command with automatic maintenance disabled.
 #[must_use]
 pub fn git() -> aterm_uds::spawnfd::Command {
     let mut git = aterm_uds::fixture_git::git();
@@ -26,10 +21,10 @@ pub fn git() -> aterm_uds::spawnfd::Command {
     git
 }
 
-/// A fixed clock: 2026-10-15T00:00:00Z.
+/// Fixed fixture clock.
 pub const NOW: i64 = 1_792_022_400;
 
-/// A horizon no fixture outlives.
+/// Far-future timestamp for fixture expiry fields.
 pub const FAR_FUTURE: &str = "2099-01-01T00:00:00Z";
 
 /// A master, one rostered machine, and the master-signed roster naming it.
@@ -101,8 +96,7 @@ impl Keys {
         atpkg_keys::sign(&self.master_key, bytes).expect("master signs")
     }
 
-    /// A context rooted at `home` whose anchor is this master, clock [`NOW`], and whose
-    /// hosts are `host`; the machine key and record are written where the context looks.
+    /// Build a context rooted at `home` and write the machine key and record into `~/.aterm`.
     ///
     /// # Panics
     ///
@@ -123,9 +117,7 @@ impl Keys {
         ctx
     }
 
-    /// [`Keys::ctx`], writing nothing: for a `home` laid down from one made earlier, which
-    /// holds the machine key and record as that world left them (or without the key, if
-    /// it ran keyless).
+    /// Build a context rooted at `home` without writing the machine key or record.
     #[must_use]
     pub fn ctx_over(&self, home: &Path, host: Arc<FakeHost>) -> Ctx {
         let mut ctx = Ctx::new(home, None, None, NOW, Hosts::single(host));
@@ -133,8 +125,7 @@ impl Keys {
         ctx
     }
 
-    /// A schema-2 `index.toml` this machine would sign: `programs` are `(name, repo)`,
-    /// one channel `stable` pinning `pins`.
+    /// Render a schema-2 `index.toml` for `programs` and `stable` channel `pins`.
     #[must_use]
     pub fn index_toml(
         &self,

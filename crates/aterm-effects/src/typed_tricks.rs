@@ -193,7 +193,8 @@ enum Kind {
     Joiner,
     /// Whitespace, U+3000 included.
     Space,
-    /// `. ! ? , …`: closes a token and parks its fire (module docs).
+    /// `. ! ? , …`: closes a token and parks its fire until the next whitespace, fullwidth stop
+    /// or Enter.
     Stop,
     /// `。！？、，` — a full boundary.
     WideStop,
@@ -242,8 +243,8 @@ const fn is_unspaced_script(c: char) -> bool {
 /// prose far more often than a name (`猫爪` is a claw).
 const GLUED_NAME_CHARS: usize = 2;
 
-/// The glued reading of a token that is no vocabulary word (module docs): the
-/// trick it asks for and every cut that reads it so.
+/// The glued reading of a token that is no vocabulary word, a name and a trick word in either
+/// order: the trick it asks for and every cut that reads it so.
 fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(Trick, Cuts)> {
     let mut chars = 0usize;
     for c in token.chars() {
@@ -268,10 +269,11 @@ fn glued(lexicon: &TrickLexicon, token: &str, scratch: &mut String) -> Option<(T
             }
             Some(_) | None => continue,
         };
-        let trick = match (head_role, lexicon.classify_glued_half(tail, scratch)) {
-            (Some(TrickRole::Vocative), Some(TrickRole::Trick { trick, .. }))
-            | (Some(TrickRole::Trick { trick, .. }), Some(TrickRole::Vocative)) => trick,
-            _ => continue,
+        let ((Some(TrickRole::Vocative), Some(TrickRole::Trick { trick, .. }))
+        | (Some(TrickRole::Trick { trick, .. }), Some(TrickRole::Vocative))) =
+            (head_role, lexicon.classify_glued_half(tail, scratch))
+        else {
+            continue;
         };
         let cut = 1u128.checked_shl(u32::try_from(at).ok()?)?;
         match found.as_mut() {
@@ -402,7 +404,7 @@ struct Line {
     held: Option<Verdict>,
     /// A verdict parked at a stop, waiting for the next open edge.
     tail: Option<Verdict>,
-    /// A glued run's fire, waiting for a name or Enter (module docs).
+    /// A glued run's fire, waiting for a name or Enter.
     guess: Option<Verdict>,
     /// The live tentative fire.
     tentative: Option<Trick>,
@@ -756,7 +758,8 @@ impl TrickListener {
         self.feed(out, false)
     }
 
-    /// A plain Backspace (see "Typo recovery" in the module docs).
+    /// A plain Backspace: takes a character off the line's count, and one that crosses back over
+    /// the closer of the last token restores the line from before it closed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -978,7 +981,7 @@ impl TrickListener {
     }
 
     /// Snapshot the line, then take the open token off it. The snapshot is the
-    /// one level of undo Backspace has (module docs).
+    /// one level of undo Backspace has.
     #[inline]
     const fn end_token(&mut self) -> (Word, u32) {
         let token = (self.line.token, self.line.token_chars);

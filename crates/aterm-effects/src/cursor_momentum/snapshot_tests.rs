@@ -15,7 +15,8 @@ use crate::cursor_momentum::test_fixtures::{
 };
 use crate::cursor_momentum::{LightInkMemo, MomentumGlowConfig, MomentumGlowFrame};
 
-/// A straight run: the observation of every input.
+/// A straight run: the observation of every input, and the engine and its
+/// snapshot at every boundary (`engines[k]` is the state before input `k`).
 struct Straight {
     obs: Vec<Obs>,
     engines: Vec<MomentumGlow>,
@@ -1285,7 +1286,9 @@ fn random_gap(r: &mut Rng) -> i128 {
     }
 }
 
-/// A tick on a dark or a light page, admitted under the profile, with each inert arm.
+/// A tick on a dark or a light page, admitted under the profile, with each
+/// inert arm (disabled, zero intensity, no cursor, outside the grid) drawn
+/// now and then.
 fn random_tick(r: &mut Rng, at: i128) -> Ev {
     let dark = r.below(2) == 0;
     let geom = if r.below(2) == 0 { plain() } else { padded() };

@@ -1,22 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Behavioral tests for `once_cell` consumer contracts:
-//!
-//! * `sync::OnceCell::get_or_try_init`, `sync::Lazy`, and `race::OnceBox` run
-//!   their initializer closure at most once under contention.
-//! * Failed `get_or_try_init` closures leave the cell empty and retryable.
-//! * `Lazy::get` peeks without forcing initialization.
-//! * `unsync::OnceCell::get_or_try_init` panics on reentrant initialization.
-//! * Panicking initializers do not poison the cell.
+//! Behavioral tests for `once_cell` consumer contracts.
 
 use once_cell::{race, sync, unsync};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-/// How long the initialiser sleeps to widen the race window; the barrier does
-/// the synchronising. wgpu-core's own test uses 250 ms.
 const RACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(120);
 
 #[test]
@@ -72,7 +63,6 @@ fn a_failed_initialiser_leaves_the_cell_empty_and_retryable() {
     let second: Result<&u32, &str> = cell.get_or_try_init(|| Ok(3));
     assert_eq!(second, Ok(&3), "a later call must be able to try again");
     assert_eq!(cell.get(), Some(&3));
-    // Once initialized, subsequent calls return the cached value.
     assert_eq!(cell.get_or_try_init(|| Ok::<u32, &str>(9)), Ok(&3));
 }
 
@@ -83,8 +73,6 @@ fn set_is_single_assignment_and_reports_the_loser() {
     assert_eq!(cell.set(2), Err(2), "the rejected value comes back");
     assert_eq!(cell.get(), Some(&1));
     assert_eq!(cell.try_insert(3), Err((&1, 3)));
-    // `tempfile::env::override_temp_dir` distinguishes "I set it" from "someone
-    // else had" exactly this way.
     let fresh: sync::OnceCell<u32> = sync::OnceCell::new();
     assert_eq!(fresh.try_insert(5), Ok(&5));
 }
@@ -110,8 +98,6 @@ fn debug_and_eq_match_the_upstream_shapes() {
     assert_ne!(full, empty);
     assert_eq!(full.clone().get(), Some(&9));
 
-    // `wgpu-hal`'s DCompLib derives Debug over a `sync::Lazy` field, so Lazy
-    // must be Debug with the upstream field names and must NOT force on debug.
     let lazy: sync::Lazy<u32> = sync::Lazy::new(|| unreachable!("Debug must not force"));
     assert_eq!(
         format!("{lazy:?}"),
@@ -160,14 +146,10 @@ fn unsync_lazy_forces_once_and_derefs() {
     });
     assert_eq!(runs.get(), 0);
     assert_eq!(&*lazy, "x");
-    // `wasm-bindgen`'s `LazyCell::force` and `Deref` both land here.
     assert_eq!(unsync::Lazy::force(&lazy), "x");
     assert_eq!(runs.get(), 1);
 }
 
-/// wasm-bindgen's shape (`wasm-bindgen-0.2.108/src/rt/mod.rs`): `unsync::Lazy::new`
-/// called inside an `impl<T, F>` with no `F: FnOnce() -> T` bound. Fails to
-/// compile if `new` gains that bound.
 struct WasmBindgenShapedCell<T, F = fn() -> T>(unsync::Lazy<T, F>);
 
 impl<T, F> WasmBindgenShapedCell<T, F> {
@@ -176,9 +158,6 @@ impl<T, F> WasmBindgenShapedCell<T, F> {
     }
 }
 
-/// The same construction in a const context, where wasm-bindgen puts it (a
-/// `static` behind its own `unsafe impl Sync`). A const block needs no `Sync`.
-/// Fails to compile if `unsync::Lazy::new` stops being `const fn`.
 const _: () = {
     let _ = WasmBindgenShapedCell::<u32>::new(|| 42);
 };
@@ -189,21 +168,13 @@ fn lazy_new_is_unbounded_in_f_the_way_wasm_bindgen_needs() {
     assert_eq!(*cell.0, 42);
 }
 
-/// The auto-trait surface. Without hand-written impls, `unsync::OnceCell` and
-/// `unsync::Lazy` are `!RefUnwindSafe` where upstream's are not (its
-/// `lib.rs:430`, `:729`). No consumer asks for the bound (`wasm-bindgen` wraps
-/// its argument in `AssertUnwindSafe`), so no consumer build can catch losing
-/// it and this test is the only check. `sync::Lazy` is deliberately wider than
-/// upstream (no `F: RefUnwindSafe` needed).
 #[test]
 fn the_unwind_safety_surface_matches_upstream() {
     fn rus<T: std::panic::RefUnwindSafe>() {}
     fn us<T: std::panic::UnwindSafe>() {}
 
-    // The two that need hand-written impls.
     rus::<unsync::OnceCell<u32>>();
     rus::<unsync::Lazy<u32>>();
-    // The rest of the surface.
     us::<unsync::OnceCell<u32>>();
     us::<unsync::Lazy<u32>>();
     rus::<sync::OnceCell<u32>>();
@@ -212,16 +183,11 @@ fn the_unwind_safety_surface_matches_upstream() {
     us::<sync::Lazy<u32>>();
     rus::<race::OnceBox<u32>>();
     us::<race::OnceBox<u32>>();
-
-    // No negative half: stable Rust cannot assert `!RefUnwindSafe`. The impl
-    // bounds themselves guard against widening.
 }
 
 #[test]
 fn lazy_is_sync_when_upstream_says_it_is() {
     fn assert_sync<T: Sync>(_: &T) {}
-    // Upstream: `unsafe impl<T, F: Send> Sync for Lazy<T, F> where OnceCell<T>: Sync`.
-    // Here the same bound falls out of `Mutex<Option<F>>` + `OnceCell<T>`.
     static SHARED: sync::Lazy<u32> = sync::Lazy::new(|| 5);
     assert_sync(&SHARED);
     assert_eq!(*SHARED, 5);
@@ -229,7 +195,6 @@ fn lazy_is_sync_when_upstream_says_it_is() {
 
 #[test]
 fn lazy_forced_concurrently_runs_its_initialiser_once() {
-    // Concurrent `Lazy::force` calls run the initializer closure only once.
     let runs = Arc::new(AtomicUsize::new(0));
     let runs2 = Arc::clone(&runs);
     let lazy: Arc<sync::Lazy<u32, Box<dyn Fn() -> u32 + Send>>> =
@@ -258,12 +223,9 @@ fn lazy_forced_concurrently_runs_its_initialiser_once() {
 fn once_box_is_a_single_assignment_cell_over_a_box() {
     let cell: race::OnceBox<Vec<u8>> = race::OnceBox::new();
     assert_eq!(cell.get(), None);
-    // Upstream's `set` hands back the rejected box itself, so a caller can
-    // tell its own box from the one already stored.
     assert_eq!(cell.set(Box::new(vec![1, 2])), Ok(()));
     assert_eq!(cell.set(Box::new(vec![9])), Err(Box::new(vec![9])));
     assert_eq!(cell.get(), Some(&vec![1, 2]));
-    // A full cell returns what it holds, not the initialiser's value.
     assert_eq!(cell.get_or_init(|| Box::new(vec![0])), &vec![1, 2]);
 
     let fresh: race::OnceBox<u32> = race::OnceBox::default();
@@ -277,7 +239,6 @@ fn once_box_is_a_single_assignment_cell_over_a_box() {
 
 #[test]
 fn once_box_runs_its_initialiser_once_under_contention() {
-    // Divergence 2 in src/lib.rs: stricter than upstream's `race`.
     let cell: Arc<race::OnceBox<u32>> = Arc::new(race::OnceBox::new());
     let runs = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(Barrier::new(3));
@@ -316,7 +277,6 @@ fn unsync_once_cell_matches_its_sync_sibling() {
     assert_eq!(cell.into_inner(), None);
 }
 
-/// The panic message of `f`, which must panic.
 fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
     let payload = std::panic::catch_unwind(f).expect_err("accepted without a panic");
     match payload.downcast::<&'static str>() {
@@ -327,11 +287,6 @@ fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
 
 #[test]
 fn unsync_get_or_try_init_refuses_a_reentrant_initialisation() {
-    // Upstream asserts `self.set(val).is_ok()` with "reentrant init"
-    // (once_cell-1.21.4/src/lib.rs:644) and `get_or_init` panics the same
-    // way through core's cell: a closure that fills the cell it is
-    // initialising is a caller bug, and its value must not be dropped quietly
-    // while the caller is handed one its closure never produced.
     let by_set = panic_message(|| {
         let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
         let _ = cell.get_or_try_init(|| {
@@ -348,7 +303,6 @@ fn unsync_get_or_try_init_refuses_a_reentrant_initialisation() {
         by_get_or_init.contains("reentrant init"),
         "got {by_get_or_init:?}"
     );
-    // The control: `get_or_init` has always refused it.
     let control = panic_message(|| {
         let cell: unsync::OnceCell<u32> = unsync::OnceCell::new();
         let _ = cell.get_or_init(|| {
@@ -361,8 +315,6 @@ fn unsync_get_or_try_init_refuses_a_reentrant_initialisation() {
 
 #[test]
 fn a_panicking_initialiser_leaves_the_cell_usable() {
-    // Upstream has no locks: after a panic in `f` the cell is still empty.
-    // The private `Mutex` must not turn that into a poisoned lock.
     let cell: Arc<sync::OnceCell<u32>> = Arc::new(sync::OnceCell::new());
     let c = Arc::clone(&cell);
     let panicked = thread::spawn(move || {

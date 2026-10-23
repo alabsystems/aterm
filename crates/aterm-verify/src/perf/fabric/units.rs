@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the fabric lane's build compiles ON THE MEASURED PATH, read from
-//! cargo's own plan, so an arm's label is a fact about its build and never an
-//! assumption about `Cargo.toml`.
-//!
-//! WHY READ THE PLAN. A profile's opt-level is not one number: the root
-//! manifest's `[profile.dev.package.<name>]` speed rows set a crate at a time,
-//! a custom profile inherits the rows of the profile it inherits, and a named
-//! row outranks the profile's own `package."*"`. So "this arm is optimized" is
-//! checked here, crate by crate, before the lane spends minutes measuring it.
-//!
-//! THE SOURCE is `targo --unverified bench <arm> -p aterm --bench fabric_bench
-//! --unit-graph -Z unstable-options`: every unit cargo would compile, with its
-//! resolved profile and its dependency edges, and nothing compiled. The
-//! measured path is what the bench's processes execute: the `fabric_bench` bench
-//! unit (which holds the in-process broker), the `aterm` binary it launches as
-//! the window and the bridge, and every library either links. A build script
-//! and a proc macro run inside the compiler, not in a measured process, so the
-//! walk does not cross into one, nor into what only they link (`cc`, the
-//! `syn` of a derive): those compile under the profile's `build-override`,
-//! opt-level 0 in every arm, and say nothing about the measurement.
-//!
-//! WHAT THE PLAN CANNOT SHOW: the rustflags cargo appends to every rustc line,
-//! where a later `-C opt-level` wins over the profile's. Those are
-//! [`super::flags`]'s to hold.
+//! Fabric perf lane build-plan audit over `--unit-graph` units on the measured path.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,10 +22,6 @@ pub(crate) struct Audit {
     pub units: Vec<Unit>,
 }
 
-/// A package's name out of a cargo package id: `…/crates/aterm-core#0.106.0`
-/// is `aterm-core`, `registry+…#shlex@2.0.1` is `shlex`, and
-/// `…/crates/aterm-log-shim#log@0.4.32` (a path whose package is named
-/// otherwise) is `log`. Pure (unit-tested).
 fn package_name(pkg_id: &str) -> &str {
     match pkg_id.rsplit_once('#') {
         Some((_, fragment)) if fragment.contains('@') => {
@@ -59,8 +32,6 @@ fn package_name(pkg_id: &str) -> &str {
     }
 }
 
-/// Whether the walk crosses an edge into `unit`: never into a build script's
-/// run or compile, never into a proc macro.
 fn on_the_path(unit: &Value) -> bool {
     let mode = unit.get("mode").and_then(Value::as_str);
     let compile_time = unit
@@ -76,8 +47,7 @@ fn on_the_path(unit: &Value) -> bool {
 }
 
 impl Audit {
-    /// Read the measured path out of a `--unit-graph` document. Pure
-    /// (unit-tested).
+    /// Read the measured path out of a `--unit-graph` document.
     ///
     /// # Errors
     ///
@@ -152,8 +122,6 @@ impl Audit {
         Ok(Audit { units })
     }
 
-    /// The packages at each opt-level, names sorted and deduplicated (a
-    /// package's lib and its binaries are two units of one name).
     fn by_level(&self) -> BTreeMap<&str, (usize, BTreeSet<&str>)> {
         let mut levels: BTreeMap<&str, (usize, BTreeSet<&str>)> = BTreeMap::new();
         for u in &self.units {
@@ -166,7 +134,6 @@ impl Audit {
 
     /// One line for the ledger: how many units, at which opt-levels (naming
     /// the packages of every level but the commonest), and the two checks.
-    /// Pure (unit-tested).
     pub(crate) fn summary(&self) -> String {
         let levels = self.by_level();
         let commonest = levels
@@ -261,7 +228,6 @@ mod tests {
         }
     }
 
-    /// A unit of a synthetic graph: `(package, mode, kind, opt-level, deps)`.
     fn unit(package: &str, mode: &str, kind: &str, opt: &str, deps: &[usize]) -> String {
         let deps: Vec<String> = deps.iter().map(|d| format!("{{\"index\":{d}}}")).collect();
         format!(
@@ -281,9 +247,6 @@ mod tests {
         )
     }
 
-    /// The shape a real plan has (read off `aterm`'s on 2026-10-16): the test
-    /// links a library whose build script links `cc`, and a derive that links
-    /// `syn`; the test depends on the binary it launches.
     fn plan(lib_opt: &str) -> String {
         graph(
             &[
@@ -310,7 +273,6 @@ mod tests {
             3,
             "the bench, the binary and the library"
         );
-        // cc and syn are at 0 and say nothing: opt is satisfied.
         assert_eq!(audit.refusal(Some("3")), None);
         assert_eq!(
             audit.summary(),
@@ -321,12 +283,10 @@ mod tests {
 
     #[test]
     fn a_crate_below_the_promise_is_named_and_the_dev_mix_is_reported() {
-        // A dev speed row inherited into an "optimized" profile.
         let audit = Audit::of(&plan("2")).expect("parses");
         let why = audit.refusal(Some("3")).expect("refused");
         assert!(why.contains("aterm-core (opt-level 2)"), "{why}");
         assert!(!why.contains("cc") && !why.contains("syn"), "{why}");
-        // The dev arm promises no single level: the same build is reported.
         assert_eq!(audit.refusal(None), None);
         assert_eq!(
             audit.summary(),

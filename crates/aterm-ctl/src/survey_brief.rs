@@ -1,42 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl survey --brief [--budget <chars>]`: THE LOCAL BRIEF (DESIGN:607-609).
-//! The survey client's
-//! walk asks every live instance on this machine for its own node log (`log
-//! n`: what the instance itself did — its `start prev_end=`, each fabric
-//! `link state=`, each `config key=`) and its sessions' briefs (`brief all`),
-//! both Owner-only and both answered with the token beside the socket, and
-//! prints, after [`BRIEF_DATA_LINE`], one block per instance:
-//!
-//! * a header line (at most [`HEADER_CHARS`]): its pid, how long it has been
-//!   up (its node log's `start` record), how many node records it printed of
-//!   how many it holds, and each read it REFUSED, with the refusal — never a
-//!   block silently missing;
-//! * its node log lines as `log n` printed them, oldest first, every `gap`
-//!   line kept (a reader is told what the ring evicted, never shown a whole
-//!   that is not), at most [`NODE_LINES_MAX`] records, the newest;
-//! * its `brief all` reply's lines, the briefs fitted by the server to the
-//!   share of the budget left to this instance.
-//!
-//! THE BUDGET IS SHARED NEWEST FIRST: the instances are read in the order
-//! they started, newest first (an instance whose start the ring evicted
-//! last), each taking what it needs of what is left — its header, gaps and
-//! node lines here, then `brief all budget=<what is left, in tokens>` — so
-//! an older instance gets what the newer left. The whole never passes
-//! `--budget` (characters, [`DEFAULT_BUDGET`] by default); what the BUDGET
-//! left out is counted in one closing line. The node records past
-//! [`NODE_LINES_MAX`] are no budget's: the header's `node log <shown> of
-//! <held>` says them, and no `--budget` prints them (`log n` does).
-//!
-//! AN INSTANCE THAT REFUSES `log n` IS STILL ONE HERE: a build before 5J-3
-//! answers `ERR usage: log …`, and that refusal ([`crate::Probe::Replied`])
-//! is said in its header while its `brief all` is still asked. Only when no
-//! instance was reached at all (nothing answered or refused in its own
-//! words) is the walk `ls`'s report and status ([`brief_of`]).
-//!
-//! Every line quoted passes `aterm_codec::tty::one_line` ([`shown`]), as
-//! every survey line does.
+//! Local brief survey (`aterm ctl survey --brief`) combining instance node logs and session briefs.
 
 use super::{DEFAULT_BUDGET, HEADER_CHARS, TRUST_LABEL, age, fit, shown};
 
@@ -50,10 +15,8 @@ pub(crate) const BRIEF_DATA_LINE: &str = "# aterm survey --brief: each == block 
 /// keep the rest of the budget.
 pub(crate) const NODE_LINES_MAX: usize = 32;
 
-/// The widest a quoted line is printed.
 const QUOTED_CHARS: usize = 400;
 
-/// The room kept for the closing line, so it always fits.
 const CLOSING_ROOM: usize = 120;
 
 /// What the walk read of one instance before its brief: its `log n` reply.
@@ -70,13 +33,10 @@ pub(crate) struct NodeRead {
     pub(crate) node: Result<Vec<String>, String>,
 }
 
-/// Whether `line` is a `gap` line of a `log` reply.
 fn is_gap(line: &str) -> bool {
     line.starts_with("gap ")
 }
 
-/// The instance's start, wall ms: its node log's `start` record's `t=`
-/// (`<seq> open n start … t=<ms>`), when the ring still holds it.
 fn started(lines: &[String]) -> Option<u64> {
     lines.iter().find_map(|l| {
         let mut w = l.split(' ');
@@ -89,7 +49,6 @@ fn started(lines: &[String]) -> Option<u64> {
     })
 }
 
-/// One instance's header ([`HEADER_CHARS`]).
 fn header(
     read: &NodeRead,
     now_ms: u64,
@@ -121,7 +80,7 @@ fn header(
 /// THE LOCAL BRIEF's text from what the walk read (`reads`) and its brief
 /// asks (`ask`: an instance and the tokens left for its `brief all`, answered
 /// with the reply's body lines or why there are none), within `budget`
-/// characters, the newest instance first (the module doc).
+/// characters, the newest instance first.
 pub(crate) fn render_brief(
     mut reads: Vec<NodeRead>,
     budget: usize,
@@ -136,8 +95,6 @@ pub(crate) fn render_brief(
     });
     let mut out = format!("{BRIEF_DATA_LINE}\n");
     let Some(mut room) = budget.checked_sub(out.chars().count() + CLOSING_ROOM) else {
-        // What a budget could have printed: each header, its gaps and its
-        // newest NODE_LINES_MAX records.
         let mut lines = 0;
         for r in &reads {
             let node = r.node.as_deref().unwrap_or_default();
@@ -162,10 +119,6 @@ pub(crate) fn render_brief(
             cut_instances += 1;
             continue;
         };
-        // The newest records that fit, at most NODE_LINES_MAX. Only the ones
-        // the budget had no room for are the budget's to count: those past
-        // the cap are the header's (`node log <kept> of <held>`), and no
-        // `--budget` would print them.
         let records: Vec<&String> = node.iter().filter(|l| !is_gap(l)).collect();
         let shown_max = records.len().min(NODE_LINES_MAX);
         let mut kept = 0;
@@ -177,8 +130,6 @@ pub(crate) fn render_brief(
             kept += 1;
         }
         cut_lines += shown_max - kept;
-        // What is left is this instance's brief's, in tokens (a token is at
-        // most four bytes, so at most four characters).
         let brief = if read.dial {
             ask(read, (left / 4).max(1))
         } else {
@@ -214,8 +165,6 @@ pub(crate) fn render_brief(
     out
 }
 
-/// The closing line: what the budget left out, and how to read it, fitted
-/// to `room`.
 fn closing(budget: usize, lines: usize, instances: usize, room: usize) -> String {
     let line = format!(
         "… the {budget}-char budget left out {lines} line(s) and {instances} instance(s); \
@@ -256,12 +205,6 @@ pub(crate) fn local_brief(
     )
 }
 
-/// THE LOCAL BRIEF from the walk's `log n` `probes` ([`render_brief`], its
-/// `ask` the `brief all` dial). An instance REACHED — it answered `log n`, or
-/// refused it in its own words ([`crate::Probe::Replied`]: a build before
-/// 5J-3 answers `ERR usage: log …`, which says nothing of its `brief all`) —
-/// is a block, its refusal said in its header; only when none was reached
-/// is this `ls`'s report and status ([`crate::discovery_report`]).
 fn brief_of(
     dir: crate::DirOutcome,
     probes: &[(u32, String, crate::Probe)],
@@ -283,7 +226,6 @@ fn brief_of(
         .filter_map(|(pid, sock, probe)| {
             let node = match probe {
                 crate::Probe::Answered(lines) => Ok(lines.clone()),
-                // A stale socket of an instance long gone is no instance.
                 crate::Probe::Refused {
                     pid_running: Some(false),
                 } => return None,

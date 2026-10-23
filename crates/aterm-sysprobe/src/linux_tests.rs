@@ -800,9 +800,10 @@ fn a_status_file_gives_anonymous_memory_resident_and_swapped() {
 
 /// One sweep of a fixture `/proc`: parents, names (a `comm` with spaces and
 /// parentheses), CPU time at the clock rate, memory from `status` with
-/// `statm` for a kernel thread, and what the stuck-process engine forms
-/// job units from (state, group, session leadership, a terminal, the
-/// owner).
+/// `statm` where it names no anonymous memory, none read for a kernel thread
+/// (`PF_KTHREAD`, whose `status` and `statm` are absent here), and what the
+/// stuck-process engine forms job units from (state, group, session
+/// leadership, a terminal, the owner).
 #[test]
 fn the_sweep_reads_a_fixture_proc() {
     let root = tree(&[
@@ -818,8 +819,6 @@ fn the_sweep_reads_a_fixture_proc() {
             "proc/2/stat",
             "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 7 0 0 20 0 1 0 5 0 0\n",
         ),
-        ("proc/2/status", "Name:\tkthreadd\nPPid:\t0\n"),
-        ("proc/2/statm", "0 0 0 0 0 0 0\n"),
         (
             "proc/4242/stat",
             "4242 (tmux: server (1)) S 1 4242 4242 0 -1 4194560 1209 0 0 0 37 12 0 0 20 0 1 0 12345 0 0\n",
@@ -833,6 +832,12 @@ fn the_sweep_reads_a_fixture_proc() {
             "4300 (zsh) R 4242 4300 4242 34816 4300 4194304 100 0 0 0 5 5 0 0 20 0 1 0 900 0 0\n",
         ),
         ("proc/4300/status", "Name:\tzsh\nRssAnon:\t    1000 kB\n"),
+        (
+            "proc/4400/stat",
+            "4400 (old) S 1 4400 4400 0 -1 4194304 0 0 0 0 2 3 0 0 20 0 1 0 50 0 0\n",
+        ),
+        ("proc/4400/status", "Name:\told\nPPid:\t1\n"),
+        ("proc/4400/statm", "900 250 0 0 0 0 0\n"),
         ("proc/5000/stat", "5000 (cut"),
         ("proc/self/stat", "1 (systemd) S 0 1 1\n"),
         ("proc/meminfo", MEMINFO_ZSWAP),
@@ -859,6 +864,7 @@ fn the_sweep_reads_a_fixture_proc() {
                 Some(3072 * 1024)
             ),
             (4300, 4242, "zsh", Some(100_000_000), Some(1000 * 1024)),
+            (4400, 1, "old", Some(50_000_000), Some(250 * 4096)),
         ]
     );
     let unit: Vec<(u32, RunState, bool, bool)> = sweep
@@ -880,6 +886,7 @@ fn the_sweep_reads_a_fixture_proc() {
             (0, RunState::Sleeping, false, false),
             (4242, RunState::Sleeping, true, false),
             (4300, RunState::Running, false, true),
+            (4400, RunState::Sleeping, true, false),
         ]
     );
     assert!(sweep.procs.iter().all(|p| p.uid.is_some()), "{sweep:?}");

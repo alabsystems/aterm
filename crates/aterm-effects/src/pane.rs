@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pane placement for a composed (split) frame: where one pane sits in the window grid, and
-//! translators that move a pane-local effect stream into window-content coordinates and clip
-//! it at the pane's interior edges, so no light or fur crosses a divider.
+//! Pane placement and coordinate translators for a composed (split) frame.
 
 /// Translate one pane's rain emission into window-content coords and clip it to the pane's
-/// grid-interior box. Rain streams are grid-interior pixels plus a viewport row tag, so
-/// `row += row_off`, `x += col_off·cell_w`, `y += row_off·cell_h`. A clipped halo renders the
-/// same pixels over the surviving area (its falloff depends only on the shifted centre).
-/// Quads that would leave u16 pixel space are dropped.
+/// grid-interior box.
 #[allow(
     clippy::too_many_arguments,
     reason = "the pane placement (row/col offset + rows/cols) and cell metrics are one flat geometry tuple; a wrapper struct would relocate the list, not simplify it"
@@ -35,8 +30,6 @@ pub fn translate_rain_into_pane(
         let (nx0, ny0) = (x + dx, y + dy);
         let nx1 = nx0.saturating_add(w).min(x1);
         let ny1 = ny0.saturating_add(h).min(y1);
-        // Lazy `then`: `then_some` would evaluate the subtractions even when
-        // the guard is false.
         (nx1 > nx0 && ny1 > ny0 && nx1 <= u32::from(u16::MAX) && ny1 <= u32::from(u16::MAX)).then(
             || {
                 (
@@ -75,8 +68,6 @@ pub fn translate_rain_into_pane(
             };
             (q.x, q.y, q.w, q.h) = (x, y, w, h);
             q.row = q.row.saturating_add(row_off);
-            // The falloff centre shifts with the quad; it may lie outside the
-            // clipped rect, since the radial math is absolute.
             q.cx = (u32::from(q.cx) + dx).min(u32::from(u16::MAX)) as u16;
             q.cy = (u32::from(q.cy) + dy).min(u32::from(u16::MAX)) as u16;
             true
@@ -104,7 +95,6 @@ impl PanePlace {
     #[inline]
     const fn px_box(self) -> (i32, i32, i32, i32) {
         let (cw, ch) = (self.cell_w as i32, self.cell_h as i32);
-        // Half the range: unreachable by any real sprite, far from overflow in `x0 + w`.
         let open_lo = i32::MIN / 2;
         let open_hi = i32::MAX / 2;
         let x0 = if self.col_off == 0 {
@@ -140,8 +130,7 @@ impl PanePlace {
     }
 }
 
-/// Move one pane's sparkle-word decorations into the composed window grid. `row`/`col` are
-/// viewport cells, so the shift is the pane's cell offset; the sub-cell `dx`/`dy` ride untouched.
+/// Move one pane's sparkle-word decorations into the composed window grid.
 #[inline]
 pub fn translate_decos_into_pane(decos: &mut Vec<aterm_render::WordDecoration>, place: PanePlace) {
     if decos.is_empty() {
@@ -157,9 +146,9 @@ pub fn translate_decos_into_pane(decos: &mut Vec<aterm_render::WordDecoration>, 
     });
 }
 
-/// Move one pane's animated-ink fg overrides into the composed window grid. The caller must
-/// re-sort the merged stream by `(row, col)`: `aterm_render::sparse_row_slice` binary-searches
-/// it and debug-asserts strict column order.
+/// Move one pane's animated-ink fg overrides into the composed window grid.
+///
+/// The caller must re-sort the merged stream by `(row, col)`.
 #[inline]
 pub fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, place: PanePlace) {
     if ink.is_empty() {
@@ -175,10 +164,7 @@ pub fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, place: Pane
     });
 }
 
-/// Move one pane's free-overlay sprites (peeking cats, gaze dots, the cursor companion) into
-/// the composed window grid: dest origins are signed grid-interior pixels, and a sprite
-/// straddling an interior edge is cropped by [`crop_free_sprite`]. The crop is proportional
-/// (scaled by `aw/w`) because a pose-scaled dest can differ from the natural `aw/ah`.
+/// Move one pane's free-overlay sprites into the composed window grid and crop them to [`PanePlace`].
 #[inline]
 pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, place: PanePlace) {
     if free.is_empty() {
@@ -193,8 +179,7 @@ pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, 
     });
 }
 
-/// Crop one free sprite to the pixel box `(x0, y0, x1, y1)`: dest rect and, in lockstep, its
-/// atlas source rect by the sprite's own scale. `false`: nothing of it is left in the box.
+/// Crop one free sprite and its atlas source rect to the pixel box `(x0, y0, x1, y1)`.
 #[inline]
 pub const fn crop_free_sprite(
     s: &mut aterm_core::render::FreeSprite,
@@ -216,8 +201,6 @@ pub const fn crop_free_sprite(
     if cx0 == x0 && cy0 == y0 && cx1 == x1 && cy1 == y1 {
         return true; // wholly inside: a pure shift, no atlas math
     }
-    // Dest span -> atlas span by the sprite's own scale, rounded to nearest so a one-pixel
-    // dest sliver still selects a texel instead of an empty source rect.
     const fn scale(span: i32, dest: u16, atlas: u16) -> u16 {
         if dest == 0 {
             return 0;
@@ -234,9 +217,6 @@ pub const fn crop_free_sprite(
     }
     let (aw0, ah0) = (s.aw, s.ah);
     let (w0, h0) = (s.w, s.h);
-    // A mirrored sprite samples its atlas window backwards from `ax + aw` on both backends
-    // (`aterm-render`'s `aw - 1 - sx`, the GPU's negative `du`), so trimming the left of the
-    // destination trims the right of the source and leaves `ax` where it is.
     let left_trim = cx0 - x0;
     let right_trim = x1 - cx1;
     s.ax = s.ax.saturating_add(scale(
@@ -247,7 +227,6 @@ pub const fn crop_free_sprite(
     s.ay = s.ay.saturating_add(scale(cy0 - y0, h0, ah0));
     s.w = (cx1 - cx0) as u16;
     s.h = (cy1 - cy0) as u16;
-    // At least one texel, or the sprite has nothing to sample.
     let aw_scaled = scale(cx1 - cx0, w0, aw0);
     s.aw = if aw_scaled < 1 { 1 } else { aw_scaled };
     let ah_scaled = scale(cy1 - cy0, h0, ah0);
@@ -255,9 +234,7 @@ pub const fn crop_free_sprite(
     true
 }
 
-/// Move one pane's supernova additive light into the composed window grid. `nova_add` quads
-/// are grid-interior `u16` pixels plus a `row` damage hint, so both shift; the pixel shift
-/// saturates and the quad is clipped to the pane box.
+/// Move one pane's supernova additive light into the composed window grid and clip to the pane box.
 #[inline]
 pub fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, place: PanePlace) {
     if nova.is_empty() {
@@ -311,8 +288,6 @@ mod pane_free_crop_tests {
         }
     }
 
-    /// The atlas column each destination column samples at 1:1, by the CPU renderer's rule
-    /// (`sx = if flip_x { aw - 1 - sx0 } else { sx0 }`).
     fn sampled(s: &FreeSprite) -> Vec<u16> {
         (0..s.w)
             .map(|i| {
@@ -322,8 +297,6 @@ mod pane_free_crop_tests {
             .collect()
     }
 
-    /// An interior pane (window edges stay open, so only interior edges crop): `cols` cells
-    /// from window column 4 in a 40-column window, 1x1 px cells.
     fn place(cols: u16) -> PanePlace {
         PanePlace {
             row_off: 1,
@@ -337,11 +310,9 @@ mod pane_free_crop_tests {
         }
     }
 
-    /// Surviving pixels sample the same texels, checked against the renderer's sampling rule.
     #[test]
     fn cropping_preserves_which_texels_the_surviving_pixels_sample() {
         for flip in [false, true] {
-            // 8 px wide starting 2 px left of the pane: the left 2 are cut.
             let full = sprite(-2, 8, 100, 8, flip);
             let want: Vec<u16> = sampled(&full).into_iter().skip(2).collect();
             let mut v = vec![full];

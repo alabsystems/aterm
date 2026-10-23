@@ -80,7 +80,8 @@ impl Target {
     /// Validates that `user` and `address` are safe for `ssh`.
     ///
     /// # Errors
-    /// Returns a human-readable refusal when `user` or `address` is empty or malformed.
+    /// One line naming the bad word: `user`, `address` or the host key alias, when it is
+    /// empty or malformed.
     pub fn check(&self) -> Result<(), String> {
         let word_ok = |w: &str, extra: &[u8]| {
             !w.is_empty()
@@ -197,7 +198,7 @@ fn config_path(path: &Path) -> String {
 /// Builds the [`Cmd`] for a forced-command request on `target`.
 ///
 /// # Errors
-/// Returns [`Target::check`]'s refusal if the target is invalid.
+/// [`RunFailed::Refused`] for a target or command `ssh` could misread.
 pub fn request_cmd(paths: &Paths, target: &Target, command: &str) -> Result<Cmd, RunFailed> {
     target.check().map_err(RunFailed::Refused)?;
     if command.is_empty() || !command.bytes().all(|b| (b' '..=b'~').contains(&b)) {
@@ -216,7 +217,8 @@ pub fn request_cmd(paths: &Paths, target: &Target, command: &str) -> Result<Cmd,
 /// Runs one forced-command request on `target` with `stdin`.
 ///
 /// # Errors
-/// Returns an error if the target is invalid or spawning `ssh` fails.
+/// [`RunFailed`] when ssh did not run to completion, or [`RunFailed::Refused`] before it
+/// starts for a target or command `ssh` could misread.
 pub fn request(
     sys: &dyn System,
     paths: &Paths,

@@ -1,20 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The git questions the producer asks of a checkout, each `git -C <dir>` through
-//! `aterm_uds::spawnfd::command`. A program's build number is `git rev-list --count` of
-//! the commit packed: monotonic, and the updater's own convention.
+//! Git queries on a checkout through [`aterm_uds::spawnfd::command`].
 
 use std::path::Path;
 
 use crate::error::{Error, Result};
 
 /// `git -C <dir> <args…>`'s trimmed stdout.
-///
 /// # Errors
-///
-/// A could-not-run when git cannot be started; a refusal quoting git's first stderr line
-/// when it fails.
+/// A could-not-run when git cannot be started, or a refusal when git fails.
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     let out = aterm_uds::spawnfd::command("git")
         .arg("-C")
@@ -39,10 +34,8 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
-/// The build number of `rev` in `dir`: `git rev-list --count <rev>`.
-///
+/// The build number of `rev` in `dir`.
 /// # Errors
-///
 /// When git fails or prints something that is not a count.
 pub fn rev_count(dir: &Path, rev: &str) -> Result<u64> {
     let n = run(dir, &["rev-list", "--count", rev])?;
@@ -55,19 +48,14 @@ pub fn rev_count(dir: &Path, rev: &str) -> Result<u64> {
 }
 
 /// The full sha `HEAD` names in `dir`.
-///
 /// # Errors
-///
 /// When git fails.
 pub fn head(dir: &Path) -> Result<String> {
     run(dir, &["rev-parse", "HEAD"])
 }
 
-/// Whether `dir` is a work tree with no change to a tracked or untracked file — a dirty
-/// tree cannot carry its commit's build number.
-///
+/// Whether `dir` is a work tree with no change to a tracked or untracked file.
 /// # Errors
-///
 /// When `dir` is not a work tree.
 pub fn is_clean(dir: &Path) -> Result<bool> {
     run(dir, &["rev-parse", "--is-inside-work-tree"])?;

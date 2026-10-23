@@ -17,14 +17,12 @@ use std::process::Command;
 use aterm_models_session::notify_follow_checkpoint_model;
 use harness::{FLEET, Fleet, until};
 
-/// A `notify` run's captured output.
 struct Run {
     status: std::process::ExitStatus,
     stdout: String,
     stderr: String,
 }
 
-/// One notifier under test: a state dir, a cap, and the command it runs.
 struct Watch {
     state: PathBuf,
     cap: PathBuf,
@@ -44,13 +42,10 @@ impl Watch {
         }
     }
 
-    /// A notifier watching `attention` with a read cap on the presence face.
     fn attention(fleet: &Fleet, tag: &str) -> Self {
         Self::new(fleet, tag, &[format!("ro:/f/{FLEET}/pub/>")])
     }
 
-    /// The `--exec` line every test uses unless it says otherwise: one line per
-    /// notification, carrying the three facts the assertions read.
     fn appender(&self) -> String {
         format!(
             "printf '%s dup=%s sup=%s\\n' \"$ATERM_NOTIFY_OFFSET\" \"$ATERM_NOTIFY_DUP\" \
@@ -84,7 +79,6 @@ impl Watch {
         v
     }
 
-    /// Run the real binary to completion in `--once` mode.
     fn once(&self, on: &str, extra: &[&str]) -> Run {
         self.once_with(on, &self.appender(), extra, &[])
     }
@@ -105,7 +99,6 @@ impl Watch {
         }
     }
 
-    /// Spawn the binary in FOLLOW mode, killed on every exit path.
     fn follow(&self, on: &str) -> Follower {
         self.follow_with(on, &self.appender(), &[])
     }
@@ -114,7 +107,6 @@ impl Watch {
         self.follow_env(on, exec, extra, &[])
     }
 
-    /// [`Watch::follow_with`] with extra environment: a dev seam a control arms.
     fn follow_env(&self, on: &str, exec: &str, extra: &[&str], env: &[(&str, &str)]) -> Follower {
         let out = std::fs::File::create(self.state.join("follow.out")).expect("stdio");
         let err = out.try_clone().expect("stdio clone");
@@ -130,12 +122,10 @@ impl Watch {
         Follower(Some(cmd.spawn().expect("spawn aterm link notify")))
     }
 
-    /// What a follower has written to stdout and stderr so far.
     fn follow_out(&self) -> String {
         std::fs::read_to_string(self.state.join("follow.out")).unwrap_or_default()
     }
 
-    /// The lines the notification command has appended.
     fn fired(&self) -> Vec<String> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -144,8 +134,6 @@ impl Watch {
             .collect()
     }
 
-    /// The persisted count of rate-dropped notifications the human has not been
-    /// told about yet.
     fn suppressed(&self) -> u64 {
         std::fs::read_to_string(self.state.join("notify/suppressed"))
             .ok()
@@ -153,7 +141,6 @@ impl Watch {
             .unwrap_or(0)
     }
 
-    /// The durable journal, one verdict per line.
     fn journal(&self) -> Vec<String> {
         std::fs::read_to_string(self.state.join("notify/journal"))
             .unwrap_or_default()
@@ -163,7 +150,6 @@ impl Watch {
     }
 }
 
-/// A follow-mode notifier that is killed when the test leaves, panic included.
 struct Follower(Option<aterm_uds::spawnfd::Child>);
 
 impl Follower {
@@ -181,7 +167,6 @@ impl Drop for Follower {
     }
 }
 
-/// Publish one presence row carrying an `attention=`, and answer its offset.
 fn raise_attention(fleet: &Fleet, who: &str, seq: u64, text: &str) -> u64 {
     presence_row(
         fleet,
@@ -194,8 +179,6 @@ fn raise_attention(fleet: &Fleet, who: &str, seq: u64, text: &str) -> u64 {
     )
 }
 
-/// Publish one presence row for `who` carrying `fields` verbatim, and answer
-/// its offset.
 fn presence_row(fleet: &Fleet, who: &str, seq: u64, fields: &str) -> u64 {
     let subject = format!("/f/{FLEET}/pub/n-alpha/{who}/presence");
     let body = format!("v=1 t={seq} {fields}");
@@ -206,7 +189,6 @@ fn presence_row(fleet: &Fleet, who: &str, seq: u64, fields: &str) -> u64 {
         .0
 }
 
-/// The offset a fired line names.
 fn offset_of(line: &str) -> u64 {
     line.split_whitespace()
         .next()
@@ -214,8 +196,6 @@ fn offset_of(line: &str) -> u64 {
         .unwrap_or_else(|| panic!("a fired line starts with its offset: {line}"))
 }
 
-/// **THE RUNG.** One command per matching offset, and the second run of the
-/// notifier over the same records runs nothing at all.
 #[test]
 fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
     let fleet = Fleet::boot("notify-once");
@@ -272,8 +252,6 @@ fn the_command_runs_exactly_once_per_matching_offset_across_a_restart() {
     );
 }
 
-/// **A STANDING ATTENTION PAGES ONCE, HOWEVER OFTEN ITS ROW IS REWRITTEN**
-/// (r3-22).
 #[test]
 fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_does() {
     let fleet = Fleet::boot("notify-standing");
@@ -332,7 +310,6 @@ fn a_republished_standing_attention_pages_nobody_and_a_reraise_after_a_clear_doe
     );
 }
 
-/// **The in-doubt window, entered on purpose.**
 #[test]
 fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
     let fleet = Fleet::boot("notify-doubt");
@@ -377,7 +354,6 @@ fn a_crash_between_the_exec_and_its_journal_entry_refires_and_says_dup() {
     assert_eq!(w.fired().len(), 2, "a resolved offset never fires again");
 }
 
-/// **The rate limit drops nothing silently.**
 #[test]
 fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
     let fleet = Fleet::boot("notify-rate");
@@ -428,7 +404,6 @@ fn the_rate_limit_records_every_drop_and_tells_the_next_notification() {
     );
 }
 
-/// **A record's body never becomes a command.**
 #[test]
 fn an_attention_string_cannot_become_a_shell_word() {
     let fleet = Fleet::boot("notify-inject");
@@ -454,7 +429,6 @@ fn an_attention_string_cannot_become_a_shell_word() {
     );
 }
 
-/// **Follow mode, a `SIGKILL`, and a restart.**
 #[test]
 fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
     let fleet = Fleet::boot("notify-follow");
@@ -488,8 +462,6 @@ fn a_follow_mode_notifier_survives_a_kill_and_neither_repeats_nor_misses() {
     );
 }
 
-/// A follow-mode reader may have a deep, slow backlog while another selector
-/// has a fresh halt.
 #[test]
 fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
     let fleet = Fleet::boot("notify-parallel-catchup");
@@ -533,8 +505,6 @@ fn a_slow_attention_catch_up_does_not_put_halt_behind_its_whole_backlog() {
     );
 }
 
-/// `--since=head` is an initial cut, not a fresh cut on every restart. Follow
-/// mode persists that first head before subscribing, even when the log is idle.
 #[test]
 fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
     let fleet = Fleet::boot("notify-head-restart");
@@ -554,9 +524,6 @@ fn follow_since_head_keeps_its_initial_cut_across_an_idle_restart() {
     });
 }
 
-/// Tier-1 for `NotifyFollowCheckpoint`: the reader can offer a page mark after
-/// handing its last record to the executor, while that record's command is
-/// still running.
 #[test]
 fn a_page_checkpoint_waits_for_the_last_notification_command() {
     let fleet = Fleet::boot("notify-page-checkpoint");
@@ -646,10 +613,6 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
     assert!(model.check_invariant("CursorNeverSkipsUnfinishedRecord", &state));
 }
 
-/// **Every selector is a real broker filter, read with the cap that holds
-/// it.** `ask:h-andrew` is an ask ADDRESSED TO h-andrew — the subject a
-/// session's `post to=h-andrew kind=ask` lands on — read with h-andrew's own
-/// ring (`mint-for h-andrew`); `halt` with node.cap's fleet grant.
 #[test]
 fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     let fleet = Fleet::boot("notify-sel");
@@ -718,7 +681,6 @@ fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     assert!(node.fired().is_empty(), "a refused run fires nothing");
 }
 
-/// **A COMMAND THAT DID NOT DELIVER DOES NOT CLEAR THE SUPPRESSED COUNT.**
 #[test]
 fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
     let fleet = Fleet::boot("notify-sup");
@@ -772,8 +734,6 @@ fn a_command_that_did_not_deliver_does_not_clear_the_suppressed_count() {
     assert_eq!(w.suppressed(), 0, "and only then is it cleared");
 }
 
-/// **ON A BROKER THAT SERVES ORDERED, A FOLLOWER PAGES AN ATTENTION ROW ONLY
-/// ONCE IT IS DURABLE** (`aterm_link::notify`'s module doc).
 #[test]
 fn an_ordered_brokers_attention_pages_once_it_is_durable() {
     let mut opts = harness::broker_opts(aterm_link::durability::Durability::Ordered);

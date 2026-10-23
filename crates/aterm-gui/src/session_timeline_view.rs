@@ -144,7 +144,7 @@ impl ViewCopy {
         let head = log.row_head();
         let after = after.filter(|&a| a <= head);
         let from = after.unwrap_or(0);
-        // The ids this log issued in (lo, head], as `rows_lost_between`
+        // The ids this log issued in `(lo, head]`, as `rows_lost_between`
         // counts them, and those it holds, counted on the same walk.
         let lo = from.max(log.row_first().saturating_sub(1));
         let (mut held, mut taken) = (0u64, 0usize);

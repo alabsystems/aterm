@@ -543,7 +543,7 @@ impl PressCredits {
 
     /// Blank every slot whose press instant `pred` admits, in place.
     pub(super) fn blank_where(&mut self, pred: impl Fn(Instant) -> bool) {
-        for slot in self.slots.iter_mut() {
+        for slot in &mut self.slots {
             if slot.is_some_and(|(t, _, _)| pred(t)) {
                 *slot = None;
             }
@@ -1863,6 +1863,7 @@ impl CursorGlow {
         }
         let credits = self.typed_credits_within(now);
         if cr == pr && cc > pc {
+            // Exact for one cell, at least two for anything wider (the
             // coalesce's own floor).
             return credits >= usize::from(cc - pc).min(2);
         }
@@ -2209,6 +2210,8 @@ impl CursorGlow {
 
     /// Consume every one-shot classifier at a completed hidden→visible boundary where `spawn`.
     pub(super) fn retire_hidden_movement_provenance(&mut self, now: Instant) {
+        // A held park is spared while fresh, like the typed bank: Ink brackets
+        // its park and rewrite in DECTCEM hides, so a boundary can complete
         // mid-park. A park past its window is judged now, as the tick would.
         if self.held_park.is_some_and(|p| !p.fresh(now)) {
             self.flush_held_park();

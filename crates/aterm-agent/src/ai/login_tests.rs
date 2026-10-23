@@ -332,6 +332,24 @@ fn claude_never_adopts_over_a_listed_row_or_a_refused_roster() {
             runner.calls()
         );
     }
+    let mut with_successor = listed_view(false, None);
+    with_successor.next_sign_in = Some("m27".into());
+    let mut f = facts(&CLAUDE, shim);
+    f.accounts = Some(with_successor);
+    let runner = FakeRunner::quiet();
+    assert_eq!(
+        rig.sign_in(&runner, &store, &f, &row(&CLAUDE, State::Limited(100)), &[]),
+        Done::SignedIn(None),
+        "when next_sign_in is present, login renews the successor even if the default row has no email"
+    );
+    assert_eq!(
+        runner
+            .calls()
+            .iter()
+            .map(|c| c.args.clone())
+            .collect::<Vec<_>>(),
+        [vec!["harness", "accounts", "renew", "m27"]]
+    );
 }
 
 #[test]

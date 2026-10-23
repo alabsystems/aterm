@@ -51,9 +51,7 @@ pub fn is_test_binary(exe: &Path) -> bool {
     in_deps && executable && named
 }
 
-/// Whether `dir` is the login session's runtime directory, `/run/user/<uid>` (systemd's
-/// `pam_systemd` exports it to every process of a desktop session): an inherited `$XDG_RUNTIME_DIR`
-/// naming the person's own, never one a test chose.
+/// Whether `dir` is the login session's runtime directory (`/run/user/<uid>`).
 #[must_use]
 pub fn is_login_runtime_dir(dir: &OsStr) -> bool {
     #[cfg(unix)]
@@ -176,7 +174,6 @@ fn sweep_at_exit(roots: &Path) {
         }
     }
     unsafe extern "C" {
-        /// `stdlib.h`, declared inline as `aterm-gui`'s process scratch declares it.
         fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
     }
     // SAFETY: registers a plain `extern "C"` function with no captured state; a failed registration
@@ -195,8 +192,6 @@ mod tests {
     use super::{is_test_binary, owner_pid, scratch_root};
     use std::path::Path;
 
-    /// Cargo's test binaries are `deps/<crate>-<16 hex>`; the uplifted `aterm` an
-    /// integration test runs, a build script, an example and a shipped app are not.
     #[test]
     fn only_a_cargo_test_binary_is_one() {
         for exe in [
@@ -221,10 +216,6 @@ mod tests {
         }
     }
 
-    /// This binary is a test binary, so it has a root: private, in the temp dir's
-    /// private directory of roots, named for this process. Negative control: a process
-    /// that is not one has none ([`only_a_cargo_test_binary_is_one`]'s refusals are what
-    /// `scratch_root` reads).
     #[test]
     fn a_test_binary_gets_a_private_root_of_its_own() {
         let root = scratch_root().expect("this test binary's root");

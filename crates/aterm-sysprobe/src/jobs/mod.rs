@@ -389,6 +389,130 @@ pub struct ProcFacts {
     pub fds: Option<Vec<FdReading>>,
     /// Whether it holds more descriptors than were read.
     pub fds_truncated: bool,
+    /// What its start reads, from the thread handles and the BSD record this reading took ([`StartFacts`], judged by [`Self::program_check`]); `None` where unread (a zombie, a refused list, the Linux arm, which has no program check).
+    pub start_facts: Option<StartFacts>,
+}
+
+impl ProcFacts {
+    /// Where it stands at its start: [`judge_start`] over [`Self::start_facts`].
+    #[must_use]
+    pub fn program_check(&self) -> Option<AtStart> {
+        self.start_facts.as_ref().map(judge_start)
+    }
+}
+
+/// How long since its fork a process whose one thread never ran must have stood before it reads as held at macOS's program check: a normal exec reads its first thread's handle as `0` for under 0.3 ms (M2).
+pub const PROGRAM_CHECK_AGE_MS: u64 = 20_000;
+
+/// Where a process stands at its start (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.2), judged by [`judge_start`] from its [`StartFacts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtStart {
+    /// It runs: its thread set its handle, or it is younger than [`PROGRAM_CHECK_AGE_MS`], stopped or traced.
+    Started,
+    /// Held at macOS's program check: one thread that never ran, past [`PROGRAM_CHECK_AGE_MS`], neither stopped nor traced, native, its executable on a local volume.
+    Held,
+    /// The same signature in an x86_64 process on an arm64 Mac: Rosetta translates it, and the Developer Tools grant does not reach that.
+    Translating,
+    /// The same signature on an executable whose volume is not proven local: it has not started, and nothing read says why.
+    Unstarted,
+}
+
+impl AtStart {
+    /// The word a reader prints: `started`, `program-check`, `translating` or `not-started`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Held => "program-check",
+            Self::Translating => "translating",
+            Self::Unstarted => "not-started",
+        }
+    }
+}
+
+/// What [`judge_start`] judges a process's start by, as [`read_start`] reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StartFacts {
+    /// Its thread list is one handle, `0`: its one thread never ran far enough to set it (M1).
+    pub lone_zero: bool,
+    /// Its BSD status is `SSTOP`: a start-suspended spawn, a `SIGSTOP`, a tracer's stop.
+    pub stopped: bool,
+    /// A debugger traces it (`PROC_FLAG_TRACED`).
+    pub traced: bool,
+    /// An x86_64 process on an arm64 Mac.
+    pub translated: bool,
+    /// Whether its executable's volume is local and not automounted; `None` when unread (no path, a deleted file, no mount holds it).
+    pub local: Option<bool>,
+    /// Milliseconds since its fork; `None` when unread.
+    pub age_ms: Option<u64>,
+}
+
+/// Where a process with `f` stands at its start: [`AtStart::Started`] unless its one thread never ran and it is past [`PROGRAM_CHECK_AGE_MS`] while neither stopped nor traced; then [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, [`AtStart::Unstarted`] unless its executable's volume reads local (an unread mount proves nothing local), and [`AtStart::Held`] otherwise.
+#[must_use]
+pub fn judge_start(f: &StartFacts) -> AtStart {
+    if !(f.lone_zero && !f.stopped && !f.traced && f.age_ms >= Some(PROGRAM_CHECK_AGE_MS)) {
+        return AtStart::Started;
+    }
+    if f.translated {
+        AtStart::Translating
+    } else if f.local != Some(true) {
+        AtStart::Unstarted
+    } else {
+        AtStart::Held
+    }
+}
+
+/// The [`StartFacts`] of `pid` at `now_us` (µs since the epoch, [`now_us`]): one two-slot thread list, and for a lone `0` only its BSD record, its arch and its executable's mount. `None` when the list or a record the judgment needs cannot be read (gone, another user's), and off macOS. Nothing of its arguments or environment is read: such a read of a program held mid-start can hang (M29).
+#[must_use]
+pub fn read_start(pid: u32, now_us: u64) -> Option<StartFacts> {
+    read_start_in(pid, now_us, &std::cell::OnceCell::new())
+}
+
+/// [`read_start`], the mount table taken from `mounts` and read into it the first time a lone `0` needs it: a reader of many pids hands every read one cell, as [`JobsReader::read_all`] does.
+#[must_use]
+pub fn read_start_in(
+    pid: u32,
+    now_us: u64,
+    mounts: &std::cell::OnceCell<crate::volumes::Table>,
+) -> Option<StartFacts> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::read_start(pid, now_us, mounts)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, now_us, mounts);
+        None
+    }
+}
+
+/// Where `pid` stands at its start now ([`read_start`], [`judge_start`]); `None` when unread.
+#[must_use]
+pub fn at_start(pid: u32) -> Option<AtStart> {
+    read_start(pid, now_us()).map(|f| judge_start(&f))
+}
+
+/// The wall clock in µs since the epoch, as the kernel counts a process's start; 0 before the epoch.
+#[must_use]
+pub fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_micros()).ok())
+        .unwrap_or(0)
+}
+
+/// Whether the volume `table` places `path` on is local and not automounted ([`local_mount`]); `None` when no mount of `table` holds it, or when it calls it local but was cut ([`crate::volumes::Table::complete`]): a mount it left out may be the one that holds `path`.
+fn local_at(path: &Path, table: &crate::volumes::Table) -> Option<bool> {
+    match crate::volumes::mount_of(path, table).map(local_mount)? {
+        true if !table.complete => None,
+        local => Some(local),
+    }
+}
+
+/// A mount whose files are on this Mac: local, and neither automounted nor autofs.
+fn local_mount(m: &crate::volumes::Mount) -> bool {
+    m.local && !m.automounted && m.fstype != "autofs"
 }
 
 /// One process the engine wants read.
@@ -482,6 +606,11 @@ impl JobsReader {
 
     /// Read every process `reqs` names, in order; a process gone or refused meanwhile is left out.
     pub fn read_all(&mut self, reqs: &[ReadReq]) -> Vec<ProcFacts> {
+        self.read_all_at(reqs, now_us())
+    }
+
+    /// [`Self::read_all`], each start's age taken at `now` (µs since the epoch, [`now_us`]).
+    fn read_all_at(&mut self, reqs: &[ReadReq], now: u64) -> Vec<ProcFacts> {
         let lanes = if reqs.iter().any(|r| r.fds) {
             Some(self.lanes())
         } else {
@@ -490,12 +619,25 @@ impl JobsReader {
         let mounts = std::cell::OnceCell::new();
         let mut out = Vec::with_capacity(reqs.len());
         for r in reqs {
-            let Some(mut facts) = self.read_raw(r.pid, r.fds, lanes) else {
+            let Some((mut facts, start)) = self.read_raw(r.pid, r.fds, lanes, now) else {
                 continue;
             };
-            if facts.state != RunState::Zombie {
-                facts.exe = self.exe_name(r.pid);
-            }
+            let exe = (facts.state != RunState::Zombie)
+                .then(|| self.exe_path(r.pid))
+                .flatten();
+            facts.exe = exe
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .map(str::to_owned);
+            facts.start_facts = start.map(|mut f| {
+                if f.lone_zero {
+                    f.local = exe
+                        .as_deref()
+                        .and_then(|p| local_at(p, mounts.get_or_init(crate::volumes::table)));
+                }
+                f
+            });
             if let Some(fds) = facts.fds.as_mut() {
                 self.check_tails(&facts_key(r.pid, facts.start), fds, &mounts);
             }
@@ -512,36 +654,44 @@ impl JobsReader {
         self.read_all(&[req]).pop()
     }
 
-    fn read_raw(&self, pid: u32, fds: bool, lanes: Option<Lanes>) -> Option<ProcFacts> {
+    /// One process's facts, and the [`StartFacts`] its thread list gave (the macOS arm; `local` left for [`Self::read_all`], which holds the executable's path).
+    fn read_raw(
+        &self,
+        pid: u32,
+        fds: bool,
+        lanes: Option<Lanes>,
+        now_us: u64,
+    ) -> Option<(ProcFacts, Option<StartFacts>)> {
         #[cfg(target_os = "macos")]
         {
             let _ = (&self.root, self.hz);
-            macos::read(pid, fds, lanes.unwrap_or(OFF_LANES))
+            macos::read(pid, fds, lanes.unwrap_or(OFF_LANES), now_us)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = lanes;
+            let _ = (lanes, now_us);
             if cfg!(target_os = "linux") || self.root != Path::new("/proc") {
-                linux::read(&self.root, pid, fds, self.hz)
+                linux::read(&self.root, pid, fds, self.hz).map(|f| (f, None))
             } else {
                 None
             }
         }
     }
 
-    /// The file name of `pid`'s executable, as the kernel holds its path
-    /// (`proc_pidpath`; the `exe` link under the root on Linux).
-    fn exe_name(&self, pid: u32) -> Option<String> {
+    /// `pid`'s executable, as the kernel holds its path (`proc_pidpath`;
+    /// the `exe` link under the root on Linux).
+    fn exe_path(&self, pid: u32) -> Option<PathBuf> {
         #[cfg(target_os = "macos")]
-        let path = {
+        {
             let _ = &self.root;
             crate::process_path(pid)
-        };
+        }
         #[cfg(not(target_os = "macos"))]
-        let path = std::fs::read_link(self.root.join(pid.to_string()).join("exe"))
-            .ok()
-            .filter(|p| p.is_absolute());
-        path?.file_name()?.to_str().map(str::to_owned)
+        {
+            std::fs::read_link(self.root.join(pid.to_string()).join("exe"))
+                .ok()
+                .filter(|p| p.is_absolute())
+        }
     }
 
     /// Fill each output file's `lf_tail` from the bytes appended since the
@@ -644,7 +794,7 @@ pub const TAIL_ROOTS: [&str; 7] = [
     "/run/user/",
 ];
 
-/// Whether an output file at `path` may be opened to read its new bytes: an absolute path with no `.` or `..`, under a [`TAIL_ROOTS`] folder, on a mount `table` calls local and not automounted.
+/// Whether an output file at `path` may be opened to read its new bytes: an absolute path with no `.` or `..`, under a [`TAIL_ROOTS`] folder, on a mount `table` proves local and not automounted ([`local_at`]).
 #[must_use]
 pub fn tail_allowed(path: &Path, table: &crate::volumes::Table) -> bool {
     let Some(text) = path.to_str() else {
@@ -653,8 +803,7 @@ pub fn tail_allowed(path: &Path, table: &crate::volumes::Table) -> bool {
     if !TAIL_ROOTS.iter().any(|r| text.starts_with(r)) {
         return false;
     }
-    crate::volumes::mount_of(path, table)
-        .is_some_and(|m| m.local && !m.automounted && m.fstype != "autofs")
+    local_at(path, table) == Some(true)
 }
 
 /// Whether the bytes of `path` between `from` and `to` hold a line feed: at most the last [`TAIL_CAP`] of them, read with one `pread` on a descriptor opened read-only, non-blocking and without following a final symlink.

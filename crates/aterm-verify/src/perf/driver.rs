@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `targo` the perf lanes build with: the run's own toolchain
-//! ([`crate::run_toolchain`]), refused rather than replaced when it is not the
-//! pin, so no lane measures a build from another compiler under the pin's name.
+//! Pinned `targo` command builder for performance lanes.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -16,8 +14,6 @@ pub(crate) struct CargoDriver {
     pub(crate) program: PathBuf,
 }
 
-/// targo's compiling verbs, the only ones that take `--unverified` (and the
-/// only ones that require a lane); `metadata` and `tree` refuse it.
 const LANE_VERBS: &[&str] = &["build", "check", "test", "run", "bench", "doc", "rustc"];
 
 impl CargoDriver {
@@ -37,18 +33,13 @@ impl CargoDriver {
         cmd
     }
 
-    /// [`Self::command`] for a build of THIS workspace, led by its build-dir
-    /// `--config` ([`workspace_build_dir`]) when the verb compiles, so a perf
-    /// build shares a shell build's cache and keeps its intermediates out of
-    /// Spotlight.
+    /// [`Self::command`] configured with [`workspace_build_dir`] for compiling verbs.
     pub(crate) fn workspace_command(&self, verb: &str) -> Command {
         let mut cmd = command(&self.program);
         cmd.args(Self::lead(verb, workspace_build_dir()));
         cmd
     }
 
-    /// What goes before the caller's arguments: `--config <build_dir>` for a
-    /// compiling verb given one, the lane flag, the verb.
     fn lead(verb: &str, build_dir: Option<&str>) -> Vec<String> {
         let mut lead = Vec::new();
         if let Some(value) = build_dir.filter(|_| LANE_VERBS.contains(&verb)) {
@@ -64,7 +55,6 @@ impl CargoDriver {
         self.display_led(verb, workspace_build_dir(), args)
     }
 
-    /// The command line led by `build_dir` ([`Self::lead`]).
     fn display_led(&self, verb: &str, build_dir: Option<&str>, args: &[&str]) -> String {
         let mut parts: Vec<String> = vec![self.program.display().to_string()];
         parts.extend(Self::lead(verb, build_dir));
@@ -73,12 +63,7 @@ impl CargoDriver {
     }
 }
 
-/// The build-dir `--config` every perf build of this workspace leads with,
-/// resolved once: plain `targo`'s cache where atpkg's shim would hand one
-/// ([`crate::main_build_dir`]), else `<target>/build.noindex` under the target
-/// directory `targo metadata` names ([`crate::fallback_build_dir`]), so the
-/// intermediates stay out of Spotlight and the binaries still land in
-/// `<target>/<profile>/`. `None` where the caller chose a build directory.
+/// Resolves the `--config` build-dir argument for performance builds in this workspace.
 pub(crate) fn workspace_build_dir() -> Option<&'static str> {
     static DIR: OnceLock<Option<String>> = OnceLock::new();
     DIR.get_or_init(|| {
@@ -92,8 +77,7 @@ pub(crate) fn workspace_build_dir() -> Option<&'static str> {
     .as_deref()
 }
 
-/// The target directory: `targo`'s own answer through `metadata`, since a
-/// caller's `CARGO_TARGET_DIR` (or the reroute's, or a cargo config) moves it.
+/// Queries the workspace target directory from `targo metadata`.
 pub(crate) fn target_dir() -> Result<PathBuf, String> {
     let driver = cargo_driver()?;
     let out = driver
@@ -137,8 +121,6 @@ pub(crate) fn cargo_driver() -> Result<&'static CargoDriver, &'static str> {
 mod tests {
     use super::*;
 
-    /// An accepted toolchain is driven by its own `targo`; a refused one (a
-    /// `targo` with no branded `trustc` beside it) drives nothing.
     #[test]
     fn a_refused_stage2_is_not_driven() {
         let stage2 = PathBuf::from("/s/bin");
@@ -173,8 +155,6 @@ mod tests {
             d.display_led("run", None, &["--release", "-p", "aterm-bench"]),
             "/s/targo --unverified run --release -p aterm-bench"
         );
-        // A workspace build leads with its build dir; a verb that compiles nothing
-        // never does.
         let dir = Some("build.build-dir='/w/target/build.noindex'");
         assert_eq!(
             d.display_led("build", dir, &["--release"]),

@@ -36,7 +36,7 @@ pub(crate) use aterm_messages::ink::{
 #[cfg(test)]
 pub(crate) use aterm_messages::palette::lin;
 
-/// The band's cell measure, the char count (see the module doc).
+/// The band's cell measure, the char count (the band writes one `char` per cell).
 #[cfg(test)]
 pub(crate) fn cell_width(s: &str) -> usize {
     char_width(s)

@@ -1,31 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every byte the caller asks for is written, at every length from 0 to 4096
-//! (sixteen of getentropy(2)'s 256-byte chunks, and every remainder), through
-//! [`getrandom`] and [`getrandom_uninit`].
-//!
-//! The property is [`every_byte_is_written`]: a buffer preset to a sentinel
-//! is filled, and each byte must leave the sentinel at least once in up to
-//! [`ROUNDS`] fills (a random byte equals it with probability 1/256, so a
-//! position misses all of them with probability 2^-64), and two fills of 16
-//! bytes or more must differ (2^-128). Length 0 is in the sweep, so an empty
-//! request must succeed too.
+//! Tests that [`getrandom`] and [`getrandom_uninit`] fill every requested byte across lengths 0..=4096.
 
 use core::mem::MaybeUninit;
 
 use getrandom::{Error, getrandom, getrandom_uninit};
 
-/// The longest buffer checked.
 const MAX_LEN: usize = 4096;
-/// Fills per length before a byte that never left the sentinel is a failure.
 const ROUNDS: usize = 8;
-/// What every byte holds before a fill: zero, the state a fresh or zeroed
-/// buffer that nothing wrote would show.
 const SENTINEL: u8 = 0;
 
-/// `Ok` when `fill` writes every byte of every length up to [`MAX_LEN`] and
-/// does not repeat itself; otherwise the first length and byte it missed.
 fn every_byte_is_written(fill: impl Fn(&mut [u8]) -> Result<(), Error>) -> Result<(), String> {
     for len in 0..=MAX_LEN {
         let mut written = vec![false; len];

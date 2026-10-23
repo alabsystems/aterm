@@ -152,7 +152,7 @@ fn is_prose_row(row: &str) -> bool {
 const GUTTER: char = '⎿';
 
 /// The kind of block row `i` opens, or `None` when it continues the one above,
-/// by Claude Code's grammar (the module doc).
+/// by Claude Code's grammar.
 fn head_kind(rows: &[String], i: usize) -> Option<BlockKind> {
     let row = rows[i].as_str();
     if !row.starts_with(['⏺', '●']) && is_tool_call(row) {

@@ -8,8 +8,6 @@ use super::*;
 #[cfg(unix)]
 use crate::volumes::{Mount, Table};
 
-// State words.
-
 #[test]
 fn every_kernel_state_word_maps_to_one_run_state() {
     assert_eq!(RunState::from_bsd(1), RunState::Idle);
@@ -44,8 +42,6 @@ fn every_kernel_state_word_maps_to_one_run_state() {
     assert_eq!(KnoteFilter::from_darwin(-99), KnoteFilter::Other(-99));
 }
 
-// Darwin layouts, decoded from bytes written here.
-
 fn put(b: &mut [u8], at: usize, v: &[u8]) {
     b[at..at + v.len()].copy_from_slice(v);
 }
@@ -75,7 +71,6 @@ fn a_vnode_answer_gives_mode_size_identity_and_path() {
     assert!(v.regular() && !v.char_device());
     assert_eq!((v.dev, v.ino, v.size), (16_777_232, 987_654, 36));
     assert_eq!(v.path, b"/private/tmp/t/1.output");
-    // A negative size reads 0; a short buffer reads nothing.
     put(&mut b, darwin::VNODE_SIZE_AT, &(-5i64).to_ne_bytes());
     assert_eq!(darwin::vnode(&b).unwrap().size, 0);
     assert_eq!(darwin::vnode(&b[..darwin::VNODE_PATH_SIZE - 1]), None);
@@ -159,11 +154,9 @@ fn a_socket_answer_names_tcp_state_peer_and_queue() {
     assert_eq!(t.remote, Some("[2001:db8::1]:443".parse().unwrap()));
     assert_eq!(t.queued_read, 7);
 
-    // A listener's peer is the wildcard on port 0: none.
     let b = tcp_bytes(1, darwin::INI_IPV4, &[0; 16], 0, 5173, 0);
     assert_eq!(darwin::socket(&b).unwrap().unwrap().remote, None);
 
-    // Not TCP: a socket, no TCP part; short: nothing.
     let mut b = vec![0u8; darwin::SOCKET_SIZE];
     put(&mut b, darwin::SOCKET_KIND_AT, &3i32.to_ne_bytes());
     assert_eq!(darwin::socket(&b), Some(None));
@@ -196,7 +189,6 @@ fn a_kqueue_answer_gives_its_sleep_and_its_knotes() {
         &(-7i16).to_ne_bytes(),
     );
     assert_eq!(darwin::knotes(&k, 2), vec![(3, -1), (9, -7)]);
-    // A count past the buffer stops where the buffer does.
     assert_eq!(darwin::knotes(&k, 5).len(), 2);
 }
 
@@ -240,13 +232,125 @@ fn a_kinfo_answer_gives_a_zombies_parent_group_and_state() {
     assert_eq!((k.tty, k.tpgid), (Some(0x1000_0003), Some(6301)));
     assert!(k.session_leader);
     assert_eq!(k.comm, "node");
-    // Without `P_CONTROLT` the terminal is none, whatever `e_tdev` says.
     put(&mut b, darwin::KINFO_FLAG_AT, &0u32.to_ne_bytes());
     assert_eq!(darwin::kinfo(&b).unwrap().tty, None);
     assert_eq!(darwin::kinfo(&b[..100]), None);
 }
 
-// Linux parsers.
+#[test]
+fn an_arch_answer_gives_its_cpu_type() {
+    let mut b = vec![0u8; darwin::ARCHINFO_SIZE];
+    put(
+        &mut b,
+        darwin::ARCHINFO_CPUTYPE_AT,
+        &darwin::CPU_TYPE_X86_64.to_ne_bytes(),
+    );
+    assert_eq!(darwin::archinfo_cputype(&b), Some(darwin::CPU_TYPE_X86_64));
+    assert_eq!(darwin::archinfo_cputype(&b[..4]), None);
+}
+
+/// Only a process whose one thread never ran, 20 s or more after its fork,
+/// neither stopped nor traced, reads held, and then only native and on a
+/// local volume: M1's row is held and M2's normal exec, caught at its first
+/// instruction, is not.
+#[test]
+fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
+    let m1 = StartFacts {
+        lone_zero: true,
+        stopped: false,
+        traced: false,
+        translated: false,
+        local: Some(true),
+        age_ms: Some(21_000),
+    };
+    let rows = [
+        ("M1: one unstarted thread, 21 s", m1, AtStart::Held),
+        (
+            "M2: a normal exec at its first instruction",
+            StartFacts {
+                age_ms: Some(0),
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "exactly 20 s",
+            StartFacts {
+                age_ms: Some(PROGRAM_CHECK_AGE_MS),
+                ..m1
+            },
+            AtStart::Held,
+        ),
+        (
+            "19.999 s",
+            StartFacts {
+                age_ms: Some(19_999),
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "stopped",
+            StartFacts {
+                stopped: true,
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "traced",
+            StartFacts { traced: true, ..m1 },
+            AtStart::Started,
+        ),
+        (
+            "a thread that ran",
+            StartFacts {
+                lone_zero: false,
+                ..m1
+            },
+            AtStart::Started,
+        ),
+        (
+            "x86_64 on arm64",
+            StartFacts {
+                translated: true,
+                ..m1
+            },
+            AtStart::Translating,
+        ),
+        (
+            "a remote volume",
+            StartFacts {
+                local: Some(false),
+                ..m1
+            },
+            AtStart::Unstarted,
+        ),
+        (
+            "an unread mount",
+            StartFacts { local: None, ..m1 },
+            AtStart::Unstarted,
+        ),
+        (
+            "an unread age",
+            StartFacts { age_ms: None, ..m1 },
+            AtStart::Started,
+        ),
+    ];
+    for (row, facts, want) in rows {
+        assert_eq!(judge_start(&facts), want, "{row}: {facts:?}");
+    }
+    assert_eq!(
+        [
+            AtStart::Started,
+            AtStart::Held,
+            AtStart::Translating,
+            AtStart::Unstarted
+        ]
+        .map(AtStart::word),
+        ["started", "program-check", "translating", "not-started"]
+    );
+}
 
 const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
                     150 50 20 10 20 0 3 0 123456 0 0";
@@ -265,7 +369,6 @@ fn a_stat_line_gives_every_field_past_any_command_name() {
         (3, 150, 50, 20, 10)
     );
     assert_eq!((s.threads, s.start), (3, 123_456));
-    // No terminal: `tty_nr` 0, `tpgid` -1.
     let s = linux::parse_stat("9 (d) R 1 9 9 0 -1 0 0 0 0 0 1 2 0 0 20 0 1 0 7 0 0").unwrap();
     assert_eq!((s.tty_nr, s.tpgid), (0, 0));
     assert_eq!(linux::parse_stat("9 (d) R 1"), None);
@@ -359,8 +462,6 @@ fn a_tcp_table_gives_state_peer_and_queue_and_skips_a_torn_row() {
     assert_eq!(rows[0].remote, Some("[2001:db8::1]:443".parse().unwrap()));
     assert_eq!(rows[0].rx_queue, 5);
 }
-
-// The Linux arm over a fixture tree written here.
 
 #[cfg(unix)]
 fn write(root: &Path, rel: &str, text: &str) {
@@ -495,19 +596,14 @@ fn the_linux_arm_reads_a_fixture_tree() {
     );
     assert_eq!(kind(5), Some(FdKind::Watch));
 
-    // A zombie is named, with no counters and no threads.
     let z = linux::read(r, 4713, true, 100).unwrap();
     assert_eq!(z.state, RunState::Zombie);
     assert!(z.counters.is_none() && z.threads.is_none() && z.fds.is_none());
-    // Another user's `io` is refused: counters unknown, not zero.
     let o = linux::read(r, 4714, false, 100).unwrap();
     assert!(o.counters.is_none());
     assert!(o.fds.is_none());
-    // A pid not in the tree reads nothing.
     assert!(linux::read(r, 9999, false, 100).is_none());
 }
-
-// The output tail.
 
 #[cfg(unix)]
 fn table(mounts: &[(&str, bool, bool)]) -> Table {
@@ -554,6 +650,33 @@ fn only_a_local_temporary_file_is_opened_for_its_tail() {
     assert!(!tail_allowed(Path::new("/private/tmp/../Users//me/x"), &t));
     assert!(!tail_allowed(Path::new("relative/tmp/x"), &t));
     assert!(!tail_allowed(Path::new("/private/tmp/x"), &table(&[])));
+    let cut = Table {
+        complete: false,
+        ..t
+    };
+    assert!(
+        !tail_allowed(Path::new("/private/tmp/agent-501/t/1.output"), &cut),
+        "a cut table proves no mount local"
+    );
+}
+
+/// A mount table proves a volume local only when it was read whole: a cut one
+/// may have left out the mount that holds the path, so its local answer is
+/// unread, while a mount it lists as remote still reads remote.
+#[cfg(unix)]
+#[test]
+fn a_cut_mount_table_proves_no_volume_local() {
+    let whole = table(&[("/", true, false), ("/Volumes/share", false, false)]);
+    let cut = Table {
+        complete: false,
+        ..whole.clone()
+    };
+    let (gh, shared) = (Path::new("/usr/bin/gh"), Path::new("/Volumes/share/gh"));
+    assert_eq!(local_at(gh, &whole), Some(true));
+    assert_eq!(local_at(gh, &cut), None, "the cut may hold its mount");
+    assert_eq!(local_at(shared, &whole), Some(false));
+    assert_eq!(local_at(shared, &cut), Some(false));
+    assert_eq!(local_at(Path::new("relative/gh"), &whole), None);
 }
 
 #[cfg(unix)]
@@ -562,18 +685,14 @@ fn the_tail_check_reads_only_the_appended_bytes() {
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     let p = dir.path().join("out");
     std::fs::write(&p, b"line one\nspin\rspin\r").unwrap();
-    // The first nine bytes hold the line feed; the rest only returns.
     assert_eq!(tail_has_lf(&p, 0, 9), Some(true));
     assert_eq!(tail_has_lf(&p, 9, 19), Some(false));
     assert_eq!(tail_has_lf(&p, 9, 9), None);
     assert_eq!(tail_has_lf(&dir.path().join("missing"), 0, 4), None);
-    // A symlink as the final component is refused.
     let l = dir.path().join("link");
     std::os::unix::fs::symlink(&p, &l).unwrap();
     assert_eq!(tail_has_lf(&l, 0, 9), None);
 }
-
-// Live self-reads (macOS): shapes only, never timings.
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -589,8 +708,6 @@ fn this_process_reads_itself_with_threads_counters_and_descriptors() {
     assert!(f.ppid > 0 && f.pgid > 0, "{f:?}");
     assert!(f.start.is_some_and(|s| s > 0));
     assert!(f.sid.is_some());
-    // The executable's own file name, whole (the test binary's name passes
-    // `p_comm`'s 16 bytes).
     let own = std::env::current_exe().expect("this test's executable");
     assert_eq!(
         f.exe.as_deref(),
@@ -659,7 +776,6 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
     assert_eq!(f.sid, Some(pid), "it leads its own session");
     assert_eq!((f.tty, f.tpgid), (None, None));
     assert_eq!(f.ppid, std::process::id());
-    // The sweep says the same: it leads a session, with no terminal.
     let sweep = crate::processes().expect("a sweep");
     let row = sweep
         .procs
@@ -688,7 +804,6 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
         "hang detector: one minute"
     );
     child.kill().expect("kill");
-    // Not reaped yet: a zombie.
     let zombie = (0..6000).find_map(|_| {
         let f = reader.read(ReadReq { pid, fds: false });
         if f.as_ref().is_some_and(|f| f.state == RunState::Zombie) {
@@ -700,13 +815,11 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
     });
     let z = zombie.expect("hang detector: one minute");
     assert!(z.counters.is_none() && z.threads.is_none());
-    // An exited process has left its session: its parent is what is known.
     assert_eq!(z.ppid, std::process::id());
     assert!(
         z.start.is_some_and(|s| s == f.start.unwrap_or(0)),
         "{z:?} {f:?}"
     );
-    // The sweep lists it too, from the sysctl.
     let sweep = crate::processes().expect("a sweep");
     let row = sweep
         .procs
@@ -719,8 +832,6 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
     );
     child.wait().expect("reaped");
 }
-
-// Live CPU time (macOS): units, read from a stopped child.
 
 /// The job probe's CPU times are nanoseconds: a spinning child, stopped so
 /// that every reading counts the same CPU at any load, reads its counters and
@@ -738,7 +849,6 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
         let threads = f.threads?.iter().map(|t| t.cpu_ns).sum::<Option<u64>>()?;
         Some((f.counters?.cpu_ns, threads))
     };
-    // Burn until the counters say 50 ms.
     let (both, kernel) = read(|pid| cpu(pid).is_some_and(|(c, _)| c >= 50_000_000), cpu);
     let (counters, threads) = both.expect("the probe reads its own child");
     assert!(
@@ -747,4 +857,135 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
          stopped child is {kernel} ns (timebase {:?})",
         crate::procs::kernel_timebase()
     );
+}
+
+/// A start-suspended spawn reads one thread whose handle is `0`, stopped and
+/// untraced, so its stop, not its age, keeps it from reading held (the age is
+/// read 21 s ahead, so the bound is passed with no wait). The job probe reads
+/// the same facts, its mount from the table it holds and its age from its own
+/// clock; a reader handed a table places the executable by that table. This
+/// process, which runs, never reads a lone `0`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
+    let held =
+        aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command("/bin/sleep").arg("30"))
+            .expect("a start-suspended sleep");
+    let pid = held.id();
+    let later = now_us() + 21_000_000;
+    let facts = read_start(pid, later).expect("the child reads");
+    assert!(
+        facts.lone_zero && facts.stopped && !facts.traced && !facts.translated,
+        "{facts:?}"
+    );
+    assert_eq!(
+        facts.local,
+        Some(true),
+        "/bin is on the system volume: {facts:?}"
+    );
+    assert!(facts.age_ms >= Some(PROGRAM_CHECK_AGE_MS), "{facts:?}");
+    assert_eq!(
+        judge_start(&facts),
+        AtStart::Started,
+        "a start-suspended child is not held: {facts:?}"
+    );
+    assert_eq!(
+        judge_start(&StartFacts {
+            stopped: false,
+            ..facts
+        }),
+        AtStart::Held,
+        "its stop, not its age, is what excludes it"
+    );
+    let f = JobsReader::new()
+        .read_all_at(&[ReadReq { pid, fds: false }], later)
+        .pop()
+        .expect("the job probe reads it");
+    assert_eq!(f.state, RunState::Stopped, "{f:?}");
+    assert_eq!(
+        f.threads
+            .as_deref()
+            .map(|ts| ts.iter().map(|t| t.id).collect::<Vec<_>>()),
+        Some(vec![0]),
+        "one thread, its handle never set: {f:?}"
+    );
+    assert_eq!(
+        f.start_facts,
+        Some(facts),
+        "the job probe reads the same start"
+    );
+    assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");
+    let now = JobsReader::new()
+        .read(ReadReq { pid, fds: false })
+        .expect("the job probe reads it");
+    assert!(
+        now.start_facts
+            .is_some_and(|f| f.lone_zero && f.age_ms.is_some()),
+        "the job probe's own clock reads the age: {now:?}"
+    );
+    let empty = std::cell::OnceCell::from(Table::default());
+    assert_eq!(
+        read_start_in(pid, later, &empty).map(|f| f.local),
+        Some(None),
+        "a handed table that holds no mount places nothing"
+    );
+    let me = read_start(std::process::id(), later).expect("this process reads");
+    assert!(!me.lone_zero, "{me:?}");
+    drop(held);
+}
+
+/// A program stopped by `SIGSTOP` after it ran keeps its threads' handles:
+/// only a process whose thread never ran reads a lone `0`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_program_stopped_after_it_ran_keeps_its_thread_handles() {
+    use aterm_uds::spawnfd::Stdio;
+    let mut cat = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("cat starts");
+    let stdin = aterm_uds::deadline::cat_echoes(&mut cat);
+    let pid = cat.id();
+    // SAFETY: our own child.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    let mut reader = JobsReader::new();
+    let stopped = (0..6000).find_map(|_| {
+        let f = reader.read(ReadReq { pid, fds: false });
+        if f.as_ref().is_some_and(|f| f.state == RunState::Stopped) {
+            f
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        }
+    });
+    let f = stopped.expect("hang detector: one minute");
+    let facts = read_start(pid, now_us() + 21_000_000).expect("the child reads");
+    assert!(!facts.lone_zero, "{facts:?} {f:?}");
+    assert!(
+        f.threads
+            .as_deref()
+            .is_some_and(|ts| !ts.is_empty() && ts.iter().all(|t| t.id != 0)),
+        "{f:?}"
+    );
+    assert_eq!(f.start_facts, Some(StartFacts::default()), "{f:?}");
+    assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");
+    cat.kill().expect("kill");
+    drop(stdin);
+    cat.wait().expect("reaped");
+}
+
+/// A job member's reading carries where it stands at its start: this
+/// process runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_member_reading_carries_its_program_check() {
+    let f = JobsReader::new()
+        .read(ReadReq {
+            pid: std::process::id(),
+            fds: false,
+        })
+        .expect("this process reads itself");
+    assert_eq!(f.start_facts, Some(StartFacts::default()), "{f:?}");
+    assert_eq!(f.program_check(), Some(AtStart::Started), "{f:?}");
 }

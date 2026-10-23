@@ -2,35 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A best-effort wake for the running agent harness after a managed agent twin moves.
-//!
-//! The CLI publishes only after a mutating pass has returned and the final target of a
-//! twin the live upgrade moves sessions onto
-//! ([`crate::vendor_direct::VendorSpec::live_upgrade`]: `agents/claude`, `agents/codex`,
-//! `agents/agy`, `agents/muse`) differs from the one it found under the store lock. The window watches the notice
-//! directory for an atomic replacement of a marker and re-reads the twin before acting;
-//! its minute timer is the fallback. A marker carries no release fact or authority.
-//!
-//! WHICH MARKER ([`marker_name`]): a moved `agents/claude` or `agents/codex` replaces the
-//! first marker, [`CLAUDE_MARKER`], which the window's host answers by looking at every
-//! supervised session, as it always has; every other live-upgrade twin replaces a marker of
-//! its own, named for its program (`agy`, `muse`), which the host answers by looking at that
-//! agent's sessions alone — so a Muse Code or agy landing parks no Claude Code loop and renews
-//! no Claude Code upgrade's counts. Two twins moved by one pass replace both.
 
 use std::path::PathBuf;
 
 use crate::store::Layout;
 
-/// The notice directory has no pass progress, status or download files in it:
-/// an active download cannot repeatedly wake the idle harness host.
+/// The notice directory has no pass progress, status or download files in it.
 pub const NOTICE_DIR: &str = "activation-notices";
 
 /// The first marker: replaced after a change of Claude Code's or Codex's twin, which every
 /// supervised session looks at ([`marker_name`]).
 pub const CLAUDE_MARKER: &str = "claude";
 
-/// The marker a moved twin of `program` replaces (module header): Claude Code's and Codex's
-/// share [`CLAUDE_MARKER`]; every other live-upgrade row's is its own, named for its program.
+/// The marker a moved twin of `program` replaces: Claude Code's and Codex's share
+/// [`CLAUDE_MARKER`]; every other program's is its own name.
 #[must_use]
 pub fn marker_name(program: &str) -> &str {
     match program {
@@ -39,15 +24,12 @@ pub fn marker_name(program: &str) -> &str {
     }
 }
 
-/// Create the notice directory before a pass can start writing progress; an error is only
-/// a lost hint. The window's host calls it too, so its watch sits on the directory itself
-/// from the start, never on an ancestor it would have to poll until the first install.
+/// Create the notice directory before a pass can start writing progress.
 pub fn prepare(layout: &Layout) {
     let _ = layout.ensure_dir(&layout.prefix.join(NOTICE_DIR));
 }
 
-/// The first marker the window watches ([`CLAUDE_MARKER`]). It is a wake hint, never a
-/// version source.
+/// The first marker the window watches ([`CLAUDE_MARKER`]).
 #[must_use]
 pub fn marker_path(layout: &Layout) -> PathBuf {
     marker_path_of(layout, "claude")
@@ -59,21 +41,17 @@ pub fn marker_path_of(layout: &Layout, program: &str) -> PathBuf {
     layout.prefix.join(NOTICE_DIR).join(marker_name(program))
 }
 
-/// What the front-of-PATH managed twin of `agent` actually runs at this
-/// instant. A missing or pending twin has no target.
+/// What the front-of-PATH managed twin of `agent` actually runs at this instant.
 #[must_use]
 pub(crate) fn agent_target(layout: &Layout, agent: &str) -> Option<PathBuf> {
     crate::activate::twin_target(layout, agent)
 }
 
-/// What the front-of-PATH managed Claude twin actually runs at this instant.
 #[cfg(test)]
 fn claude_target(layout: &Layout) -> Option<PathBuf> {
     agent_target(layout, "claude")
 }
 
-/// The programs of every agent the live upgrade moves sessions onto
-/// ([`crate::vendor_direct::VendorSpec::live_upgrade`]), in table order.
 fn live_programs() -> impl Iterator<Item = &'static str> {
     crate::vendor_direct::VENDORS
         .iter()
@@ -81,9 +59,9 @@ fn live_programs() -> impl Iterator<Item = &'static str> {
         .map(|row| row.program)
 }
 
-/// The live target of the twin of every agent the live upgrade moves sessions
-/// onto ([`live_programs`]), in table order: what a pass snapshots under the
-/// store lock and compares after ([`note_if_changed`]).
+/// The live target of the twin of every agent the live upgrade moves sessions onto
+/// ([`live_programs`]), in table order: what a pass snapshots under the store lock and compares
+/// after ([`note_if_changed`]).
 #[must_use]
 pub(crate) fn agent_targets(layout: &Layout) -> Vec<Option<PathBuf>> {
     live_programs()
@@ -91,12 +69,9 @@ pub(crate) fn agent_targets(layout: &Layout) -> Vec<Option<PathBuf>> {
         .collect()
 }
 
-/// Publish one coalescible hint per marker whose twin a completed pass changed
-/// ([`marker_name`]; `before`: the targets [`agent_targets`] read as the pass
-/// found them, in its order, a missing entry read as no twin). An unrelated pass
-/// or a transaction rolled back to its original twins writes nothing. A failed
-/// hint does not turn a successful install into a failure: the host still looks
-/// at a worker's start.
+/// Publish one coalescible hint per marker whose twin a completed pass changed ([`marker_name`];
+/// `before`: the targets [`agent_targets`] read as the pass found them, in its order, a missing
+/// entry read as no twin).
 pub(crate) fn note_if_changed(layout: &Layout, before: &[Option<PathBuf>]) {
     let after = agent_targets(layout);
     let mut published: Vec<&str> = Vec::new();
@@ -123,9 +98,6 @@ fn publish(layout: &Layout, marker: &str) -> std::io::Result<()> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    // `create_new` refuses a planted link rather than following it. One process owns the
-    // store lock, so a stale temp at worst loses this hint; the minute sweep stays
-    // authoritative.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -162,7 +134,6 @@ mod tests {
         note_if_changed(&layout, &[None, None, None, None]);
         assert!(!marker.exists(), "an unchanged absent twin emits no hint");
 
-        // The twin reader, not a caller-supplied claim, decides the change.
         let build = layout.build_dir("claude", 42);
         std::fs::create_dir_all(build.join("bin")).unwrap();
         std::fs::write(build.join("bin/claude"), b"#!/bin/sh\nexit 0\n").unwrap();
@@ -197,8 +168,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// A pass that moves only `agents/codex` replaces the same marker; laying the same twin
-    /// again moves nothing (the negative control).
     #[test]
     fn a_codex_twin_change_replaces_the_marker_too() {
         let prefix = crate::testdir::dir("atpkg-codex-activation-notice-");
@@ -233,15 +202,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// WHAT A PASS DOES WHEN IT LANDS A NEWER MUSE CODE (the live upgrade's quiet flow,
-    /// 2026-10-18): `muse` is a live-upgrade row, so the pass that re-points `agents/muse`
-    /// from the running revision build onto a newer one replaces MUSE CODE'S OWN marker
-    /// (`activation-notices/muse`), which the window's host answers by looking at its Muse
-    /// Code sessions alone; their workers then read the twin's build record before they act.
-    /// NEGATIVE CONTROLS: the same twin laid again wakes nobody, and so does a twin of a
-    /// program no live upgrade moves (`gemini`: no vendor row at all); and the first marker,
-    /// which every supervised session looks at (Claude Code's among them), is never replaced
-    /// by a Muse landing.
     #[test]
     fn a_muse_twin_change_replaces_the_marker() {
         use std::os::unix::fs::MetadataExt as _;
@@ -260,7 +220,6 @@ mod tests {
             "no row lands a Gemini CLI"
         );
         std::fs::create_dir_all(layout.agents_dir()).unwrap();
-        // 1.4.10-R6427.1 and 1.4.11-R6500.1, at the build ids the store lays them under.
         let old = layout
             .build_dir("muse", 2_001_004_010_006_427_002)
             .join("bin/muse");
@@ -318,12 +277,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// WHAT A PASS DOES WHEN IT LANDS A NEWER AGY (the live upgrade's quiet flow,
-    /// 2026-10-18): `agy` is a live-upgrade row, so the pass that re-points `agents/agy` from
-    /// 1.4.0 onto 1.4.1 replaces AGY'S OWN marker (`activation-notices/agy`, mode 0600),
-    /// which the window's host answers by looking at its agy sessions alone. NEGATIVE
-    /// CONTROLS: the same twin laid again wakes nobody; neither the first marker (every
-    /// supervised session's) nor Muse Code's own is replaced by an agy landing.
     #[test]
     fn an_agy_twin_change_replaces_its_own_marker() {
         use std::os::unix::fs::MetadataExt as _;
@@ -339,7 +292,6 @@ mod tests {
         };
         prepare(&layout);
         std::fs::create_dir_all(layout.agents_dir()).unwrap();
-        // 1.4.0 and 1.4.1, at the build ids the store lays them under.
         let old = layout
             .build_dir("agy", 1_000_001_000_004_000_000)
             .join("bin/agy");
@@ -377,9 +329,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
-    /// ONE PASS THAT MOVES TWO TWINS replaces each one's marker: Claude Code's the first,
-    /// Muse Code's its own; Claude Code and Codex share the first. NEGATIVE CONTROL: a twin
-    /// the pass left as it found it replaces nothing of its own.
     #[test]
     fn a_pass_moving_two_twins_replaces_each_ones_marker() {
         use std::os::unix::fs::MetadataExt as _;

@@ -26,7 +26,7 @@
 //! `breaker-read-only@v4` added the pending call's command as one more
 //! reading where it drew as the box, which never turned a refusal into an
 //! approval and cost every too-many box its lag retries and a 1 s settle;
-//! `breaker-read-only@v6` judges the screen's readings alone
+//! `breaker-read-only@v7` judges the screen's readings alone
 //! (`docs/measured/box-notes-2026-10-22.md`).
 
 /// `Err` naming a form of `text`, a reading of a Bash box's rows, in which

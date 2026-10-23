@@ -78,7 +78,8 @@ impl Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
-        // SAFETY: Objects this value bound.
+        // SAFETY: Objects this value bound, each destroyed once (every Toplevel made from them is
+        // gone: it borrows the Shell).
         unsafe {
             if let Some(d) = self.decorations {
                 zxdg_decoration_manager_v1::destroy(d);
@@ -142,7 +143,8 @@ struct PendingToplevel {
 
 impl Drop for PendingToplevel {
     fn drop(&mut self) {
-        // SAFETY: Objects made by this constructor and not transferred to a Toplevel.
+        // SAFETY: Objects made by this constructor and not transferred to a Toplevel; taken once,
+        // children first, before listeners are freed.
         unsafe {
             if let Some(d) = self.decoration.take() {
                 zxdg_toplevel_decoration_v1::destroy(d);
@@ -276,7 +278,8 @@ impl<'s> Toplevel<'s> {
     /// Give `surface` the toplevel role, titled.
     ///
     /// # Safety
-    /// Caller must ensure `surface` is a live role-less `wl_surface` that outlives the toplevel.
+    /// `surface` is a live `wl_surface` with no role, on the same display as the shell, and
+    /// outlives the toplevel.
     pub unsafe fn new(
         shell: &'s Shell,
         surface: Proxy,
@@ -293,7 +296,8 @@ impl<'s> Toplevel<'s> {
             decoration: None,
             listeners: Vec::new(),
         };
-        // SAFETY: An xdg_surface made here, held by the pending owner.
+        // SAFETY: An xdg_surface made here; its pending owner destroys it before any installed
+        // listeners are freed on a later error.
         pending
             .listeners
             .push(unsafe { listen_part(xdg, &toplevel_book, Part::Surface) }?);
@@ -407,7 +411,8 @@ impl<'s> Toplevel<'s> {
 
 impl Drop for Toplevel<'_> {
     fn drop(&mut self) {
-        // SAFETY: Objects this value made, destroyed once, children first.
+        // SAFETY: Objects this value made, destroyed once, children first; the listeners drop
+        // after, with the fields.
         unsafe {
             if let Some(d) = self.decoration {
                 zxdg_toplevel_decoration_v1::destroy(d);

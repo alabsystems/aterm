@@ -124,7 +124,7 @@ impl ReplayHost {
     }
 }
 
-/// An argument a host's call is taped with: its `Debug` text, compared as it is ([module docs](self)).
+/// An argument a host's call is taped with: its `Debug` text, compared as it is.
 pub(crate) trait TapeArg: fmt::Debug {}
 
 impl<T: TapeArg + ?Sized> TapeArg for &T {}
@@ -188,7 +188,8 @@ pub(crate) fn request(args: &[(&str, &dyn TapeArg)]) -> Vec<u8> {
     text.into_bytes()
 }
 
-/// An answer of the host's, as a tape holds it: what [`TapedHost`] writes and [`ReplayHost`] reads back, with the tape's origin to place an `Instant` by ([module docs](self)).
+/// An answer of the host's, as a tape holds it: what [`TapedHost`] writes and [`ReplayHost`] reads
+/// back, with the tape's origin to place an `Instant` by.
 pub(crate) trait HostReply: Sized {
     /// The answer's bytes on the tape, its instants from `origin`.
     fn put(&self, origin: Instant) -> Vec<u8>;
@@ -716,52 +717,61 @@ fn level_of(word: &str) -> Result<Level, CodecError> {
     .ok_or(bad("a disk level this build does not know"))
 }
 
+/// [`OccupancyReading`] as its wire.
+fn occupancy_wire(r: &OccupancyReading) -> OccupancyWire {
+    let OccupancyReading {
+        taken_ms,
+        stale,
+        avail_mib,
+        pressure,
+        disk,
+        slots,
+        slots_free_ms,
+        room,
+        held_slot_last_ms,
+    } = *r;
+    OccupancyWire {
+        taken_ms,
+        stale,
+        avail_mib,
+        pressure: pressure.map(|p| pressure_word(p).to_string()),
+        disk: disk.map(|l| l.as_str().to_string()),
+        slots: slots.map(|SlotsSeen { usable, n }| SlotsWire { usable, n }),
+        slots_free_ms,
+        room,
+        held_slot_last_ms,
+    }
+}
+
+/// [`occupancy_wire`] read back.
+fn reading_of(w: OccupancyWire) -> Result<OccupancyReading, CodecError> {
+    Ok(OccupancyReading {
+        taken_ms: w.taken_ms,
+        stale: w.stale,
+        avail_mib: w.avail_mib,
+        pressure: w.pressure.as_deref().map(pressure_of).transpose()?,
+        disk: w.disk.as_deref().map(level_of).transpose()?,
+        slots: w.slots.map(|s| SlotsSeen {
+            usable: s.usable,
+            n: s.n,
+        }),
+        slots_free_ms: w.slots_free_ms,
+        room: w.room,
+        held_slot_last_ms: w.held_slot_last_ms,
+    })
+}
+
 /// A DOOR NEWER THAN THE TAPE: a recording build with no `host.occupancy`
 /// asked nothing there, and its loop judged no rule on the machine, so its
 /// replay answers the empty reading ([`TapeValue::absent`]) — where the
 /// tape's header says that build lacked the door, and only there.
 impl TapeValue for OccupancyReading {
     fn to_tape(&self) -> Vec<u8> {
-        let OccupancyReading {
-            taken_ms,
-            stale,
-            avail_mib,
-            pressure,
-            disk,
-            slots,
-            slots_free_ms,
-            room,
-            held_slot_last_ms,
-        } = *self;
-        json(&OccupancyWire {
-            taken_ms,
-            stale,
-            avail_mib,
-            pressure: pressure.map(|p| pressure_word(p).to_string()),
-            disk: disk.map(|l| l.as_str().to_string()),
-            slots: slots.map(|SlotsSeen { usable, n }| SlotsWire { usable, n }),
-            slots_free_ms,
-            room,
-            held_slot_last_ms,
-        })
+        json(&occupancy_wire(self))
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        let w = of_json::<OccupancyWire>(bytes)?;
-        Ok(OccupancyReading {
-            taken_ms: w.taken_ms,
-            stale: w.stale,
-            avail_mib: w.avail_mib,
-            pressure: w.pressure.as_deref().map(pressure_of).transpose()?,
-            disk: w.disk.as_deref().map(level_of).transpose()?,
-            slots: w.slots.map(|s| SlotsSeen {
-                usable: s.usable,
-                n: s.n,
-            }),
-            slots_free_ms: w.slots_free_ms,
-            room: w.room,
-            held_slot_last_ms: w.held_slot_last_ms,
-        })
+        reading_of(of_json::<OccupancyWire>(bytes)?)
     }
 
     fn absent() -> Option<Self> {
@@ -769,18 +779,38 @@ impl TapeValue for OccupancyReading {
     }
 }
 
+/// A re-read board's pace answer ([`PaceGrant::Room`]) on a tape: the reading
+/// beside its word.
+#[derive(Serialize, Deserialize)]
+struct RoomWire {
+    room: OccupancyWire,
+}
+
 /// `occupancy_pace`'s answer on a tape: its word ([`PaceGrant::word`]), as a
-/// JSON string. A word this build does not know is refused. No absent form:
-/// a build without the door typed no fact line, so a replay that reaches the
-/// door diverges there.
+/// JSON string, and a re-read board's as `{"room": <reading>}` (the reading
+/// as `occupancy` tapes it). A word this build does not know is refused. AN
+/// OLDER TAPE (slice 1's, whose pace re-read nothing) holds a word for every
+/// answer, read as before: its `granted` to a slot rule types the line as it
+/// was decided, as that build typed it (`PaceGrant::slot_answer`), so the
+/// tape replays as recorded. No absent form: a build without the door typed
+/// no fact line, so a replay that reaches the door diverges there.
 impl TapeValue for PaceGrant {
     fn to_tape(&self) -> Vec<u8> {
-        json(&self.word())
+        match self {
+            PaceGrant::Room(reading) => json(&RoomWire {
+                room: occupancy_wire(reading),
+            }),
+            _ => json(&self.word()),
+        }
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        PaceGrant::of_word(&of_json::<String>(bytes)?)
-            .ok_or(bad("a pace answer this build does not know"))
+        if let Ok(word) = of_json::<String>(bytes) {
+            return PaceGrant::of_word(&word).ok_or(bad("a pace answer this build does not know"));
+        }
+        Ok(PaceGrant::Room(reading_of(
+            of_json::<RoomWire>(bytes)?.room,
+        )?))
     }
 }
 

@@ -73,7 +73,8 @@ enum Step {
     Complete,
     /// The card changed size: a fresh ring, and this window presents it.
     Remint,
-    /// This window presents the card unchanged.
+    /// This window presents the card unchanged, and the drawable's present is
+    /// refused after its Submit B was committed, so Submit B is waited inline.
     Refused,
 }
 

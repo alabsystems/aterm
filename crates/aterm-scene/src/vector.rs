@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **Bake-time vector rasterizer** for the cat-art v4 glyph pipeline: fill absolute cubic-Bézier/line paths into a [`Tile`] with scanline even-odd coverage.
+//! **Bake-time vector rasterizer** for the cat-art v4 glyph pipeline.
 
 use crate::atlas::Tile;
 use crate::clampf;
 
-/// One absolute path command in the glyph's own normalized frame (0..1, y down), scaled into device space by the [`PathTransform`] at fill time.
+/// One absolute path command in the glyph's normalized `0..1` frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathCmd {
     /// Start a new subpath at `(x, y)` (implicitly closing any open one at fill time).
@@ -19,10 +19,16 @@ pub enum PathCmd {
     Close,
 }
 
-/// The side length of a glyph's own fixed-point frame: quantized path coordinates live in the integer grid `0..=FIXED_ONE` (`x = round(px/viewbox * FIXED_ONE)`), so the whole const drawlist is integer — `Eq`-safe and byte-deterministic (the codegen contract, docs/cat-art-v4-design.md §1).
+/// The side length of a glyph's own fixed-point frame.
 pub const FIXED_ONE: u16 = 4096;
 
-/// One absolute path command in a glyph's **fixed-point** `0..=FIXED_ONE` frame — the integer counterpart of [`PathCmd`] that the codegen'd cat drawlists store.
+#[inline]
+const fn fixed_to_unit(v: u16) -> f32 {
+    const INV_FIXED: f32 = 1.0 / FIXED_ONE as f32;
+    (v as f32) * INV_FIXED
+}
+
+/// One absolute path command in a glyph's **fixed-point** `0..=FIXED_ONE` frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PathSeg {
     /// Start a new subpath at `(x, y)` (implicitly closing any open one at fill time).
@@ -35,7 +41,28 @@ pub enum PathSeg {
     Close,
 }
 
-/// Affine scale+offset mapping glyph coordinates into device (tile) pixels: `device = (x·scale_x + dx, y·scale_y + dy)`.
+impl PathSeg {
+    /// Convert this fixed-point command in `0..=FIXED_ONE` to its normalized `0..=1` [`PathCmd`].
+    #[inline]
+    #[must_use]
+    pub const fn to_cmd(self) -> PathCmd {
+        match self {
+            Self::Move(x, y) => PathCmd::Move(fixed_to_unit(x), fixed_to_unit(y)),
+            Self::Line(x, y) => PathCmd::Line(fixed_to_unit(x), fixed_to_unit(y)),
+            Self::Cubic(x1, y1, x2, y2, x, y) => PathCmd::Cubic(
+                fixed_to_unit(x1),
+                fixed_to_unit(y1),
+                fixed_to_unit(x2),
+                fixed_to_unit(y2),
+                fixed_to_unit(x),
+                fixed_to_unit(y),
+            ),
+            Self::Close => PathCmd::Close,
+        }
+    }
+}
+
+/// Affine scale+offset mapping glyph coordinates into device (tile) pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathTransform {
     pub scale_x: f32,
@@ -58,15 +85,11 @@ impl PathTransform {
     }
 }
 
-/// Device-space coordinate bound: anything larger (or non-finite) is clamped/zeroed before rasterization, so degenerate assets stay safe and fast.
+/// Device-space coordinate bound before rasterization.
 pub(crate) const COORD_LIMIT: f32 = 1.0e6;
 
-/// Cubic flattening tolerance in device pixels (~0.15 px at target scale keeps the
-/// error invisible under the 4×4 supersampling).
 const FLATTEN_TOL: f32 = 0.15;
 
-/// A non-horizontal device-space edge in canonical top-to-bottom form, tagged with the
-/// path it came from (even-odd parity is per path; the layer unions paths).
 #[derive(Clone, Copy)]
 struct Edge {
     path: u32,
@@ -76,8 +99,6 @@ struct Edge {
     dxdy: f32,
 }
 
-/// Reusable working memory for [`fill_path`]'s scanline core — one set per
-/// thread, length-reset per call, never returned to the allocator.
 struct FillScratch {
     edges: Vec<Edge>,
     active: Vec<Edge>,
@@ -100,7 +121,7 @@ thread_local! {
     };
 }
 
-/// Fill `paths` (even-odd per path, union across paths) into `tile` with `rgb` at `alpha`, 4×4-supersampled, blended through [`Tile::over`]/[`Tile::over_run`].
+/// Fills `paths` (even-odd per path, union across paths) into `tile` with 4×4 supersampling.
 pub fn fill_path(
     tile: &mut Tile,
     paths: &[&[PathCmd]],
@@ -108,13 +129,13 @@ pub fn fill_path(
     alpha: f32,
     t: PathTransform,
 ) {
-    if alpha <= 0.0 || tile.width() == 0 || tile.height() == 0 || paths.is_empty() {
+    if alpha <= 0.0 || alpha.is_nan() || tile.width() == 0 || tile.height() == 0 || paths.is_empty()
+    {
         return;
     }
     FILL_SCRATCH.with_borrow_mut(|scratch| fill_scanline(tile, paths, rgb, alpha, t, scratch));
 }
 
-/// The scanline core of [`fill_path`], with its working memory handed in.
 fn fill_scanline(
     tile: &mut Tile,
     paths: &[&[PathCmd]],
@@ -123,14 +144,6 @@ fn fill_scanline(
     t: PathTransform,
     scratch: &mut FillScratch,
 ) {
-    let FillScratch {
-        edges,
-        active,
-        xs,
-        spans,
-        diff,
-        extra,
-    } = scratch;
     let mut bbox = BBox::empty();
     let est = paths.iter().fold(0usize, |n, p| {
         p.iter().fold(n, |n, cmd| {
@@ -141,11 +154,67 @@ fn fill_scanline(
             n.saturating_add(e)
         })
     });
-    edges.clear();
-    edges.reserve(est);
+    scratch.edges.clear();
+    scratch.edges.reserve(est);
     for (pid, p) in paths.iter().enumerate() {
-        flatten_path(p, pid as u32, t, &mut bbox, edges);
+        flatten_path(
+            p.iter().copied(),
+            pid as u32,
+            t,
+            &mut bbox,
+            &mut scratch.edges,
+        );
     }
+    rasterize_edges(tile, rgb, alpha, &bbox, scratch);
+}
+
+fn fill_scanline_fixed(
+    tile: &mut Tile,
+    paths: &[&[PathSeg]],
+    rgb: (f32, f32, f32),
+    alpha: f32,
+    t: PathTransform,
+    scratch: &mut FillScratch,
+) {
+    let mut bbox = BBox::empty();
+    let est = paths.iter().fold(0usize, |n, p| {
+        p.iter().fold(n, |n, seg| {
+            let e = match *seg {
+                PathSeg::Cubic(..) => 4,
+                _ => 1,
+            };
+            n.saturating_add(e)
+        })
+    });
+    scratch.edges.clear();
+    scratch.edges.reserve(est);
+    for (pid, p) in paths.iter().enumerate() {
+        flatten_path(
+            p.iter().copied().map(PathSeg::to_cmd),
+            pid as u32,
+            t,
+            &mut bbox,
+            &mut scratch.edges,
+        );
+    }
+    rasterize_edges(tile, rgb, alpha, &bbox, scratch);
+}
+
+fn rasterize_edges(
+    tile: &mut Tile,
+    rgb: (f32, f32, f32),
+    alpha: f32,
+    bbox: &BBox,
+    scratch: &mut FillScratch,
+) {
+    let FillScratch {
+        edges,
+        active,
+        xs,
+        spans,
+        diff,
+        extra,
+    } = scratch;
     let Some((x0, x1, y0, y1)) = bbox.pixel_range(tile.width(), tile.height()) else {
         return;
     };
@@ -187,7 +256,6 @@ fn fill_scanline(
                     spans.push((a.1, b.1));
                     i += 2;
                 } else {
-                    // unpaired trailing crossing of a path: drop it
                     i += 1;
                 }
             }
@@ -247,7 +315,7 @@ fn fill_scanline(
     }
 }
 
-/// Fill fixed-point [`PathSeg`] drawlists (the codegen'd cat glyph layers) into `tile` — the u16 counterpart of [`fill_path`].
+/// Fill fixed-point [`PathSeg`] drawlists (the codegen'd cat glyph layers) into `tile`.
 pub fn fill_path_fixed(
     tile: &mut Tile,
     paths: &[&[PathSeg]],
@@ -255,36 +323,14 @@ pub fn fill_path_fixed(
     alpha: f32,
     t: PathTransform,
 ) {
-    if alpha <= 0.0 || tile.width() == 0 || tile.height() == 0 || paths.is_empty() {
+    if alpha <= 0.0 || alpha.is_nan() || tile.width() == 0 || tile.height() == 0 || paths.is_empty()
+    {
         return;
     }
-    const INV_FIXED: f32 = 1.0 / FIXED_ONE as f32;
-    let c = |v: u16| f32::from(v) * INV_FIXED;
-    let total = paths.iter().fold(0usize, |n, p| n.saturating_add(p.len()));
-    let mut flat: Vec<PathCmd> = Vec::with_capacity(total);
-    for p in paths {
-        flat.extend(p.iter().map(|seg| match *seg {
-            PathSeg::Move(x, y) => PathCmd::Move(c(x), c(y)),
-            PathSeg::Line(x, y) => PathCmd::Line(c(x), c(y)),
-            PathSeg::Cubic(x1, y1, x2, y2, x, y) => {
-                PathCmd::Cubic(c(x1), c(y1), c(x2), c(y2), c(x), c(y))
-            }
-            PathSeg::Close => PathCmd::Close,
-        }));
-    }
-    let mut refs: Vec<&[PathCmd]> = Vec::with_capacity(paths.len());
-    let mut off = 0usize;
-    for p in paths {
-        let end = off.saturating_add(p.len());
-        refs.push(flat.get(off..end).unwrap_or(&[]));
-        off = end;
-    }
-    fill_path(tile, &refs, rgb, alpha, t);
+    FILL_SCRATCH
+        .with_borrow_mut(|scratch| fill_scanline_fixed(tile, paths, rgb, alpha, t, scratch));
 }
 
-/// Accumulate one disjoint span `[a, b)` (device x) into the row: ±4 into `diff` for
-/// the fully-covered pixel range, exact subsample counts into `extra` for the (at most
-/// a few) partial boundary pixels.
 #[inline]
 fn add_span(
     diff: &mut [i32],
@@ -296,10 +342,7 @@ fn add_span(
     hi_t: &mut usize,
 ) {
     let width = extra.len();
-    let clamp_px = |v: f32| -> usize {
-        // Bounded float → index: sanitized coords keep `v` finite and small.
-        clampf(v - x0 as f32, 0.0, width as f32) as usize
-    };
+    let clamp_px = |v: f32| -> usize { clampf(v - x0 as f32, 0.0, width as f32) as usize };
     let p_lo = clamp_px((a - 0.875).ceil());
     let p_hi = clamp_px((b - 0.125).ceil());
     if p_lo >= p_hi {
@@ -346,7 +389,6 @@ fn add_span(
     }
 }
 
-/// Union bounding box of device-space geometry.
 struct BBox {
     min_x: f32,
     min_y: f32,
@@ -373,8 +415,6 @@ impl BBox {
         self.max_y = self.max_y.max(y);
     }
 
-    /// Clamp to the tile and widen by one pixel of slack for the AA lattice; `None`
-    /// when nothing overlaps the tile.
     #[inline]
     fn pixel_range(&self, w: u32, h: u32) -> Option<(usize, usize, usize, usize)> {
         if self.min_x > self.max_x || self.min_y > self.max_y {
@@ -391,8 +431,6 @@ impl BBox {
     }
 }
 
-/// Non-finite → 0, magnitude clamped to [`COORD_LIMIT`] (the "out-of-range coords
-/// clamp" contract).
 #[inline]
 const fn sanitize(v: f32) -> f32 {
     if v.is_finite() {
@@ -402,10 +440,8 @@ const fn sanitize(v: f32) -> f32 {
     }
 }
 
-/// Flatten one path (cubics → line segments at [`FLATTEN_TOL`]) into canonical edges
-/// tagged `path`, implicitly closing every subpath, growing `bbox` as it goes.
 fn flatten_path(
-    cmds: &[PathCmd],
+    cmds: impl IntoIterator<Item = PathCmd>,
     path: u32,
     t: PathTransform,
     bbox: &mut BBox,
@@ -423,7 +459,6 @@ fn flatten_path(
         bbox.add(p0.0, p0.1);
         bbox.add(p1.0, p1.1);
         if p0.1 == p1.1 {
-            // horizontal edges never cross a sub-scanline
             return;
         }
         let (top, bot) = if p0.1 < p1.1 { (p0, p1) } else { (p1, p0) };
@@ -436,9 +471,8 @@ fn flatten_path(
         });
     };
     for cmd in cmds {
-        match *cmd {
+        match cmd {
             PathCmd::Move(x, y) => {
-                // Implicitly close the open subpath.
                 if let (Some(c), Some(s)) = (cur, start)
                     && c != s
                 {
@@ -453,7 +487,6 @@ fn flatten_path(
                 if let Some(c) = cur {
                     push(edges, c, p);
                 } else {
-                    // tolerate a missing Move: begin here
                     start = Some(p);
                 }
                 cur = Some(p);
@@ -486,7 +519,6 @@ fn flatten_path(
     }
 }
 
-/// Uniform-parameter cubic flattening.
 fn flatten_cubic(
     p0: (f32, f32),
     p1: (f32, f32),
@@ -503,7 +535,6 @@ fn flatten_cubic(
     let n = if err <= FLATTEN_TOL {
         1
     } else {
-        // sqrt of a clamped positive — bounded 1..=64.
         clampf((err / FLATTEN_TOL).sqrt().ceil(), 1.0, 64.0) as u32
     };
     let mut prev = p0;
@@ -523,7 +554,7 @@ fn flatten_cubic(
     }
 }
 
-/// Parse one glyph-asset path string — absolute `M`/`L`/`C`/`Z` with implicit command repetition (SVG semantics: numbers after a completed `M` continue as `L`) — into [`PathCmd`]s.
+/// Parse one glyph-asset path string.
 #[must_use]
 pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
     let mut out = Vec::new();
@@ -545,7 +576,6 @@ pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
         for chunk in nums.chunks_exact(need) {
             match (cmd, chunk) {
                 ('M', [x, y]) => {
-                    // Only the first pair is a Move; the rest are implicit Lines.
                     if first {
                         out.push(PathCmd::Move(*x, *y));
                     } else {
@@ -601,7 +631,6 @@ pub fn parse_path(d: &str) -> Option<Vec<PathCmd>> {
             let tok = d.get(s..i)?;
             let v: f32 = tok.parse().ok()?;
             if cmd.is_none() || cmd == Some('Z') {
-                // numbers before any command / after Z with no command
                 return None;
             }
             nums.push(v);
@@ -761,6 +790,20 @@ mod tests {
             &[&move_only, &zero_area, &lone_close, &[]],
             (1.0, 1.0, 1.0),
             1.0,
+            PathTransform::fit(16, 16),
+        );
+        let box_cmd = [
+            PathCmd::Move(0.0, 0.0),
+            PathCmd::Line(1.0, 0.0),
+            PathCmd::Line(1.0, 1.0),
+            PathCmd::Line(0.0, 1.0),
+            PathCmd::Close,
+        ];
+        fill_path(
+            &mut t,
+            &[&box_cmd],
+            (1.0, 1.0, 1.0),
+            f32::NAN,
             PathTransform::fit(16, 16),
         );
         assert_eq!(t.pixels(), &before[..], "degenerate input paints nothing");

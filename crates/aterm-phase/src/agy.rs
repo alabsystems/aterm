@@ -241,7 +241,10 @@ fn work(rows: &[String], f: Frame) -> Option<&'static str> {
         .or_else(|| f.footer.and_then(|r| footer_work(&rows[r])))
 }
 
-/// THE AGENT'S OWN BACKGROUND WORK RUNS AND ITS TURN IS OVER (module header): the composer drawn with no menu open, the turn over it ended — idle (on a wall too), a question or a limit, as evidence ([`framed_phase`]) — and the panel under it (or the footer's count) says a task, a timer or a subagent runs.
+/// THE AGENT'S OWN BACKGROUND WORK RUNS AND ITS TURN IS OVER: the composer drawn with no menu open,
+/// the turn over it ended — idle (on a wall too), a question or a limit, as evidence
+/// ([`framed_phase`]) — and the panel under it (or the footer's count) says a task, a timer or a
+/// subagent runs.
 #[must_use]
 pub fn background_wait(rows: &[String]) -> Option<&'static str> {
     let f = frame(rows)?;
@@ -322,7 +325,8 @@ fn last_user(rows: &[String], top: usize) -> Option<usize> {
     (1..top).rev().find(|&i| is_user_row(rows, i))
 }
 
-/// THE ROWS WHOSE CELLS BOUND THE LAST MESSAGE (module header's A MESSAGE'S BLANK LINE): `(its caret row, the blank rows under it that have words under them above the composer's top rule, top down)`.
+/// THE ROWS WHOSE CELLS BOUND THE LAST MESSAGE:
+/// `(its caret row, the blank rows under it that have words under them above the composer's top rule, top down)`.
 #[must_use]
 pub fn message_blanks(rows: &[String]) -> Option<(usize, Vec<usize>)> {
     let f = frame(rows)?;
@@ -335,7 +339,9 @@ pub fn message_blanks(rows: &[String]) -> Option<(usize, Vec<usize>)> {
     (!blanks.is_empty()).then_some((user, blanks))
 }
 
-/// THE LAST MESSAGE BOUNDED BY ITS CELLS (module header): `rows` with the blank rows `inner` of the message whose caret row is `caret` — those of [`message_blanks`] a read of the cells found drawn in the caret row's style — taken out, and as many empty rows put above the rule over the message.
+/// THE LAST MESSAGE BOUNDED BY ITS CELLS: `rows` with the blank rows `inner` of the message whose
+/// caret row is `caret` — those of [`message_blanks`] a read of the cells found drawn in the caret
+/// row's style — taken out, and as many empty rows put above the rule over the message.
 #[must_use]
 pub fn fold_message(rows: &[String], caret: usize, inner: &[usize]) -> Vec<String> {
     let folds = |i: usize| i > caret && inner.contains(&i) && blank(&rows[i]);
@@ -382,7 +388,12 @@ fn is_banner_row(row: &str) -> bool {
     })
 }
 
-/// The phase, and whether it is evidence (module header): a subagent's alert in the turn is a prompt, its spinner running or not; the spinner in the turn over the composer is busy; the composer with `? for shortcuts` (or with a draft and nothing on the footer's left) is idle — limited when the turn ended on a quota, rate, usage or spend wall ([`WallKind::reads_limited`]), a question when the reply's last words end in `?`; a box, and a first run's onboarding screen, is a prompt; the sign-in wall is idle on its wall.
+/// The phase, and whether it is evidence: a subagent's alert in the turn is a prompt, its spinner
+/// running or not; the spinner in the turn over the composer is busy; the composer with
+/// `? for shortcuts` (or with a draft and nothing on the footer's left) is idle — limited when the
+/// turn ended on a quota, rate, usage or spend wall ([`WallKind::reads_limited`]), a question when
+/// the reply's last words end in `?`; a box, and a first run's onboarding screen, is a prompt; the
+/// sign-in wall is idle on its wall.
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
     let Some(f) = frame(rows) else {
@@ -614,7 +625,8 @@ fn signed_out(rows: &[String]) -> Option<usize> {
     (method && frame(rows).is_none()).then_some(at)
 }
 
-/// The wall on the screen (module header): agy signed out (`WallKind::Auth`; a person's browser lifts it, and its login menu is never read), or the Gemini API's failure the last turn ended on (`failed_turn`).
+/// The wall on the screen: agy signed out (`WallKind::Auth`; a person's browser lifts it, and its
+/// login menu is never read), or the Gemini API's failure the last turn ended on (`failed_turn`).
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     signed_out(rows)
@@ -739,7 +751,9 @@ fn failed_turn(rows: &[String], f: Frame) -> Option<Wall> {
     })
 }
 
-/// The feedback survey (module header), as a rating card ([`SurveyBlock`]): no composer drawn, and as the last rows drawn — the footer under them or not — the question row and the options row, both at column 1, the options opening `[1] ` and ending on `[0] Skip`.
+/// The feedback survey, as a rating card ([`SurveyBlock`]): no composer drawn, and as the last rows
+/// drawn — the footer under them or not — the question row and the options row, both at column 1,
+/// the options opening `[1] ` and ending on `[0] Skip`.
 #[must_use]
 pub fn survey(rows: &[String]) -> Option<SurveyBlock> {
     if frame(rows).is_some() {
@@ -817,7 +831,10 @@ fn key_row(rows: &[String]) -> Option<usize> {
     is_key_row(&rows[k]).then_some(k)
 }
 
-/// The box on `rows` (module header): no composer, its key row — and the rows it wrapped onto — the last drawn or over the footer's `esc to cancel` (or the right side alone), the pending edit's word after an Esc under it or not, its options the block of rows above it with one of them focused in column 0.
+/// The box on `rows`: no composer, its key row — and the rows it wrapped onto — the last drawn or
+/// over the footer's `esc to cancel` (or the right side alone), the pending edit's word after an
+/// Esc under it or not, its options the block of rows above it with one of them focused in column
+/// 0.
 pub(crate) fn agy_box(rows: &[String]) -> Option<AgyBox> {
     let end = rows.iter().rposition(|r| !blank(r))?;
     let footer = matches!(footer_of(&rows[end]), Footer::Cancel | Footer::Blank).then_some(end);
@@ -1616,7 +1633,11 @@ pub mod fixtures {
         pub const BUSY_STREAMING: &str = include_str!("fixtures/agy-1.4.0-lab-busy-streaming.txt");
         /// The end of a turn.
         pub const END_OF_TURN: &str = include_str!("fixtures/agy-1.4.0-lab-end-of-turn.txt");
-        /// A spawned worker's first prompt holding a blank line (the task, a blank line, the spawn's fact line), its reply, then the harness's Land act and the landing (`lab forever`'s L15, before a worker's task file dropped agy's blank lines): the message's blank line is a blank row, and the rows under it sit two columns in, as the reply's (the module header's A MESSAGE'S BLANK LINE).
+        /// A spawned worker's first prompt holding a blank line (the task, a blank line, the
+        /// spawn's fact line), its reply, then the harness's Land act and the landing
+        /// (`lab forever`'s L15, before a worker's task file dropped agy's blank lines): the
+        /// message's blank line is a blank row, and the rows under it sit two columns in, as the
+        /// reply's.
         pub const WORKER_FIRST_PROMPT: &str =
             include_str!("fixtures/agy-1.4.0-lab-worker-first-prompt.txt");
         /// A person's message of three paragraphs (a line break, then a blank line, each later one opening `NEEDS YOU:`) sent through `send`/`key as=person`, the stub's reply under it, then the harness's Cruise act and its reply: the message's blank line a blank row like the one that ends it.

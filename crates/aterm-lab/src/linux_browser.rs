@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Linux guest browser verification lane (`STOCK EXCEPTION`: guest builds `aterm-verify` with
-//! stock Rust).
+//! Linux guest browser verification lane (`STOCK EXCEPTION`: the modules build on rustup stable's
+//! wasm32 std, as `verify browser`'s do, and the guest builds `aterm-verify` with stock Rust).
 
 use std::fmt::Write as _;
 use std::path::Path;

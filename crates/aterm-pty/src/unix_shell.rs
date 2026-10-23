@@ -190,7 +190,12 @@ fn account_shell() -> Option<OsString> {
     let mut len = 4096;
     let shell = loop {
         let mut buf = vec![0u8; len];
-        // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid writable buffer.
+        // SAFETY: `pw` is a valid, writable passwd out-param; `buf` is a valid
+        // writable buffer of the stated length that outlives every read of `pw`'s
+        // string fields, which point INTO it on success; `out` is a valid
+        // out-pointer. getpwuid_r writes nothing past buflen. `pw_shell` is read
+        // only when `out` is non-null (success), and is then a NUL-terminated C
+        // string inside `buf`, copied out before `buf` goes out of scope.
         unsafe {
             let rc = libc::getpwuid_r(
                 libc::getuid(),

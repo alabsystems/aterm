@@ -30,18 +30,15 @@ use crate::dpi::{Position, Size};
 use crate::event::Ime;
 use crate::platform_impl::platform::window_state::ImeState;
 
-/// LOCAL PATCH (aterm): what the IME handling reads from the window's input context, so a
-/// recorded composition can stand in for `ImmGetCompositionStringW` (`super::recorded`).
+/// LOCAL PATCH (aterm): window input context reader for live or recorded IME compositions.
 pub(crate) trait CompositionSource {
     /// `ImmGetCompositionStringW(gcs_mode)`'s bytes: `None` on an error, empty for nothing.
     fn data(&self, gcs_mode: u32) -> Option<Vec<u8>>;
-    /// `ImmGetCompositionStringW(GCS_CURSORPOS)`: the caret, in UTF-16 units, negative on an
-    /// error.
+    /// `ImmGetCompositionStringW(GCS_CURSORPOS)`: the caret in UTF-16 units, negative on error.
     fn cursor(&self) -> i32;
 }
 
-/// The composition being typed, and the range the IME targets in it (or its caret), in UTF-8
-/// byte offsets.
+/// The composition being typed and the targeted UTF-8 byte offset range.
 pub(crate) fn composing_text_and_cursor(
     source: &dyn CompositionSource,
 ) -> Option<(String, Option<usize>, Option<usize>)> {
@@ -74,8 +71,6 @@ pub(crate) fn composing_text_and_cursor(
     if first.is_some() && last.is_none() {
         last = Some(text.len());
     } else if first.is_none() {
-        // IME haven't split words and select any clause yet, so trying to retrieve normal
-        // cursor.
         let cursor = source.cursor();
         let cursor =
             (cursor >= 0).then(|| text.chars().take(cursor as _).map(|c| c.len_utf8()).sum());
@@ -103,11 +98,7 @@ fn composition_string(source: &dyn CompositionSource, gcs_mode: u32) -> Option<S
     }
 }
 
-/// LOCAL PATCH (aterm): the window's answer to an IME message (`WM_IME_STARTCOMPOSITION`,
-/// `WM_IME_COMPOSITION` with its `lparam`, `WM_IME_ENDCOMPOSITION`): the `Ime` events to send,
-/// in order, given whether IME is `allowed` for the window, with its IME `state` updated.
-/// `source` is read only where the composition is. Upstream's window-procedure arms, moved here
-/// unchanged so a recorded composition can drive them (`super::recorded`).
+/// LOCAL PATCH (aterm): translate an IME window message into `Ime` events and update `state`.
 pub(crate) fn ime_events(
     msg: u32,
     lparam: LPARAM,
@@ -121,15 +112,11 @@ pub(crate) fn ime_events(
             *state = ImeState::Enabled;
             events.push(Ime::Enabled);
         },
-        // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-        // check whether composing.
         WM_IME_COMPOSITION if allowed && *state != ImeState::Disabled => {
             if lparam == 0 {
                 events.push(Ime::Preedit(String::new(), None));
             }
 
-            // Google Japanese Input and ATOK have both flags, so
-            // first, receive composing result if exist.
             if (lparam as u32 & GCS_RESULTSTR) != 0 {
                 if let Some(text) = composed_text(source) {
                     *state = ImeState::Enabled;
@@ -138,7 +125,6 @@ pub(crate) fn ime_events(
                 }
             }
 
-            // Next, receive preedit range for next composing if exist.
             if (lparam as u32 & GCS_COMPSTR) != 0 {
                 if let Some((text, first, last)) = composing_text_and_cursor(source) {
                     *state = ImeState::Preedit;
@@ -149,8 +135,6 @@ pub(crate) fn ime_events(
         },
         WM_IME_ENDCOMPOSITION if allowed || *state != ImeState::Disabled => {
             if *state == ImeState::Preedit {
-                // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
-                // trying receiving composing result and commit if exists.
                 if let Some(text) = composed_text(source) {
                     events.push(Ime::Preedit(String::new(), None));
                     events.push(Ime::Commit(text));
@@ -169,8 +153,7 @@ pub struct ImeContext {
     himc: HIMC,
 }
 
-/// LOCAL PATCH (aterm): `window`'s input context, taken (`ImmGetContext`) only once the
-/// composition is read, as upstream's window procedure took it.
+/// LOCAL PATCH (aterm): `window`'s input context, acquired lazily via `ImmGetContext`.
 pub(crate) struct LazyImeContext {
     window: HWND,
     context: std::cell::OnceCell<ImeContext>,

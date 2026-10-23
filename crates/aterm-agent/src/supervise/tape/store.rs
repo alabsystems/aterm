@@ -31,7 +31,7 @@ pub fn tape_id() -> String {
     )
 }
 
-/// The tape file at `path`, made new and `0600` ([module docs](self)).
+/// The tape file at `path`, made new and `0600`.
 /// # Errors
 /// The path is taken, or the file cannot be made there.
 pub fn create(path: &Path) -> std::io::Result<std::fs::File> {
@@ -151,7 +151,8 @@ pub(crate) fn beside_files(
     .collect()
 }
 
-/// THE DEVELOPMENT SEAM that records every hosted run ([module docs](self)), read by the window's host through `aterm_types::dev_seam!` — so no shipped binary reads it — and set by the lab's instances.
+/// THE DEVELOPMENT SEAM that records every hosted run, read by the window's host through
+/// `aterm_types::dev_seam!` — so no shipped binary reads it — and set by the lab's instances.
 pub const HOSTED_SEAM: &str = "ATERM_HARNESS_TAPE";
 
 /// Whether the seam's `value` asks for tapes: set, and neither empty nor `0`.
@@ -321,7 +322,7 @@ pub fn forget(store: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The door a hosted run reads its world through, recording to a new tape
-/// in the store beside its approval ledger ([module docs](self)) — after the
+/// in the store beside its approval ledger — after the
 /// store's retention has run — or the shipped live door, said to `warn`,
 /// when the run keeps no ledger or its tape cannot be made.
 fn hosted_fx(

@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The lanes' fixtures: a scratch home with a rostered machine, the channel on a
-//! [`FakeHost`], real git repos for the program sources, and fakes of the packer and the
-//! indexer that write what the real ones would (a manifest the client parses, signed by
-//! the machine key, uploaded to staging; an index quad with the delta applied).
+//! Test fixtures for publication lanes: scratch home, fake host, git repos, and fake packer/indexer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -47,8 +44,6 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
             "init.defaultBranch=main",
             "-c",
             "advice.detachedHead=false",
-            // No template: a fixture repository carries no sample hooks, no description and
-            // no info/exclude, files every test lays down and removes and nothing reads.
             "-c",
             "init.templateDir=",
         ])
@@ -78,7 +73,6 @@ pub fn repo(dir: &Path, commits: u64) -> Vec<String> {
     made_once(&MADE, &commits, dir, |dir| make_repo(dir, commits))
 }
 
-/// [`repo`], made: its commits, oldest first.
 fn make_repo(dir: &Path, commits: u64) -> Vec<String> {
     use std::io::Write as _;
     std::fs::create_dir_all(dir).expect("mkdir repo");
@@ -99,13 +93,10 @@ fn make_repo(dir: &Path, commits: u64) -> Vec<String> {
         }
         stream.push('\n');
     }
-    // Each mark's commit, read back from fast-import itself rather than one more git.
     let marks = dir.join(".git/fixture-marks");
     let mut child = atpkg_publish::testkit::git()
         .arg("-C")
         .arg(dir)
-        // One pack, not a loose object (and a directory) per commit: below its unpack limit
-        // fast-import explodes what it wrote, and every test lays the tree down and removes it.
         .args(["-c", "fastimport.unpackLimit=0", "fast-import", "--quiet"])
         .arg(format!("--export-marks={}", marks.display()))
         .stdin(aterm_uds::spawnfd::Stdio::piped())

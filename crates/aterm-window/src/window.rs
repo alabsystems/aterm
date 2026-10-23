@@ -7,6 +7,10 @@
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
 //! The [`Window`] struct and associated types.
+//!
+//! LOCAL PATCH (aterm): an item marked `#[cfg(not(macos_platform))]` is API no aterm crate calls on
+//! macOS, and one marked `#[cfg(windows_platform)]` API no aterm crate calls on Linux either; only
+//! the Windows backend still implements them.
 
 use std::fmt;
 
@@ -23,6 +27,8 @@ pub use crate::cursor::{BadImage, CustomCursor, CustomCursorSource, MAX_CURSOR_S
 #[cfg(not(macos_platform))]
 pub use crate::icon::{BadIcon, Icon};
 
+// LOCAL PATCH (aterm): the crate's own type, where upstream re-exports cursor-icon's (and its
+// `ParseError`).
 #[doc(inline)]
 pub use crate::cursor_icon::CursorIcon;
 
@@ -37,6 +43,8 @@ impl fmt::Debug for Window {
     }
 }
 
+// LOCAL PATCH (aterm): Windows only; macOS, X11 and Wayland have no exclusive fullscreen to leave,
+// and their windows close in their own `Drop`.
 #[cfg(windows_platform)]
 impl Drop for Window {
     fn drop(&mut self) {
@@ -85,6 +93,10 @@ impl From<u64> for WindowId {
 }
 
 /// Attributes used when creating a window.
+///
+/// LOCAL PATCH (aterm): only the builders aterm calls. Upstream's other fifteen (`with_resizable`,
+/// `with_fullscreen`, `with_decorations`, `with_parent_window` and the rest) are gone, so the
+/// fields they set hold their [`Default`].
 #[derive(Debug, Clone)]
 pub struct WindowAttributes {
     pub(crate) inner_size: Option<Size>,
@@ -553,6 +565,8 @@ impl Window {
             reason = "The Linux backends dispatch through runtime window state."
         )
     )]
+    /// LOCAL PATCH (aterm): added; upstream has no such query, so a tiled frame read as the normal
+    /// one.
     pub fn is_tiled(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_tiled",).entered();
         #[cfg(any(x11_platform, wayland_platform))]
@@ -566,6 +580,9 @@ impl Window {
     }
 
     /// Whether the window shows full screen now, however it got there.
+    ///
+    /// LOCAL PATCH (aterm): added; on X11 [`Window::fullscreen`] says only what this window asked
+    /// for, not a full screen the window manager gave it.
     #[inline]
     pub fn is_shown_fullscreen(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_shown_fullscreen",).entered();
@@ -866,7 +883,12 @@ impl Window {
     }
 }
 
-// SAFETY: the display is the event loop's connection, which every window holds a reference.
+// LOCAL PATCH (aterm): the X11 or Wayland handles through first-party
+// `aterm_types::native_window::HasNativeWindow`, so the GL arm and aterm-gui's CPU presenters reach
+// them without `raw-window-handle` (`rwh_06` is opt-in and wraps this answer).
+// SAFETY: the display is the event loop's connection, which every window holds a reference to
+// (X11's `Arc<XConnection>`, Wayland's `Arc<Connection>`), so it stays open while `self` lives;
+// the X11 window is destroyed and the `wl_surface` released only when `self` drops.
 #[cfg(free_unix)]
 unsafe impl aterm_types::native_window::HasNativeWindow for Window {
     #[inline]
@@ -880,7 +902,8 @@ impl rwh_06::HasWindowHandle for Window {
     fn window_handle(&self) -> Result<rwh_06::WindowHandle<'_>, rwh_06::HandleError> {
         let raw = self.window.raw_window_handle_rwh_06()?;
 
-        // SAFETY: The window handle will never be deallocated while the window is alive.
+        // SAFETY: The window handle will never be deallocated while the window is alive, and the
+        // main thread safety requirements are upheld internally by each platform.
         Ok(unsafe { rwh_06::WindowHandle::borrow_raw(raw) })
     }
 }
@@ -890,7 +913,8 @@ impl rwh_06::HasDisplayHandle for Window {
     fn display_handle(&self) -> Result<rwh_06::DisplayHandle<'_>, rwh_06::HandleError> {
         let raw = self.window.raw_display_handle_rwh_06()?;
 
-        // SAFETY: The window handle will never be deallocated while the window is alive.
+        // SAFETY: The window handle will never be deallocated while the window is alive,
+        // and the main thread safety requirements are upheld internally by each platform.
         Ok(unsafe { rwh_06::DisplayHandle::borrow_raw(raw) })
     }
 }

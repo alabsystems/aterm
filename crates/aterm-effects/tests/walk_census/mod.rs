@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The walk census host (`crate::walk_census`), shared by `walk_continuity_census.rs` and other
-//! suite tests. [`Shell`] is a readline-shaped line editor on the primary screen that folds at
-//! the margin as the program behind it does ([`Fold`]); [`Snap::judge`] flags every
-//! discontinuity in one frame's text cells read in walk order; [`recolours`] reads them across
-//! frames.
+//! Shared walk census host (`crate::walk_census`) with [`Shell`], [`Snap::judge`], and [`recolours`].
 #![allow(dead_code)]
 
 use aterm_core::render::GlowQuad;
@@ -66,27 +62,23 @@ pub fn class_of(ch: char) -> (bool, TypedClass) {
     }
 }
 
-/// What the census flags between two text-adjacent lit cells, or at a
-/// dark text cell between lit ones.
+/// Discontinuity flagged between text-adjacent lit cells or at a dark cell between lit ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Flag {
-    /// A backward colour step between text-adjacent lit cells.
+    /// Backward colour step between text-adjacent lit cells.
     Back,
-    /// The same stop twice.
+    /// Same stop twice.
     Repeat,
-    /// More than one walk step, or a step that is neither walk step.
+    /// Step larger than one fast step, or matching neither walk step.
     Jump,
-    /// A `1/16` step right of a `1/36` one on the same line: the fast leg
-    /// restarted mid-line.
+    /// A `1/16` step right of a `1/36` step on the same line.
     Restart,
-    /// A `1/36` step inside the line's first sixteen cells: the line did
-    /// not start its walk where it started.
+    /// A `1/36` step inside the line's first sixteen cells.
     NoFastLeg,
-    /// A dark text cell between lit ones.
+    /// Dark text cell between lit ones.
     Hole,
 }
 
-/// One text cell on one frame.
 #[derive(Clone, Copy, Debug)]
 pub struct Pos {
     pub lit: bool,
@@ -104,11 +96,9 @@ pub struct Snap {
     /// Text index the line's walk started at (a line kill restarts it).
     pub start: usize,
     pub pos: Vec<Pos>,
-    /// Indices `i` after which `pos[i + 1]` is not the walk's next cell (a
-    /// composer's row end: its rows are judged apart).
+    /// Indices `i` after which `pos[i + 1]` starts a separate walk segment.
     pub breaks: Vec<usize>,
-    /// `(flag, text index)`: for a step flag, the index of the pair's left
-    /// cell.
+    /// `(flag, text index)` pairs.
     pub flags: Vec<(Flag, usize)>,
 }
 
@@ -127,7 +117,6 @@ impl Snap {
         }
     }
 
-    /// The flags of the walk segment `a..b` of [`Snap::pos`].
     fn judge_segment(&mut self, a: usize, b: usize) {
         let lit: Vec<usize> = (a..b).filter(|&i| self.pos[i].lit).collect();
         if let (Some(&l), Some(&r)) = (lit.first(), lit.last()) {
@@ -137,8 +126,6 @@ impl Snap {
                 }
             }
         }
-        // Whether a step at the lay rate has been read to the left on this
-        // line: a fast step after it is the fast leg restarting mid-line.
         let mut laying = false;
         let fast_leg = (a..b).contains(&self.start);
         for i in a..b.saturating_sub(1) {
@@ -218,8 +205,7 @@ pub struct Host {
     blink: u64,
     last_blink: Option<Instant>,
     scroll: Option<ContentScrollState>,
-    /// The GUI's real pacing: a frame when output lands, then 16 ms while
-    /// the engine asks for cadence, else at its next change deadline.
+    /// True to use GUI cadence pacing instead of a fixed `frame_ms` tick.
     pub paced: bool,
 }
 
@@ -337,8 +323,7 @@ impl Host {
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
     }
 
-    /// Runs every frame due at or before `t`, calling `each` after each one presented.
-    /// SYNC-1: no present while a `?2026` bracket is open and dirty.
+    /// Runs every frame due at or before `t`, skipping presents while a `?2026` bracket is open and dirty.
     pub fn frames_to(&mut self, t: Instant, mut each: impl FnMut(&mut Self)) {
         if self.paced {
             let fd = Duration::from_millis(16);
@@ -414,33 +399,17 @@ impl Host {
     }
 }
 
-/// How the shell's echo reaches the glass relative to its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Echo {
-    /// The echo lands this many ms after the press.
     After(u64),
 }
 
-/// How the line folds at the margin. Captured over a pty at 60 columns
-/// (`TERM=xterm-256color`), the key that fills the margin echoes:
-///
-/// * bash 3.2 readline: `<glyph> \r`, so the caret lands at the next row's
-///   column 0 on that key and the fold glyph is an ordinary same-row key;
-/// * zsh 5.9 zle: `<glyph> \r\x1b[K`, then the next glyph bare, then
-///   `\r<glyph><glyph>` for the one after (the row reprinted from column 0);
-/// * the kernel's cooked-mode echo (`cat`, `read` without `-e`): every glyph
-///   as typed, folded by the terminal's deferred autowrap.
-///
-/// Only the key ending exactly at the margin differs; a reprint
-/// ([`Shell::reprint`]) or a paste crossing the margin folds by autowrap in
-/// every shape.
+/// How the line folds at the margin: bash readline (`<glyph> \r`), zsh zle (`<glyph> \r\x1b[K`
+/// then `\r<g0><g1>`), or cooked-mode kernel echo (deferred autowrap).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fold {
-    /// bash readline, the default ([`Shell::new`]).
     Readline,
-    /// zsh 5.9 zle.
     Zle,
-    /// The kernel's cooked-mode echo.
     Kernel,
 }
 
@@ -459,8 +428,6 @@ impl Fold {
 }
 
 thread_local! {
-    /// The fold a [`Shell`] built on this thread takes when it names none
-    /// ([`with_default_fold`]).
     static DEFAULT_FOLD: std::cell::Cell<Fold> = const { std::cell::Cell::new(Fold::Readline) };
 }
 
@@ -473,8 +440,7 @@ pub fn with_default_fold<T>(fold: Fold, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// A readline-shaped line editor at a `$ ` prompt on the primary screen. It folds as
-/// [`Fold::Readline`] unless [`Shell::folding`] or [`with_default_fold`] names another fold.
+/// Readline-shaped line editor at a `$ ` prompt on the primary screen.
 pub struct Shell {
     pub h: Host,
     cols: usize,
@@ -482,10 +448,8 @@ pub struct Shell {
     prompt: usize,
     pub text: Vec<char>,
     pub caret: usize,
-    /// Text index the current line's walk started at.
     start: usize,
     echo: Echo,
-    /// How the line folds at the margin ([`Fold`]).
     fold: Fold,
     pub key_ms: u64,
     last: Instant,
@@ -522,7 +486,6 @@ impl Shell {
             label: "start".into(),
             snaps: Vec::new(),
         };
-        // The prompt's own output is presented, as the window presents it.
         s.h.frame();
         s.run_to(s.h.now + Duration::from_millis(32));
         s
@@ -540,8 +503,6 @@ impl Shell {
     pub fn append_echo(&self, from: usize) -> String {
         let mut out: String = self.text[from..].iter().collect();
         let (row, col) = self.pos(from);
-        // zle reprints the continuation row from its column 0 on the key
-        // after the fold's bare glyph.
         if self.fold == Fold::Zle
             && from > 0
             && self.text.len() == from + 1
@@ -613,9 +574,7 @@ impl Shell {
         self.snaps.push(s);
     }
 
-    /// `s` typed at the line's end `gap` ms apart, each key's echo `lag` ms
-    /// after its press — past the gap, the next key is pressed before the
-    /// last one's echo (type-ahead).
+    /// Types `s` at the line's end `gap` ms apart, with each key's echo `lag` ms after its press.
     pub fn type_lagged(&mut self, s: &str, gap: u64, lag: u64) {
         let mut evs: Vec<(Instant, bool, char)> = Vec::new();
         for (k, ch) in s.chars().enumerate() {
@@ -883,8 +842,7 @@ impl Shell {
     }
 }
 
-/// The flagged runs: consecutive snaps carrying the same `(flag, index)`,
-/// `(flag, index, first snap, last snap)`.
+/// Consecutive snaps carrying the same `(flag, index)` as `(flag, index, first snap, last snap)`.
 pub fn runs(snaps: &[Snap]) -> Vec<(Flag, usize, usize, usize)> {
     let mut open: Vec<(Flag, usize, usize, usize)> = Vec::new();
     let mut done = Vec::new();
@@ -938,14 +896,10 @@ pub fn dump(snaps: &[Snap], from: usize, to: usize) -> String {
     s
 }
 
-/// Every text cell lit again in another colour while the text up to it stayed the same on every
-/// frame between: `(text index, snap, t before, t after)`.
+/// Every text cell lit again in another colour while the text prefix up to it stayed unchanged:
+/// `(text index, snap, t before, t after)`.
 pub fn recolours(snaps: &[Snap]) -> Vec<(usize, usize, f32, f32)> {
     let n = snaps.iter().map(|s| s.pos.len()).max().unwrap_or(0);
-    // Text index `i` stays under unchanged text only while every snap's first `i + 1` chars
-    // equal the one before's (any change resets `prev`), so each snap needs only the length of
-    // the prefix it shares with the one before; a prefix String per (index, snap) is quadratic
-    // in the line.
     let texts: Vec<Vec<char>> = snaps.iter().map(|s| s.text.chars().collect()).collect();
     let shared: Vec<usize> = (0..texts.len())
         .map(|k| match k.checked_sub(1) {
@@ -959,12 +913,9 @@ pub fn recolours(snaps: &[Snap]) -> Vec<(usize, usize, f32, f32)> {
         .collect();
     let mut out = Vec::new();
     for i in 0..n {
-        // The last lit stop seen under the current text, if the text up to
-        // `i` has not changed since.
         let mut prev: Option<f32> = None;
         for (k, s) in snaps.iter().enumerate() {
             if shared[k] <= i {
-                // The text up to `i` changed (or is gone): start over.
                 prev = None;
             }
             if texts[k].len() <= i {
@@ -973,8 +924,6 @@ pub fn recolours(snaps: &[Snap]) -> Vec<(usize, usize, f32, f32)> {
             let Some(p) = s.pos.get(i) else {
                 continue;
             };
-            // Unlit: nothing to compare yet; the text check above still
-            // resets a later change.
             if !p.lit {
                 continue;
             }
@@ -1015,8 +964,6 @@ pub fn prose(n: usize) -> String {
     }
     s
 }
-
-// Real bytes: the captured Claude Code composer takes
 
 pub enum Rec {
     Out(Vec<u8>),
@@ -1065,14 +1012,11 @@ pub struct Capture {
     pub ch: usize,
     pub text_rows: (u16, u16),
     pub indent: u16,
-    /// A rest inserted before the `k`-th printable key: `(k, ms)`.
+    /// Rest inserted before the `k`-th printable key: `(k, ms)`.
     pub pause: Option<(usize, u64)>,
 }
 
-/// The composer's text cells now: every row of `text_rows` whose first
-/// text column is laid out as a composer row (`❯ ` or two blanks) with
-/// text after it, from the indent to its last glyph (or the caret, a
-/// typed Space's cell), each row its own walk segment.
+/// Active composer text cells across `cap.text_rows`, with each row as its own walk segment.
 pub fn composer_cells(h: &Host, cap: &Capture) -> (Vec<(u16, u16)>, Vec<usize>, String) {
     let mut cells = Vec::new();
     let mut breaks = Vec::new();
@@ -1082,9 +1026,6 @@ pub fn composer_cells(h: &Host, cap: &Capture) -> (Vec<(u16, u16)>, Vec<usize>, 
     for row in cap.text_rows.0..=cap.text_rows.1 {
         h.term.row_cols_into(usize::from(row), &mut buf);
         let head: String = buf.iter().take(usize::from(cap.indent)).collect();
-        // The composer's first row carries its `❯ `; each continuation row
-        // after it, two blanks. Rows before the `❯` (a status line) are not
-        // the composer's.
         let first = head.starts_with('\u{276f}');
         if first {
             cells.clear();

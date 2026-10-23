@@ -158,7 +158,8 @@ fn cache_scratch<'s>(
 /// Ensures `cache/<sha256>` holds a verified copy of `item`, downloading via `curl` if needed.
 ///
 /// # Errors
-/// Returns an error if the URL is not `https://`, download fails, or the SHA-256 mismatches.
+/// One line: not https, download failed, or the bytes do not hash to the pin (and then
+/// nothing is cached).
 pub fn ensure(sys: &dyn System, paths: &Paths, item: &Needed) -> Result<PathBuf, String> {
     if !item.url.starts_with("https://") {
         return Err(format!(

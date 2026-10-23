@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: the program share ([`Log::enforce_program_share`],
-//! run by every append of a program mark and by the readers' fence lifting)
-//! against the derived `SessionLogProgramShare` model
-//! (`aterm_models_session::session_log_program_share_model`, checked at
-//! Tier-0 in `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded walk drives a real 64-record ring (a share of two program marks
-//! a node) under a session and an open run, both opened before the walk (the
-//! model's records are the walk's): observations (a bell at the session),
-//! program marks at the run (the model's node `a`) and at the session (node
-//! `b`), the readers fenced and the fence lifted. After every
-//! step the live records are projected onto the model (others and each
-//! node's program marks, fenced or not, the newest's node, the log's own
-//! `lost`), and the step must be the model's: the action, then whatever the
-//! level-aware batch took. NEGATIVE CONTROLS: a projection that miscounts a
-//! program mark as another record, one in which the share took a fenced
-//! program mark, and one in which it took the other node's, are each
-//! rejected.
+//! Conformance tests for [`Log::enforce_program_share`] against `SessionLogProgramShare`.
 
 use aterm_models_session::session_log_program_share_model;
 use aterm_slog::{
@@ -30,9 +13,7 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::at;
 
-/// The model's appends.
 const MAX_SEQ: u64 = 7;
-/// The records the world opens before the walk: the session and its run.
 const SETUP: u64 = 2;
 
 struct World {
@@ -62,7 +43,6 @@ impl World {
         World { log, run, clock: 2 }
     }
 
-    /// Which program node `r` is a mark of: 1 the run, 2 the session, 0 none.
     fn program_node(&self, r: &aterm_slog::Rec) -> i64 {
         match (r.k == Kind::Program, r.node) {
             (true, n) if n == self.run => 1,
@@ -124,7 +104,6 @@ impl World {
     }
 }
 
-/// The states the model reaches from `prev` by `action`, then any evictions.
 fn reach(m: &Model, action: &str, prev: &State) -> Vec<State> {
     let mut all: Vec<State> = m.successors(action, prev);
     let mut i = 0;
@@ -204,11 +183,6 @@ fn slog_program_share_conforms_to_derived_model() {
     assert!(took > 0, "the share never took a mark");
 }
 
-/// The broken state `broken` is no state the honest `action` (and the
-/// ring's level-aware batch after it) makes of `prev`, and it is exactly
-/// what mutant `mutant` makes of `prev` (T11: each negative control is its
-/// mutant's successor, so the conformance check would catch that mutant's
-/// call in the code).
 fn rejected(m: &Model, (action, mutant): (&str, &str), prev: &State, broken: &State) {
     assert!(
         !reach(m, action, prev).contains(broken),
@@ -220,7 +194,6 @@ fn rejected(m: &Model, (action, mutant): (&str, &str), prev: &State, broken: &St
     );
 }
 
-/// `s` with each `(key, delta)` added.
 fn moved(s: &State, deltas: &[(&'static str, i64)]) -> State {
     let mut out = s.clone();
     for (k, d) in deltas {
@@ -229,14 +202,6 @@ fn moved(s: &State, deltas: &[(&'static str, i64)]) -> State {
     out
 }
 
-/// NEGATIVE CONTROLS, each the successor of its mutant from the real run's
-/// state before the append (T11): the share removed (`AppendAUnshared`),
-/// a take left uncounted (`ShareUncounted`), the share taking another
-/// record (`ProgramShareEvictsAny`) or the other node's program mark
-/// (`ShareTakesOtherNode`) beside the run's own, and the share taking a
-/// fenced program mark (`ShareTakesFenced`); a ghost the broken take sets
-/// (`qoth`, `fgone`) is what the real run's projection reads as zero. And
-/// a projection that miscounts a program mark as another record.
 #[test]
 fn slog_program_share_conformance_rejects_a_miscount_and_a_wrong_take() {
     let m = session_log_program_share_model();
@@ -253,24 +218,17 @@ fn slog_program_share_conformance_rejects_a_miscount_and_a_wrong_take() {
         (honest["ua"], honest["ub"], honest["uo"], honest["lost"]),
         (2, 1, 1, 1)
     );
-    // The share removed: the third program mark of the run is kept.
     let unshared = moved(&honest, &[("ua", 1), ("lost", -1)]);
     rejected(&m, ("AppendA", "AppendAUnshared"), &prev, &unshared);
-    // The take is not counted into `lost`.
     let uncounted = moved(&honest, &[("lost", -1)]);
     rejected(&m, ("AppendA", "ShareUncounted"), &prev, &uncounted);
-    // The share took the bell beside the run's own mark.
     let any = moved(&honest, &[("uo", -1), ("lost", 1), ("qoth", 1)]);
     rejected(&m, ("AppendA", "ProgramShareEvictsAny"), &prev, &any);
-    // The share took the session's program mark beside the run's own.
     let other_node = moved(&honest, &[("ub", -1), ("lost", 1), ("qoth", 1)]);
     rejected(&m, ("AppendA", "ShareTakesOtherNode"), &prev, &other_node);
-    // A program mark counted as another record (the projection's own
-    // miscount: no mutant makes it, and no honest step does).
     let miscounted = moved(&honest, &[("ua", -1), ("uo", 1)]);
     assert!(!reach(&m, "AppendA", &prev).contains(&miscounted));
 
-    // Fenced: two program marks held by the fence, the third beside them.
     let mut f = World::new();
     f.program(f.run, "working");
     f.program(f.run, "idle");
@@ -280,7 +238,6 @@ fn slog_program_share_conformance_rejects_a_miscount_and_a_wrong_take() {
     let honest = f.project();
     admitted(&m, "AppendA", &prev, &honest);
     assert_eq!((honest["fa"], honest["ua"], honest["lost"]), (2, 1, 0));
-    // The same append had the share taken a fenced program mark.
     let took_fenced = moved(&honest, &[("fa", -1), ("lost", 1), ("fgone", 1)]);
     rejected(&m, ("AppendA", "ShareTakesFenced"), &prev, &took_fenced);
 }

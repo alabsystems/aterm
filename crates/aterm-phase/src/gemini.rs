@@ -46,8 +46,7 @@ fn run_of(row: &str, glyph: &str) -> Option<usize> {
     (t.len() >= 10 * g.len() && t.chunks(g.len()).all(|c| c == g)).then_some(t.len() / g.len())
 }
 
-/// The composer's caret (module header): `>`, `*` while YOLO is on, `!` in
-/// shell mode.
+/// The composer's caret: `>`, `*` while YOLO is on, `!` in shell mode.
 const CARET: u8 = b'>';
 const CARET_YOLO: u8 = b'*';
 const CARET_SHELL: u8 = b'!';
@@ -123,7 +122,7 @@ fn frame(rows: &[String]) -> Option<Frame> {
         .or_else(|| details_hidden_frame(rows))
 }
 
-/// The composer with the UI details hidden (module header): the band that
+/// The composer with the UI details hidden: the band that
 /// is the LAST thing drawn — every row under its `▀` blank, so no box and no
 /// menu stands there — with a status row right above its `▄`: the spinner, a
 /// shortcut hint ([`status_words`]), a mode alone, or a blank row.
@@ -192,7 +191,7 @@ fn frame_at(rows: &[String], top: usize) -> Option<Frame> {
 }
 
 /// The text a caret row holds: what follows ` > `, and NOTHING when that is
-/// the placeholder (module header) — a person who typed two blanks and then
+/// the placeholder — a person who typed two blanks and then
 /// its words is the one draft read as empty.
 fn caret_text(row: &str) -> &str {
     let text = crate::text::trim_end(row).get(3..).unwrap_or("");
@@ -258,7 +257,7 @@ pub fn folded_paste(text: &str) -> Option<String> {
     }
 }
 
-/// What the status row says (module header).
+/// What the status row says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// ` ⠧ … (esc to cancel, 3s)`: a turn runs.
@@ -404,7 +403,10 @@ fn is_banner_row(row: &str) -> bool {
     })
 }
 
-/// The phase, and whether it is evidence (module header): a box is a prompt; the spinner on the status row is busy; the composer empty with `? for shortcuts` (`press tab twice for more`) or a blank status row (no hint is drawn in a narrow pane, nor under `ui.showShortcutsHint = false`), or holding a draft with the row blank, is idle — a question when the reply's last words end in `?`.
+/// The phase, and whether it is evidence: a box is a prompt; the spinner on the status row is busy;
+/// the composer empty with `? for shortcuts` (`press tab twice for more`) or a blank status row (no
+/// hint is drawn in a narrow pane, nor under `ui.showShortcutsHint = false`), or holding a draft
+/// with the row blank, is idle — a question when the reply's last words end in `?`.
 #[must_use]
 pub fn phase(rows: &[String]) -> (Phase, bool) {
     let Some(f) = frame(rows) else {
@@ -597,7 +599,9 @@ fn error_kind(message: &str) -> WallKind {
     }
 }
 
-/// The wall the last turn ended on (module header): its `✕ [API Error: …]` row and the rows it wrapped onto, with nothing under them but blank rows and Gemini CLI's own `ℹ` notices (`ℹ This request failed. …`) with theirs.
+/// The wall the last turn ended on: its `✕ [API Error: …]` row and the rows it wrapped onto, with
+/// nothing under them but blank rows and Gemini CLI's own `ℹ` notices (`ℹ This request failed. …`)
+/// with theirs.
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     let (from, end) = ended_on(rows)?;
@@ -692,7 +696,8 @@ fn inside(row: &str, col: usize, width: usize) -> Option<&str> {
         .then(|| crate::text::trim_end(inner.strip_prefix(' ').unwrap_or(inner)))
 }
 
-/// The box on `rows` (module header): its bottom border the last row drawn, every row above it inside the box up to its top border (or the top of the rows read), no composer on the screen.
+/// The box on `rows`: its bottom border the last row drawn, every row above it inside the box up to
+/// its top border (or the top of the rows read), no composer on the screen.
 pub(crate) fn gemini_box(rows: &[String]) -> Option<GeminiBox> {
     let bottom = rows.iter().rposition(|r| !blank(r))?;
     let col = leading_spaces(&rows[bottom]);
@@ -726,7 +731,7 @@ fn numbered(text: &str) -> Option<(u8, &str, bool)> {
     crate::prompt::numbered_option(text, "● ", ". ")
 }
 
-/// What choosing an approval box's `label` does (module header).
+/// What choosing an approval box's `label` does.
 fn approval_role(label: &str) -> Role {
     if label == const { anchor_text("gemini.box.once") } {
         Role::Once
@@ -764,12 +769,12 @@ fn role_of(kind: PromptKind, label: &str) -> Role {
 }
 
 /// The question dialog's tab row, drawn under its title when it asks more
-/// than one question (module header): `← □ Colour │ □ Size │ ≡ Review →`.
+/// than one question: `← □ Colour │ □ Size │ ≡ Review →`.
 fn is_tab_row(text: &str) -> bool {
     text.starts_with("← ") && text.ends_with(" →") && text.contains(" │ ")
 }
 
-/// The first row of the model-fallback dialog (module header, bundle:
+/// The first row of the model-fallback dialog (bundle:
 /// `ProQuotaDialog`) other than the usage limit's: a model the key cannot
 /// reach, a model it does not know, or the service's demand.
 fn is_fallback_head(text: &str) -> bool {
@@ -793,7 +798,7 @@ fn is_expansion_row(text: &str) -> bool {
     text.starts_with("• ")
 }
 
-/// The box's kind and the row of its question (module header's table): the
+/// The box's kind and the row of its question: the
 /// question dialog and the usage-limit dialog by their title, the trust
 /// dialog by its question, an approval box by the question over its options
 /// and the tool its title names; the model-fallback dialog by its first row,
@@ -1022,7 +1027,9 @@ pub fn banner_login(rows: &[String]) -> Option<String> {
     })
 }
 
-/// THE RESET THE USAGE-LIMIT DIALOG NAMES (module header): what its `Access resets at <time>.` row says, under the title of the dialog [`prompt`] reads whole and over its options — `5:06 AM` in `PDT` of `Access resets at 5:06 AM PDT.` ([`fixtures::LIMIT_DIALOG_ACCOUNT`]).
+/// THE RESET THE USAGE-LIMIT DIALOG NAMES: what its `Access resets at <time>.` row says, under the
+/// title of the dialog [`prompt`] reads whole and over its options — `5:06 AM` in `PDT` of
+/// `Access resets at 5:06 AM PDT.` ([`fixtures::LIMIT_DIALOG_ACCOUNT`]).
 #[must_use]
 pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
     let p = prompt(rows)?;
@@ -1072,15 +1079,24 @@ pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
     })
 }
 
-/// The box on `rows`, read whole ([`PromptV2`]): its title (an approval box's tool row less its `?`; under `Action Required`, the tool's row below it), kind, question row and options with their roles — every role [`Role::Other`] unless the options run `1.`, `2.`, … with the cursor on exactly one and the box is named (its kind, the first row of its model-fallback dialog, or a box whose head is off the rows read that offers `Allow once`), and every role [`Role::Other`] on a question dialog of several questions (module header) — the command (the rows of the box drawn inside a shell or sandbox-expansion box), a file box's path (from its title), the question's text (an MCP, fetch or expansion box's too, the fallback dialog's message whole), its notes (the tab row of several questions, the review's answers, the expansion's `• …` rows), chosen by digit, and the Esc offered.
+/// The box on `rows`, read whole ([`PromptV2`]): its title (an approval box's tool row less its
+/// `?`; under `Action Required`, the tool's row below it), kind, question row and options with
+/// their roles — every role [`Role::Other`] unless the options run `1.`, `2.`, … with the cursor on
+/// exactly one and the box is named (its kind, the first row of its model-fallback dialog, or a box
+/// whose head is off the rows read that offers `Allow once`), and every role [`Role::Other`] on a
+/// question dialog of several questions — the command (the rows of the box drawn inside a shell or
+/// sandbox-expansion box), a file box's path (from its title), the question's text (an MCP, fetch
+/// or expansion box's too, the fallback dialog's message whole), its notes (the tab row of several
+/// questions, the review's answers, the expansion's `• …` rows), chosen by digit, and the Esc
+/// offered.
 #[must_use]
 pub fn prompt(rows: &[String]) -> Option<PromptV2> {
     read_box(rows).or_else(|| frame(rows).and_then(|f| kept_box(rows, f)))
 }
 
 /// The rows over the live zone that starts at row `live`, less the queue of
-/// messages the composer draws at its top (module header: `Queued (press ↑
-/// to edit):` two columns in, each message four in): what a box kept over
+/// messages the composer draws at its top (`Queued (press ↑ to edit):` two
+/// columns in, each message four in): what a box kept over
 /// the composer is the last thing of.
 fn over_the_queue(rows: &[String], live: usize) -> &[String] {
     let over = &rows[..live.min(rows.len())];
@@ -1100,7 +1116,7 @@ fn over_the_queue(rows: &[String], live: usize) -> &[String] {
 }
 
 /// The box drawn over the composer `f` with `ui.collapseDrawerDuringApproval
-/// = false` (module header): the last thing over its live zone, a queue of
+/// = false`: the last thing over its live zone, a queue of
 /// messages under it aside, read whole as [`read_box`] reads a box, with an
 /// option under the cursor (a box still pending, never a finished tool's
 /// box in the transcript) — and every option [`Role::Other`]: the composer

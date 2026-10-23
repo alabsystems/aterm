@@ -209,7 +209,8 @@ impl HumanInputStamp {
         Some(age.saturating_add(now_us.saturating_sub(at) / 1000))
     }
 
-    /// THE OUTGOING PROCESS'S STAMP, CARRIED (module header, "Across a seamless update"): a person last gave the session input `age_ms` before `now_us`, in the instance a seamless update adopted it from.
+    /// THE OUTGOING PROCESS'S STAMP, CARRIED: a person last gave the session input `age_ms` before
+    /// `now_us`, in the instance a seamless update adopted it from.
     #[cfg(any(unix, test))]
     pub(crate) fn carry(&self, age_ms: u64, now_us: u64) {
         self.carried_at.store(now_us, Ordering::Relaxed);
@@ -217,7 +218,8 @@ impl HumanInputStamp {
             .store(age_ms.saturating_add(1), Ordering::Release);
     }
 
-    /// THE HOST HAS SERVED THE SESSION WITH NO PERSON'S GESTURE (module header, "Never, and for how long"): `age_ms` before `now_us` it began, here or, carried, in the instance a seamless update adopted it from.
+    /// THE HOST HAS SERVED THE SESSION WITH NO PERSON'S GESTURE: `age_ms` before `now_us` it began,
+    /// here or, carried, in the instance a seamless update adopted it from.
     #[cfg(any(unix, test))]
     pub(crate) fn serve_from(&self, age_ms: u64, now_us: u64) {
         let now = i64::try_from(now_us).unwrap_or(i64::MAX);
@@ -255,7 +257,10 @@ impl HumanInputStamp {
 
 #[cfg(unix)]
 impl crate::App {
-    /// THE OUTGOING PROCESS'S STAMPS, WRITTEN RIGHT BEFORE ITS COMMIT'S ONE WRITE (module header, "Across a seamless update"): each carried session's age of its last person's gesture, in the attempt `nonce`'s person-stamps sidecar ([`crate::seamless::person_stamps_path`]), after the drain gate's last dispatch of input — a key the overlap passed through to a shell is in it.
+    /// THE OUTGOING PROCESS'S STAMPS, WRITTEN RIGHT BEFORE ITS COMMIT'S ONE WRITE: each carried
+    /// session's age of its last person's gesture, in the attempt `nonce`'s person-stamps sidecar
+    /// ([`crate::seamless::person_stamps_path`]), after the drain gate's last dispatch of input — a
+    /// key the overlap passed through to a shell is in it.
     pub(crate) fn write_person_stamps_at_commit(&self, nonce: &str) -> Option<std::path::PathBuf> {
         let path =
             crate::seamless::person_stamps_path(&crate::seamless::outgoing_manifest_path(nonce)?);
@@ -305,7 +310,11 @@ impl crate::App {
         }
     }
 
-    /// THE SUCCESSOR TAKES THE OUTGOING PROCESS'S STAMPS AT ITS COMMIT (module header, "Across a seamless update"): every adopted shell starts serving here, at the Commit — the outgoing process served it until now, and only its own row says how — then each one the sidecar names by its outgoing id carries its keyed age ([`HumanInputStamp::carry`]) or how long it was served unkeyed ([`HumanInputStamp::serve_from`]).
+    /// THE SUCCESSOR TAKES THE OUTGOING PROCESS'S STAMPS AT ITS COMMIT: every adopted shell starts
+    /// serving here, at the Commit — the outgoing process served it until now, and only its own row
+    /// says how — then each one the sidecar names by its outgoing id carries its keyed age
+    /// ([`HumanInputStamp::carry`]) or how long it was served unkeyed
+    /// ([`HumanInputStamp::serve_from`]).
     pub(crate) fn take_carried_person_stamps(&mut self) {
         let now_us = crate::metrics::now_us();
         for session in self.pool.iter() {
@@ -403,7 +412,8 @@ pub(crate) fn reaches_program(
     }
 }
 
-/// Whether `ev` is a person's deliberate gesture toward a session (see the module doc): everything but a key release, bare pointer motion, a focus change and a geometry change.
+/// Whether `ev` is a person's deliberate gesture toward a session: everything but a key or button
+/// release, bare pointer motion, a focus change and a geometry change.
 pub(crate) const fn is_person_gesture(ev: &InputEvent) -> bool {
     match ev {
         InputEvent::Key { event_type, .. } => {

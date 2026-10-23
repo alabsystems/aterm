@@ -13,8 +13,6 @@ const CODEX_INSERT: &[u8] = b"\x1b[1;3r\x1b[3;1H\r\nX\x1b[r";
 fn codex_top_anchored_decstbm_output_enters_scrollback() {
     let mut term = Terminal::new(5, 10);
 
-    // Seed five rows, then replay Codex's insert_history bytes for a three-row history
-    // area: DECSTBM 1..3, CUP to its bottom, CRLF to make room, print, reset margins.
     term.process(SEED_ROWS);
     term.process(CODEX_INSERT);
 
@@ -94,15 +92,10 @@ fn ordinary_full_screen_scrollback_does_not_bump_piecewise_row_revision() {
 fn codex_scroll_keeps_footer_metadata_on_its_content_in_parser_order() {
     let mut term = Terminal::new(5, 10);
     term.process(SEED_ROWS);
-
-    // Attach every public durable metadata shape to the last footer row.
     term.process(b"\x1b[5;1H\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
     term.add_named_mark("footer");
     term.add_annotation("footer annotation");
 
-    // Finish with a new OSC marker in the same parser batch. Existing anchors
-    // must move with the protected footer, while this post-scroll anchor must
-    // be created directly in the new coordinate space (and never shifted twice).
     let mut batch = CODEX_INSERT.to_vec();
     batch.extend_from_slice(b"\x1b[5;1H\x1b]133;A\x07");
     term.process(&batch);
@@ -146,9 +139,6 @@ fn codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection() {
     term.process(SEED_ROWS);
     term.process(CODEX_INSERT);
 
-    // Read one row into the newly-created history and select from live history
-    // content (B) through protected-footer content (D). Selection coordinates
-    // are terminal-relative even while the viewport is pinned.
     term.scroll_display(1);
     let offset_before = term.grid().display_offset();
     let top_before = term.display_row_text(0).expect("pinned top row");
@@ -161,8 +151,6 @@ fn codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection() {
         selection.complete_selection();
     }
 
-    // Replay the exact Codex insert_history batch while the user is reading
-    // scrollback. B enters history, D stays fixed below the DECSTBM margin.
     term.process(CODEX_INSERT);
 
     assert_eq!(
@@ -202,8 +190,6 @@ fn codex_scroll_repins_viewport_and_piecewise_reanchors_active_selection() {
     );
 }
 
-/// A blank separator line streamed through Codex's insert-history protocol, one scroll
-/// per line, follows the line before it into history as an empty line.
 #[test]
 fn codex_streamed_blank_separator_line_is_archived() {
     let mut term = Terminal::new(5, 10);
@@ -212,8 +198,6 @@ fn codex_streamed_blank_separator_line_is_archived() {
         term.process(seq.as_bytes());
     }
 
-    // The first three scrolls displace never-written rows (dropped); the next three
-    // displace A, the separator and B, in order.
     assert_eq!(
         term.grid().scrollback_lines(),
         3,
@@ -235,7 +219,6 @@ fn codex_streamed_blank_separator_line_is_archived() {
     }
 }
 
-/// Insert-history scrolls that displace never-written rows mint no history.
 #[test]
 fn codex_fresh_session_never_written_scrolls_mint_no_history() {
     let mut term = Terminal::new(24, 80);
@@ -250,14 +233,10 @@ fn codex_fresh_session_never_written_scrolls_mint_no_history() {
     );
 }
 
-/// A rows-only grow reveals the archived transcript at the top with no blank band, and
-/// the cursor rides its content line down, so post-SIGWINCH repaints and CPR answers
-/// anchor on it.
 #[test]
 fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
     let mut term = Terminal::new(24, 80);
 
-    // Codex's first paint: a UI block filling the top rows.
     for (row, text) in [
         "codex-banner",
         "model: gpt",
@@ -271,7 +250,6 @@ fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
         let seq = format!("\x1b[{};1H{text}", row + 1);
         term.process(seq.as_bytes());
     }
-    // Three insert-history scrolls displace the top three written rows.
     for i in 0..3u8 {
         let seq = format!("\x1b[1;20r\x1b[20;1H\r\nT{i}\x1b[r");
         term.process(seq.as_bytes());
@@ -281,14 +259,10 @@ fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
         3,
         "written displaced rows archive exactly as before"
     );
-    // The prompt line, cursor parked on it.
     term.process(b"\x1b[21;1Hprompt>\x1b[21;8H");
 
-    // Window -> fullscreen: rows-only grow.
     term.resize(72, 80);
 
-    // The revealed rows hold the archived lines in order from visual row 0, with no
-    // blank band above them.
     for (row, expected) in ["codex-banner", "model: gpt", "dir: ~/aterm"]
         .into_iter()
         .enumerate()
@@ -300,7 +274,6 @@ fn codex_fullscreen_grow_reveals_transcript_not_blanks_and_cursor_rides() {
         );
     }
 
-    // The cursor rides its content line down through the reveal.
     let cur = term.grid().cursor();
     assert_eq!(
         term.display_row_text(cur.row as usize)

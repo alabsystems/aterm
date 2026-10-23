@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CRASH RESTORE'S SOAK.
+//! Evaluates crash-restore soak criteria from recovery ledger rows.
 
 use crate::recovery_ledger::{EndClass, KeeperAtLaunch, Restores, Row};
 
@@ -23,7 +23,6 @@ pub const P4: Bar = Bar {
     min_exact_permille: 900,
 };
 
-/// Seconds in a day.
 const DAY: u64 = 86_400;
 
 /// One judged criterion: its name, whether the evidence meets the bar, and what it read.
@@ -55,9 +54,9 @@ pub struct Soak {
     pub streak_since: Option<u64>,
     /// Launches in that streak whose keeper answered at boot (`keeper=on`).
     pub streak_on: u32,
-    /// See [`Self::streak_on`].
+    /// Launches in that streak whose link was armed for an update's Commit (`keeper=armed`).
     pub streak_armed: u32,
-    /// See [`Self::streak_on`].
+    /// Launches in that streak whose keeper did not answer (`keeper=absent`).
     pub streak_absent: u32,
     /// Launches that recovered sessions after an unexpected end.
     pub kills_recovered: u32,
@@ -73,7 +72,8 @@ pub struct Soak {
     pub unclassified_recoveries: u32,
     /// Kills the keeper should have brought back and did not.
     pub misses: Vec<Miss>,
-    /// The judged criteria, in the order the module doc lists them.
+    /// The judged criteria: `keeper-on`, `real-kills`, `exact`, `none-blank` and `no-miss`, in that
+    /// order.
     pub criteria: Vec<Criterion>,
 }
 
@@ -147,13 +147,10 @@ impl Soak {
     }
 }
 
-/// Whether a row's link counts toward the streak: on, armed or absent (the link was on,
-/// whatever answered it).
 fn streak_link(row: &Row) -> Option<KeeperAtLaunch> {
     row.keeper.filter(|k| k.link_on())
 }
 
-/// `n` of `d` in thousandths, rounded down; 0 of 0 is 0.
 fn permille(n: u32, d: u32) -> u32 {
     if d == 0 {
         return 0;
@@ -162,7 +159,6 @@ fn permille(n: u32, d: u32) -> u32 {
     u32::try_from(p).unwrap_or(u32::MAX)
 }
 
-/// `p` thousandths as a percentage with one decimal (`93.7%`).
 fn percent(p: u32) -> String {
     format!("{}.{}%", p / 10, p % 10)
 }
@@ -196,8 +192,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
         let killed = row.prev.class.is_unexpected();
         match (&row.restores, killed) {
             (Some(r), true) => {
-                // A recovery that refused every offer brought nothing back: its refusals
-                // count against `exact` and `no-miss`, and it is no recovered kill.
                 if r.recovered() > 0 {
                     kills_recovered = kills_recovered.saturating_add(1);
                     kills_in_flight =
@@ -214,10 +208,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
                 }
             }
             (None, true) if row.keeper == Some(KeeperAtLaunch::On) => {
-                // The killed run's own row, when the ledger still holds it: was its keeper
-                // link on? Then its terminals were registered with whichever keeper answered
-                // it, at boot (`on`), at its Commit (`armed`) or since (`absent`: the link
-                // registers with the first keeper that answers).
                 let Some(killed_pid) = row.prev.pid else {
                     continue;
                 };
@@ -339,8 +329,6 @@ pub fn judge(rows: &[Row], now: u64, bar: &Bar) -> Soak {
     }
 }
 
-/// Add one recovery's [`Restores`] to a running sum (the `restore_why` words by word, in
-/// the order each was first seen).
 fn add(sum: &mut Restores, r: &Restores) {
     sum.exact = sum.exact.saturating_add(r.exact);
     sum.screen = sum.screen.saturating_add(r.screen);

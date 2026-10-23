@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Native Linux worker and immutable handoff to the one release cutter. A handoff is
-//! local provenance, not a release signature: only `ship cut` admits its exact bytes into
-//! the appcast, before signing and the draft upload.
+//! Native Linux worker and immutable handoff to the one release cutter.
 
 use aterm_uds::spawnfd::{Command, command};
 use std::fs::{self, File, OpenOptions};
@@ -32,44 +30,31 @@ pub struct Artifact {
     pub compiler_provenance_sha256: String,
 }
 
-/// The directory is fixed before the claim. The first successful import freezes the
-/// complete pair, not just paths that could change under a resumed cut.
+/// The directory is fixed before the claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
     pub directory: PathBuf,
     pub targets: Vec<String>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
-    /// The native hosts the cutter drives itself (`--linux-worker`), journaled so a resumed
-    /// cut still knows where each architecture is built. Empty: every worker runs by hand.
+    /// The native hosts the cutter drives itself (`--linux-worker`), journaled so a resumed cut
+    /// still knows where each architecture is built.
     #[serde(default)]
     pub workers: Vec<Worker>,
 }
 
-/// A native Linux host the cutter drives over ssh: `ARCH=DESTINATION:REPOSITORY` on the
-/// command line (`aarch64=buildhost:/home/me/src/aterm`).
-///
-/// The cutter runs `ship linux-build` there in a throwaway worktree of REPOSITORY detached
-/// at the claim commit, copies the executable and its receipt back into the handoff
-/// directory, and removes the remote run. The pair then goes through the same
-/// [`Handoff::import`] as a hand-carried pair, so a worker is trusted exactly as much as
-/// an operator carrying it: a mistaken or stale pair is refused, and only the host's own
-/// integrity rules out hostile bytes with a matching receipt. No credential crosses to it.
+/// A native Linux host the cutter drives over ssh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     /// The Linux target triple this host builds natively.
     pub target: String,
     /// The ssh destination (`host` or `user@host`, an ssh config alias included).
     pub destination: String,
-    /// The aterm checkout on that host that the throwaway worktree comes from:
-    /// absolute, or `~/`-relative to the remote login.
+    /// The aterm checkout on that host that the throwaway worktree comes from: absolute, or
+    /// `~/`-relative to the remote login.
     pub repository: String,
 }
 
-/// The ssh options on every worker call: `BatchMode`, since the launchd-hosted cut cannot
-/// answer a prompt; timeouts, so a dead host fails the step instead of holding the release
-/// lock forever; and no forwarding, so a user's `ForwardAgent yes` cannot hand the
-/// publisher's agent to a build host.
 const SSH_OPTIONS: [&str; 14] = [
     "-o",
     "BatchMode=yes",
@@ -87,19 +72,6 @@ const SSH_OPTIONS: [&str; 14] = [
     "ClearAllForwardings=yes",
 ];
 
-/// The shell a worker runs, fed to `bash -l -s` on stdin so no script text is re-quoted
-/// through ssh's argv join. Its arguments are validated [`Worker`] fields and cut
-/// identity, each one shell-safe word. The build talks on stderr (streamed to the
-/// operator); stdout's last line is the private directory holding the pair (a login file
-/// may print before it).
-///
-/// The body is one function called with stdin from `/dev/null`: bash parses all of it
-/// before running any, so nothing the build runs can read the script off the pipe. Each
-/// run gets its own `mktemp -d`. The build runs in the clone's one release cache
-/// (`crate::snapshot::CacheRoot`), held by one take at a time (`CacheHold`), so an
-/// orphaned earlier run is waited for, never built beside. `umask 077` because the worker
-/// refuses a group- or other-writable target root, which a login's `umask 002` (Ubuntu's
-/// default) makes.
 const WORKER_SCRIPT: &str = r#"main() {
 set -eu
 umask 077
@@ -128,8 +100,6 @@ printf '%s\n' "$out"
 main "$@" </dev/null
 "#;
 
-/// One shell-safe word: nothing a remote shell would split, glob, expand or
-/// read as an option.
 fn shell_word(value: &str, extra: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('-')
@@ -138,9 +108,6 @@ fn shell_word(value: &str, extra: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c) || extra.contains(c))
 }
 
-/// Whether `directory` already holds this cut's valid pair for `target`: the receipt
-/// parses, names exactly this version, build, commit and architecture, and the executable
-/// matches it.
 fn pair_is_current(
     directory: &Path,
     target: LinuxTarget,
@@ -204,10 +171,6 @@ impl Worker {
         })
     }
 
-    /// Build this worker's architecture at the claim and copy its pair into `directory`,
-    /// unless this cut's valid pair is already there (a resumed cut, or one carried by
-    /// hand). Anything else under those names (another build's pair, a torn copy) is
-    /// removed and rebuilt, so a stale file never stops a cut after its claim.
     fn run(&self, directory: &Path, version: &str, build: u64, commit: &str) -> Result<(), String> {
         let target = target(&self.target)?;
         check_identity(version, build, commit)?;
@@ -287,8 +250,6 @@ impl Worker {
                 self.destination
             ));
         }
-        // Copy into a private staging directory, then rename into place, receipt last: an
-        // interrupted copy never leaves a pair that looks whole.
         let staging = directory.join(format!(".worker-{arch}"));
         match fs::remove_dir_all(&staging) {
             Ok(()) => {}
@@ -315,7 +276,6 @@ impl Worker {
                 .map_err(|e| format!("move the Linux worker's {file} into place: {e}"))?;
         }
         let _ = fs::remove_dir(&staging);
-        // Best effort: the remote run directory is scratch once the pair is here.
         let _ = command("ssh")
             .args(SSH_OPTIONS)
             .args([
@@ -528,8 +488,7 @@ impl Handoff {
         })
     }
 
-    /// Run every declared [`Worker`] whose pair is not in the handoff directory yet. An
-    /// architecture with no worker is left for [`Self::import`] to ask the operator for.
+    /// Run every declared [`Worker`] whose pair is not in the handoff directory yet.
     pub fn run_workers(&self, version: &str, build: u64, commit: &str) -> Result<(), String> {
         private_directory(&self.directory)?;
         for worker in &self.workers {
@@ -538,8 +497,7 @@ impl Handoff {
         Ok(())
     }
 
-    /// Import every declared architecture's pair (all are required) into `dist`. The
-    /// default target set is both; an explicit subset advertises only those platforms.
+    /// Import every declared architecture's pair (all are required) into `dist`.
     pub fn import(
         &mut self,
         dist: &Path,
@@ -655,8 +613,6 @@ impl Handoff {
 fn private_directory(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
     let uid = super::current_release_uid()?;
-    // Input paths may be outside the checkout. Unlike a source take, they do
-    // not inherit the repository's ancestry proof, so inspect every component.
     for ancestor in path.ancestors() {
         let metadata = fs::symlink_metadata(ancestor).map_err(|e| e.to_string())?;
         let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
@@ -723,7 +679,6 @@ fn clean_head(repo: &Path, commit: &str) -> Result<(), String> {
         command("git").args(["rev-parse", "HEAD"]).current_dir(repo),
         "Linux worker source HEAD",
     )?;
-    // The one clean-tree judge (`gates::dirty_paths`, the Trust lane's rule).
     let dirty = crate::gates::dirty_paths(repo).map_err(|e| e.to_string())?;
     if head.trim() != commit || !dirty.is_empty() {
         return Err(
@@ -738,10 +693,7 @@ fn output_text(command: &mut Command, what: &str) -> Result<String, String> {
         .map_err(|e| format!("{what} is not UTF-8: {e}"))
 }
 
-/// A local-only worker: no credentials, signing, release API or upload code is reachable
-/// from here. Source and dependencies come from the same snapshot of git objects as the
-/// Mac cutter's (`crate::snapshot`), and `build_one` with no target is always the Trust
-/// native lane.
+/// A local-only worker: no credentials, signing, release API or upload code is reachable from here.
 pub fn run_worker(
     repo: &Path,
     out: &Path,
@@ -901,7 +853,6 @@ pub fn run_worker(
 mod tests {
     use super::*;
 
-    /// A private (0700) scratch directory, removed on drop.
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::Builder::new()
             .prefix("aterm-linux-handoff-")
@@ -910,7 +861,6 @@ mod tests {
     }
 
     fn fixture(dir: &Path, target: LinuxTarget) -> Artifact {
-        // A synthetic ELF header only: unit-test data, never executable output.
         let mut bytes = vec![0u8; 80];
         bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
         bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
@@ -1106,9 +1056,6 @@ mod tests {
         );
     }
 
-    /// Linux is declared, never defaulted away: a real cut that names neither
-    /// --linux-artifacts nor --mac-only is refused pre-claim, a contradiction is
-    /// refused, and a resume cannot change where the artifacts come from.
     #[test]
     fn a_real_cut_declares_its_linux_shape() {
         let parse = |args: &[&str]| {
@@ -1199,7 +1146,6 @@ mod tests {
         );
         fixture(dir.path(), target);
         assert!(pair_is_current(dir.path(), target, "0.100.0", 100, &commit));
-        // A dry run's (or a failed claim's) pair: same file names, other build.
         assert!(!pair_is_current(
             dir.path(),
             target,
@@ -1221,7 +1167,6 @@ mod tests {
             100,
             &commit
         ));
-        // A torn copy: the executable no longer matches its receipt.
         let asset = dir.path().join(target.asset_name("0.100.0"));
         let mut bytes = fs::read(&asset).unwrap();
         bytes.truncate(70);
@@ -1237,8 +1182,6 @@ mod tests {
 
     #[test]
     fn the_worker_script_is_parsed_whole_before_it_runs() {
-        // `umask 077`: a login's `umask 002` made a target root the worker refuses (the
-        // first live run).
         assert!(WORKER_SCRIPT.starts_with("main() {\n"));
         assert!(WORKER_SCRIPT.trim_end().ends_with("main \"$@\" </dev/null"));
         assert!(WORKER_SCRIPT.contains("umask 077"));

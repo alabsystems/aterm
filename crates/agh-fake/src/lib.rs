@@ -501,7 +501,7 @@ impl FakeGithub {
 
     /// Overrides which release `releases/latest` serves for `slug`.
     /// # Panics
-    /// Panics if `slug` or `release_id` does not exist.
+    /// Panics if repository `slug` does not exist.
     pub fn set_latest(&self, slug: &str, release_id: Option<u64>) {
         self.state().set_latest(slug, release_id);
     }
@@ -557,7 +557,7 @@ impl FakeGithub {
 
     /// Schedules `change` to run after the `count`-th request matching `m`.
     /// # Panics
-    /// Panics if `count == 0`.
+    /// Panics if `change` names a release or repository the fake does not hold now.
     pub fn after(&self, m: Match, count: usize, change: Change) {
         self.state().after(m, count, change);
     }

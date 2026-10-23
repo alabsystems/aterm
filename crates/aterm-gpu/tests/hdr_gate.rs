@@ -428,6 +428,12 @@ fn palette_input(
 /// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))` capped at 3x and clamped to the
 /// headroom. Measured on the real pipeline as crowned minus pass-less, over the
 /// palette:
+///
+///   * every coloured mark is multiplied by exactly 1.0;
+///   * every white core climbs, and a white core is brighter than a coloured
+///     mark of the same coverage on the same channel;
+///   * the pixels over reference white are exactly the predicted ones, none
+///     within 3 % of the boundary.
 #[test]
 #[cfg(wgpu_arm)]
 fn only_the_whitest_cores_exceed_reference_white() {

@@ -58,9 +58,15 @@ pub trait FromAbi: Sized + Describe {
 
     /// The value the glue lowered into `w0`, `w1`.
     /// # Safety
-    /// The words are this type's lowering as the glue writes it (module docs): a pointer and length name a live allocation of exactly that many elements, made by [`crate::mem::alloc`] at the element's alignment, which this call takes ownership of.
+    /// The words are this type's lowering as the glue writes it
+    /// ([`crate::descriptor::Ty::param_words`]): a pointer and length name a live allocation of
+    /// exactly that many elements, made by [`crate::mem::alloc`] at the element's alignment, which
+    /// this call takes ownership of. A string's bytes are UTF-8, as the glue's `TextEncoder` writes
+    /// them; a release build does not check that.
     /// # Errors
-    /// [`Thrown::Error`] when the words are no value of the type (an invalid `char`; in a debug build, a string that is not UTF-8).
+    /// [`Thrown::Error`] when the words are no value of the type (an invalid
+    /// `char`; in a debug build, a string that is not UTF-8). Ownership was
+    /// still taken.
     unsafe fn from_abi(w0: Self::W0, w1: Self::W1) -> Result<Self, Thrown>;
 }
 
@@ -502,6 +508,7 @@ mod tests {
 
     #[test]
     fn scalars_cross_as_wasm_bindgen_casts_them() {
+        // SAFETY (each from_abi below): scalars carry no memory.
         unsafe {
             assert_eq!(bool::from_abi(2, 0), Ok(true));
             assert_eq!(bool::from_abi(0, 0), Ok(false));

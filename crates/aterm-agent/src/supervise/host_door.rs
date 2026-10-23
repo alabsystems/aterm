@@ -403,8 +403,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
 
     /// Takes the machine's pace for a line of `rule` in a hold begun at `hold_since_ms` (unix
     /// ms), with one free build slot's reservation for a slot rule, together; or holds or refuses
-    /// the line ([`crate::supervise::occupancy::PaceGrant`]). Asked under `occupancy = "prompt"`
-    /// alone, last before the intent row. The default host keeps no machine pace.
+    /// the line ([`crate::supervise::occupancy::PaceGrant`]). For a slot rule the host re-reads
+    /// its board first and answers the reading the line will type
+    /// ([`crate::supervise::occupancy::PaceGrant::Room`]), or holds it there. Asked under
+    /// `occupancy = "prompt"` alone, last before the intent row. The default host keeps no
+    /// machine pace and no board.
     act fn occupancy_pace(
         &self,
         rule: crate::supervise::occupancy::RuleId,

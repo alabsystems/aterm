@@ -2,24 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The parser's partial state on the seamless-handoff wire
-//! ([`CheckpointMeta::parser`](super::CheckpointMeta::parser)).
-//!
-//! [`ParserRepr`] is [`ParserCarry`] in serde shape: the state by name (a
-//! later build may renumber the enum, never rename a state it still has), byte
-//! strings as lowercase hex, empty fields omitted. Converting back checks only
-//! that it reads; whether a parser may take the carry is
-//! [`aterm_parser::Parser::restore_carry`]'s decision, made in
-//! `Terminal::restore_checkpoint`.
-//!
-//! The carry crosses builds in both directions, so a carry an older build would
-//! refuse rides in the form that build reads, with the exact one under
-//! [`ParserRepr::exact`]: a DCS header goes out as `{"state":"DcsIgnore","exact":{…}}`.
-//! An older build reads the `DcsIgnore` and ignores the key; this build reads `exact`.
+//! Parser partial state on the seamless-handoff wire ([`CheckpointMeta::parser`](super::CheckpointMeta::parser)).
 
 use aterm_parser::{ParserCarry, State, TmuxPassthrough};
 
-/// [`ParserCarry`] on the handoff wire (see the module docs).
+/// [`ParserCarry`] on the handoff wire.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParserRepr {
     /// [`State::name`] of the parser state.
@@ -54,21 +41,13 @@ pub struct ParserRepr {
     /// The length of the character `utf8_tail` begins.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub utf8_expected: u8,
-    /// The head of a split UTF-8 character a DCS or APC string's payload ends in,
-    /// hex. An older build ignores it (and reads the string's next `0x9C` as its ST).
+    /// The head of a split UTF-8 character a DCS or APC string's payload ends in, hex.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub string_utf8_tail: String,
-    /// The tmux passthrough wrapper the parser stands in or at the head of
-    /// ([`aterm_parser::TmuxPassthrough::name`]: `head1`..`head4`, `open`,
-    /// `escape`), absent for none. An older build ignores it and reads the rest of
-    /// the wrapper bare, as it read every wrapper.
+    /// The tmux passthrough wrapper name ([`aterm_parser::TmuxPassthrough::name`]), or empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tmux: String,
-    /// The carry itself, when the fields beside it are the coarser form an older
-    /// build reads instead ([`ParserCarry::for_older_builds`]): a DCS header, which
-    /// such a build refuses (it would resume at Ground and print the string), rides
-    /// beside a `DcsIgnore`. Older builds ignore the key; this one reads only it, one
-    /// level deep.
+    /// Exact carry when outer fields hold the coarser form for older builds ([`ParserCarry::for_older_builds`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact: Option<Box<ParserRepr>>,
 }
@@ -110,7 +89,6 @@ fn to_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// Decode hex; `None` for an odd length or a non-hex digit.
 fn from_hex(hex: &str) -> Option<Vec<u8>> {
     let (pairs, rest) = hex.as_bytes().as_chunks::<2>();
     if !rest.is_empty() {
@@ -127,9 +105,7 @@ fn from_hex(hex: &str) -> Option<Vec<u8>> {
 }
 
 impl ParserRepr {
-    /// The wire form of `carry`: its fields, or the fields of the form a build
-    /// that predates it reads ([`ParserCarry::for_older_builds`]) with the
-    /// carry itself under [`Self::exact`].
+    /// Convert `carry` into its wire representation, nesting under [`Self::exact`] when needed for older builds.
     #[must_use]
     pub fn from_carry(carry: &ParserCarry) -> Self {
         match carry.for_older_builds() {
@@ -141,7 +117,6 @@ impl ParserRepr {
         }
     }
 
-    /// `carry`'s own fields, with no [`Self::exact`].
     fn fields(carry: &ParserCarry) -> Self {
         Self {
             state: carry.state.name().to_owned(),
@@ -161,16 +136,14 @@ impl ParserRepr {
         }
     }
 
-    /// The carry this names — [`Self::exact`] when there is one, else these
-    /// fields — or `None` for an unknown state name or non-hex bytes. Not a
-    /// validation of the carry (see the module docs).
+    /// Decode the carry ([`Self::exact`] when present), or `None` for an unknown state or tmux name
+    /// or invalid hex.
     #[inline]
     #[must_use]
     pub fn to_carry(&self) -> Option<ParserCarry> {
         self.exact.as_deref().unwrap_or(self).fields_to_carry()
     }
 
-    /// The carry these fields name, [`Self::exact`] aside.
     fn fields_to_carry(&self) -> Option<ParserCarry> {
         Some(ParserCarry {
             state: State::from_name(&self.state)?,
@@ -244,8 +217,6 @@ mod tests {
         let repr = ParserRepr::from_carry(&string);
         assert_eq!(repr.string_utf8_tail, "e6");
         assert_eq!(repr.to_carry(), Some(string));
-        // A tmux passthrough wrapper: its head, and an open one at its ESC
-        // with the payload's own CSI beside it.
         for (carry, name) in [
             (
                 ParserCarry {
@@ -279,9 +250,6 @@ mod tests {
         assert_eq!(unknown.to_carry(), None, "a wrapper no build writes");
     }
 
-    /// A DCS header rides under `exact` beside the empty `DcsIgnore` an older build
-    /// reads and restores; this build reads the header. An older producer's
-    /// `DcsIgnore` reads as meant, and a carry an older build reads as-is has no `exact`.
     #[test]
     fn a_dcs_header_rides_beside_the_form_an_older_build_reads() {
         let header = ParserCarry {
@@ -360,7 +328,6 @@ mod tests {
         ] {
             assert_eq!(repr.to_carry(), None, "{repr:?}");
         }
-        // Negative control: the same shapes, well formed, read.
         assert!(
             ParserRepr {
                 state: "Ground".into(),

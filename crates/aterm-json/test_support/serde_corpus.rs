@@ -1,24 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Recorded answers for the serde corpus: what aterm's models do with a
-//! document, holding first-party serde to the reference verdicts.
-//!
-//! Each crate whose models carry a persistence or security surface includes
-//! this file by `#[path]` and records one case per input: an `Ok` as the value
-//! written back out (re-serialized bytes, or the value's `Debug` where the
-//! model has no `Serialize`), an `Err` as its `Display` text. The answers live
-//! in `<crate>/tests/fixtures/serde-corpus/<name>.txt`, one case per line, and
-//! are compared whole: a changed, missing or new case is a red that names its
-//! id. `ATERM_BLESS_SERDE_CORPUS=1` rewrites the file instead; a re-record
-//! belongs in a commit that says which answer moved and why. The variable is
-//! this corpus's own, so blessing another crate's goldens (`ATERM_BLESS_GOLDEN`)
-//! never re-records an answer the serde switch is held to.
+//! Recorded-answer harness for the serde corpus.
 
 use std::fmt::Write as _;
 
-/// An `Ok` answer longer than this is pinned by digest and length rather than
-/// spelled out (a fixture's re-serialized manifest, a checkpoint's meta).
 const VERBATIM_MAX: usize = 4096;
 
 pub(crate) struct Corpus {
@@ -82,9 +68,6 @@ impl Corpus {
         if let Some(pair) = ids.windows(2).find(|pair| pair[0] == pair[1]) {
             panic!("{}: case id {:?} is recorded twice", self.name, pair[0]);
         }
-        // NEGATIVE CONTROL: a corpus whose every case answers alike (a harness
-        // that records nothing, an input that never reaches the model) cannot
-        // tell one serde from another.
         for verdict in ["ok", "err"] {
             assert!(
                 self.cases.iter().any(|(_, v, _)| *v == verdict),
@@ -105,7 +88,6 @@ impl Corpus {
         got
     }
 
-    /// Panic, naming each moved answer, unless `got` is the committed file.
     fn compare(&self, got: &str) {
         let want = std::fs::read_to_string(&self.path).unwrap_or_else(|e| {
             panic!(
@@ -113,9 +95,6 @@ impl Corpus {
                 self.path
             )
         });
-        // A Windows checkout under `core.autocrlf` ends each line CRLF; an
-        // answer's own carriage return is always written escaped, so a raw one
-        // is only ever the checkout's.
         let want = want.replace("\r\n", "\n");
         if want == got {
             return;

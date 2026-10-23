@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ConPTY backend's FFI: direct `extern "system"` declarations against kernel32 (std
-//! already links it), ntdll (`NtOpenFile`, the ConDrv opens the OpenConsole launch needs,
-//! and `NtQueryInformationProcess`, a process's parent read through its handle) and
-//! version.dll (an OpenConsole's file version, for the host report), all three system
-//! DLLs. Handles are plain `isize`, so the session registry is `Send + Sync` without unsafe
-//! impls; struct layouts are transcribed from the Windows SDK.
+//! ConPTY Win32 FFI against `kernel32`, `ntdll`, and `version.dll`. Handles are plain `isize` so
+//! the session registry is `Send + Sync` without unsafe impls.
 
-// Win32 ABI names are kept verbatim (PascalCase fields, SCREAMING struct names)
-// so they can be checked against the SDK headers line by line.
 #![allow(non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
 
 use std::ffi::c_void;
@@ -29,8 +23,7 @@ pub(crate) const CREATE_UNICODE_ENVIRONMENT: u32 = 0x400;
 /// `CreateProcessW` flag: create the primary thread suspended, so no child instruction
 /// runs before confinement and `ResumeThread`.
 pub(crate) const CREATE_SUSPENDED: u32 = 0x4;
-/// `STARTUPINFOW.dwFlags`: honor the `hStd*` fields. Set with NULL handles to suppress
-/// the Win8+ std-handle auto-duplication (see the spawn).
+/// Set with NULL handles to suppress Win8+ std-handle auto-duplication.
 pub(crate) const STARTF_USESTDHANDLES: u32 = 0x100;
 /// `GetLastError` after `ReadFile` when the pipe's write side is gone (EOF).
 pub(crate) const ERROR_BROKEN_PIPE: u32 = 109;
@@ -46,10 +39,7 @@ pub(crate) const INFINITE: u32 = 0xFFFF_FFFF;
 pub(crate) const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 /// `JOBOBJECTINFOCLASS::JobObjectExtendedLimitInformation`.
 pub(crate) const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
-/// `ABOVE_NORMAL_PRIORITY_CLASS`, the focus-boost class: the shell's line editor
-/// preempts NORMAL background load, while its children still start at NORMAL (a child
-/// inherits only an IDLE/BELOW_NORMAL class), so a build it launches cannot starve the
-/// terminal.
+/// Focus-boost class: preempts NORMAL background load without passing to children.
 pub(crate) const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x8000;
 /// `NORMAL_PRIORITY_CLASS` — the blur restore class.
 pub(crate) const NORMAL_PRIORITY_CLASS: u32 = 0x20;
@@ -57,17 +47,14 @@ pub(crate) const NORMAL_PRIORITY_CLASS: u32 = 0x20;
 pub(crate) const PROCESS_POWER_THROTTLING_CLASS: i32 = 4;
 /// `PROCESS_POWER_THROTTLING_STATE.Version` — current (only) version.
 pub(crate) const PROCESS_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
-/// Power-throttling bit (EcoQoS / efficiency cores): set in `ControlMask` with a clear
-/// `StateMask` bit to force throttling off; `ControlMask = 0` is system-managed.
+/// EcoQoS bit: set in `ControlMask` with a clear `StateMask` bit to force throttling off.
 pub(crate) const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
 /// `OpenProcess` access right: change priority/QoS only (least privilege for
 /// the conhost focus-boost handle).
 pub(crate) const PROCESS_SET_INFORMATION: u32 = 0x0200;
 /// `CreateToolhelp32Snapshot` flag: snapshot every process in the system.
 pub(crate) const TH32CS_SNAPPROCESS: u32 = 0x2;
-/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` — the ONLY inheritable handles a child
-/// created with `bInheritHandles = TRUE` receives (the OpenConsole launch hands
-/// it exactly four).
+/// Restricts inheritable handles a child created with `bInheritHandles = TRUE` receives.
 pub(crate) const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 /// `SetHandleInformation` mask/flag: the handle is inherited by children.
 pub(crate) const HANDLE_FLAG_INHERIT: u32 = 0x1;
@@ -110,12 +97,9 @@ pub(crate) const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
 /// Console output mode: VT sequences written are parsed, so a `?1049l` switches
 /// the screen buffer.
 pub(crate) const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-/// Console input mode: a `ReadConsoleW` returns a whole line the console edited
-/// (cmd.exe's prompt); PSReadLine, readline and reedline clear it and read raw.
+/// Set when `ReadConsoleW` returns cooked lines; cleared by raw line editors.
 pub(crate) const ENABLE_LINE_INPUT: u32 = 0x0002;
 
-/// `JOBOBJECT_BASIC_PROCESS_ID_LIST`, sized for [`JOB_PROCESS_IDS`] ids (a job
-/// holding more reports the first ones, which is all a probe of it needs).
 #[repr(C)]
 pub(crate) struct JOBOBJECT_BASIC_PROCESS_ID_LIST {
     pub NumberOfAssignedProcesses: u32,
@@ -123,16 +107,13 @@ pub(crate) struct JOBOBJECT_BASIC_PROCESS_ID_LIST {
     pub ProcessIdList: [usize; JOB_PROCESS_IDS],
 }
 
-/// `INPUT_RECORD`, as the one kind this crate writes: the `EventType` word,
-/// then the 16-byte event union, whose first field for a `MENU_EVENT_RECORD`
-/// is `dwCommandId` (the union is 4-aligned, so it starts at offset 4).
+/// `EventType` followed by the 16-byte 4-aligned event union (`Event[0]` is `dwCommandId`).
 #[repr(C)]
 pub(crate) struct INPUT_RECORD {
     pub EventType: u16,
     pub Event: [u32; 4],
 }
 
-/// `SMALL_RECT` — a console rectangle, edges inclusive.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SMALL_RECT {
@@ -142,7 +123,6 @@ pub(crate) struct SMALL_RECT {
     pub Bottom: i16,
 }
 
-/// `CONSOLE_SCREEN_BUFFER_INFO`; the clients read `srWindow` and `dwCursorPosition`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CONSOLE_SCREEN_BUFFER_INFO {
@@ -153,8 +133,7 @@ pub(crate) struct CONSOLE_SCREEN_BUFFER_INFO {
     pub dwMaximumWindowSize: [i16; 2],
 }
 
-/// `UNICODE_STRING` — the counted (NOT NUL-terminated) name `NtOpenFile` takes.
-/// Lengths are in BYTES.
+/// Counted (non-NUL-terminated) UTF-16 string with byte lengths.
 #[repr(C)]
 pub(crate) struct UNICODE_STRING {
     pub Length: u16,
@@ -162,8 +141,6 @@ pub(crate) struct UNICODE_STRING {
     pub Buffer: *mut u16,
 }
 
-/// `OBJECT_ATTRIBUTES` — the object name, the directory it is relative to, and
-/// the handle attributes (`OBJ_*`).
 #[repr(C)]
 pub(crate) struct OBJECT_ATTRIBUTES {
     pub Length: u32,
@@ -174,14 +151,12 @@ pub(crate) struct OBJECT_ATTRIBUTES {
     pub SecurityQualityOfService: *mut c_void,
 }
 
-/// `IO_STATUS_BLOCK` (64-bit layout: the NTSTATUS/PVOID union is pointer-sized).
 #[repr(C)]
 pub(crate) struct IO_STATUS_BLOCK {
     pub Status: isize,
     pub Information: usize,
 }
 
-/// `VS_FIXEDFILEINFO` — the numeric version block of a PE version resource.
 #[repr(C)]
 pub(crate) struct VS_FIXEDFILEINFO {
     pub dwSignature: u32,
@@ -199,7 +174,6 @@ pub(crate) struct VS_FIXEDFILEINFO {
     pub dwFileDateLS: u32,
 }
 
-/// `COORD` — ConPTY size in character cells.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct COORD {
@@ -207,8 +181,6 @@ pub(crate) struct COORD {
     pub y: i16,
 }
 
-/// `STARTUPINFOW` (64-bit layout). Only `cb` and `dwFlags` are set: the ConPTY pipes
-/// travel in the attribute list, not `hStd*`.
 #[repr(C)]
 pub(crate) struct STARTUPINFOW {
     pub cb: u32,
@@ -231,15 +203,12 @@ pub(crate) struct STARTUPINFOW {
     pub hStdError: HANDLE,
 }
 
-/// `STARTUPINFOEXW` — `STARTUPINFOW` plus the proc-thread attribute list that
-/// carries `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`.
 #[repr(C)]
 pub(crate) struct STARTUPINFOEXW {
     pub StartupInfo: STARTUPINFOW,
     pub lpAttributeList: *mut c_void,
 }
 
-/// `PROCESS_INFORMATION` — the child's process/thread handles + ids.
 #[repr(C)]
 pub(crate) struct PROCESS_INFORMATION {
     pub hProcess: HANDLE,
@@ -248,7 +217,6 @@ pub(crate) struct PROCESS_INFORMATION {
     pub dwThreadId: u32,
 }
 
-/// `JOBOBJECT_BASIC_LIMIT_INFORMATION`.
 #[repr(C)]
 pub(crate) struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
     pub PerProcessUserTimeLimit: i64,
@@ -262,7 +230,6 @@ pub(crate) struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
     pub SchedulingClass: u32,
 }
 
-/// `IO_COUNTERS`.
 #[repr(C)]
 pub(crate) struct IO_COUNTERS {
     pub ReadOperationCount: u64,
@@ -273,7 +240,6 @@ pub(crate) struct IO_COUNTERS {
     pub OtherTransferCount: u64,
 }
 
-/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`; only `LimitFlags` is set here.
 #[repr(C)]
 pub(crate) struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
     pub BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
@@ -284,8 +250,6 @@ pub(crate) struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
     pub PeakJobMemoryUsed: usize,
 }
 
-/// `PROCESS_POWER_THROTTLING_STATE` — the SetProcessInformation payload for
-/// the EcoQoS opt-in/out (see the `PROCESS_POWER_THROTTLING_*` consts).
 #[repr(C)]
 pub(crate) struct PROCESS_POWER_THROTTLING_STATE {
     pub Version: u32,
@@ -293,7 +257,6 @@ pub(crate) struct PROCESS_POWER_THROTTLING_STATE {
     pub StateMask: u32,
 }
 
-/// `PROCESSENTRY32W` (Toolhelp), for the spawn-time conhost discovery walk.
 #[repr(C)]
 pub(crate) struct PROCESSENTRY32W {
     pub dwSize: u32,
@@ -308,8 +271,6 @@ pub(crate) struct PROCESSENTRY32W {
     pub szExeFile: [u16; 260],
 }
 
-/// `PROCESS_BASIC_INFORMATION` (64-bit layout): the ids of a process and of the
-/// one that created it, read through a handle (`NtQueryInformationProcess`).
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct PROCESS_BASIC_INFORMATION {
@@ -321,8 +282,6 @@ pub(crate) struct PROCESS_BASIC_INFORMATION {
     pub InheritedFromUniqueProcessId: usize,
 }
 
-/// `FILETIME`: 100 ns ticks since 1601-01-01 UTC, in two halves
-/// (`GetProcessTimes`).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct FILETIME {
@@ -439,9 +398,7 @@ unsafe extern "system" {
         lpKernelTime: *mut FILETIME,
         lpUserTime: *mut FILETIME,
     ) -> i32;
-    /// `SetConsoleCtrlHandler(NULL, FALSE)` restores normal CTRL+C processing for this
-    /// process, the state a child inherits at `CreateProcessW`: the only public switch
-    /// for the "Ctrl+C ignored" flag `CREATE_NEW_PROCESS_GROUP` sets.
+    /// `SetConsoleCtrlHandler(NULL, FALSE)` restores inherited Ctrl+C processing.
     pub(crate) fn SetConsoleCtrlHandler(HandlerRoutine: *const c_void, Add: i32) -> i32;
     /// The pid behind a process HANDLE: the DefTerm adoption path's only way to learn
     /// the client's pid, since a handoff carries a handle, not a pid. 0 on failure.
@@ -485,7 +442,6 @@ unsafe extern "system" {
         lpTotalBytesAvail: *mut u32,
         lpBytesLeftThisMessage: *mut u32,
     ) -> i32;
-    /// appmodel.h: the full names of every installed package of a family.
     /// Returns a Win32 error code (0 = success).
     pub(crate) fn GetPackagesByPackageFamily(
         packageFamilyName: *const u16,
@@ -494,8 +450,7 @@ unsafe extern "system" {
         bufferLength: *mut u32,
         buffer: *mut u16,
     ) -> i32;
-    /// appmodel.h: the install folder of one package. Returns a Win32 error
-    /// code (0 = success).
+    /// Returns a Win32 error code (0 = success).
     pub(crate) fn GetPackagePathByFullName(
         packageFullName: *const u16,
         pathLength: *mut u32,
@@ -551,9 +506,7 @@ unsafe extern "system" {
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
-    /// Opens `\Device\ConDrv\Server` and its `\Reference` for the OpenConsole
-    /// launch — the two handles winconpty opens the same way. Returns an
-    /// NTSTATUS (negative = failure).
+    /// Opens `\Device\ConDrv\Server` and its `\Reference`; returns an NTSTATUS (negative = failure).
     pub(crate) fn NtOpenFile(
         FileHandle: *mut HANDLE,
         DesiredAccess: u32,
@@ -562,9 +515,7 @@ unsafe extern "system" {
         ShareAccess: u32,
         OpenOptions: u32,
     ) -> i32;
-    /// One class of facts about a process, read through a handle: here
-    /// [`PROCESS_BASIC_INFORMATION`], whose parent id kernel32 has no call for.
-    /// Returns an NTSTATUS (negative = failure).
+    /// Queries process information (such as [`PROCESS_BASIC_INFORMATION`]); returns an NTSTATUS.
     pub(crate) fn NtQueryInformationProcess(
         ProcessHandle: HANDLE,
         ProcessInformationClass: u32,
@@ -591,14 +542,11 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// RAII guard around a raw kernel HANDLE: closes on drop unless released via
-/// [`Handle::into_raw`], so every early return in the spawn closes exactly the handles
-/// it created.
+/// RAII guard around a raw kernel HANDLE that closes on drop unless released via [`Handle::into_raw`].
 pub(crate) struct Handle(HANDLE);
 
 impl Handle {
-    /// Take ownership of `raw` (0 / `INVALID_HANDLE_VALUE` are tolerated as
-    /// "nothing to close").
+    /// Takes ownership of `raw` (0 and `INVALID_HANDLE_VALUE` are ignored on drop).
     pub(crate) fn new(raw: HANDLE) -> Self {
         Self(raw)
     }
@@ -608,8 +556,7 @@ impl Handle {
         self.0
     }
 
-    /// Release ownership without closing (the success path hands the handle to
-    /// the session registry, whose `Drop` then owns the close).
+    /// Releases ownership without closing the handle.
     pub(crate) fn into_raw(mut self) -> HANDLE {
         std::mem::replace(&mut self.0, 0)
     }

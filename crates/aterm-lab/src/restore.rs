@@ -112,7 +112,7 @@ fn land_after(
     Ok((seen, typed))
 }
 
-/// Which Land run `restore` is (module docs).
+/// Which Land run `restore` is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Land {
     /// `--land`: the tab LANDED before aterm ends.
@@ -521,7 +521,7 @@ fn hold_of(door: &Door<'_>, sid: &str) -> String {
 }
 
 /// `--hold`'s report on the restarted instance: the held tab stays the
-/// holder's, its record names a lift the socket takes (module docs).
+/// holder's, its record names a lift the socket takes.
 fn held_report(
     run: &Run,
     door: &Door<'_>,

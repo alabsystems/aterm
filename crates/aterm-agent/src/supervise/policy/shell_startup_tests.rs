@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`read`] over fixture Claude Code directories and snapshots written the way
-//! 2.1.284 writes them (its `oMn`/`tMn`/`nMn`; the person's part from `zsh -f`
-//! 5.9 and bash 3.2.57 against a fake rc). Never the owner's files.
+//! Shell-startup policy tests over fixture Claude Code directories and snapshots.
 
 use super::*;
 
-/// A scratch directory, removed on drop.
 struct Scratch(aterm_tempfile::TempDir);
 
 impl Scratch {
@@ -35,7 +32,6 @@ impl Scratch {
         self.0.path().join("project")
     }
 
-    /// Write `text` as a snapshot of `kind` (`zsh`/`bash`) named by `ms`.
     fn snapshot(&self, kind: &str, ms: u64, text: &str) {
         let path = self
             .claude()
@@ -43,8 +39,6 @@ impl Scratch {
         std::fs::write(path, text).expect("write snapshot");
     }
 
-    /// A worker whose shell is `shell`, its Claude Code directory and home
-    /// this scratch's, plus `extra` (`KEY=value`).
     fn worker(&self, shell: &str, extra: &[&str]) -> WorkerEnv {
         let mut vars = vec![
             format!("HOME={}", self.home().display()),
@@ -60,8 +54,6 @@ impl Scratch {
     }
 }
 
-/// Claude Code's own part of a snapshot: the `rg` fallback, its
-/// `find`/`grep` shadows (ant-native builds) and `pkill` shadow, and `PATH`.
 const CLAUDE_TAIL: &str = "# Check for rg availability
 if ! (unalias rg 2>/dev/null; command -v rg) >/dev/null 2>&1; then
   alias rg='/opt/claude/rg'
@@ -80,9 +72,6 @@ function pkill {
 export PATH='/usr/bin:/bin'
 ";
 
-/// A zsh snapshot: the person's `functions`, the options a login `zsh -c`
-/// lists with an empty rc (`nohashdirs`, `login`) plus `options`, the default
-/// aliases plus `aliases`, then Claude Code's part.
 fn zsh_snapshot(functions: &str, options: &str, aliases: &str) -> String {
     format!(
         "# Snapshot file
@@ -99,10 +88,6 @@ alias -- which-command=whence
     )
 }
 
-/// A bash 3.2 snapshot: `shopt -p` as a login `bash -c` prints it with an
-/// empty rc, each of `shopts` (`name`, on) replacing its row, the person's
-/// `functions`, the `set -o` rows the snapshot's `grep "on"` keeps, plus
-/// `sets`, then the aliases and Claude Code's part.
 fn bash_snapshot(shopts: &[(&str, bool)], functions: &str, sets: &str, aliases: &str) -> String {
     let mut out = String::from(
         "# Snapshot file\n# Unset all aliases to avoid conflicts with functions\nunalias -a \
@@ -146,9 +131,7 @@ fn a_default_zsh_snapshot_fails_no_line_and_its_aliases_fail_the_lines_naming_th
     let why = state.admits("cd /tmp && ll").expect_err("an alias");
     assert!(why.contains("`ll` is an alias"), "{why}");
     assert!(state.admits("x; ll2 .").is_err(), "a function");
-    // Claude Code's own shadows are not the person's.
     assert_eq!(state.admits("find . -name x | grep y; rg z"), Ok(()));
-    // A path to the command, or a word only containing the name, is not it.
     assert_eq!(state.admits("/bin/ll x; ll-x; x.ll"), Ok(()));
     assert!(
         state.admits("\\ll").is_err(),
@@ -156,8 +139,6 @@ fn a_default_zsh_snapshot_fails_no_line_and_its_aliases_fail_the_lines_naming_th
     );
 }
 
-/// `setopt globsubst` in the snapshot globs a plain `$N`'s value; every option
-/// the models do not assume fails every line, the reason naming it.
 #[test]
 fn an_option_the_models_do_not_assume_fails_every_line_naming_it() {
     for opt in [
@@ -188,7 +169,6 @@ fn an_option_the_models_do_not_assume_fails_every_line_naming_it() {
         let why = s.read(&s.worker("/bin/zsh", &[])).expect_err(opt);
         assert!(why.contains(&format!("`setopt {opt}`")), "{opt}: {why}");
     }
-    // KSH_OPTION_PRINT turns the listing into `setopt X off` rows.
     let s = Scratch::new("zsh-kshprint");
     s.snapshot(
         "zsh",
@@ -196,7 +176,6 @@ fn an_option_the_models_do_not_assume_fails_every_line_naming_it() {
         &zsh_snapshot("", "setopt noaliases             off\n", ""),
     );
     assert!(s.read(&s.worker("/bin/zsh", &[])).is_err());
-    // Claude Code resets these two after the snapshot, on every command.
     let s = Scratch::new("zsh-reset");
     s.snapshot(
         "zsh",
@@ -204,7 +183,6 @@ fn an_option_the_models_do_not_assume_fails_every_line_naming_it() {
         &zsh_snapshot("", "setopt extendedglob\nsetopt nobareglobqual\n", ""),
     );
     assert!(s.read(&s.worker("/bin/zsh", &[])).is_ok());
-    // A function body's own `setopt` (indented) is not the shell's.
     let s = Scratch::new("zsh-body");
     s.snapshot(
         "zsh",
@@ -219,22 +197,17 @@ fn every_snapshot_of_the_tools_shell_is_judged_and_none_is_unknown() {
     let s = Scratch::new("which");
     let err = s.read(&s.worker("/bin/zsh", &[])).expect_err("no snapshot");
     assert!(err.contains("no shell snapshot of zsh"), "{err}");
-    // A bash snapshot is not the zsh tool's.
     s.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
     assert!(s.read(&s.worker("/bin/zsh", &[])).is_err());
     s.snapshot("zsh", 2, &zsh_snapshot("", "", ""));
     assert!(s.read(&s.worker("/bin/zsh", &[])).is_ok());
-    // Another live session's snapshot may be this one's: it counts.
     s.snapshot("zsh", 3, &zsh_snapshot("", "setopt globsubst\n", ""));
     assert!(s.read(&s.worker("/bin/zsh", &[])).is_err());
-    // CLAUDE_CODE_SHELL names the shell first; both it and the fallback
-    // count, since it is taken only when executable.
     assert_eq!(
         tool_kinds(&s.worker("/bin/zsh", &["CLAUDE_CODE_SHELL=/bin/bash"])),
         [Kind::Bash, Kind::Zsh]
     );
     assert_eq!(tool_kinds(&s.worker("/bin/sh", &[])), [Kind::Zsh]);
-    // A truncated snapshot (no Claude Code part yet) is unknown.
     let t = Scratch::new("truncated");
     t.snapshot("zsh", 1, "# Snapshot file\n# Functions\n");
     assert!(t.read(&t.worker("/bin/zsh", &[])).is_err());
@@ -275,7 +248,6 @@ fn a_bash_snapshot_is_judged_against_bash_3_2s_defaults() {
         let why = s.read(&s.worker("/bin/bash", &[])).expect_err(what);
         assert!(why.contains(what), "{what}: {why}");
     }
-    // bash's own variables that run a file or set options first.
     for var in ["BASH_ENV=/x/env", "SHELLOPTS=noglob", "POSIXLY_CORRECT=1"] {
         let s = Scratch::new("bash-env");
         s.snapshot("bash", 1, &bash_snapshot(&[], "", "", ""));
@@ -311,8 +283,6 @@ fn a_hook_or_function_that_runs_unnamed_fails_every_line() {
 
 #[test]
 fn what_runs_before_every_command_besides_the_snapshot_is_read() {
-    // `.zshenv`: plain exports pass; what the snapshot's listing would not
-    // show, or code this check does not read, fails.
     let s = Scratch::new("zshenv");
     s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
     let zshenv = s.home().join(".zshenv");
@@ -336,7 +306,6 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
         let why = s.read(&s.worker("/bin/zsh", &[])).expect_err(text);
         assert!(why.contains(".zshenv"), "{text}: {why}");
     }
-    // `$ZDOTDIR`'s, not `$HOME`'s, when it is set.
     let zdot = s.0.path().join("zdot");
     std::fs::create_dir_all(&zdot).expect("zdotdir");
     std::fs::write(zdot.join(".zshenv"), "setopt globsubst\n").expect("zshenv");
@@ -344,7 +313,6 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
     let with = format!("ZDOTDIR={}", zdot.display());
     assert!(s.read(&s.worker("/bin/zsh", &[&with])).is_err());
 
-    // The person's own code Claude Code puts before every command.
     let s = Scratch::new("envfile");
     s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
     for var in [
@@ -366,7 +334,6 @@ fn what_runs_before_every_command_besides_the_snapshot_is_read() {
         .expect_err("a hook script");
     assert!(why.contains("sessionstart-hook-0.sh"), "{why}");
 
-    // A variable Claude Code's settings give the Bash tool and not the process.
     let s = Scratch::new("settings");
     s.snapshot("zsh", 1, &zsh_snapshot("", "", ""));
     std::fs::create_dir_all(s.project().join(".claude")).expect(".claude");
@@ -399,9 +366,6 @@ fn a_word_is_named_only_whole() {
     }
 }
 
-/// The hooks a `zsh -c` never runs (`precmd`, `preexec`, `periodic`,
-/// `zshaddhistory`; only `chpwd` and `zshexit` fire) are ordinary functions:
-/// a person's `precmd() { vcs_info }` fails only the lines that name it.
 #[test]
 fn a_prompt_or_history_hook_is_an_ordinary_function() {
     let s = Scratch::new("prompt-hooks");
@@ -425,8 +389,6 @@ fn a_prompt_or_history_hook_is_an_ordinary_function() {
     }
 }
 
-/// A quoted spelling of a function's name (`r\m`, `r""m`, `$'\x72m'`,
-/// `r\<newline>m`, `eval "r\\m d"`) runs that function.
 #[test]
 fn a_function_is_named_by_any_quoting_of_its_name() {
     let s = Scratch::new("quoted-fn");
@@ -462,9 +424,6 @@ fn a_function_is_named_by_any_quoting_of_its_name() {
     }
 }
 
-/// A plain alias runs only in command position, and 2.1.284's snapshot demotes
-/// a global alias to a plain one: oh-my-zsh's `alias 1='cd -1'` … `9` and
-/// `alias -- -='cd -'` fail `5` and `x && 1`, not `tail -n 5`.
 #[test]
 fn an_alias_fails_only_a_line_that_may_run_it() {
     let s = Scratch::new("omz-aliases");
@@ -541,11 +500,6 @@ fn an_alias_fails_only_a_line_that_may_run_it() {
     }
 }
 
-/// A `.zshenv`'s verdict names the line by its number and what failed it by
-/// the check's own word, never by the line's text: the line can carry a key
-/// (`alias deploy='AWS_SECRET_ACCESS_KEY=… ./deploy'`), and the verdict is a
-/// reason a journal row and a harness tape hold. The same for a snapshot's
-/// line of a shape the check does not read.
 #[test]
 fn a_startup_verdict_names_a_line_by_its_number_never_its_text() {
     let secret = "planted-zshenv-0005"; // gitleaks:allow

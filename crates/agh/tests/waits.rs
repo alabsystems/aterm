@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh release wait` on virtual time (design §12): `Ctx::for_tests`'s `Fx::simulated`, so no
-//! test sleeps. Held, revalidation, timeout, blindness, heartbeats, impossible, drafts, the
-//! conditions' forms and the backoff table.
+//! `agh release wait` tests on simulated time.
 
 use std::time::Duration;
 
@@ -21,26 +19,22 @@ const REPO: &str = "alabsystems/aterm";
 const TAGS: &str = "/repos/alabsystems/aterm/releases/tags/";
 const CREATED: &str = "2026-10-01T00:00:00Z";
 
-/// A fake holding the public `alabsystems/aterm`.
 fn fake() -> FakeGithub {
     let fake = FakeGithub::start();
     fake.add_repo(REPO, RepoSpec::public());
     fake
 }
 
-/// An anonymous CLI context (no agh.toml) over `fake`.
 fn context(root: &std::path::Path, fake: &FakeGithub) -> (Ctx, Captured) {
     common::ctx(root, fake, common::env())
 }
 
-/// `agh release wait alabsystems/aterm {args…}`.
 fn wait(ctx: &mut Ctx, args: &[&str]) -> u8 {
     let mut line = vec!["release", "wait", REPO];
     line.extend_from_slice(args);
     common::run_cli(ctx, &line)
 }
 
-/// The error lines on stderr: every line but the heartbeats.
 fn error_lines(captured: &Captured) -> Vec<String> {
     captured
         .stderr_text()
@@ -50,12 +44,10 @@ fn error_lines(captured: &Captured) -> Vec<String> {
         .collect()
 }
 
-/// The error object, the heartbeats left out.
 fn error_json(captured: &Captured) -> Value {
     common::error_json(&error_lines(captured).join("\n"))
 }
 
-/// The tag lookups the fake saw, in order.
 fn tag_reads(fake: &FakeGithub) -> Vec<agh_fake::Seen> {
     fake.seen()
         .into_iter()
@@ -63,7 +55,6 @@ fn tag_reads(fake: &FakeGithub) -> Vec<agh_fake::Seen> {
         .collect()
 }
 
-/// The validator of `v1.0.0`'s release as it is now, read once by a client of its own.
 fn release_etag(root: &std::path::Path, fake: &FakeGithub) -> String {
     let (mut ctx, _captured) = context(root, fake);
     let gh = ctx.github().expect("the client");
@@ -134,8 +125,6 @@ fn a_wait_revalidates_with_the_last_etag() {
     let reads = tag_reads(&fake).split_off(before);
     assert_eq!(reads.len(), 4);
     assert!(reads[0].header("if-none-match").is_none());
-    // Reads 2 to 4 each revalidate with the first answer's ETag: reads 2 and 3 meet the
-    // unchanged release (a 304), and read 4 the release the asset changed.
     for read in &reads[1..] {
         assert_eq!(
             read.header("if-none-match"),
@@ -145,8 +134,6 @@ fn a_wait_revalidates_with_the_last_etag() {
     }
     let state = common::stdout_json(&captured);
     assert_eq!(state["conditions"][0]["observed"], Value::from(2u64));
-    // Reads 2 and 3 were answered 304 and reused the first answer: no change, so the
-    // interval grew from 2 s.
     assert_eq!(
         ctx.fx.slept(),
         [
@@ -166,8 +153,6 @@ fn a_304_is_an_observation_of_the_last_answer() {
     let etag = release_etag(root.path(), &fake);
     let before = tag_reads(&fake).len();
     let (mut ctx, captured) = context(root.path(), &fake);
-    // Every read after the first is a 304. Were a 304 no observation, the wait would go blind
-    // (exit 3) after 60 s; it is one, so the wait runs to its timeout.
     let exit = wait(&mut ctx, &["v1.0.0", "assets=2", "--timeout", "120s"]);
     assert_eq!(exit, 8, "{}", captured.stderr_text());
     let state = common::stdout_json(&captured);
@@ -214,10 +199,6 @@ fn a_dot_segment_tag_or_asset_name_is_usage_before_any_request() {
 fn a_heartbeat_redacts_before_it_cuts() {
     let root = common::scratch("wait-redact-cut");
     let fake = fake();
-    // `last` is `prerelease:{"assets":0,"draft":false,"id":ID,"prerelease":false,
-    // "tag_name":"TAG"}`: 74 characters and the id before the tag, so the learned value
-    // after a 105-character pad starts near 180 and crosses the 200-character cut, while
-    // its `[redacted]` ends before it.
     let secret = "learned-opaque-value-for-the-cut-test";
     let tag = format!("{}{secret}", "x".repeat(105));
     fake.add_release(REPO, ReleaseSpec::published(&tag, CREATED));
@@ -252,8 +233,6 @@ fn a_timeout_prints_the_state_and_exits_8() {
         ctx.fx.slept().iter().sum::<Duration>(),
         Duration::from_secs(10)
     );
-    // The first round observed (no release), a change from nothing: the first sleep is the
-    // backoff's start.
     assert_eq!(ctx.fx.slept()[0], Backoff::STANDARD.start);
 }
 
@@ -262,8 +241,6 @@ fn a_failing_check_keeps_its_last_observation_in_the_state() {
     let root = common::scratch("wait-unknown");
     let fake = fake();
     fake.add_release(REPO, ReleaseSpec::published("v1.0.0", CREATED));
-    // The first probe answers absent, every later one 500: a failed check is no observation,
-    // so the state keeps anon-visible's last one, `absent`.
     let status = |status: u16| Fault::Status {
         status,
         body: String::new(),
@@ -444,20 +421,17 @@ fn include_drafts_sees_a_draft_and_two_drafts_conflict() {
 fn gone_with_drafts_holds_while_only_drafts_have_the_tag() {
     let root = common::scratch("wait-gone-drafts");
     let (fake, mut ctx, captured) = writer_context(root.path());
-    // `gone` is "no published release has the tag" (design §12): one draft is gone.
     let id = fake.add_release(REPO, ReleaseSpec::draft("v1.0.0", CREATED));
     let exit = wait(&mut ctx, &["v1.0.0", "gone", "--include-drafts"]);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     let state = common::stdout_json(&captured);
     assert_eq!(state["conditions"][0]["observed"]["id"], Value::from(id));
 
-    // Two drafts are no conflict for `gone`.
     fake.add_release(REPO, ReleaseSpec::draft("v1.0.0", CREATED));
     let (mut ctx, captured) = context(root.path(), &fake);
     let exit = wait(&mut ctx, &["v1.0.0", "gone", "--include-drafts"]);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
 
-    // A published one beside them is the release still there.
     fake.add_release(REPO, ReleaseSpec::published("v1.0.0", CREATED));
     let (mut ctx, captured) = context(root.path(), &fake);
     let exit = wait(
@@ -566,7 +540,6 @@ fn the_backoff_grows_resets_and_stays_in_bounds() {
 fn an_empty_tag_or_tag_part_is_usage_before_any_request() {
     let root = common::scratch("wait-empty-tag");
     let fake = fake();
-    // A published release: were "" read as "no release", `gone` would hold at once.
     fake.add_release(REPO, ReleaseSpec::published("v1.0.0", CREATED));
     for args in [["", "gone"], ["v1/", "exists"], ["a//b", "published"]] {
         let (mut ctx, captured) = context(root.path(), &fake);
@@ -618,9 +591,6 @@ fn an_anonymous_wait_on_a_spent_budget_goes_blind_with_the_rate_limit() {
     let root = common::scratch("wait-rate");
     let fake = fake();
     let (mut ctx, captured) = context(root.path(), &fake);
-    // The default 30-minute timeout, anonymous: the budget runs out first. A rate limit is a
-    // retriable error, no observation, so 60 s without one is blind (exit 3), and the error
-    // keeps the reset the rate limit named.
     let exit = wait(&mut ctx, &["v1.0.0", "exists", "published"]);
     let stderr = captured.stderr_text();
     assert_eq!(exit, 3, "{stderr}");
@@ -634,7 +604,6 @@ fn an_anonymous_wait_on_a_spent_budget_goes_blind_with_the_rate_limit() {
     assert!(captured.stdout().is_empty());
 }
 
-/// A condition that never holds, observing `observed` each round with no request.
 struct Never {
     observed: String,
 }
@@ -682,8 +651,6 @@ fn the_poller_redacts_then_cuts_a_heartbeats_last() {
     assert!(lasts[0].contains("[redacted]"), "{}", lasts[0]);
 }
 
-/// A condition that holds on its first check, observing a release, and fails retriably on
-/// every later one.
 struct HeldThenFailing {
     checks: usize,
 }
@@ -742,7 +709,6 @@ fn a_rate_limit_past_the_blind_limit_is_blind_on_the_backoff() {
     let root = common::scratch("wait-rate-reset");
     let fake = fake();
     fake.add_release(REPO, ReleaseSpec::published("v1.0.0", CREATED));
-    // `Ctx::for_tests`'s clock starts at 1_760_000_000: the budget resets 120 s in.
     let reset = 1_760_000_120u64.to_string();
     fake.fault(
         Match::api(TAGS),
@@ -763,9 +729,6 @@ fn a_rate_limit_past_the_blind_limit_is_blind_on_the_backoff() {
     assert_eq!(exit, 3, "{}", captured.stderr_text());
     let error = error_json(&captured);
     assert_eq!(error["reset"], Value::from(1_760_000_120u64), "{error}");
-    // No pause for the reset: the backoff alone paces the rounds, and the wait ends blind
-    // once 60 s pass with no observation. No round observed anything, so none is a change
-    // (plan §11.4 step 5): the interval grows from the first round on.
     let slept = ctx.fx.slept();
     assert_eq!(
         slept[..3],
@@ -784,7 +747,6 @@ fn a_rate_limit_past_the_blind_limit_is_blind_on_the_backoff() {
 fn a_wait_refuses_no_probe_before_any_request() {
     let root = common::scratch("wait-no-probe");
     let fake = fake();
-    // No release yet: an unprobed 404 would end the wait at once as not visible.
     let (mut ctx, captured) = context(root.path(), &fake);
     let exit = wait(&mut ctx, &["v1.0.0", "exists", "--no-probe"]);
     assert_eq!(exit, 2, "{}", captured.stderr_text());

@@ -8,9 +8,7 @@
 // publisher thread is woken through a socket, and a poisoned lock is
 // recovered rather than unwound.
 
-//! One window's side of the publisher: the [`Adapter`] a window owns, the
-//! state it shares with the publisher thread, and the callback through which
-//! the semantics' tree changes reach that thread.
+//! Window-side [`Adapter`] state and publisher callback.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -126,8 +124,7 @@ impl AdapterCallback for Callback {
     }
 }
 
-/// One window's accessibility tree, published while an assistive technology
-/// listens. The handlers are called on the publisher thread.
+/// One window's accessibility tree, published while an assistive technology listens.
 #[derive(Debug)]
 pub struct Adapter {
     id: usize,
@@ -157,8 +154,12 @@ impl Adapter {
         Self { id, link, state }
     }
 
-    /// The window's outer bounds (decorations included) and inner bounds, in
-    /// screen coordinates. Only X11 tells a client where its window is.
+    /// Whether an assistive technology listens: its first tree owed or published.
+    pub fn is_listened(&self) -> bool {
+        !matches!(*self.state.lock_or_recover(), AdapterState::Inactive { .. })
+    }
+
+    /// Sets outer (with decorations) and inner window bounds in screen coordinates.
     pub fn set_root_window_bounds(&mut self, outer: Rect, inner: Rect) {
         let bounds = WindowBounds::new(outer, inner);
         match &mut *self.state.lock_or_recover() {
@@ -172,9 +173,7 @@ impl Adapter {
         }
     }
 
-    /// Applies the update `update_factory` builds, if and only if an
-    /// assistive technology listens. After [`ActivationHandler`] answered
-    /// `None`, the update must hold the full tree.
+    /// Applies `update_factory`'s update if an assistive technology listens.
     pub fn update_if_active(&mut self, update_factory: impl FnOnce() -> TreeUpdate) {
         let mut state = self.state.lock_or_recover();
         match &mut *state {
@@ -220,17 +219,6 @@ impl Drop for Adapter {
     }
 }
 
-/// A window's first tree, published on the `epoch`th accessibility bus.
-///
-/// The window's focus is applied as a change once the tree is registered,
-/// not built into it: an AT that has just been shown the window then hears it
-/// activated (`window:activate`, `state-changed:active`, the root's
-/// `active-descendant-changed`) and its focus, the events it hears when the
-/// focus comes after the tree. Built in, as accesskit_unix 0.22.0 builds it,
-/// the focus was announced alone, and Orca named no window: it spoke a
-/// terminal's text with no frame when aterm-gui had the keyboard focus before
-/// its first tree reached the bus (the Linux lane's Orca row, x86_64,
-/// 2026-10-19).
 fn first_tree(
     id: usize,
     link: &Link,
@@ -319,7 +307,6 @@ impl Entry {
         };
         let previous = std::mem::replace(&mut *state, next);
         drop(state);
-        // The tree goes outside the lock: its drop reports the window gone.
         drop(previous);
         self.deactivation_handler.deactivate_accessibility();
     }

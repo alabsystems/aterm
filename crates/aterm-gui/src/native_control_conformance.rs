@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for native-front control routing.
-//!
-//! The projection calls the shipping classifier for every principal/target pair, so the model
-//! binds to the real routing decisions rather than a second truth table. The App bind reads
-//! the two session routes through `session_route_decision` over the App's real active handle
-//! and session store, so a slip at the dispatcher's call site (its two liveness bools swapped)
-//! fails there.
+//! Conformance tests for native-front control routing.
 
 #![cfg(test)]
 
@@ -83,8 +77,6 @@ impl RealRouting {
         state
     }
 
-    /// The projection with the classifier's two liveness bools swapped: the negative control
-    /// for that slip in `session_route`, which the App bind below drives.
     fn project_with_swapped_inputs(self, model: &Model) -> State {
         let swapped = Self {
             front_has_terminal: self.explicit_session_live,
@@ -131,8 +123,6 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
         real.front_has_terminal = false;
     });
 
-    // An explicitly named live session remains reachable behind native focus,
-    // while an implicit session request gets the typed no-terminal decision.
     assert_eq!(
         native_control_decision(
             false,
@@ -169,9 +159,6 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
         real.explicit_session_live = true;
     });
 
-    // Negative control: with a native front and a live explicit session the two
-    // inputs differ, so swapping them opens the bare route and closes the
-    // explicit one. The model admits neither.
     let swapped = real.project_with_swapped_inputs(&model);
     assert_eq!(
         (
@@ -187,8 +174,6 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
         real.front_has_terminal = true;
     });
 
-    // Negative control: a hidden terminal kept behind a focused native view breaks the
-    // terminal-mirror and fallback invariants.
     let before_native = real.project(&model);
     let mut hidden_fallback = before_native.clone();
     hidden_fallback.insert("front_kind", 2);
@@ -201,15 +186,12 @@ fn shipping_classifier_conforms_across_focus_and_session_lifecycle() {
     assert!(!model.check_invariant("NoHiddenTerminalFallback", &hidden_fallback));
     assert!(!model.check_invariant("NoSessionWithoutTarget", &hidden_fallback));
 
-    // Negative control: an app edge bypass fails the authority invariant.
     let mut edge_bypass = before_native;
     edge_bypass.insert("edge_app_allowed", 1);
     assert_eq!(admits(&model, &real.project(&model), &edge_bypass), None);
     assert!(!model.check_invariant("EdgeAppDenied", &edge_bypass));
 }
 
-/// Binds the focus transition to the real window resolver. The terminal session stays live in
-/// the pool while Settings is focused; bare-session authority must still go.
 #[test]
 fn real_window_focus_projects_exact_optional_terminal_capability() {
     let model = native_control_routing_model();
@@ -218,8 +200,6 @@ fn real_window_focus_projects_exact_optional_terminal_capability() {
     let route = |app: &App, line: &str| {
         session_route_decision(line, &app.active_handle, &app.store, Scope::Owner)
     };
-    // The two session routes as the dispatcher resolves them: a bare verb, and
-    // one naming the window's session (local id 0) explicitly.
     let project = |app: &App| {
         let mut state = RealRouting {
             front_has_terminal: app.front_terminal(wid).is_some(),
@@ -234,8 +214,6 @@ fn real_window_focus_projects_exact_optional_terminal_capability() {
 
     let terminal = project(&app);
     assert_eq!(terminal, model.init_state());
-    // A terminal front with a retired explicit session: the bare route resolves
-    // and the explicit one does not.
     assert_eq!(route(&app, "text"), NativeControlDecision::ResolveSession);
     assert_eq!(
         route(&app, "@99 text"),
@@ -250,7 +228,6 @@ fn real_window_focus_projects_exact_optional_terminal_capability() {
         app.pool.get(0).is_some(),
         "hidden shell remains explicitly addressable"
     );
-    // The reverse: a native front with a live explicit session.
     assert_eq!(route(&app, "text"), NativeControlDecision::NoActiveTerminal);
     assert_eq!(
         route(&app, "@0 text"),

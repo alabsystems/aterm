@@ -589,6 +589,16 @@ fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
         ("edit", TOOL_ROW_EDIT, "◆ Edited README.md (+1 −1)"),
         ("bash", TOOL_ROW_BASH, "◆ Ran ls — failed"),
         (
+            "bash-ran",
+            TOOL_ROW_BASH_RAN,
+            "◆ Ran ls · ✓ · 0.2s · ctrl+o",
+        ),
+        (
+            "bash-ran-described",
+            TOOL_ROW_BASH_RAN_DESCRIBED,
+            "◆ Ran command · Count the README's lines · ✓ · 0.2s · ctrl+o",
+        ),
+        (
             "read-memory",
             TOOL_ROW_READ_MEMORY,
             "◆ Read memory notes.md — failed",
@@ -659,6 +669,22 @@ fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
     bare.retain(|r| !r.starts_with("◆ Read memory"));
     assert!(bare.iter().any(|r| r == "└ memory file not found"));
     assert_eq!(phase(&bare), (Phase::Idle, false), "a branch alone");
+    // A shell call that ran (Muse Code's sandbox off) draws its row with no branch under it;
+    // the same place holding a reply is the agent's words, a reply that opens with `Ran `
+    // included, and so is a shell row cut before its duration.
+    for text in [TOOL_ROW_BASH_RAN, TOOL_ROW_BASH_RAN_DESCRIBED] {
+        for said in [
+            "Counted the README's lines: one.",
+            "Ran the tests: all 580 pass.",
+            "Ran ls and found one file. Nothing left: the parser is committed and pushed.",
+            "Ran ls · ✓",
+            "Ran the suite · it took · ctrl+o",
+        ] {
+            let rows = edited(&screen(text), "◆ Ran ", &format!("◆ {said}"));
+            assert_eq!(phase(&rows), (Phase::Idle, true), "{said}");
+            assert_eq!(said_tail(&rows).as_deref(), Some(said));
+        }
+    }
 }
 
 /// The bare `◇ Thinking` first frame before timer text appears classifies as a running turn.

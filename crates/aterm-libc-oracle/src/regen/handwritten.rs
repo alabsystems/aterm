@@ -1,22 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shim's ONLY hand-written code: the bodies of the C macros libc
-//! reimplements in Rust, the inherent `siginfo_t` accessors, and the notes a
-//! measurement cannot state. One text per OS family, so each same-OS pair of
-//! cells carries the same section ([`crate::siblings`] holds them to it).
-//!
-//! Each set is fail-closed against the reference: a macro the reference grows
-//! without a body here stops the regeneration, and the oracle's coverage audit
-//! ([`super::oracle`]) fails on an accessor or macro without a behaviour test.
+//! Hand-written C macro bodies, `siginfo_t` accessors, and struct notes for regenerated libc shims.
 
 use crate::cells::Os;
 
 /// One C macro libc reimplements as a Rust function: its body, unindented.
 pub struct MacroBody {
     pub name: &'static str,
-    /// Whether the shim writes it `const fn`, set by hand to match the
-    /// reference; the shape gate compares the two headers.
+    /// Whether the shim writes it `const fn` to match the reference.
     pub is_const: bool,
     pub body: &'static str,
 }
@@ -215,9 +207,7 @@ pub fn macro_body(os: Os, name: &str) -> Option<&'static MacroBody> {
     macros(os).iter().find(|m| m.name == name)
 }
 
-/// The `# Safety` section of a public unsafe macro, one doc line per entry:
-/// clippy's `missing_safety_doc` is an error under the lint gate, and an
-/// emitted body inherits no documentation from an `extern` block.
+/// `# Safety` doc lines for a public unsafe macro.
 #[must_use]
 pub fn safety_doc(name: &str) -> Option<&'static [&'static str]> {
     const ARITHMETIC: &[&str] = &[
@@ -243,8 +233,7 @@ pub fn safety_doc(name: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// The integer `fd_set` is a bitmap of: the word the oracle diffs the bitmap
-/// in, byte for byte.
+/// The integer word type of the `fd_set` bitmap.
 #[must_use]
 pub const fn fd_word(os: Os) -> &'static str {
     match os {
@@ -253,8 +242,7 @@ pub const fn fd_word(os: Os) -> &'static str {
     }
 }
 
-/// The inherent methods libc puts on `siginfo_t`: reinterpret-casts over the
-/// private payload, each carrying its own `repr(C)` prefix struct.
+/// Inherent `siginfo_t` accessor impl block for `os`.
 #[must_use]
 pub const fn siginfo_impls(os: Os) -> &'static str {
     match os {
@@ -263,8 +251,7 @@ pub const fn siginfo_impls(os: Os) -> &'static str {
     }
 }
 
-/// The `pub unsafe fn` names in `source`: the accessors an impl text
-/// actually emits, which the coverage audit holds to the reference's set.
+/// Extracts `pub unsafe fn` names emitted by `source`.
 #[must_use]
 pub fn public_unsafe_fns(source: &str) -> Vec<String> {
     let words: Vec<&str> = source.split_whitespace().collect();
@@ -284,8 +271,7 @@ pub fn public_unsafe_fns(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// A note a measurement cannot state, emitted as the struct's doc comment so a
-/// regeneration keeps it.
+/// Extra doc note emitted on regenerated struct `name`, if any.
 #[must_use]
 pub fn struct_note(os: Os, name: &str) -> Option<&'static str> {
     match (os, name) {

@@ -1,24 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The JSON string escape every control-path JSON writer shares: the control
-//! wire's `--json` replies, `subscribe … cells` and the asciicast emitter
-//! (`aterm_control::wire::json_escape*` re-export it), and the supervisor's
-//! journal.
-//!
-//! RFC 8259 requires only `"`, `\` and U+0000-U+001F escaped, but a reply is
-//! often read raw on a terminal and its values are text a program chose (an
-//! OSC 7 cwd, an OSC 633 command line, a cell's glyph). So every character a
-//! terminal acts on or reorders text around ([`crate::tty::is_active`]: DEL, C1,
-//! the bidi marks, embeddings, overrides and isolates, U+2028/U+2029) is escaped
-//! as `\uXXXX` too: still valid JSON decoding to the same string, but the raw
-//! bytes carry no instructions. Every other character, non-ASCII included, is
-//! verbatim UTF-8, so a styled frame of CJK text stays its size.
-//!
-//! `aterm_link::glance`'s `json_string` stays separate because it escapes every
-//! character outside printable ASCII for an ASCII-only file contract.
+//! JSON string escaping for control-path JSON writers.
 
-/// `s` as a JSON string body (no quotes) — see the module docs.
+/// Escapes `s` as a JSON string body (without surrounding quotes).
 #[must_use]
 #[inline]
 pub fn escape(s: &str) -> String {
@@ -27,14 +12,9 @@ pub fn escape(s: &str) -> String {
     out
 }
 
-/// [`escape`] appending into a caller-owned buffer, with no allocation of its
-/// own. Hot: the styled frame escapes a glyph for every cell (up to ~15 000
-/// per snapshot, per subscriber per change), so a run of plain bytes is copied
-/// whole, and only a lead byte that can start an active character is decoded.
+/// Appends `s` escaped as a JSON string body into `out`.
 pub fn escape_into(out: &mut String, s: &str) {
     let bytes = s.as_bytes();
-    // `start..at` is the plain run not yet copied; both are always on a
-    // character boundary.
     let mut start = 0;
     let mut at = 0;
     while let Some(&b) = bytes.get(at) {
@@ -43,8 +23,6 @@ pub fn escape_into(out: &mut String, s: &str) {
             continue;
         }
         if b >= 0x80 {
-            // Every active character past ASCII starts with C2 (C1), D8
-            // (U+061C) or E2 (U+200E-U+2069); any other lead starts text.
             let len = utf8_len(b);
             if matches!(b, 0xc2 | 0xd8 | 0xe2)
                 && let Some(c) = s.get(at..).and_then(|rest| rest.chars().next())
@@ -68,7 +46,6 @@ pub fn escape_into(out: &mut String, s: &str) {
             b'\t' => out.push_str("\\t"),
             0x08 => out.push_str("\\b"),
             0x0c => out.push_str("\\f"),
-            // The rest of C0, and DEL.
             b => push_u(out, u32::from(b)),
         }
         at += 1;
@@ -100,8 +77,6 @@ fn push_u(out: &mut String, u: u32) {
 mod tests {
     use super::*;
 
-    /// The escape as RFC 8259 states it, plus the terminal-active class: the
-    /// reference the fast path is held to.
     fn reference(s: &str) -> String {
         let mut out = String::new();
         for c in s.chars() {
@@ -120,7 +95,6 @@ mod tests {
         out
     }
 
-    /// RFC 8259's escapes, plus the active class past C0 as `\uXXXX`.
     #[test]
     fn escape_spells_rfc_8259_and_the_active_class() {
         for (raw, json) in [
@@ -137,7 +111,6 @@ mod tests {
             ("\u{202e}dcba\u{2066}\u{2069}", "\\u202edcba\\u2066\\u2069"),
             ("\u{61c}\u{200e}\u{200f}", "\\u061c\\u200e\\u200f"),
             ("a\u{2028}b\u{2029}", "a\\u2028b\\u2029"),
-            // Leads the fast path decodes, starting text: NBSP, Arabic, ZWSP.
             (
                 "\u{a0}\u{627}\u{200b}\u{2014}",
                 "\u{a0}\u{627}\u{200b}\u{2014}",
@@ -148,8 +121,6 @@ mod tests {
         }
     }
 
-    /// The fast path equals the reference over every one- and two-byte scalar
-    /// and a stride of wider ones, alone and inside text.
     #[test]
     fn the_fast_path_is_the_reference() {
         let narrow = (0u32..0x800).filter_map(char::from_u32);
@@ -164,8 +135,6 @@ mod tests {
         assert_eq!(into, "k=a\\u009b");
     }
 
-    /// No byte a terminal acts on is left in the output, and a JSON reader
-    /// decodes the output back to the input: the escape is the same string.
     #[test]
     fn the_output_holds_no_active_byte_and_decodes_back() {
         let raw =
@@ -175,8 +144,6 @@ mod tests {
         assert_eq!(decode(&json), raw);
     }
 
-    /// A JSON string body's decoder (`\uXXXX` and the two-character escapes):
-    /// enough of RFC 8259 to read back what [`escape`] writes.
     fn decode(json: &str) -> String {
         let mut out = String::new();
         let mut chars = json.chars();

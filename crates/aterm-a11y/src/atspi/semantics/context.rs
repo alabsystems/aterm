@@ -6,9 +6,7 @@
 // Apache-2.0) src/context.rs, and changed by the aterm project in 2026: a
 // poisoned lock is recovered rather than unwound.
 
-//! The state a window's tree shares with its nodes and the application:
-//! the tree, the window's bounds and action handler, and the application's
-//! name, toolkit, registry id and windows.
+//! Shared tree, window and application context for AT-SPI nodes.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -19,8 +17,7 @@ use aterm_types::MutexExt as _;
 
 use super::WindowBounds;
 
-/// A window's action handler behind a shared reference: the publisher hands
-/// requests on from any node.
+/// A window's action handler behind a shared reference.
 pub(crate) trait ActionHandlerNoMut {
     fn do_action(&self, request: ActionRequest);
 }
@@ -40,9 +37,7 @@ impl<H: ActionHandler + Send> ActionHandlerNoMut for ActionHandlerWrapper<H> {
     }
 }
 
-/// A read-write lock whose poisoning is recovered: a panic on another
-/// thread while it was held leaves the value as it was, and the publisher
-/// goes on serving it.
+/// A read-write lock whose poisoning is recovered.
 #[derive(Debug, Default)]
 pub(crate) struct SharedLock<T>(RwLock<T>);
 
@@ -99,8 +94,7 @@ impl Context {
     }
 }
 
-/// The application: its name, its toolkit's name and version, the id the
-/// registry gave it, and its windows' trees, by adapter id.
+/// The application.
 #[derive(Debug)]
 pub(crate) struct AppContext {
     pub(crate) name: Option<String>,
@@ -184,7 +178,6 @@ mod tests {
     #[test]
     fn reverse_registration_retires_the_exact_window_context() {
         let app = AppContext::new(None);
-        // Ordinary registration order and each actual Adapter Drop.
         let first = window(&app, 0);
         let second = window(&app, 1);
         assert_eq!(app.read().adapter_index(0), Ok(0));
@@ -194,8 +187,6 @@ mod tests {
         drop(second);
         assert!(app.read().adapters.is_empty());
 
-        // IDs are assigned before activation. Window2 can finish its async
-        // initial tree after window3: register3 first, then2, as Pending allows.
         let later = window(&app, 3);
         let earlier = window(&app, 2);
         let weak_later = {

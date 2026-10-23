@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
-//! The identity verbs (design §6.7): `auth status`, `auth add` and `auth remove`. Provisioning
-//! is a person's step, so both edits refuse unless stderr is a terminal.
+//! Identity verbs: `auth status`, `auth add`, and `auth remove`.
 
 use std::path::Path;
 
@@ -27,7 +25,6 @@ const PLATFORM: &str = "unix";
 #[cfg(not(unix))]
 const PLATFORM: &str = "windows: anonymous only (file credentials need unix permission checks)";
 
-/// The refusal both edits give without a terminal on stderr, before any other check or read.
 fn needs_terminal(ctx: &Ctx, verb: &str) -> Result<()> {
     if ctx.stderr_is_terminal {
         return Ok(());
@@ -38,7 +35,6 @@ fn needs_terminal(ctx: &Ctx, verb: &str) -> Result<()> {
     .with_next("a person runs it at a terminal"))
 }
 
-/// L10: `[a-z][a-z0-9-]{0,31}`, and neither `anonymous` nor `none`.
 fn check_name(name: &str) -> Result<()> {
     match crate::config::profile_name_fault(name) {
         Some(fault) => Err(Error::usage(fault)),
@@ -46,14 +42,11 @@ fn check_name(name: &str) -> Result<()> {
     }
 }
 
-/// `agh auth add`'s request, from its arguments (plan §11.3, step 2).
 fn add_request(inv: &Invocation) -> Result<AddRequest> {
     let usage = |why: &str| inv.usage(why);
     let name = inv.require(0, "NAME")?;
     check_name(name)?;
     if inv.global.anonymous {
-        // auth add binds the login by sending the new token (GET /user); --anonymous sends
-        // no credential (design §6.4).
         return Err(usage(
             "--anonymous sends no credential, and agh auth add binds the login with the new token: drop --anonymous",
         ));
@@ -103,10 +96,6 @@ fn add_request(inv: &Invocation) -> Result<AddRequest> {
     })
 }
 
-/// The terminal-stdin refusal's next: the same request with stdin filled from a file,
-/// `agh auth add NAME --stdin --tier T [--owner O]… [--write] [--drafts] < FILE`, so following
-/// it provisions the profile the person asked for. NAME and each owner were checked as names,
-/// so each is one shell word.
 fn stdin_next(req: &AddRequest) -> String {
     let mut next = format!(
         "agh auth add {} --stdin --tier {}",
@@ -135,12 +124,7 @@ fn stdin_next(req: &AddRequest) -> String {
 pub(crate) fn auth_add(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     needs_terminal(ctx, "add")?;
     let req = add_request(inv)?;
-    // Off unix `provision::add_metered` refuses every `auth add` by name, so a well-formed one
-    // reaches that refusal first rather than a usage error whose next is then refused. A
-    // `cfg!` and not a `#[cfg]` block, so `stdin_next` keeps a caller on every platform.
     if cfg!(unix) && req.from == AddFrom::Stdin && ctx.stdin_is_terminal {
-        // A token typed at a terminal is echoed as it is typed: on the screen, in the
-        // scrollback, in whatever records the session.
         return Err(Error::usage(
             "--stdin reads the token from a pipe or a file, never from a terminal, which would show it as it is typed",
         )
@@ -203,9 +187,6 @@ pub(crate) fn auth_remove(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// What reading agh.toml for `auth status` found: `None` for no file (or no platform permission
-/// check), the rules it breaks (a file `read_private` refuses is one fault, rule `file`), or a
-/// valid file.
 type Read = Option<std::result::Result<crate::config::Validated, Vec<ConfigFault>>>;
 
 /// agh.toml read and judged by `policy check`'s rules.
@@ -223,8 +204,7 @@ fn read_config(dirs: &crate::config::Dirs) -> Read {
     None
 }
 
-/// `agh auth status`: every profile, its presence and fingerprint, the ambient tokens, and
-/// agh.toml's faults. It reads agh.toml itself and never builds the client.
+/// `agh auth status`: profile status, ambient tokens, and `agh.toml` faults.
 ///
 /// # Errors
 ///
@@ -293,9 +273,6 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     Ok(Outcome { answer, receipt })
 }
 
-/// The first profile, by name, that an owner's `read` or `write`, or `[default].read`, names
-/// and whose credential is unusable: its name, the load error's slug and its remedy. An absent
-/// profile is no failure: a builder may lack the release token.
 fn referenced_unusable(
     validated: &crate::config::Validated,
     env: &dyn identity::EnvSource,

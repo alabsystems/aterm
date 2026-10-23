@@ -305,6 +305,7 @@ pub(crate) fn compute_blue_edges(
                 }
                 if group == ScriptGroup::Default {
                     // Now compare to overshoot position for the default script
+                    // group.
                     if edge.flags.contains(TopoFlags::ROUND) && dist != 0 && !is_neutral {
                         let is_under_ref = (edge.fpos as i32) < unscaled_blue.position;
                         if is_top ^ is_under_ref {

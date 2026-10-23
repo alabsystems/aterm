@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance of the index channel's reader to the derived model `AtpkgIndexPublishWalk`
-//! (crates/aterm-models-atpkg/src/models_atpkg_index_publish.rs), which proves the published
-//! index tags are one run and the walk from every verified floor lands the newest.
-//!
-//! Every channel and floor the model reaches is served to the real tag walk
-//! ([`GithubFetcher::walk_candidates`]) as download-host HEAD answers, and the walk must land
-//! the newest published index. Negative control: the `Buggy = 1` draft-baseline hole is one
-//! the real walk does not cross either. The writer half is bound by
-//! `crates/atpkg-publish/tests/channel/conformance_index_publish.rs`.
+//! Conformance of [`GithubFetcher::walk_candidates`] to the `AtpkgIndexPublishWalk` model.
 
 use super::GithubFetcher;
 use aterm_models_atpkg::atpkg_index_publish_walk_model;
@@ -18,7 +10,6 @@ use aterm_spec::interp::{self, State};
 use aterm_update_core::{HeadAnswer, HttpError};
 use std::collections::{BTreeSet, VecDeque};
 
-/// Every state `model` reaches, breadth-first over its actions.
 fn reachable(model: &Model) -> Vec<State> {
     let key = |s: &State| s.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
     let init = model.init_state();
@@ -38,13 +29,10 @@ fn reachable(model: &Model) -> Vec<State> {
     out
 }
 
-/// The channel of a state: the codes of atpkg-index-2..=4 (0 absent, 1/3 a draft, 2/4
-/// published; 1/2 publisher A's bytes, 3/4 another publisher's).
 fn channel(state: &State) -> [i64; 3] {
     [state["t2"], state["t3"], state["t4"]]
 }
 
-/// Whether `build` answers on the download host: 1 always, 2..=4 when published.
 fn published(tags: [i64; 3], build: u64) -> bool {
     match build {
         1 => true,
@@ -57,9 +45,6 @@ fn newest(tags: [i64; 3]) -> u64 {
     (1..=4).rev().find(|b| published(tags, *b)).unwrap_or(1)
 }
 
-/// Where the real walk leaves a store verified at `floor`: the newest candidate the tag
-/// walk returns (the floor's own quad when nothing past it is published, or a run it cannot
-/// see across).
 fn real_walk(floor: u64, tags: [i64; 3]) -> u64 {
     const PREFIX: &str = "https://github.com/alabsystems/aterm/releases/download/atpkg-index-";
     let fetcher = GithubFetcher::new("alabsystems".into()).with_index_floor(floor);
@@ -81,8 +66,6 @@ fn real_walk(floor: u64, tags: [i64; 3]) -> u64 {
             }
         })
     };
-    // Every quad a candidate names downloads whole: the bind is about which number the
-    // walk lands, not about an incomplete release (net.rs's own walk tests cover that).
     let fetch = |url: &str, _cap: u64| -> Result<Vec<u8>, String> { Ok(url.as_bytes().to_vec()) };
     let candidates = fetcher
         .walk_candidates(&fetcher.index_slug(), &head, &fetch)
@@ -119,10 +102,6 @@ fn the_real_walk_lands_the_newest_index_on_every_channel_the_model_reaches() {
         seen.len()
     );
 
-    // Negative control: a killed publish leaves a draft at 3, the next publisher counts it and
-    // publishes 4, so 2 and 3 are missing directly above a store at 1. The model's invariant is
-    // violated there, and the real walk does not cross the gap either: the writer's guards
-    // exist to prevent it.
     let buggy = interp::with_buggy(&model, 1);
     let hole = reachable(&buggy)
         .into_iter()

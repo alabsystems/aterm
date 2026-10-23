@@ -4,9 +4,6 @@
 
 use super::*;
 
-/// Kitty layers stack in draw order (z, first-send time, placement order), at
-/// most `MAX_IMAGE_LAYERS` deep with the lowest dropped first; `set_image`
-/// replaces them all and `retain_images` keeps the survivors' order.
 #[test]
 fn cell_extra_stacks_image_layers_in_draw_order() {
     use crate::KittyPlacementTag;
@@ -30,7 +27,6 @@ fn cell_extra_stacks_image_layers_in_draw_order() {
         kitty: NonZeroU32::new(serial).map(|serial| KittyPlacementTag {
             image_id: id,
             placement_id: 0,
-            // Each image here was first sent in the order of its id.
             image_serial: NonZeroU32::new(id).unwrap_or(NonZeroU32::MIN),
             serial,
         }),
@@ -118,8 +114,6 @@ fn underline_color_u32_roundtrip() {
     assert_eq!(extra.underline_color(), None);
     assert!(!extra.has_data());
 
-    // The indexed form (0x02) round-trips as an index, not a resolved triple:
-    // an indexed SGR 58 colour re-resolves against the live palette at draw time.
     extra.set_underline_color_u32(Some(0x02_000005));
     assert_eq!(extra.underline_color_u32(), Some(0x02_000005));
     assert_eq!(extra.underline_color_index(), Some(5));
@@ -130,9 +124,6 @@ fn underline_color_u32_roundtrip() {
     );
 }
 
-/// `has_data` is true exactly while some field is set (an entry whose last
-/// field is cleared reads empty, so `CellExtras::set` drops it), and setting
-/// or clearing one field leaves the others alone.
 #[test]
 fn has_data_tracks_every_field_independently() {
     let url: Arc<str> = Arc::from("https://example.com");
@@ -205,8 +196,6 @@ fn has_data_tracks_every_field_independently() {
     }
 }
 
-/// `row_has_hyperlinks` answers for the links on that row only, through
-/// per-cell removal and `clear_range`.
 #[test]
 fn row_has_hyperlinks_tracks_the_links_on_the_row() {
     fn link(extras: &mut CellExtras, row: u16, col: u16, url: Option<&str>) {
@@ -284,9 +273,6 @@ fn cell_extras_clear_rows_shrinks_when_excess() {
     );
 }
 
-// Hyperlink limit enforcement tests
-
-/// Eviction removes from oldest rows first (lowest internal row coordinate).
 #[test]
 fn test_hyperlink_limit_evicts_oldest_rows_first() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
@@ -305,7 +291,6 @@ fn test_hyperlink_limit_evicts_oldest_rows_first() {
 
     extras.enforce_hyperlink_limit();
 
-    // Entries sort monotonically in `i`, so the survivors are the newest suffix.
     let low_water = MAX_HYPERLINK_ENTRIES * 3 / 4;
     let mut surviving: Vec<usize> = extras
         .data
@@ -326,7 +311,6 @@ fn test_hyperlink_limit_evicts_oldest_rows_first() {
     );
 }
 
-/// Non-hyperlink extras are preserved during eviction.
 #[test]
 fn test_hyperlink_limit_preserves_non_hyperlink_extras() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
@@ -376,8 +360,6 @@ fn test_hyperlink_limit_preserves_non_hyperlink_extras() {
     );
 }
 
-/// The O(1) guard bounds the hyperlink population, not the map: 600 links among
-/// 14_600 entries cost one repairing walk, then every call takes the early-out.
 #[test]
 fn hyperlink_guard_counts_links_not_total_entries() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
@@ -425,9 +407,6 @@ fn hyperlink_guard_counts_links_not_total_entries() {
     assert_eq!(extras.len(), 14_600);
 }
 
-/// A map under the limit never walks, however inflated the counter:
-/// `hyperlink_upper_bound` charges every handout to a link-free entry, but
-/// `data.len()` is a second upper bound (links <= entries).
 #[test]
 fn small_map_never_walks_however_inflated_the_counter() {
     use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
@@ -449,7 +428,6 @@ fn small_map_never_walks_however_inflated_the_counter() {
 
     let _ = take_hyperlink_walk_ops(); // reset
 
-    // Each repaint charges again: the entries exist and hold no link.
     for _ in 0..20 {
         for row in 0..10u16 {
             for col in 0..160u16 {
@@ -477,9 +455,6 @@ fn small_map_never_walks_however_inflated_the_counter() {
     assert_eq!(extras.hyperlink_entries_slow(), 0);
 }
 
-/// The bound never sits below the true hyperlink population through any mutation
-/// family. Upward drift costs one self-repairing walk; downward drift would
-/// disable eviction.
 #[test]
 fn hyperlink_upper_bound_never_under_counts() {
     fn check(extras: &CellExtras, stage: &str) {
@@ -495,7 +470,6 @@ fn hyperlink_upper_bound_never_under_counts() {
     let mut extras = CellExtras::new();
     let url: Arc<str> = Arc::from("https://example.com");
 
-    // Per-cell handout (`get_or_create`: reflow, checkpoint restore).
     for col in 0..10u16 {
         extras
             .get_or_create(CellCoord::new(0, col))
@@ -503,7 +477,6 @@ fn hyperlink_upper_bound_never_under_counts() {
     }
     check(&extras, "per-cell handout");
 
-    // Batch run (`write_ascii_run_with_extras` -> `set_range_uniform`).
     let vals = UniformExtras {
         fg_rgb: None,
         bg_rgb: None,
@@ -522,21 +495,17 @@ fn hyperlink_upper_bound_never_under_counts() {
         "a repaint of an already-linked run must not inflate the bound"
     );
 
-    // Whole-value set (DECCRA's rect copy).
     let mut carried = CellExtra::default();
     carried.set_hyperlink(Some(url.clone()));
     extras.set(CellCoord::new(2, 0), carried);
     check(&extras, "whole-value set");
 
-    // Removal refunds.
     assert!(extras.remove(CellCoord::new(2, 0)));
     check(&extras, "single removal");
 
-    // Row clear is retain-based and never refunds, so the bound stays above.
     extras.clear_row(1);
     check(&extras, "row clear");
 
-    // 300 offset scrolls cross the compaction threshold.
     for _ in 0..300 {
         extras.shift_rows_up_by(0, 1);
     }
@@ -550,14 +519,11 @@ fn hyperlink_upper_bound_never_under_counts() {
     extras.shift_cols_left(2, 0, 2, 80);
     check(&extras, "DCH column shift");
 
-    // `clear()` resets the bound exactly.
     extras.clear();
     assert_eq!(extras.hyperlink_upper_bound(), 0);
     assert_eq!(extras.hyperlink_entries_slow(), 0);
 }
 
-/// Full-screen scrolls cost 0 shift ops below the threshold and one O(E)
-/// compaction at it: amortized O(E / COMPACT_THRESHOLD) per scroll.
 #[test]
 fn scroll_compound_cost_amortized_o1() {
     use crate::test_counters::take_extras_shift_ops;
@@ -577,24 +543,19 @@ fn scroll_compound_cost_amortized_o1() {
     assert_eq!(initial_e, (num_rows * extras_per_row) as usize);
 
     let _ = take_extras_shift_ops(); // reset
-    // 50 scrolls, all below COMPACT_THRESHOLD (256) → 0 shift ops
     let scroll_count = 50;
     for _ in 0..scroll_count {
         extras.shift_rows_up_by(0, 1);
     }
     let total_ops = take_extras_shift_ops();
 
-    // All 50 scrolls used O(1) offset bumps — 0 shift ops total.
-    // This is the key improvement over the former O(N*E) = 2750 ops.
     assert_eq!(
         total_ops, 0,
         "50 scrolls below compact threshold should cost 0 shift ops, got {total_ops}"
     );
 
-    // Verify offset accumulated correctly
     assert_eq!(extras.row_offset(), 50);
 
-    // After all rows scrolled off (10 rows, 50 shifts), no valid entries remain
     assert_eq!(extras.len(), 0, "all entries should have scrolled off");
 }
 

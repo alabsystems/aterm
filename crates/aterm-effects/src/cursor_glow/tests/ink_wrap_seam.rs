@@ -267,6 +267,7 @@ fn replay(shape: WrapShape) -> Replay {
                 }
                 WrapShape::BoxGrowsUpNoScroll => {
                     // The light is where the text is: nothing lit on the caret's
+                    // row beyond the caret.
                     if since >= Duration::from_millis(1000) {
                         let beyond: BTreeSet<u16> =
                             new.iter().copied().filter(|c| *c >= caret.1).collect();

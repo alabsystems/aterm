@@ -464,7 +464,8 @@ mod tests {
     /// code.
     #[cfg(unix)]
     fn in_forked_child(probe: impl FnOnce() -> i32) -> i32 {
-        // SAFETY: The child runs only `probe` (getrlimit/setrlimit, no allocation) and `_exit`.
+        // SAFETY: the child runs only `probe` (getrlimit/setrlimit, no
+        // allocation) and `_exit`, all async-signal-safe after `fork`.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
         if pid == 0 {

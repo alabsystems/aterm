@@ -55,7 +55,9 @@ impl Refusal {
 /// Validate that the first row is `thread`'s `session_meta` on a `measured` build.
 ///
 /// # Errors
-/// [`Refusal::OtherThread`] or [`Refusal::Unmeasured`] on a mismatched thread or build.
+/// [`Refusal::OtherThread`] for a first row that is no `session_meta` of
+/// `thread`, [`Refusal::Unmeasured`] for a build `measured` does not hold
+/// (or none named).
 pub fn gate(first_row: &str, thread: &str, measured: &[&str]) -> Result<String, Refusal> {
     let v = super::transcript::codex_steps(first_row.trim()).map_err(|_| Refusal::OtherThread)?;
     let payload = v.get("payload");

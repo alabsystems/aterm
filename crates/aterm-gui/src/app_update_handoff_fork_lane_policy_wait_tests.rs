@@ -13,8 +13,6 @@ fn artifact() -> String {
     "ab".repeat(32)
 }
 
-/// A read of `(build, COMMIT, artifact)` started now and still running —
-/// the arm-time read the spacing outran — and the flag that ends it.
 fn read_in_flight(app: &mut crate::App, build: u64) -> Arc<AtomicBool> {
     let done = Arc::new(AtomicBool::new(false));
     app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
@@ -40,7 +38,6 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
     let done = read_in_flight(&mut app, target);
     assert!(unread(&app, &ticket));
 
-    // Every attempt while the read runs defers — not only the first.
     for mode in [
         ApplyMode::Automatic,
         ApplyMode::Automatic,
@@ -54,9 +51,6 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
             "as routine activity, never a failure: {wait}"
         );
     }
-    // A person's apply waits too, so it never runs the Full capture under an unread policy. It
-    // is held, not deferred (a person's deferral never comes back under
-    // `[update] auto_apply = false`), naming this target and ending within the read's ceiling.
     let before = Instant::now();
     let wait = app
         .fork_lane_policy_wait(ApplyMode::Immediate, target, unread(&app, &ticket))
@@ -73,7 +67,6 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
         "bounded by the read's ceiling"
     );
 
-    // The read ends: its verdict is published, then its flag raised.
     *app.handoff_preverified
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::HandoffPreverification {
@@ -88,7 +81,6 @@ fn the_fork_lane_waits_while_the_policy_read_runs_and_parks_under_its_answer() {
     });
     done.store(true, Ordering::Release);
 
-    // The next attempt parks — under the policy the read answered.
     let policy = app.park_policy(Some(&ticket));
     assert!(policy.known, "the policy is known by the next park");
     assert_eq!(policy.carry_ceiling(), CarryCeiling::Repaint);
@@ -104,7 +96,6 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     let mut app = crate::App::headless_for_test();
     let running = crate::running_build_number();
 
-    // Ended with nothing on record (a check that did not finish).
     let target = running.saturating_add(1);
     read_in_flight(&mut app, target).store(true, Ordering::Release);
     assert!(
@@ -113,7 +104,6 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
         "a read that ended with nothing: the fork lane parks as it always did"
     );
 
-    // No read at all: none could start (a headless app stages nothing).
     let target = running.saturating_add(2);
     app.handoff_preverify_in_flight = None;
     assert!(
@@ -123,10 +113,6 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     );
     assert!(app.handoff_preverify_in_flight.is_none());
 
-    // Still running, but this target's ceiling is spent, which the verifier's
-    // bound says only an unscheduled thread can reach
-    // (`the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock`): the wait
-    // ends and the park proceeds.
     let target = running.saturating_add(3);
     read_in_flight(&mut app, target);
     let Some(spent) = Instant::now().checked_sub(Duration::from_millis(1)) else {
@@ -138,7 +124,6 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
             .is_none(),
         "the wait is bounded: past its ceiling the fork lane parks"
     );
-    // …and a read for another target is not this target's.
     let other = running.saturating_add(4);
     assert!(
         app.fork_lane_policy_wait(ApplyMode::Automatic, other, true)
@@ -147,15 +132,10 @@ fn a_read_that_ended_is_absent_or_outran_its_ceiling_is_not_waited_for() {
     );
 }
 
-/// A pre-verification holds or queues for the staged apply lock, so the fork lane must not park
-/// while a same-key read can still hold it: the ceiling exceeds aterm-update's
-/// `HANDOFF_PREVERIFY_BOUND` (the lock wait plus the verification budget) and is derived from it.
 #[test]
 fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
     let mut app = crate::App::headless_for_test();
     let target = crate::running_build_number().saturating_add(1);
-    // The wait and the read began one whole bound ago: this is the last
-    // instant the read can still be inside its lock wait and its budget.
     let now = Instant::now();
     if now
         .checked_sub(aterm_update::HANDOFF_PREVERIFY_BOUND)
@@ -185,7 +165,6 @@ fn the_ceiling_outlasts_every_instant_a_read_can_hold_the_lock() {
             .is_some_and(|read| Arc::ptr_eq(&read.done, &done)),
         "and no second read is started beside it"
     );
-    // Once the read ends, the lane parks under whatever it published.
     done.store(true, Ordering::Release);
     assert!(
         app.fork_lane_policy_wait(ApplyMode::Automatic, target, true)

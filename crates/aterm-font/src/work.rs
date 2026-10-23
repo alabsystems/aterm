@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-/// One outline query's cumulative expansion budget. Nesting caps bound the
-/// stack, but an acyclic DAG can visit its children exponentially often.
-/// Charge every glyph entry, TrueType point and CFF instruction across all
-/// siblings/subroutines, rather than granting each recursive call a new
-/// allowance. Partial sink output is possible before refusal, as for any
-/// malformed outline.
+/// Cumulative expansion budget for a single outline query.
 pub(crate) struct OutlineWork(Option<u32>);
 
 impl Default for OutlineWork {
@@ -31,32 +26,14 @@ impl OutlineWork {
     }
 }
 
-/// One `GSUB` table's walk budget, shared by every lookup the walks of one
-/// reader reach (the shaper's lookup parses, the autohinter's style and
-/// cluster walks), one unit per lookup, subtable or entry visited: per
-/// traversal of the table the reader may make, 8 units per byte of the table
-/// and at least 16,384. The budget is aterm's own. HarfBuzz's sanitizer
-/// charges bytes rather than entries, 64 operations per byte of the table
-/// (`HB_SANITIZE_MAX_OPS_FACTOR`, at least 16,384) with each range it checks
-/// spending its length (`check_range`, src/hb-sanitize.hh at c7ef6a2ed5), so
-/// it allows a two-byte entry 32 checks per byte of the table where this
-/// allows 8. A well-formed table spends about half a unit per byte in one
-/// traversal, since each lookup, subtable and entry sits in bytes of its own
-/// (at least two); the most on this Mac (2026-10-19, 523 faces with `GSUB`)
-/// is 6.02% of the shaper's one traversal (SFIndia) and 0.26 traversals of
-/// the autohinter's eight (Hiragino Sans W3). Offsets may alias, though:
-/// every lookup of a list can name one lookup and every subtable offset of
-/// it one subtable, so a 192 KB table names 32,000 x 32,000 subtables (27 s
-/// for one two-character shape, 16 s to build the autohinter's styles,
-/// measured 2026-10-19). Once the budget is spent the walk refuses the
-/// table, as HarfBuzz drops a table that fails its sanitizer.
+/// Per-table `GSUB` traversal budget shared across shaper and autohinter lookups.
 pub(crate) struct LayoutWork {
     left: core::cell::Cell<u64>,
     refused: core::cell::Cell<bool>,
 }
 
 impl LayoutWork {
-    /// The budget for `traversals` traversals of a table of `len` bytes.
+    /// Budget for `traversals` traversals of a table of `len` bytes.
     #[inline]
     pub(crate) const fn for_table(len: usize, traversals: u64) -> Self {
         let one = (len as u64).saturating_mul(8);
@@ -67,8 +44,7 @@ impl LayoutWork {
         }
     }
 
-    /// Spends `units`; `None`, and refused from then on, when they are not
-    /// left.
+    /// Spend `units`, returning `None` and marking the table refused when exhausted.
     #[inline]
     pub(crate) fn spend(&self, units: u64) -> Option<()> {
         match self.left.get().checked_sub(units) {
@@ -83,8 +59,7 @@ impl LayoutWork {
         }
     }
 
-    /// Whether a walk ran past the budget. Only the hinter asks, so it is
-    /// built where the hinter is (`autohint`'s cfg).
+    /// Whether a walk ran past the budget.
     #[cfg(any(feature = "hint", debug_assertions))]
     #[inline]
     pub(crate) fn refused(&self) -> bool {
@@ -92,22 +67,13 @@ impl LayoutWork {
     }
 }
 
-/// What this thread's outline queries and `COLR` paint walks have spent
-/// since the last [`take_spent`]: how close a real face comes to the two
-/// work budgets, the 65,536 outline steps of [`OutlineWork`] and the 2^16
-/// paint tables of a `COLR` walk (TF.5 of
-/// docs/AUDIT-third-party-2026-10-15.md). The font oracle recorder's
-/// `budgets` mode reads it per glyph. Debug builds only: a release build
-/// counts nothing and has no such item, and neither has the Trust lane's
-/// build (`trust_verify`), which proves the budgets' code as it ships.
+/// Per-thread outline and `COLR` paint-table step counts since the last [`take_spent`].
 #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Spent {
-    /// Outline steps asked for, every one a budget refused included, so a
-    /// refused query reads more than 65,536.
+    /// Outline steps requested, including any refused by the budget.
     pub outline_steps: u64,
-    /// `COLR` paint tables a walk asked to visit, every one the budget
-    /// refused included, so a refused walk reads more than 2^16.
+    /// `COLR` paint tables visited, including any refused by the budget.
     pub paint_tables: u64,
 }
 
@@ -131,8 +97,7 @@ pub(crate) fn note(charge: impl FnOnce(&mut Spent)) {
     });
 }
 
-/// This thread's [`Spent`] since the last call, which starts it again at
-/// zero. Debug builds only.
+/// Return and reset this thread's [`Spent`] counters.
 #[cfg(all(any(test, debug_assertions), not(trust_verify)))]
 #[must_use]
 pub fn take_spent() -> Spent {

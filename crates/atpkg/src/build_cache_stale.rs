@@ -110,7 +110,13 @@ pub struct Doomed {
     pub paths: Vec<PathBuf>,
 }
 
-/// THE RULE, pure.
+/// THE RULE, pure: in each profile, every incremental crate folder nothing wrote for
+/// [`RECLAIM_STALE`]; and, when cargo last built here with a store's build
+/// ([`Survey::last_built`]), every unit whose fingerprint names a compiler no unit of the
+/// profile written since the store's `current` link was made names, nothing having written
+/// its fingerprint or any of its entries for [`RECLAIM_STALE`]. Where that build is the
+/// current one, a profile with no unit written since keeps every unit: nothing there says
+/// which compiler is current.
 #[must_use]
 pub fn decide(survey: &Survey, now: SystemTime) -> Vec<Doomed> {
     let stale = |t: Option<SystemTime>| {

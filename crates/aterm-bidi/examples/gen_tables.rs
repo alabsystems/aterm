@@ -36,9 +36,15 @@ const NAMES: &[(&str, &str)] = &[
     ("Pop_Directional_Isolate", "PDI"),
 ];
 
-const HEADER: &str = "// Copyright 2026 Andrew Yates
+/// The generator the tables' seal line names (`aterm_census::seal`).
+const GENERATOR: &str = "aterm-bidi's `gen_tables` example";
+
+const LICENCE_HEADER: &str = "// Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//
+";
+
+/// What follows the seal line.
+const HEADER: &str = "//
 // GENERATED — do not edit by hand. Regenerate with
 //     targo --unverified run -p aterm-bidi --example gen_tables -- tables <DerivedBidiClass.txt> <BidiBrackets.txt>
 // from the Unicode Character Database, whose data is under the Unicode License v3
@@ -57,6 +63,7 @@ fn main() -> ExitCode {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let done = match args.as_slice() {
         [verb, derived, brackets] if verb == "tables" => tables(&read(derived), &read(brackets))
+            .and_then(|text| aterm_census::seal::stamp(&text))
             .and_then(|text| write(&crate_dir.join("src/tables.rs"), &text)),
         [verb, bidi_test, character_test] if verb == "subset" => {
             let data = crate_dir.join("tests/data");
@@ -174,7 +181,10 @@ fn tables(
             pairs.push((span(open)?.0, span(close)?.0));
         }
     }
-    let mut out = String::from(HEADER);
+    let mut out = format!(
+        "{LICENCE_HEADER}{}\n{HEADER}",
+        aterm_census::seal::line("//", GENERATOR)
+    );
     out.push_str(&format!(
         "// Generated from the Unicode Character Database {version} (extracted/DerivedBidiClass.txt,\n\
          // including its @missing defaults) by crates/aterm-bidi/examples/gen_tables.rs. Every code point\n\

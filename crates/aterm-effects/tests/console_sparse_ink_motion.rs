@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A fixed composer caret surrounded by sparse animated program glyphs, as in
-//! a Codex scene with braille particles across its three input rows. They are
-//! ordinary terminal content, independent of aterm's effects.
+//! Sparse animated glyph tests for console pet motion.
 
 use std::time::{Duration, Instant};
 
@@ -13,9 +11,6 @@ use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
 
-/// An incoherent observation: the cells were extracted before a scroll the facts already saw
-/// (`base_y` disagrees), as when a present reuses a snapshot. A sub-row scroll offset is not
-/// one: the renderer translates the grid band and the sprite together (`PetWorld::observe`).
 fn stale_snapshot(input: &mut aterm_core::render::RenderInput) {
     input.base_y += 1;
 }
@@ -70,8 +65,6 @@ impl Scene {
     }
 
     fn particles(&mut self, near: u16) {
-        // Complete synchronized batches always restore the same visible
-        // caret. Only the sparse background glyphs move; no input is noted.
         let above = self.rows - 3;
         let caret_row = self.rows - 2;
         let below = self.rows - 1;
@@ -105,7 +98,6 @@ impl Scene {
                 .observe_console(&input, &facts, PetPane::full(&input));
         }
         self.brain.set_console_presentable(self.presentable);
-        // The shipping ink scanner; as on glass, the brain reads the last completed scan.
         let (spans, live) = self.decos.pet_ink();
         self.brain.sense_ink(0, spans, live);
         let sense = PetSense {
@@ -141,11 +133,6 @@ impl Scene {
     }
 }
 
-/// Sparse program particles do not send a fixed-caret pet across the pane,
-/// at the sampled Codex scene's size and either side of the observation
-/// budget's edges: some frames place a real particle under the old footprint,
-/// and the pet avoids that glyph using nearby empty cells. A lone distant
-/// glyph cannot turn the intervening spaces into a wall.
 #[test]
 fn sparse_ink_stays_local_across_observation_budget_edges() {
     for (rows, cols) in [(ROWS, COLS), (64, 256), (65, 257), (100, 300), (200, 600)] {
@@ -185,7 +172,6 @@ fn invalid_surface_cannot_materialize_static_capture_or_replay_an_unfocused_trip
         assert_eq!(before.alpha, 255, "fixture: the resident is on glass");
         s.incoherent = true;
         s.static_capture = capture;
-        // The body on glass is held where it was certified: never a new one, never a trip.
         let held = s.tick();
         assert_eq!(
             (held.alpha, held.col, held.row),
@@ -203,8 +189,6 @@ fn invalid_surface_cannot_materialize_static_capture_or_replay_an_unfocused_trip
             let f = s.tick();
             assert!(f.col < 9.0, "refocus replayed an invalid trip at {}", f.col);
         }
-        // An incoherent surface materializes nothing: a pet never on glass is not drawn by a
-        // capture.
         let mut cold = Scene::new();
         cold.particles(2);
         cold.incoherent = true;
@@ -275,8 +259,6 @@ fn real_failed_observations_conform_for_idle_and_airborne_locomotion() {
             state = model.successors("TickLaunch", &state)[0].clone();
         }
         state = model.successors("ObserveIncoherent", &state)[0].clone();
-        // Independently establish the observation verdict on the exact
-        // production input, rather than infer it from the resulting motion.
         let mut input = s.term.cell_frame(usize::from(s.rows), usize::from(s.cols));
         stale_snapshot(&mut input);
         let facts = PetWorldFacts::read(&s.term, 7);
@@ -297,10 +279,7 @@ fn real_failed_observations_conform_for_idle_and_airborne_locomotion() {
                 "actual failed-observation transition diverged: {state:?} -> {post:?}"
             );
             assert!(model.check_invariant("IncoherentObservationFreezesMotion", &post));
-            // Frozen and held: the body keeps its opacity through the unknown frames.
             assert_eq!(held.alpha, before.alpha);
-            // Negative controls: an idle tick that commissions a flight, or an airborne tick
-            // that advances the committed trajectory, violates the model.
             let mut historical = post.clone();
             if airborne {
                 historical.insert("moved", 1);
@@ -320,8 +299,6 @@ fn real_failed_observations_conform_for_idle_and_airborne_locomotion() {
             );
         }
     }
-    // A host that never supplies a world keeps plain caret-following locomotion; a missing
-    // observation is not a failed one.
     let mut s = Scene::new();
     s.observe = false;
     for _ in 0..100 {

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The alternate screen's resize undo and 24-bit colour across a resize: a flap with nothing
-//! written between its halves puts every row back as drawn, cell for cell. The samples cover
-//! what a full-screen program paints (wide CJK, ZWJ emoji, combining marks, SGR, a coloured
-//! curly underline, an OSC 8 link, truecolor, blank rows); the comparison is the renderer's
-//! own row (`render_row`) plus links and cursor. The screens are random from a fixed seed.
+//! Alternate-screen resize undo and 24-bit colour preservation across resizes.
 
 use aterm_core::terminal::Terminal;
 
@@ -33,7 +29,6 @@ const SAMPLES: &[&str] = &[
     "",
 ];
 
-/// A full alternate screen of random samples, the cursor parked on a random row.
 fn paint(s: &mut u64, t: &mut Terminal, rows: u16) {
     t.process(b"\x1b[?1049h\x1b[2J");
     for r in 0..rows {
@@ -46,7 +41,6 @@ fn paint(s: &mut u64, t: &mut Terminal, rows: u16) {
     t.process(format!("\x1b[{row};{col}H").as_bytes());
 }
 
-/// Everything a flap may not change, as text a failure can print.
 fn picture(t: &Terminal) -> Vec<String> {
     let mut out: Vec<String> = (0..usize::from(t.rows()))
         .map(|r| format!("{:?}", t.render_row(r)))
@@ -77,14 +71,10 @@ fn first_difference(a: &[String], b: &[String]) -> String {
     )
 }
 
-/// Every screen height from 8 to 37 rows, each flap of 1..=9 rows (fewer on a
-/// short screen) and each pair of shrinks of 1..=3 rows grown back at once,
-/// on a freshly painted screen.
 #[test]
 fn a_quiet_flap_is_a_styled_identity() {
     let mut seed = 0x57_71_1E_D5_u64;
     for rows in 8..38u16 {
-        // One flap of 1..=9 rows.
         for k in 1..rows.min(10) {
             let mut t = Terminal::new(rows, COLS);
             paint(&mut seed, &mut t, rows);
@@ -99,7 +89,6 @@ fn a_quiet_flap_is_a_styled_identity() {
             );
         }
 
-        // Two shrinks and one grow back.
         for (k1, k2) in (1..=3u16).flat_map(|a| (1..=3u16).map(move |b| (a, b))) {
             let mut t = Terminal::new(rows, COLS);
             paint(&mut seed, &mut t, rows);
@@ -117,9 +106,6 @@ fn a_quiet_flap_is_a_styled_identity() {
     }
 }
 
-/// A truecolor colour, as `render_row` reports it, survives a same-size resize, a flap the
-/// engine undoes, a shrink nothing undoes (the coloured rows are found where they moved) and
-/// an alternate-screen width change.
 #[test]
 fn resize_keeps_truecolor_in_render_row() {
     for (name, sizes) in [
@@ -131,7 +117,6 @@ fn resize_keeps_truecolor_in_render_row() {
         let mut t = Terminal::new(12, COLS);
         t.process(b"\x1b[?1049h\x1b[2J\x1b[1;1H\x1b[48;2;10;20;30mRGBROW\x1b[0m tail");
         t.process(b"\x1b[3;1H\x1b[38;2;200;100;50mfg row\x1b[0m");
-        // Park the cursor on the bottom row: a shrink demotes the top rows.
         t.process(b"\x1b[12;1H");
         assert_eq!(t.render_row(0)[0].bg, [10, 20, 30], "{name}: fixture bg");
         let fg = t.render_row(2)[0].fg;
@@ -145,7 +130,6 @@ fn resize_keeps_truecolor_in_render_row() {
         if let Some(r) = row_of(&t, "RGBROW") {
             assert_eq!(t.render_row(r)[0].bg, [10, 20, 30], "{name}: background");
         } else {
-            // Demoted off the top of a shrink nothing undid: gone with its row.
             assert!(name.ends_with("never back"), "{name}: the bg row vanished");
         }
         let r = row_of(&t, "fg row").unwrap_or_else(|| panic!("{name}: fg row vanished"));

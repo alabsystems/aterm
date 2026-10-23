@@ -1809,6 +1809,12 @@ impl App {
                 crate::a11y_backend::note_at_client();
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.a11y_active = true;
+                    #[cfg(target_os = "linux")]
+                    if let (Some(adapter), Some(window)) =
+                        (ws.a11y.as_mut(), ws.os_window.as_deref())
+                    {
+                        adapter.listened(window);
+                    }
                 }
                 self.push_a11y_tree(wid);
             }
@@ -1899,7 +1905,6 @@ impl App {
                     .and_then(|ws| ws.palette())
                     .and_then(|palette| palette.a11y_filtered_index(req.target_node))
                 else {
-                    // root / list container carries no row action
                     return; // root / list container carries no row action
                 };
                 match req.action {
@@ -1931,7 +1936,6 @@ impl App {
                     .and_then(|ws| ws.overview())
                     .and_then(|map| map.a11y_item_index(req.target_node))
                 else {
-                    // root / list container carries no row action
                     return; // root / list container carries no row action
                 };
                 match req.action {

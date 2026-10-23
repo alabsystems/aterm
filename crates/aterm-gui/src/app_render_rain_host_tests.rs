@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Phosphor host-side wiring: pane translation, the shell-execute edge, the
-//! literal reload, the hidden-cursor damage band and the tab-strip splice
-//! shifting the rain channels with the grid.
+//! Phosphor host-side wiring tests.
 
 use super::{prepend_strip_rows, rain_refresh_needed, update_rain_hidden_band};
 use crate::matrix_rain::{EffectGeom, MatrixRain, RainConfig, RainSignal, RainTickInput};
@@ -43,23 +41,15 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, cx: u16, cy: u16) -> aterm_ren
     }
 }
 
-/// Pane-local rain emission translates by `(row_off·ch, col_off·cw)` px plus
-/// `row_off` row tags, and every surviving quad/halo lies inside the pane's
-/// grid-interior box, so rain never crosses a divider.
 #[test]
 fn translate_rain_into_pane_confines_emission_to_the_pane_box() {
     let (cw, ch) = (8u32, 16u32);
     let (row_off, col_off, rows, cols) = (5u16, 42u16, 10u16, 38u16);
-    // A quad at the pane origin, one mid-pane, one hugging the pane's
-    // bottom-right cell — all pane-local, all in-bounds.
     let mut quads = vec![
         q(0, 0, 0, 8, 16),
         q(4, 80, 64, 8, 16),
         q(9, (u32::from(cols - 1) * cw) as u16, (9 * ch) as u16, 8, 16),
     ];
-    // A halo poking past the pane's right edge clips to the box with its
-    // centre shift exact; one wholly beyond the edge drops without an
-    // underflow panic.
     let mut add = vec![
         halo(0, ((u32::from(cols) - 1) * cw) as u16, 0, 24, 16, 300, 8),
         halo(1, (u32::from(cols) * cw + 40) as u16, 16, 24, 16, 340, 24),
@@ -97,14 +87,11 @@ fn translate_rain_into_pane_confines_emission_to_the_pane_box() {
     assert_eq!(u32::from(h0.cy), 8 + y0);
 }
 
-/// Quads that would leave the u16 pixel space (a pane deep in a huge
-/// window) drop whole instead of wrapping.
 #[test]
 fn translate_rain_into_pane_drops_u16_overflow() {
     let (cw, ch) = (8u32, 16u32);
     let mut quads = vec![q(0, 65_000, 0, 40, 16)];
     let mut add = Vec::new();
-    // col_off far enough right that 65000 + col_off*8 exceeds u16::MAX.
     translate_rain_into_pane(&mut quads, &mut add, 0, 100, 5, 8200, cw, ch);
     assert!(quads.is_empty(), "overflowing quad drops whole");
 }
@@ -226,8 +213,6 @@ fn real_shell_execute_edge_conforms_and_long_level_drains() {
     );
 }
 
-/// A live classic-to-literal reload needs an authoritative material
-/// sample even when occupancy is already current at the same epoch.
 #[test]
 fn literal_reload_refreshes_without_new_grid_damage() {
     let classic = RainConfig {
@@ -295,8 +280,6 @@ fn literal_reload_refreshes_without_new_grid_damage() {
     ));
 }
 
-/// The band ring keeps the last `HIDDEN_CURSOR_BAND_ROWS` damaged rows,
-/// most recent first, bottom-biased within a frame, deduped, capped.
 #[test]
 fn hidden_band_tracks_recent_damage() {
     let mut band: Vec<u16> = Vec::new();
@@ -305,19 +288,16 @@ fn hidden_band_tracks_recent_damage() {
     update_rain_hidden_band(&mut band, &dmg, 30);
     assert_eq!(band, vec![29, 28, 27], "ascending scan ⇒ bottom rows first");
 
-    // A later frame damaging one row promotes it to the ring head.
     let mut dmg = Damage::Partial(DamageTracker::new(30));
     dmg.mark_rows(5, 6);
     update_rain_hidden_band(&mut band, &dmg, 30);
     assert_eq!(band, vec![5, 29, 28, 27]);
 
-    // Re-damaging a resident row promotes it rather than duplicating it.
     let mut dmg = Damage::Partial(DamageTracker::new(30));
     dmg.mark_rows(28, 29);
     update_rain_hidden_band(&mut band, &dmg, 30);
     assert_eq!(band, vec![28, 5, 29, 27]);
 
-    // The ring caps at HIDDEN_CURSOR_BAND_ROWS (5), evicting the oldest.
     let mut dmg = Damage::Partial(DamageTracker::new(30));
     dmg.mark_rows(10, 13); // rows 10, 11, 12
     update_rain_hidden_band(&mut band, &dmg, 30);
@@ -325,8 +305,6 @@ fn hidden_band_tracks_recent_damage() {
     assert_eq!(band, vec![12, 11, 10, 28, 5], "oldest rows evicted");
 }
 
-/// Full damage (resize / alt-swap / first frame) locates nothing — every
-/// row reads damaged — so the ring is left unchanged rather than flooded.
 #[test]
 fn hidden_band_ignores_full_damage() {
     let mut band: Vec<u16> = vec![7, 3];
@@ -336,15 +314,6 @@ fn hidden_band_ignores_full_damage() {
     assert_eq!(band, vec![7, 3], "full damage leaves the band unchanged");
 }
 
-/// The tab-strip splice moves every grid-relative projection down with the
-/// grid, checked at a 1-row and a 2-row strip:
-///
-/// * rain quads (row + pixel y) and rain halos: quads stay registered with
-///   their cells and the halo centre shifts vertically while `cx` stays;
-/// * fire contrast-halo cells (a cell-anchored grid stream): row tag only,
-///   column and strength unchanged;
-/// * selection anchors with the pane clip and per-pane selection list, the
-///   atlas-backed cat/rain streams, and rowless free sprites.
 #[test]
 fn strip_splice_shifts_every_grid_relative_channel() {
     struct Want {
@@ -403,8 +372,6 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             .selection
             .update_selection(0, 1, aterm_core::selection::SelectionSide::Right);
         input.selection_clip = Some(aterm_render::SelectionClip::new(0, 1, 0, 2));
-        // The per-pane list must move by the same translation, or a pane's
-        // band sits `strip` rows above its cells.
         input.selections = vec![aterm_core::render::PaneSelection {
             selection: input.selection.clone(),
             clip: aterm_render::SelectionClip::new(0, 1, 0, 2),
@@ -437,7 +404,6 @@ fn strip_splice_shifts_every_grid_relative_channel() {
             cy: 40,
             rx: 6,
             ry: 8,
-            // `mode` defaults to `HaloMode::Add`.
             ..Default::default()
         });
         input.fire_halo.push(aterm_render::FireHaloCell {

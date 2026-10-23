@@ -83,7 +83,7 @@ impl ActClass {
     }
 }
 
-/// The class of the round trip at `door` asking `request` ([module docs](self)).
+/// The class of the round trip at `door` asking `request` ([`ActClass`]).
 #[must_use]
 pub fn act_class(door: &str, request: &[u8]) -> ActClass {
     if door == doors::TELLER {
@@ -570,7 +570,9 @@ impl ActsCursor {
         }
     }
 
-    /// A ROUND TRIP at `door` asking `request` ([module docs](self)).
+    /// A ROUND TRIP at `door` asking `request`, served by its class ([`act_class`]): an act only
+    /// where it is the segment's closing act, byte for byte; anything else from the loop's own
+    /// segment or from before the cursor, never from past an act it has not taken.
     pub(crate) fn exchange(&mut self, door: &str, request: &[u8]) -> Result<Served, Refusal> {
         if door == doors::SLEEP {
             return Ok(self.sleep(request));
@@ -759,7 +761,9 @@ impl ActsCursor {
         })
     }
 
-    /// A FLAG read at `door` ([module docs](self)).
+    /// A FLAG read at `door`: true once the cursor has passed its record, or reached it with the
+    /// recorded false reads spent, or once the loop has strayed in the segment that holds it and
+    /// the virtual clock has reached the moment it was raised.
     pub(crate) fn raised(&mut self, door: &str) -> bool {
         if self.latched.contains(door) {
             return true;

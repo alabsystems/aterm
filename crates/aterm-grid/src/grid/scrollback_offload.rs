@@ -9,6 +9,7 @@ use aterm_scrollback::{Line, ScrollbackStorage};
 use super::Grid;
 use super::reflow::{ReflowMode, ResizePolicy};
 use super::resize_handback::ResizeLaw;
+use super::scroll_convert::LazyBuffer;
 use super::state::{DetachedReaderAim, FillDebt, PendingScrollbackSettings};
 use crate::Damage;
 
@@ -118,6 +119,10 @@ trust_island! {
 pub struct PendingScrollbackReflow {
     store: ScrollbackStorage,
     lazy_lines: Vec<Line>,
+    /// The rows staged for the store at (re)detach, after `lazy_lines`, still raw: the stream
+    /// materializes them as it reads them, on the reflow worker, not under the detaching lock
+    /// ([`LazyBuffer::take_staged`]). Boxed: a job is a [`ReflowStep`] variant.
+    lazy_staged: Box<LazyBuffer>,
     /// The ring's scrollback rows, materialized at detach; rewrapped into
     /// [`ReflowedScrollback::ring_out`].
     ring_lines: Vec<Line>,
@@ -146,7 +151,7 @@ pub struct PendingScrollbackReflow {
 /// Where an incrementally-stepped rewrap currently is. Private: callers only
 /// see [`ReflowStep`].
 enum ReflowPhase {
-    /// The streaming rewrap: read input from the front of the store (truncating it as consumed), then from the newer `lazy_lines`.
+    /// The streaming rewrap: read input from the front of the store (truncating it as consumed), then from the newer `lazy_lines` and `lazy_staged`.
     Stream {
         /// Input lines still unread at the store's front.
         store_input_left: usize,
@@ -247,7 +252,10 @@ impl PendingScrollbackReflow {
     #[must_use]
     #[inline]
     pub fn line_count(&self) -> usize {
-        self.store.line_count() + self.lazy_lines.len() + self.ring_lines.len()
+        self.store.line_count()
+            + self.lazy_lines.len()
+            + self.lazy_staged.len()
+            + self.ring_lines.len()
     }
 
     /// The whole rewrap in one call; run it off the caller's thread and lock.
@@ -288,7 +296,8 @@ impl PendingScrollbackReflow {
                 next_lazy,
                 carry,
             } => {
-                let total_left = *store_input_left + (self.lazy_lines.len() - *next_lazy);
+                let lazy_left = self.lazy_lines.len() - *next_lazy;
+                let total_left = *store_input_left + lazy_left + self.lazy_staged.len();
                 let read = budget.min(total_left);
                 self.lines_read = self.lines_read.saturating_add(read);
                 let appended_from = carry.len();
@@ -310,13 +319,15 @@ impl PendingScrollbackReflow {
                     }
                     *store_input_left -= from_store;
                 }
-                for _ in from_store..read {
+                let from_lazy = (read - from_store).min(lazy_left);
+                for _ in 0..from_lazy {
                     carry.push(std::mem::replace(
                         &mut self.lazy_lines[*next_lazy],
                         Line::new(),
                     ));
                     *next_lazy += 1;
                 }
+                carry.extend(self.lazy_staged.drain_front(read - from_store - from_lazy));
 
                 if read == total_left {
                     let straddling = if self.ring_lines.first().is_some_and(Line::is_wrapped) {
@@ -495,7 +506,7 @@ impl Grid {
 
         let prev_offset = self.storage.display_offset;
         let clear_gen = self.storage.scrollback_clear_gen;
-        let lazy_lines: Vec<Line> = self.storage.lazy_buffer.drain_all().collect();
+        let lazy_staged = Box::new(self.storage.lazy_buffer.take_staged());
         let pending_settings = PendingScrollbackSettings {
             line_limit: self.storage.scrollback_line_limit(),
             memory_budget: self
@@ -536,10 +547,11 @@ impl Grid {
         let detach_live_bottom_gen = self.storage.reader_live_bottom_gen;
 
         let phase = ReflowPhase::start(&store);
-        let lines_total = store.line_count() + lazy_lines.len() + ring_lines.len();
+        let lines_total = store.line_count() + lazy_staged.len() + ring_lines.len();
         Some(PendingScrollbackReflow {
             store,
-            lazy_lines,
+            lazy_lines: Vec::new(),
+            lazy_staged,
             ring_lines,
             lines_total,
             lines_read: 0,
@@ -633,37 +645,39 @@ impl Grid {
         self.storage.scrollback = Some(reflowed.store);
         self.reconcile_pending_scrollback_settings();
 
-        let lazy_lines = if self.storage.store_retains_lines() {
-            let mut staged = reflowed.ring_out;
-            staged.extend(self.storage.lazy_buffer.drain_all());
-            self.storage.lazy_buffer.release_spine_slack();
+        let (lazy_lines, lazy_staged) = if self.storage.store_retains_lines() {
+            let mut ring_out = reflowed.ring_out;
+            let mut staged = Box::new(self.storage.lazy_buffer.take_staged());
             if let Some(store) = self.storage.scrollback.as_mut()
                 && let Some(max) = store.line_limit()
             {
-                let total = store.line_count().saturating_add(staged.len());
+                let total = store
+                    .line_count()
+                    .saturating_add(ring_out.len() + staged.len());
                 if total > max {
                     let excess = total - max;
                     let from_store = excess.min(store.line_count());
                     if from_store > 0 {
                         let _ = store.truncate_oldest(from_store);
                     }
-                    let from_staged = excess - from_store;
-                    if from_staged > 0 {
-                        staged.drain(..from_staged);
-                    }
+                    let from_ring = (excess - from_store).min(ring_out.len());
+                    ring_out.drain(..from_ring);
+                    // Dropped unread, a drain discards its rows unconverted.
+                    drop(staged.drain_front(excess - from_store - from_ring));
                 }
             }
-            staged
+            (ring_out, staged)
         } else {
             self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
             self.drain_lazy_buffer();
-            self.storage.lazy_buffer.drain_all().collect()
+            let rest = self.storage.lazy_buffer.drain_all().collect();
+            (rest, Box::default())
         };
 
         let sb = self
             .storage
             .scrollback_lines()
-            .saturating_add(lazy_lines.len());
+            .saturating_add(lazy_lines.len() + lazy_staged.len());
         let reader_descended_to_live =
             self.storage.reader_live_bottom_gen != reflowed.detach_live_bottom_gen;
         if !(reader_descended_to_live && self.storage.display_offset == 0) {
@@ -711,10 +725,11 @@ impl Grid {
         self.storage.pending_scrollback_settings = Some(pending_settings);
         self.storage.detached_reader_aim = None;
         let phase = ReflowPhase::start(&store);
-        let lines_total = store.line_count() + lazy_lines.len();
+        let lines_total = store.line_count() + lazy_lines.len() + lazy_staged.len();
         Some(PendingScrollbackReflow {
             store,
             lazy_lines,
+            lazy_staged,
             ring_lines: Vec::new(),
             lines_total,
             lines_read: 0,
@@ -1390,6 +1405,103 @@ mod tests {
             g.scrollback_lines(),
             before,
             "a generous budget moves staged rows without losing history"
+        );
+        g.assert_invariants();
+    }
+
+    /// A WIDTH CHANGE LEAVES THE STAGED ROWS RAW FOR ITS JOB: the detach
+    /// materializes the same rows however many the compression worker has yet
+    /// to take into the store, and the job reads every staged row into history,
+    /// in order.
+    #[test]
+    fn a_width_change_leaves_the_staged_rows_raw_for_its_job() {
+        let (rows, cols) = (10u16, 40u16);
+        let detach = |staged: usize| {
+            let mut g = tiered_grid(rows, cols, 8);
+            for i in 0..50 {
+                logical_line(&mut g, &format!("H{i}"));
+            }
+            g.set_compress_offload_active(true);
+            for i in 0..staged {
+                logical_line(&mut g, &format!("S{i}"));
+            }
+            assert!(
+                g.lazy_backlog_len() + usize::from(rows) + 8 >= staged,
+                "precondition: {staged} rows are staged, not in the store"
+            );
+            crate::test_counters::take_row_to_line_ops();
+            let job = g
+                .resize_offloading_scrollback(rows, 23)
+                .expect("a width change with a tiered store detaches");
+            (g, job, crate::test_counters::take_row_to_line_ops())
+        };
+        let (_, _, few) = detach(20);
+        let (mut g, job, many) = detach(600);
+        assert_eq!(many, few, "the detach materializes no staged row");
+
+        g.reattach_reflowed_scrollback(job.reflow());
+        let history: Vec<String> = (0..g.scrollback_lines())
+            .filter_map(|i| g.get_history_line(i))
+            .map(|line| line.to_string())
+            .collect();
+        let staged: Vec<&str> = history
+            .iter()
+            .map(|line| line.trim_end())
+            .filter(|line| line.starts_with('S'))
+            .collect();
+        let want: Vec<String> = (0..staged.len()).map(|i| format!("S{i}")).collect();
+        assert_eq!(staged, want, "every staged row reached history, in order");
+        assert!(
+            staged.len() + usize::from(rows) >= 600,
+            "{} staged rows in history",
+            staged.len()
+        );
+        g.assert_invariants();
+    }
+
+    /// A width change while a job is out redetaches with the rows staged meanwhile raw, as the
+    /// first detach leaves them: a drag across a flood pays no main-thread drain per step.
+    #[test]
+    fn a_redetach_leaves_the_staged_rows_raw_for_its_job() {
+        let rows = 10u16;
+        let redetach = |staged: usize| {
+            let mut g = tiered_grid(rows, 40, 8);
+            for i in 0..50 {
+                logical_line(&mut g, &format!("H{i}"));
+            }
+            let job = g
+                .resize_offloading_scrollback(rows, 23)
+                .expect("a width change with a tiered store detaches");
+            for i in 0..staged {
+                logical_line(&mut g, &format!("S{i}"));
+            }
+            g.resize(rows, 31);
+            let reflowed = job.reflow();
+            crate::test_counters::take_row_to_line_ops();
+            let follow = g
+                .reattach_reflowed_scrollback_or_redetach(reflowed)
+                .expect("a width that moved on redetaches");
+            (g, follow, crate::test_counters::take_row_to_line_ops())
+        };
+        let (_, _, few) = redetach(20);
+        let (mut g, follow, many) = redetach(600);
+        assert_eq!(many, few, "the redetach materializes no staged row");
+
+        assert!(
+            g.reattach_reflowed_scrollback_or_redetach(follow.reflow())
+                .is_none()
+        );
+        let staged: Vec<String> = (0..g.scrollback_lines())
+            .filter_map(|i| g.get_history_line(i))
+            .map(|line| line.to_string().trim_end().to_owned())
+            .filter(|line| line.starts_with('S'))
+            .collect();
+        let want: Vec<String> = (0..staged.len()).map(|i| format!("S{i}")).collect();
+        assert_eq!(staged, want, "every staged row reached history, in order");
+        assert!(
+            staged.len() + usize::from(rows) >= 600,
+            "{} staged rows in history",
+            staged.len()
         );
         g.assert_invariants();
     }
@@ -2263,6 +2375,8 @@ mod tests {
             });
         }
         input.extend(job.lazy_lines);
+        let mut staged = job.lazy_staged;
+        input.extend(staged.drain_all());
         if job.ring_lines.first().is_some_and(Line::is_wrapped) {
             let head = input.iter().rposition(|line| !line.is_wrapped());
             input.truncate(head.unwrap_or(0));
@@ -2538,7 +2652,10 @@ mod tests {
             .expect("width mismatch must redetach");
 
         assert_eq!(follow.store.line_count(), store_lines_before_redetach);
-        assert_eq!(follow.lazy_lines.len(), ring_out_len + staged_at_redetach);
+        assert_eq!(
+            follow.lazy_lines.len() + follow.lazy_staged.len(),
+            ring_out_len + staged_at_redetach
+        );
         assert!(
             g.reattach_reflowed_scrollback_or_redetach(follow.reflow())
                 .is_none()

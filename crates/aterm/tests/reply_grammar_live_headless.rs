@@ -1,20 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The reply grammar over the real socket for `controls`, `open … close`, `await`,
-//! `temporal` and `history`, read as a client reads it through a real `aterm --headless`:
-//! the status line, then exactly the frame its `Framing` promises (`OK <n>` + n rows for
-//! Lines, `OK <nbytes>` + exactly those bytes for Bytes, one line for Status).
-//!
-//! The client speaks the wire directly (`TOKEN <owner token> <verb …>`), so a
-//! frame the server over- or under-writes is a failure here, not something a
-//! forgiving client papers over. Every reply is checked against the verb
-//! table's framing (`aterm_types::control_verbs::framing_of`), so the lane
-//! cannot drift from the table either.
-//!
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs` (a
-//! product that cannot start fails; a scratch/spawn refusal is COULD NOT RUN,
-//! `boot_with`, never a pass).
+//! Verifies reply framing (`Status`, `Lines`, `Bytes`) over a live `aterm --headless` socket
+//! against `aterm_types::control_verbs::framing_of`, plus harness turn ledger recording and
+//! connection-bound `here` lease release.
 
 #![cfg(unix)]
 
@@ -29,7 +18,6 @@ use crate::headless_boot;
 
 use headless_boot::Instance;
 
-/// How long a reply may take before it is read as a hang.
 const REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn token(inst: &Instance) -> String {
@@ -41,10 +29,7 @@ fn token(inst: &Instance) -> String {
         .to_string()
 }
 
-/// One boot with the temporal recorder on (so `temporal` has a spine to read)
-/// and the token file written. `prefix` names its scratch root, which is
-/// per process: each test boots under its own. A refused boot is COULD NOT
-/// RUN, never a pass.
+/// Boots an isolated headless instance with `temporal_recording = true` and waits for its token file.
 fn boot(prefix: &str) -> Instance {
     headless_boot::boot_with(
         prefix,
@@ -74,8 +59,7 @@ enum Reply {
     Bytes(String, Vec<u8>),
 }
 
-/// Send `line` and read one reply as `verb`'s table framing says: the status line, then (on
-/// `OK` only) the rows or bytes its count names. A missing row or a short body fails.
+/// Sends `line` and reads one reply framed according to `framing_of`.
 fn wire(inst: &Instance, line: &str) -> Reply {
     let verb = line.split_whitespace().next().expect("a verb");
     assert!(
@@ -150,14 +134,11 @@ fn field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
 fn the_audit_verbs_frame_their_replies_as_the_table_says() {
     let inst = boot("atrg");
 
-    // `await seq <n> timeout=0`: the cheap dirty check — a Status line.
     match wire(&inst, "await seq 0 timeout=0") {
         Reply::Status(s) => assert!(s.starts_with("OK") || s.starts_with("ERR "), "{s}"),
         other => panic!("await is Status-framed: {other:?}"),
     }
 
-    // A turn, so the ledger has a row: `history` is Lines, one row per turn,
-    // each carrying its fields with `text=` the free-text tail.
     match wire(&inst, "turn idle=200 timeout=10000 -- echo grammar-lane") {
         Reply::Lines(s, _) | Reply::Status(s) if s.starts_with("OK") => {}
         other => panic!("the turn ran: {other:?}"),
@@ -184,7 +165,6 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
             ] {
                 assert!(field(row, key).is_some(), "history row lacks {key}=: {row}");
             }
-            // The test's own connection presents the owner token: `ctl`.
             assert_eq!(field(row, "by"), Some("ctl"), "{row}");
             let (_, text) = row.split_once(" text=").expect("text= is the tail");
             assert!(text.contains("grammar-lane"), "{row}");
@@ -192,8 +172,6 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
         other => panic!("history is Lines-framed: {other:?}"),
     }
 
-    // `temporal status` is one status line naming the reachable ticks; a tick
-    // read is the Bytes frame, exactly the counted body — the screen then.
     let latest = match wire(&inst, "temporal status") {
         Reply::Status(s) => {
             assert!(s.starts_with("OK enabled=true "), "the recorder is on: {s}");
@@ -219,9 +197,6 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
         other => panic!("`status trim` is a usage error: {other:?}"),
     }
 
-    // `controls` (Lines) and `open <target>` / `open <target> close` (Status).
-    // A headless instance has no front window, so each either answers in its
-    // frame or refuses on one ERR line — never a half frame.
     for line in ["controls", "controls prefs"] {
         match wire(&inst, line) {
             Reply::Lines(s, rows) => assert_eq!(s, format!("OK {}", rows.len()), "{line}"),
@@ -240,24 +215,18 @@ fn the_audit_verbs_frame_their_replies_as_the_table_says() {
             other => panic!("{line} is Status-framed: {other:?}"),
         }
     }
-    // An unknown target is a usage error naming the roster, on one line.
     match wire(&inst, "open no-such-target") {
         Reply::Status(s) => assert!(s.starts_with("ERR "), "{s}"),
         other => panic!("{other:?}"),
     }
 
-    // The connection is still in sync after every frame above: a fresh read answers its own
-    // status line, not a leftover row.
     match wire(&inst, "history 1") {
         Reply::Lines(s, rows) => assert_eq!(s, format!("OK {}", rows.len())),
         other => panic!("{other:?}"),
     }
 }
 
-/// One persistent connection, as a supervisor holds one: `AUTH <token>`
-/// first (no reply), then requests whose status lines are read in turn. A
-/// lease belongs to the connection that took it, so a hand's acquire, the
-/// writes under it and its release go out on one.
+/// Persistent `AUTH <token>` control connection for connection-bound lease requests.
 struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -274,7 +243,6 @@ impl Conn {
         Conn { reader, writer }
     }
 
-    /// The one status line `line` is answered with.
     fn ask(&mut self, line: &str) -> String {
         writeln!(self.writer, "{line}").expect("write the request");
         let mut status = String::new();
@@ -285,22 +253,11 @@ impl Conn {
     }
 }
 
-/// A program that draws `READY` and reads the terminal in raw mode with no
-/// echo, keeping what it reads in `$1`: typing into it moves nothing on the
-/// screen, so one read's generation fences every write after it.
+/// Prints `READY` and reads raw stdin with no echo so subsequent writes do not advance the screen generation.
 const QUIET_READER: &str = "#!/bin/sh\nstty raw -echo\nprintf 'READY\\r\\n'\nexec cat > \"$1\"\n";
 
-/// THE WINDOW HARNESS'S `send` AND `key enter` ARE ITS TURN, over the real
-/// socket and on the turn-end loop's own wire: on one connection, the hand
-/// taken as the loop takes it (holder `aterm-harness@<this instance's pid>`,
-/// the window harness's own name, `hard here`), the fenced text (`send
-/// if-gen=<the read's generation> if=<a row of it> -- …`), its fenced Enter
-/// (`key if-gen=… if=… enter`), the hand given back (`here`) — is one
-/// `history` row, `by=harness status=pressed submitted=1`, its text the
-/// tail. NEGATIVE CONTROLS: the same fenced `send` and `key enter` with no
-/// hand, and the unfenced lines that start the reader, add no row (a raw
-/// driver's line is no turn); an owner-token `turn` is `by=ctl` (the test
-/// above).
+/// Verifies that fenced `send` and `key enter` under an `aterm-harness@<pid>` `hard here` lease
+/// record one `by=harness status=pressed submitted=1` ledger row, while unfenced or unleased writes do not.
 #[test]
 fn the_harness_send_and_enter_land_in_the_ledger_as_its_turn() {
     let inst = boot("atrh");
@@ -364,17 +321,8 @@ fn the_harness_send_and_enter_land_in_the_ledger_as_its_turn() {
     assert_eq!(text, "harness-lane", "{row}");
 }
 
-/// A HAND TAKEN `here` ENDS WITH ITS CONNECTION, over the real socket: the
-/// turn-end loop's hand, when a stop hangs the loop's connection up before
-/// the give-back (the cut lets no `lease` out after it). One connection
-/// takes the harness's hand as the loop takes it (`hard here`) and hangs up
-/// holding it; the tab is then free (`lease status` reads `none`, waited for
-/// with a one-minute hang detector, since the server reads the end on its
-/// own lane; the hand's TTL is ten, so a lapse cannot pass for it), and
-/// another connection's write is not refused `ERR busy`.
-/// NEGATIVE CONTROL: the same hand taken without `here` outlives its
-/// connection — read once a supervisor claim that connection bound to
-/// itself has been released by the same sweep, so the end was read.
+/// Verifies that a lease acquired with `here` is released when its connection closes, whereas a
+/// lease without `here` outlives its connection.
 #[test]
 fn a_hand_taken_here_ends_with_its_connection() {
     let inst = boot("atrl");
@@ -388,7 +336,6 @@ fn a_hand_taken_here_ends_with_its_connection() {
         assert!(reply.starts_with("OK"), "{line}: {reply}");
     };
 
-    // NEGATIVE CONTROL first: a plain hand outlives its connection.
     let mut c = Conn::open(&inst);
     ok(&mut c, "meta set supervisor grammar-sweep");
     ok(

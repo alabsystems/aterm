@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance of where the layout rebuild runs and what the adoption
-//! proof waits for, against
-//! `aterm_models_update::native_update_successor_attach_model`
-//! (`NativeUpdateSuccessorAttach`).
-//!
-//! Every reachable model state is projected onto the shipping decisions: a
-//! headless App's lane and queue reads (`App::restore_pass_handoff_lane`,
-//! `App::restore_pass_queued`), the site decision both call sites make
-//! (`restore_pass_due`: `FirstAttach` in `resumed`, `Park` in `about_to_wait`),
-//! whether that pass may run a slice and leave the rest owed (`restore_pass_sliced`
-//! over `App::restore_pass_carries_shells`; a drain under way is
-//! `App::restore_drain`), and the proof's paint decision over real
-//! `WindowState`s (`handoff_paint_proven`, fed as
-//! `App::maybe_signal_handoff_ready` feeds it). Each guarded step
-//! (`RebuildAtAttach`, `LeaveResume`, `RebuildAtPark`, `SliceAtPark`, `Prove`)
-//! must be enabled in the model exactly when the real code takes it.
-//!
-//! Negative control: the same decisions against `Buggy = 1` must disagree
-//! somewhere, so a pass is never vacuous.
-
+//! Conformance tests for layout rebuild sites and adoption proof against `NativeUpdateSuccessorAttach`.
 use std::collections::BTreeSet;
 
 use aterm_models_update::native_update_successor_attach_model;
@@ -32,7 +13,6 @@ use crate::{
     restore_pass_sliced,
 };
 
-/// The Apps whose guarded steps the shipping code decides in each `state`.
 struct Real {
     handoff: App,
     degraded: App,
@@ -65,7 +45,6 @@ impl Real {
             [1; 32],
             [2; 32],
         ));
-        // A degraded handoff never proves: it keeps the cold lane's order.
         let mut degraded = App::headless_for_test();
         degraded.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
             spare_write,
@@ -86,8 +65,6 @@ impl Real {
         )
     }
 
-    /// The App whose lane the model's `lane` names; on the cold lane, `handed`
-    /// picks the degraded handoff.
     fn app(&mut self, lane: i64, handed: bool) -> &mut App {
         match (lane, handed) {
             (1, _) => &mut self.handoff,
@@ -109,7 +86,6 @@ fn window(painted: bool) -> Box<WindowState> {
     ws
 }
 
-/// Which of the App's guarded steps the shipping code takes in `s`.
 fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
     let lane = s["lane"];
     let mut steps = BTreeSet::new();
@@ -117,8 +93,6 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
         return steps;
     }
     let app = real.app(lane, s["handed"] == 1);
-    // The rebuild owed: a manifest not yet begun, or a cold drain with slices
-    // to go.
     let draining = s["queued"] == 1 && s["draining"] == 1;
     app.pending_restore =
         (s["queued"] == 1 && !draining).then(|| crate::restore::RestoreManifest::new(Vec::new()));
@@ -140,7 +114,6 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
                 steps.insert("SliceAtPark");
             }
         }
-        // `resumed` returns once its pass ran or was not due.
         1 => {
             steps.insert("LeaveResume");
         }
@@ -158,8 +131,6 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
         }
         _ => {}
     }
-    // The proof: drained queues and the paint decision over the attached
-    // windows, as `maybe_signal_handoff_ready` reads them.
     let drained = !queued;
     let [unpainted, painted_window] = &real.windows;
     let (unpainted, painted_window): (&WindowState, &WindowState) = (unpainted, painted_window);
@@ -181,10 +152,6 @@ fn real_steps(real: &mut Real, s: &State) -> BTreeSet<&'static str> {
     steps
 }
 
-/// The model's actions for the App's guarded steps, each with the step it is
-/// (a `Buggy = 1` mutant takes the step it corrupts). The mutant-only
-/// liveness action, `RebuildWithoutKick`, is no guard decision: it builds
-/// windows without their first present, which this bind does not drive.
 const APP_STEPS: [(&str, &str); 10] = [
     ("RebuildAtAttach", "RebuildAtAttach"),
     ("LeaveResume", "LeaveResume"),
@@ -206,8 +173,6 @@ fn model_steps(model: &Model, s: &State) -> BTreeSet<&'static str> {
         .collect()
 }
 
-/// Every state `model` reaches, `RebuildWithoutKick` left out (see
-/// [`APP_STEPS`]).
 fn reachable(model: &Model) -> Vec<State> {
     let mut seen = BTreeSet::new();
     let mut todo = vec![model.init_state()];

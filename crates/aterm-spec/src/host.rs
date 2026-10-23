@@ -24,7 +24,8 @@ pub fn oversubscribed() -> Option<String> {
         fn getloadavg(loadavg: *mut f64, nelem: libc::c_int) -> libc::c_int;
     }
     let mut load = [0f64; 2];
-    // SAFETY: `load` is a valid writable 2-element array passed to `getloadavg`.
+    // SAFETY: `load` is a live, writable array of two doubles, and
+    // `getloadavg` writes at most the count it is given.
     let n = unsafe { getloadavg(load.as_mut_ptr(), 2) };
     let worst = match n {
         2.. => load[0].max(load[1]),

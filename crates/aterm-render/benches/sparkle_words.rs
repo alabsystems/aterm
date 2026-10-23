@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Sparkle Words v2.1's frame-cost gates (design §7.4, §14 P5): the pass-1c
-//! row cost of a sprite under every row, and the ink merge-walk's overhead at
-//! the 512-cell cap, each against a baseline of the same frame. Their numbers
-//! land in PROOF_CARRYING_PERFORMANCE.md ("Sparkle Words v2.1").
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-render --bench sparkle_words
-//! ```
+//! Frame-cost benchmarks for sprite pass-1c row stamping and ink merge-walk.
 
-// The test modules, mounted for their fixtures; their laws are not compiled.
 #[allow(dead_code, unused_imports)]
 #[path = "../tests/cat_sprites.rs"]
 mod cat_sprites;
@@ -26,12 +18,6 @@ fn main() {
     bench_ink_apply();
 }
 
-/// §7.4/§14 P5 perf gate — `bench_render_row_under_sprites`: the pass-1c row
-/// cost. A 120×40 text frame with ONE cat-scale sprite quad (80 px × cell)
-/// under EVERY row is rendered against a no-sprite baseline of the same frame;
-/// both full-frame medians are reported plus the per-row pass-1c delta. Runs
-/// alternate so drift hits both sides. The measured numbers land in
-/// PROOF_CARRYING_PERFORMANCE.md ("Sparkle Words v2.1").
 fn bench_render_row_under_sprites() {
     use std::time::Instant;
     let mut rend = cat_sprites::renderer();
@@ -49,8 +35,6 @@ fn bench_render_row_under_sprites() {
     sprite_input.cat_atlas = Some(std::sync::Arc::new(cat_sprites::patterned_atlas(
         128, ch as u32, 1,
     )));
-    // One cat-scale quad (≈ a settled HeadPeek body slice: 80 px wide, one full
-    // row band) under EVERY row — 40 pass-1c stamps per frame.
     sprite_input.cat_quads = (0..rows as u16)
         .map(|r| {
             cat_sprites::quad(
@@ -61,7 +45,6 @@ fn bench_render_row_under_sprites() {
         })
         .collect();
 
-    // Warm both paths.
     for _ in 0..4 {
         let _ = rend.render_input(&base_input);
         let _ = rend.render_input(&sprite_input);
@@ -96,13 +79,6 @@ fn bench_render_row_under_sprites() {
     );
 }
 
-/// §7.4/§14 P5 perf gate — `bench_ink_apply`: the §4.1 merge-walk overhead of
-/// a FULL 512-InkCell load (the MAX_INK_CELLS cap) in a full-frame render vs a
-/// no-ink baseline of the identical frame; both medians are reported. The
-/// merge-walk is O(1)/cell — one pointer compare per column — so the overhead
-/// must stay in the noise class, not the per-cell-binary-search class. Runs
-/// alternate so drift hits both sides. The measured numbers land in
-/// PROOF_CARRYING_PERFORMANCE.md ("Sparkle Words v2.1").
 fn bench_ink_apply() {
     use std::time::Instant;
     let mut rend = ink::renderer();
@@ -116,8 +92,6 @@ fn bench_ink_apply() {
 
     let base_input = term.cell_frame(rows, cols);
     let mut inked_input = base_input.clone();
-    // Exactly 512 InkCells (the cap), sorted (row, col), spread over every row
-    // — 12–13 word-shaped cells per row, the §7.3 worst-case ink screen.
     let mut ink = Vec::with_capacity(512);
     'fill: for r in 0..rows as u16 {
         for c in 0..13u16 {
@@ -135,7 +109,6 @@ fn bench_ink_apply() {
     assert_eq!(ink.len(), 512, "the MAX_INK_CELLS worst case");
     inked_input.ink = ink;
 
-    // Warm both paths.
     for _ in 0..4 {
         let _ = rend.render_input(&base_input);
         let _ = rend.render_input(&inked_input);

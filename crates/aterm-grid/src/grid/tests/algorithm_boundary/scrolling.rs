@@ -29,21 +29,15 @@ fn single_row_scroll_region_rejected_per_vt510() {
     grid.assert_invariants();
 }
 
-/// The first char of every row: a letter, or ' ' for a blank row.
 fn column_zero(grid: &Grid) -> String {
     (0..grid.rows())
         .map(|r| grid.cell(r, 0).map_or(' ', |c| c.char()))
         .collect()
 }
 
-/// SU/SD, scroll_region_up/down and LF/RI at a margin move only the rows of
-/// the scroll region, blank-filling what they vacate and clamping the count to
-/// the region; a degenerate one-row region (which DECSTBM never sets) is a
-/// no-op on every path.
 #[test]
 fn scrolls_move_only_the_region_rows() {
     type Op = fn(&mut Grid);
-    // (name, rows, region, cursor, op, column 0 after; rows start "ABCDEF...")
     #[expect(clippy::type_complexity, reason = "a test's case table")]
     let cases: &[(&str, u16, Option<(u16, u16)>, u16, Op, &str)] = &[
         ("SU 1", 3, None, 0, |g| g.scroll_up(1), "BC "),
@@ -177,7 +171,6 @@ fn scrolls_move_only_the_region_rows() {
     for (name, op) in degenerate {
         let mut grid = Grid::new(6, 10);
         fill_grid_rows(&mut grid, 6);
-        // Bypass set_scroll_region validation (DECSTBM rejects top == bottom).
         grid.storage.cursor_state.scroll_region = ScrollRegion { top: 3, bottom: 3 };
         op(&mut grid);
         assert_eq!(column_zero(&grid), "ABCDEF", "degenerate region {name}");
@@ -185,8 +178,6 @@ fn scrolls_move_only_the_region_rows() {
     }
 }
 
-/// Every autowrapping write path that wraps off the bottom margin scrolls the
-/// region only: the rows outside it keep their content.
 #[test]
 fn autowrap_at_the_region_bottom_scrolls_the_region_only() {
     type Write = fn(&mut Grid);
@@ -231,8 +222,6 @@ fn autowrap_at_the_region_bottom_scrolls_the_region_only() {
     }
 }
 
-/// Whatever scrolls the region while the viewport is in history snaps the view
-/// back to the live screen first (and does not panic doing it).
 #[test]
 fn a_region_scroll_from_a_scrolled_back_view_snaps_to_live() {
     type Op = fn(&mut Grid);
@@ -283,8 +272,6 @@ fn write_wide_char_wrap_at_scroll_region_bottom_scrolls_region_only() {
     assert_eq!(grid.cursor_col(), 2);
 }
 
-// Full-screen region scrolls with scrollback
-
 #[test]
 fn line_feed_full_screen_region_scrolls_with_scrollback() {
     let mut grid = Grid::with_scrollback(3, 5, 10);
@@ -305,11 +292,6 @@ fn line_feed_full_screen_region_scrolls_with_scrollback() {
     assert!(grid.row(2).unwrap().is_empty());
 }
 
-// Scroll region boundary conditions
-
-/// advance_autowrap_line with the cursor below the scroll region at the screen
-/// bottom does not scroll (xterm's CursorDown clamps at `max_row`); the cursor
-/// returns to column 0 of the last row.
 #[test]
 fn write_char_wrap_below_scroll_region_at_screen_bottom_does_not_scroll() {
     let mut grid = Grid::with_scrollback(5, 5, 10);
@@ -343,9 +325,6 @@ fn write_char_wrap_below_scroll_region_at_screen_bottom_does_not_scroll() {
     grid.assert_invariants();
 }
 
-// Targeted damage: mark_rows instead of mark_full
-
-/// scroll_to_bottom with small display_offset marks only bottom rows dirty.
 #[test]
 fn scroll_to_bottom_targeted_damage_small_offset() {
     let mut grid = Grid::with_scrollback(24, 80, 100);
@@ -378,7 +357,6 @@ fn scroll_to_bottom_targeted_damage_small_offset() {
     );
 }
 
-/// scroll_to_bottom with offset >= visible_rows falls back to mark_full.
 #[test]
 fn scroll_to_bottom_full_damage_large_offset() {
     let mut grid = Grid::with_scrollback(5, 10, 100);
@@ -402,7 +380,6 @@ fn scroll_to_bottom_full_damage_large_offset() {
     );
 }
 
-/// scroll_region_up marks only scroll region rows dirty (not full).
 #[test]
 fn scroll_region_up_targeted_damage() {
     let mut grid = Grid::new(24, 80);
@@ -432,7 +409,6 @@ fn scroll_region_up_targeted_damage() {
     }
 }
 
-/// erase_to_end_of_screen marks only rows below cursor (not full).
 #[test]
 fn erase_to_end_of_screen_targeted_damage() {
     let mut grid = Grid::new(24, 80);
@@ -462,10 +438,6 @@ fn erase_to_end_of_screen_targeted_damage() {
     }
 }
 
-// Mixed Phase 1 + Phase 2 scroll_up boundary
-
-/// A single scroll_up(n) call where n > rows_until_capacity exercises both
-/// Phase 1 (growth) and Phase 2 (reuse) in the same invocation.
 #[test]
 fn scroll_up_mixed_phase1_phase2_single_call() {
     let mut grid = Grid::with_scrollback(4, 10, 3);
@@ -518,7 +490,6 @@ fn scroll_up_mixed_phase1_phase2_single_call() {
     grid.assert_invariants();
 }
 
-/// Mixed-phase scroll_up with tiered scrollback content verification.
 #[test]
 fn scroll_up_mixed_phase_scrollback_content() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
@@ -546,7 +517,6 @@ fn scroll_up_mixed_phase_scrollback_content() {
         "row 2 blank after mixed scroll"
     );
 
-    // `tiered_scrollback_lines()` counts the lazy buffer too.
     let line_count = grid.tiered_scrollback_lines();
     assert!(
         line_count >= 2,

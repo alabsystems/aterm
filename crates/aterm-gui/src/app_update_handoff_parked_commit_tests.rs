@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! What a control verb does to a session an update has parked, before the
 //! Commit: its blocking write into a session not in front (`paste-bin`,
 //! `feed-bin`, `send`, `paste --stdin`) is never cut by the Commit's `_exit`
@@ -13,19 +12,10 @@ use super::ParkAttempt;
 use super::late_park_record_tests::prelaunch_record;
 use crate::native_updater_service::ApplyMode;
 
-/// The paste body: far more than a tty input queue holds, so a program that
-/// does not read leaves the writer parked mid-frame.
 const BODY: usize = 64 * 1024;
-
-/// DEC 2004: the program reads pastes bracketed.
 const BRACKETED: &[u8] = b"\x1b[?2004h";
-
-/// What a bracketed paste of [`BODY`] bytes puts on the wire, whole.
 const FRAME: usize = BODY + b"\x1b[200~\x1b[201~".len();
 
-/// A parked prelaunched attempt over session 0, whose sink is a real PTY
-/// master with a raw slave nobody reads: the program behind a tab not in
-/// front, its output undrained during the freeze.
 struct Parked {
     app: crate::App,
     slave: i32,
@@ -33,18 +23,16 @@ struct Parked {
     ctx: Arc<crate::SessionCtx>,
     nonce: String,
     reject: Option<std::sync::mpsc::SyncSender<()>>,
-    /// What the park and the rejection send, held as the worker holds them.
     _channels: (
         std::sync::mpsc::Receiver<()>,
         std::sync::mpsc::Receiver<super::HandoffStandDown>,
         std::sync::mpsc::Receiver<super::HandoffTransferJob>,
         std::sync::mpsc::Receiver<()>,
     ),
-    /// Last, so the descriptors close after the `App` that wrote to them.
+    // Last, so the descriptors close after the `App` that wrote to them.
     _pty: Pty,
 }
 
-/// The PTY pair, closed on drop.
 struct Pty(i32, i32);
 
 impl Drop for Pty {
@@ -55,7 +43,6 @@ impl Drop for Pty {
 }
 
 impl Parked {
-    /// Parked after the engine processed `armed`, the modes the program set.
     fn new(armed: &[u8]) -> Self {
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
         // SAFETY: a zeroed termios filled by `tcgetattr` on the live slave.
@@ -96,8 +83,6 @@ impl Parked {
         }
     }
 
-    /// The successor's proof, landed: the Commit's completion. Its pipe has no
-    /// reader, so a Commit written fails as an EPIPE does and the test runs on.
     fn proof_ready(&mut self) -> crate::UpdateHandoffCompletion {
         let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
         drop(commit_rd);
@@ -115,8 +100,6 @@ impl Parked {
         }
     }
 
-    /// One pass of the Commit, the dispatch fence's loop time already had.
-    /// Returns what the drain gate re-posted.
     fn pass(
         &mut self,
         completion: crate::UpdateHandoffCompletion,
@@ -132,9 +115,6 @@ impl Parked {
             .expect("re-posts")
     }
 
-    /// Passes until the attempt has a verdict: a claim whose answers took a
-    /// fence grain on a loaded host goes through the gate once more, and with
-    /// nothing in flight it then reads the same admission.
     fn run_to_verdict(&mut self, completion: crate::UpdateHandoffCompletion) -> String {
         let mut next = Some(completion);
         while let Some(completion) = next.take() {
@@ -149,7 +129,6 @@ impl Parked {
         self.app.handoff_rejections[0].clone()
     }
 
-    /// The program reads its input again: the whole frame, then nothing.
     fn read_frame(&self, writer: std::thread::JoinHandle<()>) -> Vec<u8> {
         let mut frame = Vec::with_capacity(FRAME);
         let mut buf = [0u8; 4096];
@@ -169,9 +148,6 @@ impl Parked {
     }
 }
 
-/// A control verb's paste into session 0, exactly as the hidden arm writes it
-/// (`control::run_feed_bin_routed`), on its own thread; returned once its frame
-/// is part-way into the kernel (`slave` has input, the writer still runs).
 fn paste_mid_frame(
     term: Arc<Mutex<aterm_core::terminal::Terminal>>,
     ctx: Arc<crate::SessionCtx>,
@@ -210,7 +186,6 @@ impl Drop for Parked {
     }
 }
 
-/// Whether `fd` has input, waiting at most `timeout_ms`.
 fn readable(fd: i32, timeout_ms: i32) -> bool {
     let mut pollfd = libc::pollfd {
         fd,
@@ -229,10 +204,6 @@ fn assert_whole(frame: &[u8]) {
 
 const WRITTEN: &str = "attempt-bound Commit pipe closed before its atomic write";
 
-/// A frame in flight holds the Commit: a control verb's 64 KiB paste parked mid-frame on a
-/// program that is not reading is unsettled egress even with the spill empty, since `_exit`
-/// would leave a bracketed paste open and every later key read as pasted text. The gate
-/// re-posts, and once the frame is read whole the same attempt commits.
 #[test]
 fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -275,10 +246,6 @@ fn a_control_paste_in_flight_holds_the_commit_until_its_frame_is_whole() {
     );
 }
 
-/// A frame begun after the drain gate's last reading stands the Commit down: the Commit holds
-/// every handed session's egress fence through its write, so the paste waits before its first
-/// byte or, already part-way in, refuses the write as unsettled egress (a lossless retry), and
-/// its frame is whole when the program reads again.
 #[test]
 fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -301,11 +268,6 @@ fn a_control_paste_begun_after_the_drain_gate_stands_the_commit_down() {
     assert_whole(&parked.read_frame(writer));
 }
 
-/// AN INPUT REPLY OWED HOLDS THE COMMIT: a background paste delivered whole
-/// whose `OK n bytes` is still on its way to the client is not settled, since the Commit's
-/// `_exit` would leave the client an EOF for input that landed, and a retry would type it twice.
-/// The drain gate re-posts while the reply is owed (`control::InputReplies`), and once it is
-/// delivered the same attempt commits.
 #[test]
 fn an_input_reply_still_owed_holds_the_commit_until_it_is_delivered() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -345,10 +307,6 @@ fn an_input_reply_still_owed_holds_the_commit_until_it_is_delivered() {
     );
 }
 
-/// An input reply first owed after the drain gate's last reading stands the Commit down: the
-/// fence reads the count once every handed session's frame lock is held, so a request that
-/// counted itself and wrote before the fence is seen, and the update retries (lossless).
-/// NEGATIVE CONTROL: nothing owed at the write, the Commit is written.
 #[test]
 fn an_input_reply_owed_at_the_write_stands_the_commit_down() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -377,10 +335,6 @@ fn an_input_reply_owed_at_the_write_stands_the_commit_down() {
     }
 }
 
-/// A reset on a parked session stands the Commit down: with the park's reset lane closed,
-/// `aterm ctl reset` runs on this process's engine after the carry was taken, so committing
-/// would bring the stuck modes back. The reset moves the carry serial, the Commit reads it
-/// moved (structural activity, a lossless retry), and this engine runs on, reset.
 #[test]
 fn a_reset_on_a_parked_session_stands_the_commit_down() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -415,11 +369,6 @@ fn a_reset_on_a_parked_session_stands_the_commit_down() {
     }
 }
 
-/// A reset at the write is never answered `OK`: the Commit reads the serials once, under the
-/// hold fence it keeps raised to its `_exit`, and a later reset would land on this engine alone
-/// while the successor restores the carry from before it. So it waits on the fence (the update
-/// lands with it unanswered, or stands down and answers it). Run at the write from the thread
-/// holding the fence, it waits out its bound and is refused `ERR busy update-committing`.
 #[test]
 fn a_reset_at_the_write_is_never_answered_ok() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -448,14 +397,6 @@ fn a_reset_at_the_write_is_never_answered_ok() {
     assert_eq!(verdict, WRITTEN, "and the Commit is written");
 }
 
-/// THE OUTGOING COMMIT WRITES THE PERSON'S STAMPS AT ITS WRITE (LC-4 of
-/// ; the review's KR-1): run through the Commit's own path
-/// (`App::finish_proven_handoff`), the attempt's person-stamps sidecar
-/// (`seamless::person_stamps_path` of its manifest) stands at the write and
-/// names the handed session a person keyed, with its age; a Commit that
-/// returns (its pipe has no reader) takes it back. NEGATIVE CONTROL: a
-/// session nobody keyed is named with how long it was served so (`-<age>`,
-/// the review's KR-2), never with an age.
 #[test]
 fn the_outgoing_commit_writes_the_persons_stamps_at_its_write() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();

@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`transparent`]'s tests: its child holds every descriptor this process
-//! would hand on and nothing flagged, where [`command`]'s and [`spawn`]'s hold
-//! their stdio alone; and a transparent run is the `std::process::Command` run
-//! it replaced — the same exit status, stdio, signal mask and dispositions,
-//! and the same errors. Every comparison with `std` holds on a std without
-//! SP-1 and on Trust's std since SP-1 (6eb03c9a18), which differ only in what
-//! a `std` child inherits above stdio, which no comparison here reads.
+//! Tests for [`transparent`] descriptor inheritance, error parity, and signal/stdio behavior against `std::process::Command`.
 
 use super::tests::{
     STAGE_ENV, STD_SPAWN_MUTE, park, run_staged_hup_ignored, translator, unflagged_at_or_above,
@@ -15,8 +9,7 @@ use super::tests::{
 use super::*;
 use std::path::PathBuf;
 
-/// A [`crate::host::held_probe`]'s answer: exit 3 is "held", exit 0 is "clear", and
-/// anything else is a probe that never ran, which must not read as either.
+/// Decodes [`crate::host::held_probe`]'s exit status (`3` for held, `0` for clear).
 fn answer(status: ExitStatus) -> bool {
     match status.code() {
         Some(3) => true,
@@ -30,12 +23,7 @@ fn holds(fd: RawFd) -> [String; 2] {
     ["-c".to_string(), test_support::held_probe(fd)]
 }
 
-/// **A TRANSPARENT CHILD HOLDS WHAT THIS PROCESS WOULD HAND ON; THE OTHER
-/// HELPERS' HOLD THEIR STDIO.** An unflagged descriptor above 99 (a caller's
-/// jobserver pipe, a `3>` redirect) reaches [`transparent`]'s child, named by
-/// path or searched on `PATH`, by `spawn` and by `status`; a close-on-exec
-/// one does not (upstream `std`'s spawn kept it home too). The same unflagged
-/// descriptor reaches neither [`command`]'s child nor [`spawn`]'s.
+/// A [`transparent`] child inherits unflagged descriptors above stdio and excludes `FD_CLOEXEC` ones, whereas [`command`] and [`spawn`] inherit only stdio.
 #[test]
 fn a_transparent_child_holds_every_descriptor_this_process_hands_on_and_nothing_flagged() {
     let unflagged = unflagged_at_or_above(100);
@@ -80,11 +68,7 @@ fn a_transparent_child_holds_every_descriptor_this_process_hands_on_and_nothing_
     drop((unflagged, flagged));
 }
 
-/// **IT FAILS AS `std` FAILS.** A missing program (by path or by name), one
-/// that may not be run (a directory) and a NUL each give `std`'s
-/// `io::ErrorKind`, and none of them a child. Under Rosetta `std` answers a
-/// failed `posix_spawn` with a child that exited 127 ([`STD_SPAWN_MUTE`]): such
-/// a row is still none of ours a child, and is said not run, never compared.
+/// [`transparent`] returns the same `io::ErrorKind` as `std::process::Command` on missing, non-executable, or NUL-containing program names.
 #[test]
 fn a_transparent_spawn_fails_as_std_fails() {
     let translator = translator();
@@ -121,14 +105,10 @@ fn a_transparent_spawn_fails_as_std_fails() {
     assert!(command.get_args().eq(["a", "b", "c"]));
 }
 
-/// The stage name [`a_transparent_run_is_the_std_run_it_replaces`]'s staged
-/// child runs under. Its children inherit it, so the mask probe it starts
-/// ([`transparent_mask_probe_stage`]) knows to answer.
+/// Stage name for [`a_transparent_run_is_the_std_run_it_replaces`] and [`transparent_mask_probe_stage`].
 const SIGNALS_STAGE: &str = "transparent-signals";
 
-/// THE MASK PROBE, when [`STAGE_ENV`] is [`SIGNALS_STAGE`] (nothing
-/// otherwise): print the signal mask this process was started with, as
-/// `MASK=` and the signal numbers.
+/// Prints the process's initial signal mask as `MASK=<signals>` when [`STAGE_ENV`] is [`SIGNALS_STAGE`].
 #[test]
 fn transparent_mask_probe_stage() {
     if std::env::var(STAGE_ENV).as_deref() != Ok(SIGNALS_STAGE) {
@@ -216,8 +196,7 @@ fn blocked() -> String {
         .join(",")
 }
 
-/// One run of `/bin/sh -c <script> sh <out>`, by `std` or by [`transparent`],
-/// its exit status and what it wrote to `out`.
+/// Runs `/bin/sh -c <script> sh <out>` via `std` or [`transparent`] and returns `(status, output)`.
 fn sh_run(transparent_run: bool, script: &str, out: &std::path::Path) -> (ExitStatus, String) {
     let _ = std::fs::remove_file(out);
     let args = [
@@ -237,12 +216,6 @@ fn sh_run(transparent_run: bool, script: &str, out: &std::path::Path) -> (ExitSt
 
 /// The staged half of [`a_transparent_run_is_the_std_run_it_replaces`].
 fn staged_signals() {
-    // SIGUSR2 ignored process-wide (the runtime already ignores SIGPIPE), and
-    // SIGUSR1 and SIGTERM blocked in this thread. SIGHUP at its default, set
-    // rather than inherited: the death-by-signal case needs it, and a run under
-    // `nohup` hands it on ignored, which no spawn resets, so both shells then
-    // outlive `kill -HUP $$` and the case proves nothing
-    // ([`run_staged_hup_ignored`] starts this stage that way).
     // SAFETY: `signal` with `SIG_IGN` or `SIG_DFL`, and a mask change for this
     // thread; each takes plain integers or a live local.
     unsafe {
@@ -256,9 +229,6 @@ fn staged_signals() {
     let out: PathBuf = dir.join("out");
     let exe = std::env::current_exe().expect("the test binary");
     let exe = exe.to_str().expect("a UTF-8 test binary path");
-    // Darwin reads each by its descriptor (`stat(1)` with no operand is an `fstat` of its
-    // stdin), never by `/dev/fd/N`, a path lookup another process's lookup of the number
-    // can fail there ([`super::descriptor_metadata`]); Linux's `/proc/self/fd` is per process.
     #[cfg(target_vendor = "apple")]
     let stat = "{ for n in 7 8 9; do /usr/bin/stat -f %d:%i <&$n; done; }";
     #[cfg(not(target_vendor = "apple"))]
@@ -284,8 +254,6 @@ fn staged_signals() {
             ),
         ),
     ];
-    // What a run wrote, as compared: the probe's whole report but for the mask
-    // probe's, whose libtest lines carry a timing — its `MASK=` line alone.
     let read = |what: &str, wrote: String| {
         if what.starts_with("the signal mask") {
             wrote
@@ -306,8 +274,6 @@ fn staged_signals() {
         assert_eq!(ours.0.into_raw(), theirs.0.into_raw(), "{what}: the status");
         assert_eq!(ours.1, theirs.1, "{what}: what it wrote");
     }
-    // Each comparison read something (`std` and the helper agreeing on
-    // nothing would prove nothing).
     let (status, _) = sh_run(true, &cases[0].1, &out);
     assert_eq!(status.code(), Some(7));
     let (status, _) = sh_run(true, &cases[1].1, &out);
@@ -325,15 +291,7 @@ fn staged_signals() {
     println!("STAGED transparent signals ok");
 }
 
-/// **A TRANSPARENT RUN IS THE `std` RUN IT REPLACES.** In a process that
-/// ignores SIGUSR2, on a thread that blocks SIGUSR1 and SIGTERM, the same
-/// `/bin/sh` run by `std::process::Command` and by [`transparent`] ends with
-/// the same raw status (an exit code; a death by SIGHUP), holds the same three
-/// open files as stdio, has SIGPIPE at its default (`yes` dies of it, 128 +
-/// 13) and SIGUSR2 still ignored, and starts with the spawning thread's mask.
-/// The process is started with SIGHUP ignored, as under `nohup`, and sets the
-/// default its death-by-signal case needs, so the case holds however the
-/// suite was launched.
+/// [`transparent`] matches `std::process::Command` across exit status, signal death, stdio descriptors, signal dispositions, and thread signal masks.
 #[test]
 fn a_transparent_run_is_the_std_run_it_replaces() {
     const NAME: &str = "spawnfd::transparent_tests::a_transparent_run_is_the_std_run_it_replaces";

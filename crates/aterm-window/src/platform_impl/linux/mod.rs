@@ -4,10 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (The X11 types are
-// first-party aterm-x11's, and the event loops answer no `AsFd`: the X11 loop waits in a
-// poll(2) over two descriptors, not one epoll descriptor an embedder could watch, and no
-// aterm crate embeds the loop: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+// Modified by the aterm project in 2026; see the repository NOTICE. (The X11 types are first-party
+// aterm-x11's, and the event loops answer no `AsFd`: the X11 loop waits in a poll(2) over two
+// descriptors, not one epoll descriptor an embedder could watch, and no aterm crate embeds the
+// loop.)
 
 #![cfg(free_unix)]
 
@@ -52,18 +52,13 @@ pub(crate) enum Backend {
     X,
     #[cfg(wayland_platform)]
     Wayland,
-    /// No display server at all — see [`headless`]. Only ever selected by an explicit
-    /// `EventLoopBuilderExtHeadless::with_headless`, never by probing the environment:
-    /// a windowed run that has lost its display must still FAIL rather than silently
-    /// come up invisible.
+    /// No display server at all — see [`headless`].
     Headless,
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PlatformSpecificEventLoopAttributes {
-    /// Only ever `Some(Backend::Headless)` (`EventLoopBuilderExtHeadless::with_headless`):
-    /// upstream's `with_x11` and `with_wayland`, and its `with_any_thread`, had no aterm caller
-    /// (WC.8).
+    /// Only ever `Some(Backend::Headless)` (`EventLoopBuilderExtHeadless::with_headless`).
     pub(crate) forced_backend: Option<Backend>,
 }
 
@@ -74,8 +69,6 @@ pub struct ApplicationName {
 }
 
 impl ApplicationName {
-    // Only `WindowAttributesExtWayland::with_name` names the application (WC.8 cut the X11
-    // extension's `with_name`), so an X11-only build leaves this out.
     #[cfg(wayland_platform)]
     pub fn new(general: String, instance: String) -> Self {
         Self { general, instance }
@@ -86,13 +79,11 @@ impl ApplicationName {
 pub struct PlatformSpecificWindowAttributes {
     pub name: Option<ApplicationName>,
     /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11,
-    /// `XDG_ACTIVATION_TOKEN` on Wayland): X11 names it on the window and ends the
-    /// launch sequence with it once the window maps; Wayland activates the surface
-    /// with it. An aterm addition back onto the fork's cut of upstream's
-    /// `startup_notify` (only this consuming half).
+    /// `XDG_ACTIVATION_TOKEN` on Wayland): X11 names it on the window and ends the launch sequence
+    /// with it once the window maps; Wayland activates the surface with it.
     pub activation_token: Option<String>,
     /// The X11 window's background (`0x00RRGGBB`) and top-left gravity
-    /// (`platform::x11::WindowAttributesExtX11`). An aterm addition.
+    /// (`platform::x11::WindowAttributesExtX11`).
     pub x11_background: Option<u32>,
 }
 
@@ -179,20 +170,6 @@ pub enum MonitorHandle {
 }
 
 /// Dispatch over the three event-loop backends.
-/// `any_backend!(match expr; Enum(foo) => foo.something())` expands to this
-/// pseudocode, with X11 and Wayland arms included only when their backend is enabled:
-/// ```text
-/// match expr {
-///    Enum::X(foo) => foo.something(),
-///    Enum::Wayland(foo) => foo.something(),
-///    Enum::Headless(foo) => foo.something(),
-/// }
-/// ```
-/// The result can be converted to another enum by adding `; as AnotherEnum`.
-/// `x11_or_wayland!` stays as it is for the
-/// window/monitor/device types, which a headless run never produces and which therefore
-/// have no headless variant to dispatch to; only the loop trio (`EventLoop`,
-/// `EventLoopProxy`, `ActiveEventLoop`) gained one, and only these sites may use this.
 macro_rules! any_backend {
     (match $what:expr; $enum:ident ( $($c1:tt)* ) => $x:expr; as $enum2:ident ) => {
         match $what {
@@ -262,9 +239,6 @@ impl Window {
         attribs: WindowAttributes,
     ) -> Result<Self, RootOsError> {
         match *window_target {
-            // A window needs a surface, and a surface needs a display. Refusing is the
-            // whole contract of the headless backend: better a caller-visible error here
-            // than a window handle that can never be shown.
             ActiveEventLoop::Headless(_) => Err(os_error!(OsError::Misc(
                 "cannot create a window on a headless event loop: it has no display"
             ))),
@@ -533,8 +507,7 @@ impl Window {
 pub struct KeyEventExtra {
     pub text_with_all_modifiers: Option<SmolStr>,
     pub key_without_modifiers: Key,
-    /// The press's text with Caps Lock off
-    /// (`KeyEventExtModifierSupplement::text_ignoring_lock`).
+    /// The press's text with Caps Lock off (`KeyEventExtModifierSupplement::text_ignoring_lock`).
     pub text_ignoring_lock: Option<SmolStr>,
 }
 
@@ -545,8 +518,6 @@ unsafe extern "C" fn x_error_callback(
 ) -> c_int {
     let xconn_lock = X11_BACKEND.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(ref xconn) = *xconn_lock {
-        // `assume_init` is safe here because the array consists of `MaybeUninit` values,
-        // which do not require initialization.
         let mut buf: [MaybeUninit<c_char>; 1024] = unsafe { MaybeUninit::uninit().assume_init() };
         unsafe {
             (xconn.xlib.XGetErrorText)(
@@ -568,7 +539,6 @@ unsafe extern "C" fn x_error_callback(
             }
         };
 
-        // A GLX request's error is the GL renderer's (`XConnection::glx_major`).
         if xconn.glx_major == Some(error.request_code) {
             tracing::warn!("X11 error of a GLX request: {:#?}", error);
             return 0;
@@ -576,7 +546,6 @@ unsafe extern "C" fn x_error_callback(
         tracing::error!("X11 error: {:#?}", error);
         *xconn.latest_error.lock().unwrap() = Some(error);
     }
-    // Fun fact: this return value is completely ignored.
     0
 }
 
@@ -614,8 +583,6 @@ impl<T: 'static> EventLoop<T> {
             );
         }
 
-        // NOTE: Wayland first because of X11 could be present under Wayland as well. Empty
-        // variables are also treated as not set.
         let backend = match (
             attributes.forced_backend,
             env::var("WAYLAND_DISPLAY")
@@ -626,15 +593,11 @@ impl<T: 'static> EventLoop<T> {
                 .is_some(),
             env::var("DISPLAY").map(|var| !var.is_empty()).unwrap_or(false),
         ) {
-            // User is forcing a backend.
             (Some(backend), ..) => backend,
-            // Wayland is present.
             #[cfg(wayland_platform)]
             (None, true, _) => Backend::Wayland,
-            // X11 is present.
             #[cfg(x11_platform)]
             (None, _, true) => Backend::X,
-            // No backend is present.
             (_, wayland_display, x11_display) => {
                 let msg = if wayland_display && !cfg!(wayland_platform) {
                     "DISPLAY is not set; note: enable the `aterm-window/wayland` feature to support \
@@ -649,7 +612,6 @@ impl<T: 'static> EventLoop<T> {
             },
         };
 
-        // Create the display based on the backend.
         match backend {
             Backend::Headless => Ok(EventLoop::Headless(headless::EventLoop::new()?)),
             #[cfg(wayland_platform)]
@@ -731,8 +693,6 @@ pub enum ActiveEventLoop {
 }
 
 impl ActiveEventLoop {
-    // Only `ActiveEventLoopExtWayland::is_wayland` asks (WC.8 cut the X11 extensions' `is_x11`,
-    // its other callers), so an X11-only build leaves this out.
     #[cfg(wayland_platform)]
     #[inline]
     pub fn is_wayland(&self) -> bool {
@@ -761,7 +721,6 @@ impl ActiveEventLoop {
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
         match self {
-            // A headless run enumerates no monitors, so it has no primary one either.
             ActiveEventLoop::Headless(evlp) => evlp.primary_monitor(),
             #[cfg(x11_platform)]
             ActiveEventLoop::X(evlp) => Some(MonitorHandle::X(evlp.primary_monitor()?)),
@@ -796,7 +755,6 @@ impl ActiveEventLoop {
         any_backend!(match self; Self(evlp) => evlp.exiting())
     }
 
-    // Only the Wayland loop sets and reads the exit code through the dispatcher.
     #[cfg(wayland_platform)]
     fn set_exit_code(&self, code: i32) {
         any_backend!(match self; Self(evlp) => evlp.set_exit_code(code))
@@ -808,18 +766,14 @@ impl ActiveEventLoop {
     }
 }
 
-/// Returns the minimum `Option<Duration>`, taking into account that `None`
-/// equates to an infinite timeout, not a zero timeout (so can't just use
-/// `Option::min`)
 fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }
 
 #[cfg(target_os = "linux")]
 fn is_main_thread() -> bool {
-    // SAFETY: getpid(2) cannot fail, and SYS_gettid takes no arguments and cannot fail;
-    // glibc's own `gettid` wrapper exists only since 2.30. A process's main thread is the
-    // one whose thread id is the process id.
+    // SAFETY: getpid(2) cannot fail, and SYS_gettid takes no arguments and cannot fail; glibc's own
+    // `gettid` wrapper exists only since 2.30.
     unsafe { libc::syscall(libc::SYS_gettid) == libc::c_long::from(libc::getpid()) }
 }
 

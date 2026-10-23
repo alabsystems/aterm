@@ -6,11 +6,7 @@
 use super::*;
 use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
 
-/// THE ORACLE: the fixed clock as `Session` kept it before the door — its
-/// five `cfg(test)` fields and the `cfg(test)` branches of `now_unix` and
-/// `now_unix_ms`, copied as they were (atomics, `swap` and all), standing
-/// still (the running clock is checked apart: its real elapsed time differs
-/// between two clocks by construction).
+/// Reference oracle reproducing the pre-door fixed-clock fields and `now_unix`/`now_unix_ms` logic.
 struct OldKnobs {
     clock: Option<i64>,
     clock_jump: AtomicI64,
@@ -64,13 +60,7 @@ enum Step {
 /// The test suite's own wall instant (`TEST_NOW`, 2026-05-19 14:00 PDT).
 const NOW: i64 = 1_779_224_400;
 
-/// A fixed clock under the scripts the Mac-sleep tests stage — a sleep of four
-/// hours after the wait's first read, an ordinary tick, a clock stepped BACK,
-/// a second jump staged before the first was read, a fix to the millisecond
-/// just short of a second's turn, a jump staged before the clock is fixed —
-/// reads, read by read, as the old fields did: the same milliseconds, the
-/// same seconds, the jump swapped in at the same read. A `peek` reads the
-/// clock without making that read (the oracle is not asked: it had none).
+/// `ScriptedClock` matches `OldKnobs` step by step across fixed times, staged jumps, and non-consuming peeks.
 #[test]
 fn scripted_clock_matches_the_old_knobs() {
     use Step::{Fix, Jump, Peek, ReadMs, ReadS};
@@ -164,9 +154,6 @@ fn scripted_clock_matches_the_old_knobs() {
                     reads.push(got * 1000);
                 }
                 Peek => {
-                    // What the next read will say, staged jump included —
-                    // and asking changes nothing: the oracle's next read
-                    // still agrees with the clock's next read.
                     let peeked = clock.peek_wall_ms();
                     assert_eq!(peeked, clock.peek_wall_ms(), "{what}: a peek is stable");
                     reads.push(peeked);
@@ -177,10 +164,7 @@ fn scripted_clock_matches_the_old_knobs() {
     }
 }
 
-/// The swap the Mac-sleep tests stand on, spelled out once: after
-/// `set_jump`, the next read still says the fixed time and every later one the
-/// jump; a peek in between sees the time the next read will say and moves
-/// nothing.
+/// After `set_jump`, the next read returns the fixed time, subsequent reads return the jumped time, and peeks do not advance it.
 #[test]
 fn a_staged_jump_lands_after_the_next_read_and_a_peek_lands_nothing() {
     let mut fx = Fx::os();
@@ -199,9 +183,7 @@ fn a_staged_jump_lands_after_the_next_read_and_a_peek_lands_nothing() {
     assert_eq!(fx.wall_s(), NOW + 4 * 3600);
 }
 
-/// A RUNNING fixed clock keeps pace with the monotonic clock: it never reads
-/// behind its fix, never ahead of the real time since `set_running`, and
-/// never backwards.
+/// A running scripted clock advances monotonically with elapsed time since `set_running`.
 #[test]
 fn a_running_scripted_clock_keeps_pace_with_the_monotonic_clock() {
     let mut fx = Fx::os();
@@ -219,10 +201,7 @@ fn a_running_scripted_clock_keeps_pace_with_the_monotonic_clock() {
     }
 }
 
-/// A STANDING MONOTONIC CLOCK READS NO REAL TIME: across a real sleep every
-/// read, a peek's too, is the one instant, so a test that ages the policy's
-/// instants itself is aged by no slow step of a loaded machine. NEGATIVE
-/// CONTROL: unstood, the same sleep moves it.
+/// After `stand_mono`, monotonic reads and peeks stay fixed across real sleeps.
 #[test]
 fn a_standing_monotonic_clock_reads_no_real_time() {
     let mut fx = Fx::os();
@@ -237,8 +216,7 @@ fn a_standing_monotonic_clock_reads_no_real_time() {
     assert_eq!(fx.wall_ms(), NOW * 1000);
 }
 
-/// UNFIXED, the scripted clock is the system's: a session whose test stages
-/// nothing reads what the shipped loop reads, on every clock of the door.
+/// An unfixed scripted clock delegates wall, stamp, and monotonic reads to the system clock.
 #[test]
 fn an_unfixed_scripted_clock_reads_the_systems() {
     let mut door = Fx::os();
@@ -266,9 +244,7 @@ fn an_unfixed_scripted_clock_reads_the_systems() {
     assert!(t1 >= t0, "the monotonic clock is the system's");
 }
 
-/// THE STAMPS ARE THE SYSTEM'S under a fixed clock, as they were: a journal
-/// row's `t` never read the test's fixed clock, and reading it would consume
-/// its staged jump at a read the loop did not make.
+/// `stamp_ms` reads the system clock even when a scripted clock is fixed and never consumes a staged jump.
 #[test]
 fn stamps_read_the_system_clock_and_never_consume_a_staged_jump() {
     let mut fx = Fx::os();
@@ -286,9 +262,7 @@ fn stamps_read_the_system_clock_and_never_consume_a_staged_jump() {
     assert_eq!(fx.wall_ms(), (NOW + 4 * 3600) * 1000);
 }
 
-/// VIRTUAL CLOCKS move only by sleeps: no real time passes in a sleep, and
-/// the monotonic clock, the wall clock and the stamps all advance by exactly
-/// what was slept. A fixed clock is refused over them.
+/// `VirtualClock` advances monotonic, wall, and stamp clocks solely by the requested sleep durations.
 #[test]
 fn virtual_clocks_move_only_by_sleeps() {
     let origin = Instant::now();
@@ -313,13 +287,7 @@ fn virtual_clocks_move_only_by_sleeps() {
     assert!(fx.scripted().is_none(), "no fixed clock over virtual ones");
 }
 
-/// THE TEST CLOCKS COUNT THE MACHINE'S SLEEP ONLY WHERE A TEST COUNTS
-/// ([`Fx::asleep`], [`Fx::last_sleep`]): uncounted — every test before the
-/// count — a loop over them reads a sleep by its clocks alone, as on a
-/// machine that keeps no count; counted, a sleep they stage is counted, on
-/// [`TEST_BOOT`] or the boot the test names, and recorded as the last, and a
-/// step that is no sleep (the fixed clock set on, a sleep of the loop's own
-/// through the door) is time awake.
+/// Test clocks report machine sleep counts and intervals only when `count_sleeps` is enabled.
 #[test]
 fn the_test_clocks_count_a_sleep_only_where_a_test_counts() {
     let secs = Duration::from_secs;
@@ -332,7 +300,6 @@ fn the_test_clocks_count_a_sleep_only_where_a_test_counts() {
     clock.count_sleeps(secs(100));
     clock.set_at_ms((NOW + 600) * 1000);
     assert_eq!(fx.asleep().map(|c| c.asleep), Some(secs(100)), "a step");
-    // The count moves as the wall clock's reads show the sleep.
     clock.slept(1800);
     assert_eq!(fx.asleep().map(|c| c.asleep), Some(secs(100)));
     assert_eq!(fx.wall_ms(), (NOW + 2460) * 1000);
@@ -370,8 +337,7 @@ fn the_test_clocks_count_a_sleep_only_where_a_test_counts() {
     );
 }
 
-/// `since` is `elapsed`: zero for an instant ahead of the clock, never a
-/// panic.
+/// `since` saturates to zero for an instant ahead of the clock.
 #[test]
 fn since_saturates_like_elapsed() {
     let fx = Fx::os();
@@ -379,8 +345,6 @@ fn since_saturates_like_elapsed() {
     assert_eq!(fx.since(ahead), Duration::ZERO);
     assert_eq!(ahead.elapsed(), Duration::ZERO);
 }
-
-// -- the loop's own derived doors ------------------------------------------------
 
 /// A zone table standing in for `date`.
 fn table_zone(zone: &str, unix: i64) -> Option<i64> {
@@ -410,12 +374,7 @@ fn taped_at(
         .collect()
 }
 
-/// THE LOOP'S DERIVED DOORS: a zone's offset and the local offset at an
-/// instant each come back
-/// through a recording door exactly as the live reader answers, and each is
-/// one round trip at its own door — the question out, the answer back,
-/// which reads back as the value the loop was handed. Live, nothing is
-/// recorded and the reader answers alone.
+/// Derived zone and local-offset doors return the live reader's answer and record one exchange per lookup when taped.
 #[test]
 fn the_loops_derived_doors_answer_live_and_tape_each_look() {
     use crate::supervise::tape::testing::MemoryTape;

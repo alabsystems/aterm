@@ -14,7 +14,6 @@ use aterm_objc::{
     method_types, msg, sel, strip_method_offsets,
 };
 
-/// The witness, minted unchecked: libtest runs every test on a worker.
 fn mtm() -> aterm_objc::MainThread {
     // SAFETY: no main-thread affinity; the empty ivars live and drop on this thread.
     unsafe { aterm_objc::MainThread::new_unchecked() }
@@ -40,15 +39,10 @@ unsafe impl Encode for Triple {
 }
 
 declare_class! {
-    /// The three return classes, on one class, with the argument shape the real
-    /// `NSTextInputClient` row uses.
     struct StretProbe: NSObject {
         const NAME: &str = "ATermW3StretProbe";
         type Ivars = ();
 
-        /// `crates/aterm-window`'s `view.rs` row, spelling for spelling: a by-value `NSRange`, an
-        /// `NSRange *` out-parameter, a 32-byte `NSRect` return. The result derives from the
-        /// argument, so a register shift cannot produce it by accident.
         @sel(firstRectForCharacterRange:actualRange:)
         fn first_rect(&self, range: NSRange, actual: *mut NSRange) -> CGRect {
             if !actual.is_null() {
@@ -68,7 +62,6 @@ declare_class! {
             }
         }
 
-        /// The indirect return on both ABIs: `x8` on arm64, `sret` on x86_64.
         @sel(tripleForCharacterRange:)
         fn triple(&self, range: NSRange) -> Triple {
             Triple {
@@ -78,7 +71,6 @@ declare_class! {
             }
         }
 
-        /// The control: sixteen bytes in two integer registers, no indirection.
         @sel(markedRange)
         fn marked_range(&self) -> NSRange {
             NSRange {
@@ -89,16 +81,15 @@ declare_class! {
     }
 }
 
-/// `+[NSObject instanceMethodSignatureForSelector:]`, +0.
 fn signature_for(cls: ClassPtr, s: Sel) -> Id {
-    // SAFETY: `+instanceMethodSignatureForSelector:` is `-(id)(Class, SEL)` on NSObject.
+    // SAFETY: `+instanceMethodSignatureForSelector:` is `-(id)(Class, SEL)` on NSObject and
+    // returns an autoreleased `NSMethodSignature` (+0), borrowed for the enclosing pool.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
         f(cls.as_id(), sel!(instanceMethodSignatureForSelector:), s)
     }
 }
 
-/// Build an `NSInvocation` for `sel` on `target`, +0.
 fn invocation(target: Id, cls: ClassPtr, s: Sel) -> Id {
     let sig = signature_for(cls, s);
     assert!(!sig.is_null(), "the class implements the selector");
@@ -137,7 +128,9 @@ unsafe fn set_argument(inv: Id, slot: *const c_void, index: isize) {
 /// `T` must be the exact return type recorded in the signature.
 unsafe fn invoke_returning<T: Default>(inv: Id) -> T {
     let mut out = T::default();
-    // SAFETY: `-invoke` is `-(void)` and `-getReturnValue:` writes `size_of::<T>()` bytes.
+    // SAFETY: `-invoke` is `-(void)`; `-getReturnValue:` is `-(void)(void *)`
+    // and writes exactly `methodReturnLength` bytes, which the caller has
+    // pinned to `size_of::<T>()`.
     unsafe {
         let go: unsafe extern "C-unwind" fn(Id, Sel) = msg();
         go(inv, sel!(invoke));
@@ -151,7 +144,6 @@ unsafe fn invoke_returning<T: Default>(inv: Id) -> T {
     out
 }
 
-/// Each row's registered encoding is clang's for the same C signature, minus offsets.
 #[test]
 fn the_registered_encodings_are_what_clang_emits_for_the_same_signatures() {
     let cls = StretProbe::class();
@@ -177,8 +169,6 @@ fn the_registered_encodings_are_what_clang_emits_for_the_same_signatures() {
     }
 }
 
-/// A direct, typed `objc_msgSend` into each declared trampoline: the register
-/// contract, executed.
 #[test]
 fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
     let obj = StretProbe::alloc_init(mtm(), ()).expect("the probe instantiates");
@@ -255,9 +245,6 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
     assert!(!aterm_objc::returns_indirectly::<NSRange>());
 }
 
-/// The reflective drive: `NSInvocation` sizes the return from the registered string, calls the
-/// IMP through the ABI the string implies and copies the result out, so a declared indirect
-/// return the string misdescribes corrupts here and only here.
 #[test]
 fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
     aterm_objc::autoreleasepool(|_| {

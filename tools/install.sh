@@ -957,7 +957,8 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 # write. The installing user is the one who typed `sudo` ($SUDO_UID, read only
 # when this run is root): at the console, theirs is the ordinary deferral; anyone
 # else's root run stays deferred and TOOLSET_AS_ROOT=1 names the command to run
-# as that user.
+# as that user. A root run over the home of the account that typed sudo never
+# gets here: it ran again as that account (home_account).
 #
 # Pure, so crates/aterm-update/tests/install_sh pins it without a console:
 # <console_uid> owns /dev/console (console_owner_uid), <euid> is this run's
@@ -1004,6 +1005,102 @@ console_owner_uid() {
 elect_install_lane() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 	elect_container "$@" || return 1
 	toolset_deferral "$(console_owner_uid)" "$(id -u)" "${SUDO_UID:-}"
+}
+
+# --- a root run over an account's home ---------------------------------------
+#
+# macOS's sudo keeps $HOME, so a root run would make that person's ~/.local,
+# store, links, aterm.toml and toolset root's: their own aterm and atpkg could
+# then not change them, and root would run what their account can replace
+# (~/.local/bin/aterm, ~/.cargo/bin). So a root run over the home of the account
+# that typed sudo, --uninstall's included, runs this file again as that account;
+# one over any other account's home, or piped (no file to run again), says how
+# to run it instead. A root run over a home root owns (its own, as under sudo -H,
+# the way to install into folders only root can write; an MDM's) is unchanged.
+#
+# Pure: <euid> is `id -u`, <sudo_uid> $SUDO_UID, <home_uid> the owner of $HOME.
+# HOME_ACCOUNT is the uid to run as (digits only: it rides `-u "#<uid>"`), or
+# empty; HOME_REFUSED=1 when root must not act on this home at all.
+home_account() { # <euid> <sudo_uid> <home_uid>
+	HOME_ACCOUNT=""
+	HOME_REFUSED=0
+	[[ "$1" == 0 && -n "$3" && "$3" != 0 ]] || return 0
+	if [[ "$2" =~ ^[1-9][0-9]*$ && "$2" == "$3" ]]; then
+		HOME_ACCOUNT="$2"
+	else
+		HOME_REFUSED=1
+	fi
+}
+
+# The uid that owns $HOME, empty when it cannot be read (`ls -n`: one spelling
+# for BSD and GNU, where stat's flags differ), through a symlink, since the
+# files land in the folder it names.
+home_owner_uid() {
+	/bin/ls -ndL -- "$HOME" 2>/dev/null | awk '{print $3}'
+}
+
+# The one call that runs as another account (a test replaces it): never
+# returns on success, as the account's run is this run's exit. sudo keeps the
+# variables <keep> names (comma-separated) in the environment, so their values
+# stay out of the argv that ps and sudo's log show (a proxy URL can carry a
+# password).
+exec_as_account() { # <uid> <keep> <program> <arg>...
+	local uid="$1" keep="$2"
+	shift 2
+	exec /usr/bin/sudo -n -H ${keep:+"--preserve-env=$keep"} -u "#$uid" -- "$@"
+}
+
+# Whether <uid> passes `test <op> <path>`, asked as that account, since root
+# passes every one (a test replaces it).
+account_test() { # <uid> <op> <path>
+	/usr/bin/sudo -n -u "#$1" -- /bin/sh -c 'test "$1" "$2"' sh "$2" "$3" 2>/dev/null
+}
+
+# Run this install again as HOME_ACCOUNT with the same arguments, over the same
+# HOME, with the root run's PATH and the settings it and its tools read (ATERM_*,
+# XDG_*, CARGO_HOME, RUSTUP_HOME, curl's proxy and CA variables), which sudo -H
+# would reset or drop. Or, before anything is written, say why not: no file to
+# run again, a file that account cannot read, or an ATERM_*_DIR it cannot write
+# (mkdir -p's anchor: the nearest folder that exists, the working directory for
+# a relative path with none), which sudo -H fills as root instead.
+run_as_home_account() { # <arg>...
+	local owner="${HOME_ACCOUNT:-$(home_owner_uid)}" why script keep="" v d
+	why="HOME ($HOME) is uid $owner's, and root would leave files there that its own aterm cannot change"
+	if [[ "$HOME_REFUSED" -eq 1 ]] || ! self_on_disk ||
+		! script="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/${BASH_SOURCE[0]##*/}"; then
+		echo "install.sh: not as root: $why — run it as that account, without sudo" >&2
+		exit 1
+	fi
+	if ! account_test "$HOME_ACCOUNT" -r "$script"; then
+		echo "install.sh: not as root: $why, and uid $HOME_ACCOUNT cannot read $script — run a copy it can read as that account, without sudo" >&2
+		exit 1
+	fi
+	for v in ATERM_INSTALL_DIR ATERM_BIN_DIR ATERM_STORE_DIR ATERM_MAN_DIR; do
+		[[ -n "${!v:-}" ]] || continue
+		d="${!v}"
+		while [[ ! -e "$d" ]]; do
+			case "$d" in
+			*/*) d="${d%/*}" ;;
+			*) d=. ;;
+			esac
+			[[ -n "$d" ]] || d=/
+		done
+		if ! account_test "$HOME_ACCOUNT" -w "$d"; then
+			echo "install.sh: not as root: $why, and uid $HOME_ACCOUNT cannot write $v (${!v}) — run it with sudo -H to install there as root, or name a folder that account can write" >&2
+			exit 1
+		fi
+	done
+	echo "install.sh: running as uid $HOME_ACCOUNT, not root: $why"
+	for v in $(compgen -e); do
+		case "$v" in
+		ATERM_* | XDG_* | CARGO_HOME | RUSTUP_HOME | CURL_CA_BUNDLE | CURL_HOME | SSL_CERT_FILE | SSL_CERT_DIR | \
+			http_proxy | https_proxy | HTTPS_PROXY | all_proxy | ALL_PROXY | no_proxy | NO_PROXY)
+			keep="${keep:+$keep,}$v"
+			;;
+		esac
+	done
+	exec_as_account "$HOME_ACCOUNT" "$keep" /usr/bin/env "HOME=$HOME" "PATH=$PATH" /bin/bash "$script" "$@"
+	exit $?
 }
 
 # --- the cargo that honours the pin (source-build lane) ----------------------
@@ -2760,6 +2857,7 @@ print_install_plan() {
 # ~1,600 lines would bury the guard's real diff in mechanical churn and risk
 # pushing literal tabs into multi-line strings.
 main() {
+ARGV=("$@")
 TAG=""
 TAG_INPUT=""
 TAG_EXPLICIT=0
@@ -2836,6 +2934,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	esac
 done
+home_account "$(id -u)" "${SUDO_UID:-}" "$(home_owner_uid)"
+if [[ -n "$HOME_ACCOUNT" || "$HOME_REFUSED" -eq 1 ]]; then
+	run_as_home_account ${ARGV[@]+"${ARGV[@]}"}
+fi
 if [[ "$DO_UNINSTALL" -eq 1 ]]; then
 	uninstall_everything
 	exit $?

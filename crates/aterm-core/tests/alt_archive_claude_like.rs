@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! The alt-screen scroll-off archive against a synthetic Claude-Code-shaped byte stream
-//! (never a real capture, which would carry private content).
-//!
-//! Claude Code repaints the alternate screen inside DEC 2026 synchronized updates with
-//! only absolute cursor moves and erases, so a row leaving the top is gone from the grid.
-//! The stream is `?1049h`, then frames of `?2026h ?25l`, changed rows painted with
-//! CUP/VPA+CHA + text + EL (a transcript shifted by k rows, a spinner row, a fixed
-//! composer and footer), `?25h ?2026l`.
+
+//! Alt-screen scroll-off archive tests on a synthetic Claude-Code-shaped stream.
 
 use std::time::Duration;
 
@@ -16,10 +9,6 @@ use aterm_core::terminal::{
     AltArchiveGap, AltArchiveGapKind, AltArchiveQuery, ClockReading, Terminal,
 };
 
-/// Transcript row `i`: blocks of eight — a message, two body lines, a blank, a
-/// tool call, a result line that repeats in every block (never unique, so it
-/// never votes), a counts line, a blank. Row 0 is not blank, and no two blanks
-/// touch.
 fn transcript_row(i: usize) -> String {
     match i % 8 {
         0 => format!("⏺ Step {}: reading the parser module and its tests", i / 8),
@@ -47,8 +36,6 @@ fn transcript_row(i: usize) -> String {
 
 const SPIN: [&str; 6] = ["✻", "✢", "✳", "✶", "✻", "✽"];
 
-/// The screen layout: `t` transcript rows, the spinner row, a blank, a 3-row
-/// composer box, a footer.
 struct Layout {
     rows: usize,
     cols: usize,
@@ -79,8 +66,6 @@ impl Layout {
     }
 }
 
-/// Deterministic step sizes: mostly spinner-only ticks and 1-3 row scrolls, with
-/// an occasional 12-row burst (still overlapping).
 fn steps(n: usize) -> Vec<usize> {
     let mut x: u32 = 0x9e37_79b9;
     (0..n)
@@ -99,8 +84,6 @@ fn steps(n: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Paint `next` over `prev` like a diffing TUI renderer: only changed rows, every
-/// seventh frame everything; CUP for most rows, VPA+CHA for some.
 fn paint(out: &mut Vec<u8>, prev: Option<&[String]>, next: &[String], full: bool) {
     out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
     for (r, text) in next.iter().enumerate() {
@@ -118,7 +101,6 @@ fn paint(out: &mut Vec<u8>, prev: Option<&[String]>, next: &[String], full: bool
     out.extend_from_slice(b"\x1b[?25h\x1b[?2026l");
 }
 
-/// The stream plus what it scrolled off: `(bytes, final start, frames)`.
 fn claude_like(layout: &Layout, frames: usize, alt: bool) -> (Vec<u8>, usize, usize) {
     let mut out = Vec::new();
     if alt {
@@ -181,8 +163,6 @@ fn observe(t: &Terminal) -> Observed {
     }
 }
 
-/// Feed `data` in chunks whose sizes cycle through `sizes`, at one fixed clock
-/// (so no sync timeout or fallback cadence can depend on real pacing).
 fn feed(layout: &Layout, data: &[u8], sizes: &[usize]) -> Terminal {
     let mut t = term(layout);
     let clock = fixed_clock();
@@ -216,25 +196,20 @@ fn archive_equals_exactly_the_rows_that_scrolled_off() {
     assert_eq!(t.alt_archive().gaps().count(), 0);
     assert_eq!(t.alt_archive().lost(), 0);
     assert_eq!(t.alt_archive().back(), 0);
-    // The chrome and the spinner never scrolled, so they are nowhere in it.
     assert!(
         t.alt_archive()
             .texts()
             .iter()
             .all(|r| !r.contains("Crunching") && !r.contains("accept edits") && !r.contains('╭'))
     );
-    // The clone-out read hands the same rows back, row m at index first + m.
     let r = t.alt_archive_read(AltArchiveQuery::oldest(0, 2000));
     assert_eq!(r.first, 1);
     assert_eq!(r.last, end as u64);
     assert!(!r.more);
     assert!(r.rows.iter().zip(&want).all(|(a, b)| **a == **b));
-    // The alt grid itself still keeps no scrollback: the archive is beside it.
     assert_eq!(t.grid().scrollback_lines(), 0);
     assert_eq!(t.grid().history_line_count(), 0);
 
-    // Leaving flushes the last screen's scrolling region (transcript + the
-    // spinner row, which sits above the chrome) and never the composer/footer.
     t.process(b"\x1b[?1049l");
     let mut after = want.clone();
     after.extend((end..end + LAYOUT.transcript_rows()).map(transcript_row));
@@ -286,7 +261,6 @@ fn a_frame_closed_by_the_sync_timeout_is_committed() {
     let s0 = layout.screen(0, 0);
     paint(&mut first, None, &s0, true);
     t.process_at(&first, t0);
-    // Open a frame that scrolls 3 rows and never close it.
     let s3 = layout.screen(3, 1);
     let mut open = Vec::new();
     paint(&mut open, Some(&s0), &s3, false);
@@ -294,7 +268,6 @@ fn a_frame_closed_by_the_sync_timeout_is_committed() {
     t.process_at(&open, t0);
     assert!(t.modes().synchronized_output());
     assert!(t.alt_archive().is_empty(), "an open frame is not committed");
-    // Nothing more arrives; the next batch finds the window expired.
     t.process_at(b"", later);
     assert!(
         !t.modes().synchronized_output(),

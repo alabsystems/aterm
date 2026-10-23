@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `aterm-spec`'s `ribbon_arrival_evidence_model`: the real witness
-//! writes the arrival evidence the model states (the writer half of the follow pass;
-//! `tests/ribbon_follow_conformance.rs` binds the reader).
-//!
-//! Every model trace up to its bound (`T = 5` units of 20 ms) is replayed: a three-glyph run
-//! armed on row 5 with row 4 sampled per the trace's arm, walked at each frame's time with row 4
-//! per the frame, then the run's row blanked and its text standing on row 4. The follow pass must
-//! name the run exactly where the model says the glyphs arrived (`clear == 1 && twin == 0`), and
-//! every invariant must hold. The negative control is `Buggy = 1`, a twin recorded only at arm.
+//! Conformance tests for [`ribbon_arrival_evidence_model`].
 
 use std::time::{Duration, Instant};
 
@@ -22,7 +14,6 @@ use aterm_spec::interp;
 const TEXT: [char; 3] = ['a', 'b', 'c'];
 const OTHER: [char; 3] = ['x', 'y', 'z'];
 const BLANK: [char; 3] = [' ', ' ', ' '];
-/// One model time unit: `TWIN_MIN` (40 ms) is the model's `TwinMin = 2`.
 const UNIT: Duration = Duration::from_millis(20);
 
 fn cell(col: u16, born: Instant) -> Cell {
@@ -55,7 +46,6 @@ enum Beside {
     Unsampled,
 }
 
-/// A trace: the arm's `Beside`, then each frame's `(Beside, units)`.
 type Trace = (Beside, Vec<(Beside, u32)>);
 
 fn arm_action(b: Beside) -> &'static str {
@@ -77,7 +67,6 @@ fn frame_action(b: Beside, units: u32) -> &'static str {
     }
 }
 
-/// Every trace the model can take up to its bound `t`.
 fn every_trace(bound: u32) -> Vec<Trace> {
     const ALL: [Beside; 3] = [Beside::Same, Beside::Diff, Beside::Unsampled];
     fn grow(
@@ -108,7 +97,6 @@ fn every_trace(bound: u32) -> Vec<Trace> {
     out
 }
 
-/// The model's state after the trace, every invariant checked on the way.
 fn modelled(model: &Model, trace: &Trace) -> std::collections::BTreeMap<&'static str, i64> {
     let mut st = model.init_state();
     assert!(model.fire(arm_action(trace.0), &mut st));
@@ -119,8 +107,6 @@ fn modelled(model: &Model, trace: &Trace) -> std::collections::BTreeMap<&'static
     st
 }
 
-/// The real witness over the trace: `true` when the follow pass names the
-/// run onto the copy a row up once the run's own row is blank.
 fn real_follows(trace: &Trace) -> bool {
     let t0 = Instant::now();
     let cells: Vec<Cell> = (0..3).map(|c| cell(c, t0)).collect();
@@ -203,10 +189,6 @@ fn the_real_witness_writes_the_arrival_evidence_on_every_trace() {
     );
 }
 
-/// Negative control: the arm-only twin writer (`Buggy = 1`) disagrees with the
-/// real witness on traces where a copy appeared beside the standing line and
-/// stood `TWIN_MIN` (fzf's list landing under the query), and on no trace
-/// where the copy was there at arm.
 #[test]
 fn the_2026_09_23_writer_is_caught_on_the_copies_that_stood() {
     let model = ribbon_arrival_evidence_model();

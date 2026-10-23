@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! The `brew` reroute stub (design §1): one `/bin/sh` file in the
-//! session reroute directory beside the cargo/rustc stubs, with its
-//! own marker so `reroute::lay` treats it as foreign (never swept,
-//! never rewritten). The escape walk runs in `sh`, so `brew --real`
-//! works even when atpkg cannot.
+//! The `brew` reroute stub.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +17,6 @@ pub const BREW_PATH_ENV: &str = "ABREW_BREW_PATH";
 pub const REROUTED_ENV: &str = "__ABREW_REROUTED";
 /// The hidden verb the stub execs: `atpkg __abrew [args…]`.
 pub const HIDDEN_VERB: &str = "__abrew";
-/// The stub's own identity line (never the reroute table's marker).
 const STUB_MARKER: &str = "# atpkg-abrew stub v1 — regenerable; brew --real runs real Homebrew";
 
 /// The stub file for a layout.
@@ -30,8 +25,7 @@ pub fn stub_path(layout: &Layout) -> PathBuf {
     crate::reroute::dir(layout).join("brew")
 }
 
-/// The stub body. `atpkg` is the absolute binary path to name;
-/// `disabled_file` and `bundled_brew` are baked in at lay time.
+/// Format the stub body for `atpkg`, `disabled_file`, and `bundled_brew`.
 #[must_use]
 pub fn stub_body(atpkg: &Path, disabled_file: &Path, bundled_brew: &Path) -> String {
     format!(
@@ -43,7 +37,6 @@ pub fn stub_body(atpkg: &Path, disabled_file: &Path, bundled_brew: &Path) -> Str
     )
 }
 
-/// Single-quote a string for /bin/sh (`'\''` for an embedded quote).
 fn sh_single(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
@@ -97,8 +90,7 @@ pub fn is_abrew_stub(path: &Path) -> bool {
     })
 }
 
-/// Lay or refresh the stub for a layout. Never over a foreign file.
-/// A disabled prefix lays nothing and removes an ours stub.
+/// Lay or refresh the stub for a layout (never over a foreign file).
 pub fn lay(layout: &Layout) -> std::io::Result<()> {
     lay_with(layout, &crate::stub::Embedder::this_process())
 }
@@ -127,15 +119,12 @@ pub(crate) fn lay_pending(layout: &Layout, embedder: &crate::stub::Embedder) -> 
     !matches!(plan(layout, embedder), Plan::Nothing)
 }
 
-/// What a lay of the stub does: nothing, remove an ours stub (abrew off), or write these
-/// bytes at this path.
 enum Plan {
     Nothing,
     Remove(PathBuf),
     Lay(PathBuf, String),
 }
 
-/// [`lay_with`]'s decision, read and never acted on, so the lay and its probe are one rule.
 fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     if cfg!(windows) {
         return Plan::Nothing;
@@ -143,9 +132,6 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     if layout.declined().is_file() {
         return Plan::Nothing;
     }
-    // The prefix this layout serves (never a test's neighbour): the env
-    // override when engaged, else `<layout prefix>/abrew` — the same root
-    // `Prefix::resolve` computes from a configured layout in a real run.
     let prefix = match std::env::var_os(super::prefix::PREFIX_ENV) {
         Some(p) if PathBuf::from(&p).is_absolute() => Prefix::at(&PathBuf::from(p)),
         _ => Prefix::at(&layout.prefix.join("abrew")),
@@ -182,10 +168,7 @@ fn plan(layout: &Layout, embedder: &crate::stub::Embedder) -> Plan {
     }
 }
 
-/// The one doctor row for the brew stub: laid/off/foreign/missing,
-/// plus where real brew resolves, and the class of what fixes it:
-/// `relay` (`repair` lays the stub again), or `person` for a foreign
-/// file at its path, which nothing touches. Doctor names; it never lays.
+/// Doctor row and convergence class for the brew stub.
 #[must_use]
 pub fn doctor_row(layout: &Layout) -> (crate::doctor::Row, aterm_converge::Class) {
     let prefix = Prefix::resolve();
@@ -199,8 +182,6 @@ pub fn doctor_row(layout: &Layout) -> (crate::doctor::Row, aterm_converge::Class
     )
 }
 
-/// [`doctor_row`] over what it reads from the config and the abrew prefix: whether abrew
-/// is `enabled`, whether `abrew off` `disabled` it, and where `real` brew resolves.
 fn doctor_row_with(
     layout: &Layout,
     enabled: bool,
@@ -224,9 +205,6 @@ fn doctor_row_with(
         );
     }
     if is_abrew_stub(&path) {
-        // A stub naming no live atpkg degrades silently to real brew
-        // on every invocation (found live: a dev binary with no
-        // co-located atpkg laid ATPKG=''). Name it, don't say ok.
         let live = std::fs::read_to_string(&path).is_ok_and(|body| stub_names_live_atpkg(&body));
         if live {
             row(
@@ -262,9 +240,7 @@ fn doctor_row_with(
     }
 }
 
-/// Whether a stub body names an atpkg that is actually there and
-/// executable — the same `[ -x ]` the body itself asks before its
-/// hand-over, so doctor and the stub agree.
+/// Whether `body` names an executable `atpkg`.
 #[must_use]
 pub fn stub_names_live_atpkg(body: &str) -> bool {
     crate::stub::sh_named_atpkg(body, "ATPKG").is_some_and(|p| crate::stub::is_live_atpkg(&p))
@@ -278,8 +254,7 @@ pub fn remove(layout: &Layout) {
     }
 }
 
-/// Resolve the real Homebrew (design §1 order): `ABREW_BREW_PATH`,
-/// bundled, PATH walk past reroute dirs, well-known prefixes.
+/// Resolve the real Homebrew: `ABREW_BREW_PATH`, bundled, PATH walk past reroute dirs, or well-known prefixes.
 #[must_use]
 pub fn resolve_real_brew(prefix: &Prefix) -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(BREW_PATH_ENV) {
@@ -328,7 +303,7 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
-/// Whether an env value counts as engaged (the crate's one rule).
+/// Whether an env value counts as engaged.
 #[must_use]
 pub fn engaged(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
@@ -338,9 +313,6 @@ pub fn engaged(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    /// Doctor's row for the stub's path, and the class of what fixes it: a missing stub is
-    /// `repair`'s to lay again (`relay`); a foreign file there is the person's, never
-    /// touched (`person`).
     #[test]
     fn a_foreign_file_at_the_stub_s_path_is_the_person_s() {
         use crate::doctor::Level;
@@ -388,7 +360,6 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("abrew-stub-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        // Fake atpkg: prints its argv. Fake real brew: prints REAL.
         let fake_atpkg = tmp.join("atpkg");
         std::fs::write(&fake_atpkg, "#!/bin/sh\necho ATPKG \"$@\"\n").unwrap();
         let fake_brew = tmp.join("real-brew");
@@ -423,7 +394,6 @@ mod tests {
         assert_eq!(run(&["list"], false), "ATPKG __abrew list");
         assert_eq!(run(&["--real", "list"], false), "REAL list");
         assert_eq!(run(&["list"], true), "REAL list");
-        // Disabled file flips to real with no flag at all.
         std::fs::write(tmp.join("disabled"), "off\n").unwrap();
         assert_eq!(run(&["info", "wget"], false), "REAL info wget");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -441,11 +411,8 @@ mod tests {
         let body =
             |atpkg: &Path| stub_body(atpkg, &tmp.join("disabled"), &tmp.join("none/bin/brew"));
         assert!(stub_names_live_atpkg(&body(&fake)));
-        // The ATPKG='' lay a dev binary without a co-located atpkg
-        // produces: doctor must warn, never say ok.
         assert!(!stub_names_live_atpkg(&body(Path::new(""))));
         assert!(!stub_names_live_atpkg(&body(&tmp.join("gone/atpkg"))));
-        // A non-executable file is not live either.
         let dull = tmp.join("dull");
         std::fs::write(&dull, "not a program\n").unwrap();
         std::fs::set_permissions(&dull, std::fs::Permissions::from_mode(0o644)).unwrap();

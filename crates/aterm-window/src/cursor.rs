@@ -4,6 +4,8 @@
 // Derived from winit 0.30.13 src/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): custom cursors are API no aterm crate uses: everything here but `Cursor` and
+// its `Icon` variant is Windows-only, which no other backend implements.
 #[cfg(windows_platform)]
 use core::fmt;
 #[cfg(windows_platform)]
@@ -52,6 +54,26 @@ impl From<CustomCursor> for Cursor {
 }
 
 /// Use a custom image as a cursor (mouse pointer).
+///
+/// # Examples
+///
+/// ```no_run
+/// # use aterm_window::event_loop::ActiveEventLoop;
+/// # use aterm_window::window::Window;
+/// # fn scope(event_loop: &ActiveEventLoop, window: &Window) {
+/// use aterm_window::window::CustomCursor;
+///
+/// let w = 10;
+/// let h = 10;
+/// let rgba = vec![255; (w * h * 4) as usize];
+///
+/// let source = CustomCursor::from_rgba(rgba, w, h, w / 2, h / 2).unwrap();
+///
+/// let custom_cursor = event_loop.create_custom_cursor(source);
+///
+/// window.set_cursor(custom_cursor.clone());
+/// # }
+/// ```
 #[cfg(windows_platform)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CustomCursor {

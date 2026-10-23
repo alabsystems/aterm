@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A fixed composer caret surrounded by sparse animated program glyphs.
-//! The sampled Codex scene used braille particles throughout the three input
-//! rows. They are ordinary terminal content, independent of aterm's effects.
+//! Fixed composer caret surrounded by sparse animated program glyphs.
 
 use std::time::{Duration, Instant};
 
@@ -18,11 +16,6 @@ use aterm_lexicon::Lexicon;
 const ROWS: u16 = 58;
 const COLS: u16 = 116;
 
-/// A tick's snapshot of the terminal, keyed by everything it is read from: output
-/// (`screen_mutations`), the selection and the facts. A tick whose key is unchanged hands the
-/// brain and the scanner the last snapshot (a fresh `cell_frame` per tick dominated this file's
-/// CPU); both still run every frame. A reused snapshot differs from a fresh `cell_frame` only in
-/// `row_rev`, the per-read revision lane neither reads.
 struct Seen {
     mutations: u64,
     selection: TextSelection,
@@ -71,8 +64,6 @@ impl Scene {
     }
 
     fn particles(&mut self, near: u16) {
-        // Complete synchronized batches always restore the same visible
-        // caret. Only the sparse background glyphs move; no input is noted.
         let above = self.rows - 3;
         let caret_row = self.rows - 2;
         let below = self.rows - 1;
@@ -115,8 +106,6 @@ impl Scene {
         self.brain
             .observe_console(input, &facts, PetPane::full(input));
         self.brain.set_console_presentable(true);
-        // This is the shipping scanner, not a test-side approximation of its
-        // ink spans. As on glass, the brain reads the last completed scan.
         let (spans, live) = self.decos.pet_ink();
         self.brain.sense_ink(0, spans, live);
         let sense = PetSense {
@@ -149,14 +138,10 @@ impl Scene {
     }
 }
 
-/// One mode's 35 s idle ladder: its summary line and the counts the law asserts,
-/// `(line, movement, sleeps, frames)`.
 type Ladder = (String, usize, usize, usize);
 
 #[test]
 fn nearby_output_particles_allow_uninterrupted_sleep_after_the_idle_ladder() {
-    // Each mode runs on its own scene and clock, in parallel; a panic is caught and re-raised
-    // in mode order, after the far-output line prints and its law is asserted.
     let modes = ["far-output", "near-particles"];
     let ladders = crate::common::par_map(&modes, |&mode| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ladder(mode)))
@@ -232,9 +217,7 @@ fn ladder(mode: &str) -> Ladder {
 
 fn sleeping_scene() -> (Scene, PetFrame) {
     let mut s = Scene::new();
-    // Establish a sleeping seat after the real text has been avoided.
     s.particles(5);
-    // Real text, rather than a decorative dot, establishes the local detour.
     s.term.process(b"\x1b[55;5HX\x1b[57;5HX\x1b[56;3H");
     let mut frame = s.tick();
     for _ in 0..300 {
@@ -250,7 +233,6 @@ fn observed_foot_is_clear(s: &mut Scene, frame: &PetFrame) -> bool {
     let facts = PetWorldFacts::read(&s.term, 7);
     let mut world = PetWorld::default();
     assert!(world.observe(&input, &facts, PetPane::full(&input)));
-    // Exclude the authored sprite's transparent 0.30-cell side margins.
     let first = (frame.col + 0.30).floor() as usize;
     let end = (frame.col + art_cols(8, 16) - 0.30).ceil() as usize;
     (first..end).all(|col| world.locomotion_ink_at(frame.row.round() as usize, col) == Some(false))
@@ -298,8 +280,6 @@ fn real_navigation_releases_the_sleeping_seat_and_follows_the_new_caret() {
 
 #[test]
 fn single_dot_particles_remain_ink_without_displacing_the_pet() {
-    // Each byte sequence puts the candidate at row2,col5. A missing or
-    // decorated neighbour, a compound glyph and real text remain substantive.
     for (bytes, obstacle) in [
         ("⠁", false),
         ("⠂", false),

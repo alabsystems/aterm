@@ -856,7 +856,9 @@ fn kernel_path(dir: &str) -> Option<String> {
         size: 0,
         path: [0; PATH_BYTES],
     };
-    // SAFETY: `path` is NUL-terminated and outlives the call.
+    // SAFETY: `path` is NUL-terminated and outlives the call; `list` and
+    // `reply` are live, writable and sized as passed; the kernel writes at
+    // most `size_of::<Reply>()` bytes into `reply`.
     let rc = unsafe {
         getattrlist(
             path.as_ptr(),

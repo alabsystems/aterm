@@ -3350,7 +3350,9 @@ impl MetalArmLive {
         }
         let stream = slot.as_ref().expect("sized above");
         if !bytes.is_empty() {
-            // SAFETY: shared storage of at least `bytes.len()` owned by `cur_slot`, which staging awaited.
+            // SAFETY: shared storage of at least `bytes.len()`, owned by
+            // `cur_slot`, which staging awaited (`await_frame_slot`): no frame
+            // in flight reads it. No other slot's palette is touched.
             unsafe { layer.write_buffer_from_zero(&stream.buf, bytes) };
         }
         Ok(stream.buf.metal().clone_retained())
@@ -4688,6 +4690,19 @@ pub struct WindowGpu {
     offscreen_dirty_since_post: Option<[u32; 4]>,
     #[cfg(gl_arm)]
     gl_posted: Option<gl_present::GlPosted>,
+    // The bloom's inputs at this compose and at the last post: a post whose
+    // bloom drew from the same as the last's sends only what changed under it.
+    #[cfg(gl_arm)]
+    gl_bloom_inputs: Vec<u8>,
+    #[cfg(gl_arm)]
+    #[cfg_attr(
+        wgpu_arm,
+        expect(
+            dead_code,
+            reason = "read by the GL window post: a build with wgpu posts on wgpu"
+        )
+    )]
+    gl_posted_bloom: Vec<u8>,
     #[cfg(target_os = "macos")]
     pub(crate) metal_present_off: Option<crate::metal::resources::SealedTexture>,
     #[cfg(all(target_os = "macos", test))]
@@ -21033,7 +21048,7 @@ impl<T> WindowTarget for T where
 /// window's frames through instead of a window surface where the window
 /// system's GL stalls it (an X11 window on NVIDIA's GLX under a compositing
 /// manager: every resize of a window with a `GLXWindow` stalls the X server
-/// and the GPU for every client; `gl::surface`'s module header). Handed to
+/// and the GPU for every client). Handed to
 /// [`GpuRenderer::create_window_surface_with_sink`], which uses it only there.
 #[cfg(target_os = "linux")]
 pub trait FrameSink: Send {

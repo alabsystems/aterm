@@ -113,7 +113,7 @@ impl ColorOverridesRepr {
     }
 }
 
-/// The colour state applications set, as a diff from the configured baseline (see the module docs).
+/// The colour state applications set, as a diff from the configured baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorRepr {

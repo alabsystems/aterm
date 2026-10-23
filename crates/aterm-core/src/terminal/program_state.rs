@@ -108,7 +108,8 @@ pub struct ProgramStateReport {
     pub seq: u64,
     /// The report standing now; `None` after a `clear`, a reset, or before any.
     pub state: Option<ProgramState>,
-    /// How many turns the accepted reports began (the module doc's rule).
+    /// How many turns the accepted reports began: a `working` or `blocked` report begins one unless
+    /// the report before it (a `clear` or a full reset looked past) was `working` or `blocked` too.
     pub turns: u64,
     /// The state of the latest report taken, a `clear` or a full reset looked past.
     last: Option<ProgramStateWord>,

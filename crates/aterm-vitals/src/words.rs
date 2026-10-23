@@ -3,6 +3,7 @@
 
 //! Human-readable formatting, amount ladders, Details clauses, and spoken sentences for system vitals.
 
+use crate::explain::{Context, deck_cause};
 use crate::history::Filling;
 use crate::jobs::Verdict;
 use crate::model::{
@@ -289,6 +290,8 @@ pub enum Mark {
     Up,
     /// ↓: receiving.
     Down,
+    /// ∵: the cause aterm names (`explain`'s Deck clause).
+    Cause,
 }
 
 /// Amount-column width ladder (`Det`, `Cols`, `NoCols`).
@@ -1360,8 +1363,34 @@ fn cpu_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
             Clause::new(0, vec![on, format!("load {l}")])
         });
     }
+    out.extend(cause(snap));
     out.extend(busiest(snap));
     out
+}
+
+/// The cause the cause engine holds for the Deck (RD §4.1, p1 ahead of
+/// busiest, so it folds after it): `∵ Spotlight, after start-up`, short
+/// `∵ Spotlight` ([`deck_cause`]). Said "Why: …".
+fn cause(snap: &Snapshot) -> Option<Clause> {
+    let c = deck_cause(snap)?;
+    let long = cause_words(c.word, c.context);
+    Some(
+        Clause::new(1, vec![long.clone(), c.word.to_owned()])
+            .marked(Some(Mark::Cause))
+            .said(format!("Why: {long}.")),
+    )
+}
+
+/// A cause's words `base`, with the context that times it (RD §4.1):
+/// `Spotlight, after start-up`, `…, since wake`; any other context adds
+/// none. The one source of these words for the Deck, `sys why` and Why now.
+#[must_use]
+pub fn cause_words(base: &str, context: Option<Context>) -> String {
+    match context {
+        Some(Context::Startup) => format!("{base}, after start-up"),
+        Some(Context::Wake) => format!("{base}, since wake"),
+        _ => base.to_owned(),
+    }
 }
 
 /// The busiest program now (v2 §6.1 p1), its processes over the whole sweep
@@ -2222,6 +2251,7 @@ mod tests {
         assert_eq!(cores_figure(0.9, None, Motion::Steady), "0.9c");
     }
 
+    use crate::explain::{ActivityId, CoalLane, DeckCause, WhyFacts};
     use crate::history::Rates;
     use crate::jobs::{Class, Consumer, Findings, JobKind, JobRow, JobsView, Tick, ZombieParent};
     use crate::model::{Busiest, DiskFacts, GpuSample, Hog, LinkSample, PlanFact, Series};
@@ -2306,6 +2336,20 @@ mod tests {
 
     fn set(s: &mut Snapshot, res: Resource, view: ResourceView) {
         s.resources[res.index()] = view;
+    }
+
+    /// Facts read with the snapshot whose Deck clause names Spotlight in
+    /// `context`, as the cause engine holds it.
+    fn spotlight(context: Option<Context>) -> Option<Arc<WhyFacts>> {
+        Some(Arc::new(WhyFacts {
+            lane: CoalLane::On,
+            clause: Some(DeckCause {
+                activity: ActivityId::Spotlight,
+                word: "Spotlight",
+                context,
+            }),
+            ..WhyFacts::default()
+        }))
     }
 
     /// The facts of a disk watch that judged the home volume at `level`.
@@ -3159,6 +3203,27 @@ mod tests {
                     Words,
                     f(&["load 25.7 on 18 cores", "load 25.7"])
                 ),
+                busiest.clone()
+            ]
+        );
+        s.why = spotlight(Some(Context::Startup));
+        assert_eq!(
+            shape(&details(Resource::Cpu, &s, &MAC)),
+            vec![
+                (
+                    0,
+                    false,
+                    None,
+                    Words,
+                    f(&["8 waiting for a core (load 25.7)", "load 25.7 on 18 cores"])
+                ),
+                (
+                    1,
+                    false,
+                    Some(Mark::Cause),
+                    Words,
+                    f(&["Spotlight, after start-up", "Spotlight"])
+                ),
                 busiest
             ]
         );
@@ -3293,6 +3358,69 @@ mod tests {
         assert!(details(Resource::Gpu, &s, &MAC).is_empty());
     }
 
+    /// The Deck's cause clause (RD §4.1): p1 after the load and before
+    /// busiest (both p1, stably sorted, so it folds after busiest), marked ∵,
+    /// its long form naming the context that times it (start-up or wake, none
+    /// for the machine's), said "Why: …"; none without facts, without a
+    /// clause, or once the facts are older than 15 s, and never a state.
+    #[test]
+    fn cpu_details_name_the_cause_after_load_and_before_busiest() {
+        let mut s = snap();
+        set(&mut s, Resource::Cpu, row(3.3, 18.0));
+        s.facts.load1 = Some(5.6);
+        s.facts.busiest = Some(Busiest {
+            name: "siriactionsd".into(),
+            cores: 0.7,
+            n: 1,
+            scope: None,
+        });
+        let read = |s: &Snapshot| -> Vec<(Vec<String>, Option<Mark>, String)> {
+            details(Resource::Cpu, s, &MAC)
+                .into_iter()
+                .map(|c| (c.forms, c.mark, c.spoken))
+                .collect()
+        };
+        let load = (
+            strings(&["load 5.6 on 18 cores", "load 5.6"]),
+            None,
+            "Load 5.6 on 18 cores.".to_owned(),
+        );
+        let busiest = (
+            strings(&["busiest siriactionsd, 0.7 cores", "siriactionsd"]),
+            None,
+            "Busiest siriactionsd, 0.7 cores.".to_owned(),
+        );
+        assert_eq!(read(&s), [load.clone(), busiest.clone()]);
+        for (context, long) in [
+            (Some(Context::Startup), "Spotlight, after start-up"),
+            (Some(Context::Wake), "Spotlight, since wake"),
+            (Some(Context::Throttled), "Spotlight"),
+            (None, "Spotlight"),
+        ] {
+            s.why = spotlight(context);
+            let cause = (
+                strings(&[long, "Spotlight"]),
+                Some(Mark::Cause),
+                format!("Why: {long}."),
+            );
+            assert_eq!(
+                read(&s),
+                [load.clone(), cause, busiest.clone()],
+                "{context:?}"
+            );
+            assert_eq!(state(Resource::Cpu, &s, &MAC), None, "a cause is no state");
+        }
+
+        s.why = spotlight(Some(Context::Startup));
+        s.at_ns = 15_000_000_000;
+        assert_eq!(read(&s).len(), 3, "15 s old");
+        s.at_ns += 1_000_000;
+        assert_eq!(read(&s), [load.clone(), busiest.clone()], "older");
+        s.at_ns = 0;
+        s.why = Some(Arc::new(WhyFacts::default()));
+        assert_eq!(read(&s), [load, busiest], "no clause held");
+    }
+
     #[test]
     fn row_sentences() {
         let mut s = snap();
@@ -3306,6 +3434,20 @@ mod tests {
             "CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1 cores. \
              Steady near 98 percent. Over capacity 8 of the last 10 minutes. 8 waiting for a \
              core, load 25.7 on 18 cores."
+        );
+        s.why = spotlight(Some(Context::Startup));
+        s.facts.busiest = Some(Busiest {
+            name: "rustc".into(),
+            cores: 5.9,
+            n: 9,
+            scope: Some(ProcScope::Tab(3)),
+        });
+        assert!(
+            row_sentence(Resource::Cpu, &s, Some(2), &MAC).ends_with(
+                "8 waiting for a core, load 25.7 on 18 cores. Why: Spotlight, after start-up. \
+                 Busiest rustc, 9 processes in Tab 3, 5.9 cores."
+            ),
+            "the meter says the cause where no Details column shows"
         );
 
         assert_eq!(

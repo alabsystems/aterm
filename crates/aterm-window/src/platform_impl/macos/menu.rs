@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/macos/menu.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{alloc, send_id, send_id_id, send_id_id_sel_id, send_v_id, send_v_usize};
 use aterm_objc::{autoreleasepool, class, sel, Id, MainThread, Obj, Sel};
 
@@ -26,7 +29,13 @@ struct KeyEquivalent {
 /// `app` must be a live `NSApplication`.
 pub(super) unsafe fn initialize(app: Id, mtm: MainThread) {
     autoreleasepool(|_| {
-        // SAFETY: Receivers and selectors are valid on the main thread inside the autorelease pool.
+        // SAFETY (for this whole block): every receiver below is either a
+        // class object from `class()`, a +1 handle this scope owns, a
+        // borrowed autoreleased return that is live until the pool pops, or
+        // `app`, which the caller pins as a live `NSApplication`; each send's
+        // prototype matches the runtime's own encoding (a debug build checks
+        // it at the send, `aterm_objc::send`). `mtm` witnesses the thread
+        // `NSMenu` and `NSMenuItem` require.
         unsafe {
             let _ = mtm;
 
@@ -103,7 +112,8 @@ pub(super) unsafe fn initialize(app: Id, mtm: MainThread) {
 /// # Safety
 /// Both arguments must be live `NSString`s.
 unsafe fn append(a: Id, b: Id) -> Id {
-    // SAFETY: Caller guarantees both arguments are live `NSString`s.
+    // SAFETY: the caller pins both as live `NSString`s; the return is
+    // autoreleased into the enclosing pool.
     unsafe { send_id_id(a, sel!(stringByAppendingString:), b) }
 }
 
@@ -128,7 +138,10 @@ unsafe fn menu_item(
         Some(ke) => (ke.key, ke.masks),
         None => (nsstr(""), None),
     };
-    // SAFETY: `NSMenuItem` is allocated and initialized on the main thread with live `NSString`s.
+    // SAFETY: `+alloc` answers +1 and the initialiser consumes it and answers
+    // +1; `-initWithTitle:action:keyEquivalent:` is `@@:@:@` and a NIL action
+    // is what AppKit reads as "no action". `mtm` witnesses the thread
+    // `NSMenuItem` requires, and the title and key are live `NSString`s.
     let item = unsafe {
         let _ = mtm;
         let raw = alloc(class(c"NSMenuItem"));

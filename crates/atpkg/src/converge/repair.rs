@@ -138,7 +138,6 @@ enum Step {
     Store,
 }
 
-/// One repair step as an item.
 struct Repair {
     step: Step,
     ground: Arc<Ground>,
@@ -158,7 +157,6 @@ impl Repair {
         &self.ground.layout
     }
 
-    /// Whether this pass re-runs the step whatever its probe reads ([`Pass::Repair`]).
     fn reruns(&self) -> bool {
         self.ground.pass == Pass::Repair
             && matches!(self.step, Step::Shims | Step::ExecRoots | Step::RustupSeam)
@@ -172,7 +170,6 @@ impl Repair {
     }
 }
 
-/// `Probe::Change` from the value now to the value wanted.
 fn change(from: impl Into<String>, to: impl Into<String>) -> Probe {
     Probe::Change {
         from: from.into(),
@@ -192,7 +189,6 @@ fn blocked(why: impl Into<String>) -> Probe {
     Probe::Blocked { why: why.into() }
 }
 
-/// Paths as one comma-separated phrase.
 fn shown(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -528,7 +524,6 @@ impl Repair {
         Ok(())
     }
 
-    /// Why this pass writes nothing of the shell's.
     fn other_bundle(&self) -> Option<&'static str> {
         (self.ground.pass == Pass::Doctor
             && self
@@ -885,7 +880,6 @@ impl Repair {
         }
     }
 
-    /// Re-assert the rustup seams ([`crate::seam::repair`]).
     fn apply_seam(&self, stale: bool) -> Result<(), String> {
         let Some(rustup_home) = self.ground.rustup_home.as_deref() else {
             return Ok(());
@@ -1105,7 +1099,8 @@ pub(crate) struct ShimPlan {
     pub(crate) failed: Vec<String>,
 }
 
-/// Which builds a re-lay of the shims works from: the build ACTIVATION selects.
+/// Which builds a re-lay of the shims works from: the build ACTIVATION selects
+/// (`store/<program>/current`), or the newest complete build when there is no usable link.
 pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
     let mut builds: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
         std::collections::BTreeMap::new();
@@ -1178,7 +1173,6 @@ pub(crate) fn shim_plan(layout: &Layout) -> ShimPlan {
     plan
 }
 
-/// The `bin/` shims a re-lay of `planned` lays ([`crate::activate::Aliases::laid_for`]).
 fn shims_of(layout: &Layout, planned: &Planned) -> Vec<PathBuf> {
     let alab = crate::activate::Aliases::laid_for(layout, &planned.program)
         == crate::activate::Aliases::Alab;
@@ -1193,7 +1187,6 @@ fn shims_of(layout: &Layout, planned: &Planned) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Whether the shim at `shim` forwards to something that is there.
 fn shim_runs(shim: &Path) -> bool {
     crate::platform::resolve_shim(shim).is_some_and(|target| {
         !matches!(
@@ -1258,7 +1251,8 @@ pub(crate) fn relay(layout: &Layout) -> Relaid {
     relaid
 }
 
-/// What [`relay`] re-lays for `program` from `build_dir`: the names its own shims still carry.
+/// What [`relay`] re-lays for `program` from `build_dir`: the names its own shims still carry,
+/// plus `program` when none survive or the build ships it and its shim is gone.
 pub(crate) fn exposes(layout: &Layout, program: &str, build_dir: &Path) -> Vec<String> {
     let Some(mut exposes) = crate::installed_exposes(layout, program) else {
         return vec![program.to_string()];

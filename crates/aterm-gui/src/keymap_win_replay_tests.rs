@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows key path end to end on RECORDED input: the window messages Windows posts for a hand
-//! on a German, French, US or US-International keyboard, or for a Japanese or Korean input method,
-//! replayed through winit's real key path (`aterm_window::platform::windows::recorded`: the key
-//! event builder, the modifier read, the Alt-code and IME handling, with Windows' answers
-//! recorded), then through `App::on_key`, the modifier update and the IME arms, down to the bytes
-//! the program reads.
+//! Windows keyboard layout and IME replay tests.
 
 use aterm_window::event::{ElementState, Ime};
 use aterm_window::keyboard::ModifiersState;
@@ -28,8 +23,6 @@ const GCS_RESULTSTR: u32 = 0x0800;
 const VK_NUMLOCK: u16 = 0x90;
 const VK_CAPITAL: u16 = 0x14;
 
-/// What `VkKeyScanExW` answers on German (`00000407`) for the characters the recordings type:
-/// 1 Shift, 2 Ctrl, 4 Alt (measured on the shipped `KBDGR`, as `keymap::tests`' table).
 fn de_de_shift_state(c: char) -> Option<u8> {
     match c {
         '@' | '{' | '[' | ']' | '}' | '\\' | '~' | '|' | '€' | '²' => Some(0b110),
@@ -40,7 +33,6 @@ fn de_de_shift_state(c: char) -> Option<u8> {
     }
 }
 
-/// `VkKeyScanExW` on US (`00000409`): nothing needs Ctrl+Alt.
 fn en_us_shift_state(c: char) -> Option<u8> {
     match c {
         'a'..='z' | '0'..='9' | '\'' | '/' | ' ' => Some(0),
@@ -49,7 +41,6 @@ fn en_us_shift_state(c: char) -> Option<u8> {
     }
 }
 
-/// `VkKeyScanExW` on French (`0000040C`) for the characters the recordings type.
 fn fr_fr_shift_state(c: char) -> Option<u8> {
     match c {
         '@' | '#' | '[' | ']' | '€' | '~' => Some(0b110),
@@ -60,8 +51,6 @@ fn fr_fr_shift_state(c: char) -> Option<u8> {
     }
 }
 
-/// The bytes the program reads for `typed` on `layout` (whose `VkKeyScanExW` is
-/// `shift_state`), under keyboard `mode`.
 fn bytes(
     layout: &RecordedLayout,
     shift_state: fn(char) -> Option<u8>,
@@ -160,9 +149,6 @@ fn shifted(key: Physical, text: &str) -> Typist {
     Typist::new().press(LSHIFT).tap(key, text).release(LSHIFT)
 }
 
-/// US: letters, Shift, Caps Lock (and Caps Lock with Shift, lowercase), Alt (ESC-prefixed,
-/// from `WM_SYSCHAR`), Ctrl (its C0 byte), and Ctrl+Alt, which composes nothing on US and is
-/// the chord ESC + C0.
 #[test]
 fn us_letters_and_chords() {
     let us = layouts::en_us();
@@ -188,9 +174,6 @@ fn us_letters_and_chords() {
     assert_types(us, en_us_shift_state, &ctrl_alt, b"\x1b\x01");
 }
 
-/// An Alt code (Alt, 0, 2, 3, 3 on the NumLock-on keypad) types its character once; the
-/// digits type nothing. A keypad digit without Alt types the digit to a VT reader, and under
-/// win32-input-mode goes out as its `VK_NUMPAD2` record (§2.2's keypad rule).
 #[test]
 fn an_alt_code_types_its_character() {
     let mut typed = Typist::new().toggled(VK_NUMLOCK).press(LALT);
@@ -211,8 +194,6 @@ fn an_alt_code_types_its_character() {
     );
 }
 
-/// Text `SendInput` types (`VK_PACKET`: an on-screen keyboard, the emoji panel) arrives as
-/// typed text.
 #[test]
 fn packet_text_is_typed() {
     let typed = Typist::new().tap(PACKET, "😀").tap(PACKET, "é");
@@ -224,10 +205,6 @@ fn packet_text_is_typed() {
     );
 }
 
-/// German: AltGr (the right Alt, which Windows announces with a left Ctrl it then drops)
-/// types `@`, `{`, `€` and `\`; so does left Ctrl + left Alt, which Windows takes as AltGr;
-/// Shift types the layout's `/` and `=`, not the US table's `?` and `+`; Alt+Shift+7 is
-/// `ESC /`; and the keypad's decimal key is the layout's `,`.
 #[test]
 fn german_altgr_and_shift() {
     let de = layouts::de_de();
@@ -257,9 +234,6 @@ fn german_altgr_and_shift() {
     assert_types(de, de_de_shift_state, &decimal, b",");
 }
 
-/// German dead keys: `^` then `e` is `ê`; `^` then Space is `^` (it typed a space, and the
-/// accent was lost, before `keymap::windows_text_commit` took the Space press's text); held,
-/// that Space repeats spaces; `^` twice is `^^`.
 #[test]
 fn german_dead_keys() {
     let de = layouts::de_de();
@@ -293,8 +267,6 @@ fn german_dead_keys() {
     );
 }
 
-/// US-International: `'` then `e` is `é`, then `s` (which does not compose) is `'s`, then
-/// Space is `'`; AltGr+Q is `ä`.
 #[test]
 fn us_international_dead_keys_and_altgr() {
     let intl = layouts::en_us_intl();
@@ -318,8 +290,6 @@ fn us_international_dead_keys_and_altgr() {
     assert_types(&intl, en_us_shift_state, &altgr(Q, "ä"), "ä".as_bytes());
 }
 
-/// French AZERTY: the digit row types `&` and `é`, Shift the digits; AltGr+à is `@`; the
-/// US Q position types `a`; `^` then `e` is `ê`; AltGr+é is the dead `~`, then Space `~`.
 #[test]
 fn french_azerty() {
     let fr = layouts::fr_fr();
@@ -353,8 +323,6 @@ fn french_azerty() {
     assert_types(fr, fr_fr_shift_state, &tilde, b"~");
 }
 
-/// A Japanese IME: the keys it takes (`VK_PROCESSKEY`) and their releases type nothing, and
-/// the converted text reaches the program once, when it is committed.
 #[test]
 fn a_japanese_commit_types_once() {
     let converted = "日本語";
@@ -403,8 +371,6 @@ fn a_japanese_commit_types_once() {
     );
 }
 
-/// The Korean IME commits at the end of a composition and sends the result again after it:
-/// the program reads the syllable once.
 #[test]
 fn a_hangul_commit_types_once() {
     let syllable = || Composition {
@@ -439,9 +405,6 @@ fn a_hangul_commit_types_once() {
     );
 }
 
-/// The modifiers the window reports while AltGr is down are none, so no Ctrl or Alt binding
-/// can take an AltGr character (the left Ctrl Windows posts first does reach the window as a
-/// modifier, for a moment, with no key event).
 #[test]
 fn altgr_holds_no_modifiers() {
     let events = replay(&layouts::de_de(), altgr(Q, "@").messages());

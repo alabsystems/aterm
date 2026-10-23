@@ -116,7 +116,9 @@ impl Tap {
     }
 
     /// The projection of `slot` in `view`, or `None` once it is out of the model's
-    /// domain (the module doc).
+    /// domain: its session gone, the log moved more than the model's bound, or the bus
+    /// holding what the model has no name for (a third message, or anything but the
+    /// session's mail, at the offset; the slot's message at another offset).
     fn project(&self, slot: &mut Slot, view: &View, markers: &BTreeSet<String>) -> Option<Key> {
         let session = view.sessions.get(&slot.sid)?;
         let at = usize::try_from(slot.off).ok()?;

@@ -65,7 +65,13 @@ impl<'s> GlFrame<'s> {
                 }
             }
             if let FrameLoad::Clear(c) = load {
-                (gl.disable)(ffi::GL_SCISSOR_TEST);
+                // A clear ignores the viewport: one of a roomy texture keeps to its texels in use.
+                if target.roomy() {
+                    (gl.enable)(ffi::GL_SCISSOR_TEST);
+                    (gl.scissor)(0, 0, target.width as i32, target.height as i32);
+                } else {
+                    (gl.disable)(ffi::GL_SCISSOR_TEST);
+                }
                 (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);
                 let rgba = [c.r as f32, c.g as f32, c.b as f32, c.a as f32];
                 (gl.clear_bufferfv)(ffi::GL_COLOR, 0, rgba.as_ptr());

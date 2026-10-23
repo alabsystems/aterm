@@ -12,15 +12,25 @@ const GC: [&str; 30] = [
     "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe", "Pi",
     "Pf", "Po", "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co", "Cn",
 ];
-const HEADER: &str = "// Copyright 2026 Andrew Yates\n\
-// SPDX-License-Identifier: Apache-2.0\n\
-//\n\
-// GENERATED — do not edit by hand. Regenerate with\n";
+
+/// The generator each output's seal line names (`aterm_census::seal`).
+const GENERATOR: &str = "aterm-grapheme's `unicode_tables` example";
+const LICENCE_HEADER: &str =
+    "// Copyright 2026 Andrew Yates\n// SPDX-License-Identifier: Apache-2.0\n";
+const HEADER: &str = "//\n// GENERATED — do not edit by hand. Regenerate with\n";
 const LICENSE: &str = "// from the Unicode Character Database, whose data is under the Unicode License v3\n\
 // (UNICODE-LICENSE.txt at the repo root).\n\n";
 const USAGE: &str = "usage: targo --unverified run -p aterm-grapheme --example unicode_tables --\n\
     mirroring <BidiMirroring.txt> <output.rs>\n\
     props <Scripts.txt> <DerivedGeneralCategory.txt> <PropertyValueAliases.txt> <output.rs>";
+
+/// The licence lines, the unstamped seal line, and the regeneration note's first line.
+fn header() -> String {
+    format!(
+        "{LICENCE_HEADER}{}\n{HEADER}",
+        aterm_census::seal::line("//", GENERATOR)
+    )
+}
 
 fn version(text: &str, name: &str) -> Result<String, String> {
     let prefix = format!("{name}-");
@@ -70,7 +80,7 @@ fn mirroring(text: &str) -> Result<String, String> {
     if pairs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err("duplicate Bidi_Mirroring_Glyph source".into());
     }
-    let mut out = HEADER.to_owned();
+    let mut out = header();
     out.push_str(
         "//     targo --unverified run -p aterm-grapheme --example unicode_tables -- \\\n\
 //         mirroring <BidiMirroring.txt> crates/aterm-bidi/src/mirroring.rs\n",
@@ -193,7 +203,7 @@ fn props(scripts: &str, categories: &str, aliases: &str) -> Result<String, Strin
         .map(|(index, &name)| (name.to_owned(), index as u8))
         .collect();
     let category_values = property_values(categories, &category_indices, 29)?;
-    let mut out = HEADER.to_owned();
+    let mut out = header();
     out.push_str(
         "//     targo --unverified run -p aterm-grapheme --example unicode_tables -- \\\n\
 //         props <Scripts.txt> <DerivedGeneralCategory.txt> <PropertyValueAliases.txt> \\\n\
@@ -272,6 +282,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         _ => return Err(USAGE.into()),
     };
-    std::fs::write(Path::new(destination), out)?;
+    std::fs::write(Path::new(destination), aterm_census::seal::stamp(&out)?)?;
     Ok(())
 }

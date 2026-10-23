@@ -4066,9 +4066,12 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
-        auth_status_of(std::ffi::OsStr::new("claude"), login, &|name| {
-            std::env::var_os(name)
-        })
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        let prog = user_home
+            .as_deref()
+            .map(super::accounts_sync::resolve_claude_program)
+            .unwrap_or_else(|| PathBuf::from("claude"));
+        auth_status_of(prog.as_os_str(), login, &|name| std::env::var_os(name))
     }
 
     fn unaskable(&self) -> Option<String> {
@@ -4076,7 +4079,12 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn login(&self, dir: Option<&str>) -> Result<i32, String> {
-        login_flow_of(std::ffi::OsStr::new("claude"), dir)
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        let prog = user_home
+            .as_deref()
+            .map(super::accounts_sync::resolve_claude_program)
+            .unwrap_or_else(|| PathBuf::from("claude"));
+        login_flow_of(prog.as_os_str(), dir)
     }
 
     fn now(&self) -> i64 {
@@ -4084,12 +4092,22 @@ impl AccountsHost for LiveAccounts {
     }
 
     fn renew_flow(&self, home: &str, email: &str, browser: &RenewBrowser) -> Result<i32, String> {
-        renew_flow_of(std::ffi::OsStr::new("claude"), home, email, browser)
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        let prog = user_home
+            .as_deref()
+            .map(super::accounts_sync::resolve_claude_program)
+            .unwrap_or_else(|| PathBuf::from("claude"));
+        renew_flow_of(prog.as_os_str(), home, email, browser)
     }
 
     fn status_in_home(&self, home: &str) -> Result<Captured, String> {
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        let prog = user_home
+            .as_deref()
+            .map(super::accounts_sync::resolve_claude_program)
+            .unwrap_or_else(|| PathBuf::from("claude"));
         status_in_home_within(
-            std::ffi::OsStr::new("claude"),
+            prog.as_os_str(),
             home,
             &|name| std::env::var_os(name),
             AUTH_CHECK_BUDGET,
@@ -4160,10 +4178,23 @@ fn renew_flow_of(
             {
                 let store = accounts::Store::at(harness_state);
                 let user_home = std::env::var_os("HOME").map(PathBuf::from);
-                if let Some(mailbox) =
-                    super::accounts_sync::resolve_mailbox_dir(user_home.as_deref(), &store)
+                if std::env::var_os(super::open_url::MAILBOX_ENV).is_none_or(|v| v.is_empty())
+                    && let Some(mailbox) =
+                        super::accounts_sync::resolve_mailbox_dir(user_home.as_deref(), &store)
                 {
                     cmd.env(super::open_url::MAILBOX_ENV, mailbox);
+                }
+                let label = Path::new(home)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|s| s.rsplit_once('+').map(|(l, _)| l))
+                    .unwrap_or("default");
+                let has_mailbox =
+                    super::accounts_sync::has_configured_mailbox(user_home.as_deref(), &store);
+                if !has_mailbox
+                    && super::headless_oauth::has_browser_profile(&store.dir, label, Some(email))
+                {
+                    cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
                 }
             }
             cmd.spawn()
@@ -5827,6 +5858,25 @@ fn renew_one(
         );
         return Renewal::Failed;
     }
+    let now = host.now().max(now);
+    if let Err(why) = accounts::write_renewal_checkpoint(
+        label,
+        email,
+        &staging_text,
+        facts.subscription.as_deref(),
+        now,
+    ) {
+        say(
+            err,
+            &format!(
+                "the new login checked out, but its completion checkpoint could not be saved \
+                 ({}); nothing was recorded; its home is kept at {}",
+                super::one_line(&why.to_string(), 160),
+                staging.display(),
+            ),
+        );
+        return Renewal::Failed;
+    }
     let done = accounts_transact_logins(store, now, err, |state, logins| {
         Ok(accounts::note_renewed(
             state,
@@ -5969,6 +6019,12 @@ fn run_accounts_renew(
             if !chosen.contains(&label) {
                 chosen.push(label);
             }
+        }
+        if chosen.is_empty()
+            && let Some(target) =
+                super::accounts_sync::next_auto_renew_target(&file_roster, &state, &logins, now)
+        {
+            chosen.push(target.label);
         }
     }
     if chosen.is_empty() && machines.is_empty() {

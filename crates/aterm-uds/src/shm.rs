@@ -66,7 +66,8 @@ pub struct Region {
     writable: bool,
 }
 
-// SAFETY: the mapping is process-wide memory not bound to a specific thread.
+// SAFETY: the mapping is process-wide memory, not bound to a thread, and `Drop` unmaps it from
+// whichever thread holds it.
 unsafe impl Send for Region {}
 
 /// `Region` must never be `Sync`: its copies are plain `memcpy`s, and two threads racing them on
@@ -185,7 +186,8 @@ fn map(fd: BorrowedFd<'_>, len: usize, writable: bool) -> io::Result<Region> {
     } else {
         libc::PROT_READ
     };
-    // SAFETY: maps `len` bytes of `fd` at a kernel-chosen address.
+    // SAFETY: a fresh mapping at a kernel-chosen address of `len` bytes of an object at least that
+    // long (callers sized or checked it), so no existing memory is replaced.
     let addr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -217,7 +219,13 @@ impl Region {
     ///
     /// # Safety
     ///
-    /// The caller must ensure no other handle truncates or mutates the underlying object.
+    /// From call entry until the returned `Region` drops, no descriptor, mapping or process may
+    /// modify, resize or invalidate the backing object except through that `Region`'s methods.
+    /// Payload reads through aliases may occur only while the `Region` stays inert; metadata
+    /// queries are allowed. A separately mapped reader must meet [`Self::map_readonly`]'s contract,
+    /// and the custody descriptor goes only to a recipient known to keep these obligations:
+    /// `O_RDONLY` restricts this descriptor, not aliases reopened from it, and unlinking does not
+    /// remove every route to the object.
     pub unsafe fn create(len: usize) -> io::Result<(Region, OwnedFd)> {
         check_len(len)?;
         let (name, writer) = Self::open_fresh()?;
@@ -266,7 +274,10 @@ impl Region {
     ///
     /// # Safety
     ///
-    /// The underlying object must not be concurrently mutated or truncated while mapped.
+    /// From this call until the returned `Region` drops, the backing object is never modified,
+    /// resized or invalidated through any other mapping or descriptor, in this process or another;
+    /// an existing writer mapping may remain only if it stays inert throughout. A read-only
+    /// descriptor proves permissions, not this quiescence.
     pub unsafe fn map_readonly(fd: BorrowedFd<'_>, expected_len: usize) -> io::Result<Region> {
         check_len(expected_len)?;
         if !is_read_only(fd)? {
@@ -317,7 +328,12 @@ impl Region {
             return Err(AccessError::Misaligned { at });
         }
         self.span(at, WORD)?;
-        // SAFETY: `at + 8 <= len` and `at` is 8-byte aligned within the valid mapping.
+        // SAFETY: `at + 8 <= len` (checked above) keeps the word inside the page-aligned mapping,
+        // and `at` is a multiple of 8, so it is aligned for `AtomicU64`; the borrow cannot outlive
+        // `self`, which owns the mapping. `Region` is not `Sync` and the constructor's contract
+        // excludes conflicting aliases. A read-only mapping only ever sees a `Relaxed` load through
+        // the word (every store is refused before `word`), which core defines on read-only memory;
+        // hence a cast, not `AtomicU64::from_ptr`, which asks for writable memory.
         Ok(unsafe { &*self.base.as_ptr().add(at).cast::<AtomicU64>() })
     }
 
@@ -355,7 +371,9 @@ impl Region {
             return Err(AccessError::ReadOnly);
         }
         self.span(at, bytes.len())?;
-        // SAFETY: `[at, at + len)` is in bounds of the writable mapping and non-overlapping.
+        // SAFETY: `[at, at + len)` is inside the writable mapping (checked above), and `bytes` is
+        // caller memory, never the mapping, so they do not overlap; `Region` is not `Sync`, so no
+        // other thread touches the mapping during the copy.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.as_ptr().add(at), bytes.len());
         }
@@ -369,7 +387,9 @@ impl Region {
     /// Returns [`AccessError::OutOfBounds`] if `[at, at + out.len())` exceeds the region.
     pub fn read_into(&self, at: usize, out: &mut [u8]) -> Result<(), AccessError> {
         self.span(at, out.len())?;
-        // SAFETY: `[at, at + len)` is in bounds of the mapping and `out` is non-overlapping.
+        // SAFETY: `[at, at + len)` is inside the mapping (checked above), and `out` is caller
+        // memory, never the mapping, so they do not overlap; `Region` is not `Sync`, so no other
+        // thread touches the mapping during the copy.
         unsafe {
             std::ptr::copy_nonoverlapping(self.base.as_ptr().add(at), out.as_mut_ptr(), out.len());
         }
@@ -380,7 +400,8 @@ impl Region {
 impl Drop for Region {
     #[cfg_attr(trust_verify, trust::skip)]
     fn drop(&mut self) {
-        // SAFETY: unmaps the exact region created by `map` once.
+        // SAFETY: unmaps exactly the mapping `map` made, once; no reference into it survives (none
+        // leaves this module).
         unsafe {
             libc::munmap(self.base.as_ptr().cast(), self.len);
         }
@@ -402,7 +423,10 @@ pub mod testing {
     ///
     /// # Safety
     ///
-    /// Same requirements as [`Region::create`].
+    /// Until the returned `Region` drops, nothing writes, resizes, invalidates or maps the object
+    /// through the returned writable descriptor or its aliases, so a recipient must be known to
+    /// make no such access; writes through the `Region` itself are allowed. The descriptor is for
+    /// metadata and refusal tests only, never a production handoff.
     pub unsafe fn create_with_writable_custody(len: usize) -> io::Result<(Region, OwnedFd)> {
         check_len(len)?;
         let (name, writer) = Region::open_fresh()?;
@@ -426,7 +450,8 @@ mod tests {
     /// and exactly the region's size.
     #[test]
     fn a_region_maps_back_read_only_from_its_custody_descriptor() {
-        // SAFETY: fixture keeps custody local without concurrent writes or truncation.
+        // SAFETY: custody stays local, never reopened for writing or resizing; every write uses
+        // `region` and finishes before either read-only mapping.
         let (region, custody) = unsafe { Region::create(LEN) }.expect("create");
         assert!(region.is_writable());
         assert_eq!(region.len(), LEN);
@@ -444,7 +469,8 @@ mod tests {
             "close-on-exec"
         );
 
-        // SAFETY: all writes above are complete and the custody object is not mutated.
+        // SAFETY: all writes above are complete and the writer stays inert; the read-only custody
+        // keeps the object stable until both reader mappings drop.
         let reader = unsafe { Region::map_readonly(custody.as_fd(), LEN) }.expect("map read-only");
         assert!(!reader.is_writable());
         let mut back = [0u8; 21];
@@ -470,7 +496,8 @@ mod tests {
     /// pages.
     #[test]
     fn map_readonly_refuses_a_writable_descriptor_and_a_wrong_size() {
-        // SAFETY: private writable descriptor is only inspected and refused below.
+        // SAFETY: this private writable descriptor is only inspected and refused below; neither it
+        // nor an alias writes, resizes or maps the object while `_region` lives.
         let (_region, writable) =
             unsafe { testing::create_with_writable_custody(LEN) }.expect("create");
         assert_eq!(is_read_only(writable.as_fd()).ok(), Some(false));
@@ -478,7 +505,8 @@ mod tests {
         let e = unsafe { Region::map_readonly(writable.as_fd(), LEN) }.expect_err("writable");
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
 
-        // SAFETY: private custody is only used for refusal checks below.
+        // SAFETY: this private custody is only used for the refusal checks below; it and its
+        // aliases never modify or resize the object while `_region` lives.
         let (_region, custody) = unsafe { Region::create(LEN) }.expect("create");
         // SAFETY: private object is unchanged during this refused call.
         let e = unsafe { Region::map_readonly(custody.as_fd(), 2 * LEN) }.expect_err("wrong size");
@@ -502,7 +530,8 @@ mod tests {
     /// Every access outside the region, or at a misaligned word, is refused, never a panic.
     #[test]
     fn accesses_are_bounds_and_alignment_checked() {
-        // SAFETY: custody stays local and unused while `region` accesses the private object.
+        // SAFETY: custody stays local and unused; only `region` accesses the private object, and
+        // nothing changes its size.
         let (region, _custody) = unsafe { Region::create(PAGE) }.expect("create");
         assert_eq!(
             region.load_u64_acquire(12),
@@ -537,7 +566,8 @@ mod tests {
     /// words (relaxed loads and a fence, on `PROT_READ` pages).
     #[test]
     fn copies_across_word_edges_are_plain_memory() {
-        // SAFETY: custody is never reopened or mutated; all writes go through `region`.
+        // SAFETY: custody is never reopened or used to change the object; every write goes through
+        // `region` and finishes before the read-only mapping.
         let (region, custody) = unsafe { Region::create(PAGE) }.expect("create");
         let mut model = vec![0u8; PAGE];
         let mut seed = 0x9e37_79b9_u32;
@@ -553,7 +583,8 @@ mod tests {
                 model[at..at + len].copy_from_slice(&bytes);
             }
         }
-        // SAFETY: all writes above are complete before reading via `reader`.
+        // SAFETY: every write above is finished; the writer is only read from here on, and no other
+        // descriptor or mapping can modify the private object.
         let reader = unsafe { Region::map_readonly(custody.as_fd(), PAGE) }.expect("map read-only");
         for at in 0..4 * WORD {
             for len in 0..4 * WORD {

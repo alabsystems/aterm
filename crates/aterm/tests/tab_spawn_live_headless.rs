@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LIVE: a new tab's, split's or window's shell starts off the event loop.
-//!
-//! A tab's PTY spawn (folder check, fork, the wait for the child's exec) ran in
-//! the event-loop turn that asked for it, so a spawn stalled on a dead network
-//! volume froze every window and every main-thread verb for up to 12 s. It now
-//! runs on the `aterm-spawner` thread (`aterm-gui`'s `tab_spawn.rs`) for a
-//! `spawn`, a `spawn split=`, a `tab new` and a `spawn connected=… place=tab`,
-//! and each replies only once the new session is registered (`tab new`
-//! counting its tab). A new window's does too: Window ▸ New Window (`invoke
-//! NewWindow`, the one window path headless takes, keeping the window logical)
-//! replies once the window is booked, and the window is made when its session
-//! lands.
-//!
-//! Driven through the real binary with the spawn held in flight by the dev seam
-//! `ATERM_DEBUG_SPAWN_HOLD=<path>` (the spawner creates `<path>.held`, then
-//! waits for `<path>`):
-//!
-//! * while the spawn is held, a main-thread verb (`status` of the boot session)
-//!   answers, and the caller is still waiting;
-//! * once released, `spawn` replies `OK <sid>`, and that sid answers `status`
-//!   at once; `spawn split=v` does the same, with the window's tab now in two
-//!   panes; `tab new` replies the window's active index and its tab count; a
-//!   connected preset's tab is connected to its origin before the reply;
-//! * a new window does not exist while its spawn is held, and once released
-//!   its session lands in it, answering `status`;
-//!
-//! NEGATIVE CONTROL: with the spawn back on the event loop (the hold then runs
-//! in the turn, or not at all), `status` cannot answer while the hold stands,
-//! or the spawner never takes the spawn: the main-thread hop gives up after
-//! 30 s, answers after the spawn's reply once the seam's minute is out, or the
-//! caller finishes before `<path>.held` exists, and the test fails each way.
-//!
-//! Every wait is a one-minute hang detector, never a latency budget.
+//! Verifies that new tab, split, and window shells spawn off the event loop.
 
 #![cfg(unix)]
 
@@ -44,9 +12,6 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, boot_session, boot_with, ctl, ctl_ok, field, status};
 
-/// Run `args` with the spawner holding its spawn: the loop answers a
-/// main-thread verb (`status` of `boot_sid`) while it is out and the caller
-/// waits; once released, the caller's reply (its stdout) comes back, a success.
 fn held_round(inst: &Instance, boot_sid: &str, args: &[&str]) -> String {
     let out = held_call(inst, boot_sid, args);
     let reply = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -58,9 +23,6 @@ fn held_round(inst: &Instance, boot_sid: &str, args: &[&str]) -> String {
     reply
 }
 
-/// [`held_round`]'s hold and checks, with the caller's output however it ended.
-/// The hold is re-armed for the next round once the reply shows the spawner is
-/// past it.
 fn held_call(inst: &Instance, boot_sid: &str, args: &[&str]) -> std::process::Output {
     let hold = inst.tmp.join("hold");
     let held = inst.tmp.join("hold.held");
@@ -74,13 +36,11 @@ fn held_call(inst: &Instance, boot_sid: &str, args: &[&str]) -> std::process::Ou
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // The loop answers a main-thread verb while the spawn is out...
         let boot = status(inst, boot_sid);
         assert!(
             field(&boot, "phase").is_some(),
             "the boot session's status: {boot}"
         );
-        // ...and the caller still waits: the reply comes with the landed session.
         assert!(!call.is_finished(), "{args:?} replied before it landed");
 
         std::fs::write(&hold, b"").expect("release the hold");
@@ -91,7 +51,6 @@ fn held_call(inst: &Instance, boot_sid: &str, args: &[&str]) -> std::process::Ou
     })
 }
 
-/// The sid a `spawn` reply names.
 fn named_sid(reply: &str) -> &str {
     reply
         .split_whitespace()
@@ -147,8 +106,6 @@ fn a_held_split_tab_new_or_connected_tab_leaves_the_loop_answering() {
         "the new second tab is active: {reply}"
     );
 
-    // A connected preset's tab: replied once landed and connected, with the
-    // newborn driving the boot session it observes.
     let of = format!("of={boot_sid}");
     let reply = held_round(
         &inst,
@@ -169,11 +126,6 @@ fn a_held_split_tab_new_or_connected_tab_leaves_the_loop_answering() {
     );
 }
 
-/// Window ▸ New Window spawns the window's first shell off the loop: the
-/// `invoke` replies once it is booked, the loop answers while the spawn is
-/// held and no window exists yet, and once released the window is made with
-/// its session in it. Window ids are never reused, so the boot window is 0 and
-/// the new one 1.
 #[test]
 fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
     let inst = boot_with(
@@ -203,8 +155,6 @@ fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // The loop answers a main-thread verb while the spawn is out, and the
-    // window is not made before its session.
     let boot = status(&inst, &boot_sid);
     assert!(
         field(&boot, "phase").is_some(),

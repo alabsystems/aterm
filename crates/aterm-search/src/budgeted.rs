@@ -22,8 +22,8 @@ enum RowMatcher {
     Regex(aterm_regex::Regex),
 }
 
-/// A budgeted, resumable search over the absolute rows `base_row, base_row + total_rows)`, fed one
-/// row at a time in ascending order. See the module docs for the results-equality contract.
+/// A budgeted, resumable search over the absolute rows `[base_row, base_row + total_rows)`, fed
+/// one row at a time in ascending order.
 pub struct BudgetedSearch {
     query: String,
     matcher: RowMatcher,

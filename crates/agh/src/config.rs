@@ -969,7 +969,11 @@ pub fn expand(path: &str, home: &Path) -> Option<PathBuf> {
 
 /// Read and validate `<dirs.config>/agh.toml`.
 /// # Errors
-/// Refused, `Sub::Policy(RefusalCode::ConfigInvalid)`.
+/// Refused, `Sub::Policy(RefusalCode::ConfigInvalid)`: for a file `read_private` refuses or
+/// cannot read (why `agh.toml: {error}`); for non-UTF-8 (why `agh.toml is not UTF-8`); for
+/// faults (why `agh.toml breaks {n} rule(s): {rule}: {what}; …`). The next is the remedy
+/// `read_config_in` gives a refused file (such as the chmods that make it private, or the link
+/// to replace), else `agh policy check`.
 pub fn load(dirs: &Dirs) -> Result<Option<Validated>> {
     #[cfg(unix)]
     {

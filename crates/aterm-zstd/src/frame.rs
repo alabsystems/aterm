@@ -33,10 +33,10 @@ const CONTENT_CHECKSUM: u8 = 1 << 2;
 /// `Block_Header` bit 0.
 const LAST_BLOCK: u32 = 1;
 
-/// Writes `content` to `out` as one zstd frame of raw blocks (layout in the module docs).
+/// Writes `content` to `out` as one zstd frame of raw blocks.
 /// # Errors
 /// [`io::ErrorKind::InvalidInput`] when `content` is longer than [`WINDOW_MAX`], before anything is
-/// written; otherwise whatever `out` returns.
+/// written; otherwise whatever `out` returns. A failed write can leave a partial frame in `out`.
 pub fn write_raw<W: Write + ?Sized>(
     out: &mut W,
     content: &[u8],

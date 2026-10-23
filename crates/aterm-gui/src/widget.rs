@@ -268,7 +268,7 @@ pub(crate) fn text_prim(
 #[derive(Clone, Debug)]
 pub(crate) enum DrawPrim {
     /// The card: a flat translucent `fill` (the whole prim list is rasterized to
-    /// one RGBA overlay — see `tray_raster`'s module doc).
+    /// one RGBA overlay by `tray_raster`).
     Panel {
         x: f32,
         y: f32,

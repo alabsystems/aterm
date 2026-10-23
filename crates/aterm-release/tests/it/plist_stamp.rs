@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Golden tests for the Info.plist stamp (`bundle::stamp_info_plist`) over the committed
-//! template `apps/aterm-mac/Info.plist`.
+//! Golden tests for `bundle::stamp_info_plist` over `apps/aterm-mac/Info.plist`.
 
 use crate::bundle;
 
-/// The committed template, so template drift breaks the test, not the release.
 fn real_template() -> String {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -27,12 +25,9 @@ fn stamp_real(icon: Option<&str>) -> String {
     .expect("stamp")
 }
 
-// --- template goldens -------------------------------------------------------
-
 #[test]
 fn stamps_the_three_versioned_keys_in_the_real_template() {
     let out = stamp_real(Some("aterm"));
-    // Replaced values, in the template's own tab-indented shape.
     assert!(
         out.contains("<key>CFBundleShortVersionString</key>\n\t<string>0.2.0</string>"),
         "{out}"
@@ -45,7 +40,6 @@ fn stamps_the_three_versioned_keys_in_the_real_template() {
         out.contains("<key>CFBundleIdentifier</key>\n\t<string>com.aterm.aterm</string>"),
         "{out}"
     );
-    // The template's real baseline values (`0.0.0`, build `0`) are gone.
     assert!(
         !out.contains("<key>CFBundleShortVersionString</key>\n\t<string>0.0.0</string>"),
         "baseline short version left behind: {out}"
@@ -58,7 +52,6 @@ fn stamps_the_three_versioned_keys_in_the_real_template() {
 
 #[test]
 fn inserts_atermgitcommit_and_iconfile_before_dict_end() {
-    // Neither key is in the committed template: both are inserted before </dict>.
     let out = stamp_real(Some("aterm"));
     assert!(
         out.contains("<key>ATermGitCommit</key>\n\t<string>aed5a06c1f00</string>"),
@@ -68,7 +61,6 @@ fn inserts_atermgitcommit_and_iconfile_before_dict_end() {
         out.contains("<key>CFBundleIconFile</key>\n\t<string>aterm</string>"),
         "{out}"
     );
-    // Inserted inside the dict.
     let dict_end = out.rfind("</dict>").unwrap();
     assert!(out.find("<key>ATermGitCommit</key>").unwrap() < dict_end);
     assert!(out.find("<key>CFBundleIconFile</key>").unwrap() < dict_end);
@@ -76,14 +68,12 @@ fn inserts_atermgitcommit_and_iconfile_before_dict_end() {
 
 #[test]
 fn icon_none_stamps_no_iconfile() {
-    // The bundle step stamps CFBundleIconFile only when aterm.icns ships.
     let out = stamp_real(None);
     assert!(!out.contains("CFBundleIconFile"), "{out}");
 }
 
 #[test]
 fn stamping_twice_replaces_instead_of_duplicating() {
-    // A re-stamp takes the "Set" path and never inserts a duplicate key.
     let once = stamp_real(Some("aterm"));
     let twice = bundle::stamp_info_plist(
         &once,
@@ -107,8 +97,6 @@ fn stamping_twice_replaces_instead_of_duplicating() {
 
 #[test]
 fn non_string_key_is_refused_not_misstamped() {
-    // A stamped key holding a non-<string> value is refused, never a rewrite of the next
-    // key's <string>.
     let template = "<dict>\n\
                     \t<key>CFBundleVersion</key>\n\
                     \t<true/>\n\
@@ -127,15 +115,6 @@ fn stamped_values_are_xml_escaped() {
     assert!(out.contains("<string>a&amp;b&lt;c&gt;</string>"), "{out}");
 }
 
-// --- launch policy ----------------------------------------------------------
-
-/// The shipped bundle forbids Rosetta translation.
-///
-/// aterm is one universal binary, so on Apple silicon the native slice always exists. Without
-/// the key LaunchServices may launch the Intel slice under translation (it inherits the
-/// parent's architecture and remembers an "Open using Rosetta" tick), or refuse to open it
-/// where Rosetta is absent. Asserted on the stamped output too, because the stamp is a textual
-/// splice (`set_plist_string`) that could drop a neighbouring key.
 #[test]
 fn the_shipped_bundle_requires_native_execution() {
     let template = real_template();
@@ -150,7 +129,6 @@ fn the_shipped_bundle_requires_native_execution() {
         out.contains("<key>LSRequiresNativeExecution</key>\n\t<true/>"),
         "stamping dropped LSRequiresNativeExecution: {out}"
     );
-    // A boolean: LaunchServices ignores `<string>true</string>`.
     assert!(
         !out.contains("<key>LSRequiresNativeExecution</key>\n\t<string>"),
         "LSRequiresNativeExecution must be <true/>, not a string: {out}"

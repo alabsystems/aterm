@@ -1093,8 +1093,8 @@ impl World {
             menu.push((1, 20));
         }
         if self.opts.write_errors {
-            // The disk fills, or has room again (an emptied full disk sooner
-            // than a full one fills).
+            // The disk fills, or has room again (a full disk empties sooner
+            // than one with room fills).
             menu.push((if self.core.device.is_full() { 4 } else { 1 }, 19));
         }
         let total: u64 = menu.iter().map(|(w, _)| w).sum();

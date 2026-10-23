@@ -116,7 +116,8 @@ impl<'a> Repos<'a> {
     ///
     /// # Errors
     ///
-    /// Request failure, `drafts_unproven`, or missing permissions on a non-read response.
+    /// The call's error; Forbidden `drafts_unproven` for an unvouched fine-grained writer;
+    /// Forbidden `other` when a non-read answer carries no permissions block.
     pub fn permissions(&self, slug: &Slug, access: Access) -> Result<(RepoObject, Permissions)> {
         let how = self.how.with_access(access);
         if access == Access::WriterRead

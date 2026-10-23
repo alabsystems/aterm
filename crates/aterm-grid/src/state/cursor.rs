@@ -23,24 +23,15 @@ pub struct GridCursorState {
     pub scroll_region: ScrollRegion,
     /// Horizontal margins (DECSLRM), active only while DECLRMM (mode 69) is set.
     pub horizontal_margins: HorizontalMargins,
-    /// Tab stops (true = a stop at this column), every 8 columns by default. Never shorter
-    /// than the grid width: a narrowing keeps the stops past it for a later widen.
+    /// Tab stops (`true` = stop at this column), every 8 columns by default.
     pub tab_stops: Vec<bool>,
-    /// TBC 3 (`CSI 3 g`) cleared every tab stop and no reset has restored the defaults since,
-    /// so a widen seeds no every-8 defaults into the new columns.
+    /// Whether `TBC 3` (`CSI 3 g`) suppressed default tab stops on widen.
     pub tab_defaults_suppressed: bool,
     /// Deferred wrap flag (xterm `do_wrap`).
-    ///
-    /// Writing the last column leaves the cursor there with this flag set; the
-    /// next printable performs the wrap. Cursor movement (CR, LF, BS, CUP, ...)
-    /// clears it without wrapping.
     pub pending_wrap: bool,
-    /// BCE (background colour erase) template: erases (ED, EL, ECH, IL, DL, scroll) fill with
-    /// it instead of `Cell::EMPTY`, so erased cells take the SGR background.
+    /// BCE (background color erase) template cell.
     pub cursor_template: Cell,
-    /// The truecolor BCE background, which `cursor_template`'s `PackedColors` records only as
-    /// RGB mode: erases write it into `RgbColorRing` for each cell they fill. `None` for a
-    /// default or indexed background.
+    /// Truecolor BCE background RGB (`None` for default or indexed background).
     pub cursor_template_bg_rgb: Option<[u8; 3]>,
     /// Presentation-oriented state layered under cursor/region state.
     pub presentation: GridPresentationState,
@@ -150,9 +141,7 @@ impl GridCursorState {
         self.scroll_region
     }
 
-    /// Set the scroll region (DECSTBM), 0-indexed rows. An out-of-bounds
-    /// `bottom` clamps to `visible_rows - 1` (xterm); if top >= bottom the
-    /// region resets to full screen.
+    /// Sets the scroll region (DECSTBM), clamping `bottom` and resetting on `top >= bottom`.
     #[inline]
     pub(crate) const fn set_scroll_region(&mut self, top: u16, bottom: u16, visible_rows: u16) {
         let max_row = visible_rows.saturating_sub(1);
@@ -177,8 +166,7 @@ impl GridCursorState {
         self.horizontal_margins
     }
 
-    /// Set horizontal margins (DECSLRM), 0-indexed columns; effective only with
-    /// DECLRMM (mode 69). Invalid or out-of-bounds margins reset to full width.
+    /// Sets horizontal margins (DECSLRM), resetting to full width on invalid bounds.
     #[inline]
     pub(crate) const fn set_horizontal_margins(&mut self, left: u16, right: u16, cols: u16) {
         if left < right && right < cols {
@@ -210,9 +198,7 @@ impl GridCursorState {
         }
     }
 
-    /// Clear every tab stop (TBC 3), including columns a later widen adds (via
-    /// `tab_defaults_suppressed`). Like xterm's `TabZonk`, which clears its
-    /// whole bitmap and is never re-seeded by `ScreenResize`.
+    /// Clears every tab stop (`TBC 3`) and suppresses defaults on widen.
     #[inline]
     pub(crate) fn clear_all_tab_stops(&mut self) {
         self.tab_defaults_suppressed = true;

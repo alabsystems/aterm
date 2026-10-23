@@ -64,9 +64,12 @@ const fn level(word: DiskWord) -> Level {
     }
 }
 
-/// Build a [`Wait`] from a [`Parsed::Volume`](aterm_vitals::sys::predicate::Parsed::Volume).
+/// Build a [`SysWait`] from a
+/// [`Parsed::Volume`](aterm_vitals::sys::predicate::Parsed::Volume), its `vol=`
+/// decoded; a `vol=` that is not absolute is refused with the usage line.
 ///
 /// # Errors
+///
 /// The reply that refuses it: [`USAGE`].
 pub(crate) fn wait_of(parsed: VolumeWait) -> Result<SysWait, &'static str> {
     let vol = match parsed.vol {

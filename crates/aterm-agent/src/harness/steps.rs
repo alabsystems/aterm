@@ -747,7 +747,7 @@ struct Vacancy {
 }
 
 /// A row that asks the model a turn though its words are no prompt, read
-/// and waiting for the assistant row that says the turn ran (module docs).
+/// and waiting for the assistant row that says the turn ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pending {
     /// Its `promptId`, else its `uuid` (none: counted lost if a turn ran).
@@ -837,7 +837,7 @@ pub struct StepFold {
     /// unread).
     in_turn: Option<bool>,
     /// A prompt command's row or a wake waiting for the assistant row that
-    /// says a turn ran (module docs).
+    /// says a turn ran.
     pending: Option<Pending>,
     /// The `promptId` of the last main-chain user row that named the
     /// running turn ([`fingerprint`]; `upgrade.rs`'s `FinishedScan::turn`).

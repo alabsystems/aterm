@@ -97,64 +97,179 @@ fn await_match(inst: &Instance, sid: &str, re: &str) {
 }
 
 /// [`await_match`] handing the reply back (`aterm ctl` exits non-zero on
-/// `OK timeout`), so a test holding a [`Supervisor`] can stop it first and
-/// say what its loop printed — the one record of which side stalled.
+/// failure). The screen it waits for comes at the end of a chain of steps
+/// that must happen (the worker's turn, the loop's act, the worker's redraw),
+/// so its hang detector is [`HANG`] with no step of the chain taken
+/// ([`progress`]), however long the whole chain takes on a loaded machine.
 fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
-    let out = ctl(inst, &[&format!("@{sid}"), "await", "match", re, HANG_MS]);
-    let reply = String::from_utf8_lossy(&out.stdout).into_owned();
-    if out.status.success() && reply.starts_with("OK") && !reply.starts_with("OK timeout") {
-        return Ok(());
+    let mut taken = progress(inst);
+    loop {
+        let out = ctl(inst, &[&format!("@{sid}"), "await", "match", re, HANG_MS]);
+        let reply = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.success() && reply.starts_with("OK") && !reply.starts_with("OK timeout") {
+            return Ok(());
+        }
+        let timed_out = reply.starts_with("OK timeout");
+        let now = progress(inst);
+        if !timed_out || now == taken {
+            let hung = if timed_out {
+                format!(" (no step of the chain taken in {HANG:?})")
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "{reply:?} stderr={:?}{hung}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        taken = now;
     }
-    Err(format!(
-        "{reply:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stderr)
-    ))
 }
 
-/// The fake worker's events of `kind` (`draw-<screen>`, `submit`, `press`)
-/// in the order it did them, each stamped as it happened (the mtime of the
-/// empty file it created then), once there are `n` of them, or as many as
-/// came within `within`.
-fn stamps_when(events: &Path, kind: &str, n: usize, within: Duration) -> Vec<SystemTime> {
-    let deadline = Instant::now() + within;
+/// The steps a live chain has taken: the worker's events and the loop's
+/// steps in its journal ([`steps`]).
+fn progress(inst: &Instance) -> (usize, usize) {
+    (
+        worker_events(&inst.tmp.join("events")).len(),
+        steps(&journal(inst)),
+    )
+}
+
+/// Journal kinds the hosted loop writes again on its own with no step of a
+/// chain taken: a decision skipped and re-armed (`SKIPPED`), a read waited
+/// on and tried again (`WAITING`), a reconnect, a timeout. A loop stuck
+/// writing them is hung, not moving.
+const LOOP_OWN: [&str; 4] = ["skipped", "waiting", "reconnect", "timeout"];
+
+/// The loop's steps in `journal`: its distinct lines of any other kind (an
+/// event read, an act, an escalation), each counted once however often it
+/// is written again.
+fn steps(journal: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    journal
+        .lines()
+        .filter_map(|l| aterm_agent::supervise::journal::JournalRecord::from_json(l).ok())
+        .filter(|r| !LOOP_OWN.contains(&r.kind.as_str()))
+        .filter(|r| seen.insert(r.line.clone()))
+        .count()
+}
+
+/// A LOOP THAT ONLY REPEATS ITSELF TAKES NO STEP ([`steps`]): its `SKIPPED`,
+/// `WAITING`, `RECONNECT` and `TIMEOUT` lines, and a line written again word
+/// for word, leave the count where it was, so a livelock that keeps
+/// journaling still runs out [`moving`]'s hang detector. NEGATIVE CONTROL: a
+/// new event and an act each count.
+#[test]
+fn a_loop_that_only_repeats_itself_takes_no_step() {
+    let line = |kind: &str, text: &str| {
+        format!(
+            r#"{{"t":1,"sid":"s-1","kind":"{kind}","phase":"-","seq":7,"complete":null,"rows":null,"summary":"","line":"{text}","turn":null,"report":null}}"#
+        )
+    };
+    let event = line("event", "EVENT idle seq=7 done");
+    let base = steps(&event);
+    assert_eq!(base, 1, "an event read is a step");
+    let mut looping = event.clone();
+    for n in 0..5 {
+        for (kind, text) in [
+            (
+                "skipped",
+                format!("SKIPPED seq=7 rule=continue@v1 try {n}; nothing written"),
+            ),
+            (
+                "waiting",
+                format!("WAITING seq=7 (try {n}): read and tried again in 500 ms"),
+            ),
+            ("reconnect", format!("RECONNECT try {n}")),
+            ("timeout", format!("TIMEOUT {n}")),
+            ("event", "EVENT idle seq=7 done".to_string()),
+        ] {
+            looping.push('\n');
+            looping.push_str(&line(kind, &text));
+        }
+    }
+    assert_eq!(
+        steps(&looping),
+        base,
+        "the loop repeating itself: {looping}"
+    );
+    // NEGATIVE CONTROL: a new event, an act.
+    for (kind, text) in [
+        ("event", "EVENT idle seq=8 done"),
+        ("continued", "CONTINUED seq=8 rule=continue@v1 keep going"),
+    ] {
+        let moved = format!("{looping}\n{}", line(kind, text));
+        assert_eq!(steps(&moved), base + 1, "{kind} is a step");
+    }
+}
+
+/// `done`'s answer, waited for while the chain moves: the hang detector is
+/// [`HANG`] in which no step of the chain is taken ([`progress`]), however
+/// long the whole chain takes on a loaded machine: one step alone took up to
+/// 32.5 s at load 476 (`docs/measured/typing-under-load-2026-10-22.md`).
+fn moving<T>(inst: &Instance, mut done: impl FnMut() -> Option<T>) -> Result<T, String> {
+    let mut taken = progress(inst);
+    let mut since = Instant::now();
     loop {
-        let mut seen: Vec<(u64, SystemTime)> = std::fs::read_dir(events)
-            .map(|d| d.flatten().collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                let (seq, k) = name.split_once('.')?;
-                if k != kind {
-                    return None;
-                }
-                Some((seq.parse().ok()?, e.metadata().ok()?.modified().ok()?))
-            })
-            .collect();
-        seen.sort_by_key(|&(seq, _)| seq);
-        if seen.len() >= n || Instant::now() >= deadline {
-            return seen.into_iter().map(|(_, at)| at).collect();
+        if let Some(answer) = done() {
+            return Ok(answer);
+        }
+        let now = progress(inst);
+        if now != taken {
+            taken = now;
+            since = Instant::now();
+        } else if since.elapsed() >= HANG {
+            return Err(format!("no step of the chain taken in {HANG:?}"));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
+/// The lines of `path` once it holds `n` of them, or the ones it holds when
+/// the chain hangs ([`moving`]).
+fn submits_when(inst: &Instance, path: &Path, n: usize) -> Vec<String> {
+    let read = || -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    moving(inst, || {
+        let lines = read();
+        (lines.len() >= n).then_some(lines)
+    })
+    .unwrap_or_else(|_| read())
+}
+
+/// The fake worker's events of `kind` (`draw-<screen>`, `submit`, `press`),
+/// their stamps in order, once there are `n` of them, or the ones there are
+/// when the chain hangs ([`moving`]).
+fn stamps_when(inst: &Instance, kind: &str, n: usize) -> Vec<SystemTime> {
+    let events = inst.tmp.join("events");
+    let seen = || -> Vec<SystemTime> {
+        worker_events(&events)
+            .into_iter()
+            .filter(|(_, k, _)| k == kind)
+            .map(|(_, _, at)| at)
+            .collect()
+    };
+    moving(inst, || {
+        let stamps = seen();
+        (stamps.len() >= n).then_some(stamps)
+    })
+    .unwrap_or_else(|_| seen())
+}
+
 /// When the worker first drew `screen` (its event record, [`stamps_when`]),
-/// waiting up to a minute; panics naming what it did draw.
-fn drawn(events: &Path, screen: &str) -> SystemTime {
-    if let Some(&at) = stamps_when(
-        events,
-        &format!("draw-{screen}"),
-        1,
-        Duration::from_secs(60),
-    )
-    .first()
-    {
+/// waited for while the chain moves; panics naming what it did draw.
+fn drawn(inst: &Instance, screen: &str) -> SystemTime {
+    if let Some(&at) = stamps_when(inst, &format!("draw-{screen}"), 1).first() {
         return at;
     }
     panic!(
-        "the worker never drew `{screen}`: it did {:?}",
-        record(events)
+        "the worker never drew `{screen}` (no step of the chain taken in {HANG:?}): it did {:?}",
+        record(&inst.tmp.join("events"))
     );
 }
 
@@ -352,7 +467,7 @@ fn interrupted() -> Vec<String> {
 /// A plain end of turn after real work: continued.
 const DONE: &str = "Fixed the parser; the suite is green.";
 
-/// The fake worker (module header): `$1` the screens' directory (`<name>.scr`
+/// The fake worker: `$1` the screens' directory (`<name>.scr`
 /// drawn whole, `<name>.row` its caret row, 1-based, `<name>.below` the rows
 /// under it), `$2` the key log, `$3` the submit log, `$4` the screen the
 /// first line ([`submit`]) ends on, `$5` the columns, `$6` `mangle` to show a
@@ -719,20 +834,21 @@ impl Supervisor {
     /// shows (more `EVENT`s than the `before` there were), or panic with
     /// what it said.
     fn looked(self, inst: &Instance, before: usize) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
+        let looked = moving(inst, || {
             if looks(&journal(inst)) > before {
-                return self;
+                Some(true)
+            } else {
+                self.handle.is_finished().then_some(false)
             }
-            if self.handle.is_finished() || Instant::now() >= deadline {
-                let out = self.stop();
-                panic!(
-                    "the loop never journaled a point it read\n{}",
-                    evidence(inst, &out)
-                );
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        });
+        if looked == Ok(true) {
+            return self;
         }
+        let out = self.stop();
+        panic!(
+            "the loop never journaled a point it read ({looked:?})\n{}",
+            evidence(inst, &out)
+        );
     }
 
     /// [`await_match`] for a screen that STAYS once drawn, with the loop
@@ -768,16 +884,15 @@ fn no_answers() -> SupervisorConfig {
     }
 }
 
-/// The session's `meta` once it satisfies `ok`, or after a minute as it is.
+/// The session's `meta` once it satisfies `ok`, or as it is when the chain
+/// hangs ([`moving`]).
 fn meta_when(inst: &Instance, sid: &str, ok: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let m = ctl_ok(inst, &[&format!("@{sid}"), "meta"]);
-        if ok(&m) || Instant::now() >= deadline {
-            return m;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let meta = || ctl_ok(inst, &[&format!("@{sid}"), "meta"]);
+    moving(inst, || {
+        let m = meta();
+        ok(&m).then_some(m)
+    })
+    .unwrap_or_else(|_| meta())
 }
 
 /// The loop's journal (the `WAITING` lines are there, not on its stdout).
@@ -789,14 +904,11 @@ fn journal(inst: &Instance) -> String {
 /// hang detector for a line the loop says once its act is done, which comes
 /// after the worker has logged what the act brought it.
 fn journal_when(inst: &Instance, ok: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    moving(inst, || {
         let j = journal(inst);
-        if ok(&j) || Instant::now() >= deadline {
-            return j;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        ok(&j).then_some(j)
+    })
+    .unwrap_or_else(|_| journal(inst))
 }
 
 /// The points the loop read, as its journal holds them (`EVENT …`).
@@ -857,36 +969,27 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
     let sup = Supervisor::start(&inst, &sid, TurnEndTiming::default());
     submit(&inst, &sid, "go");
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
-    let meta = {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let m = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
-            if m.contains("need%20your%20decision")
-                || m.contains("need your decision")
-                || Instant::now() >= deadline
-            {
-                break m;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
+    let meta = meta_when(&inst, &sid, |m| {
+        m.contains("need%20your%20decision") || m.contains("need your decision")
+    });
     let out = sup.stop();
-    let submitted = lines_when(&subs, 2, HANG);
+    let ev = evidence(&inst, &out);
+    let submitted = submits_when(&inst, &subs, 2);
     assert_eq!(
         submitted,
         ["SUBMIT:go", "SUBMIT:keep going"],
-        "exactly one continuation; the loop said:\n{out}"
+        "exactly one continuation; {ev}"
     );
     let log = std::fs::read(&keys).expect("the key log");
     let rights = log.windows(3).filter(|w| *w == b"\x1b[C").count();
-    assert_eq!(rights, 1, "one accept key; the loop said:\n{out}");
+    assert_eq!(rights, 1, "one accept key; {ev}");
     assert!(
         out.contains("rule=continue-suggestion@v1 keep going"),
-        "the loop said:\n{out}"
+        "{ev}"
     );
     assert!(
         meta.contains("attention_owner=supervisor"),
-        "escalated under the supervisor's key: {meta}\nthe loop said:\n{out}"
+        "escalated under the supervisor's key: {meta}\n{ev}"
     );
 }
 
@@ -897,7 +1000,7 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
 fn a_529_end_is_continued_once_after_its_backoff() {
     let inst = boot("r");
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "e529");
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "e529");
     let backoff = Duration::from_secs(1);
     let sup = Supervisor::start(
         &inst,
@@ -908,18 +1011,19 @@ fn a_529_end_is_continued_once_after_its_backoff() {
         },
     );
     submit(&inst, &sid, "go");
-    drawn(&events, "e529");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    drawn(&inst, "e529");
+    let submitted = submits_when(&inst, &subs, 2);
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
     let out = sup.stop();
-    assert_eq!(submitted.len(), 2, "the loop said:\n{out}");
-    assert_eq!(submitted[0], "SUBMIT:go", "the loop said:\n{out}");
+    let ev = evidence(&inst, &out);
+    assert_eq!(submitted.len(), 2, "{ev}");
+    assert_eq!(submitted[0], "SUBMIT:go", "{ev}");
     assert!(
         submitted[1].contains("(overloaded)") && submitted[1] != "SUBMIT:keep going",
-        "the wall named: {:?}\nthe loop said:\n{out}",
+        "the wall named: {:?}\n{ev}",
         submitted[1]
     );
-    assert!(out.contains("rule=api-retry@v1 "), "{out}");
+    assert!(out.contains("rule=api-retry@v1 "), "{ev}");
 }
 
 /// The standing rules the narrow case rides: with them Cruise's
@@ -929,7 +1033,7 @@ fn a_529_end_is_continued_once_after_its_backoff() {
 const RULES: &str = "stay on the lane branch, never push to main,\nand run the lane's tests \
                      before every commit";
 
-/// A LONG CONTINUATION IN A NARROW COMPOSER, live (module header): Cruise's
+/// A LONG CONTINUATION IN A NARROW COMPOSER, live: Cruise's
 /// continuation with its standing rules wraps over seven composer rows, is
 /// read back whole, and is submitted ONCE; the decision after it is
 /// escalated.
@@ -967,7 +1071,7 @@ fn narrow_composer(want: &str, mangle: bool) {
     let sid = boot_session(&inst);
     let rules = inst.tmp.join("rules.txt");
     std::fs::write(&rules, RULES).expect("the rules file");
-    let (_keys, subs, events) = start_worker_with(&inst, &sid, "done", "64", mangle);
+    let (_keys, subs, _events) = start_worker_with(&inst, &sid, "done", "64", mangle);
     let sup = Supervisor::start_with(
         &inst,
         &sid,
@@ -978,40 +1082,32 @@ fn narrow_composer(want: &str, mangle: bool) {
         },
     );
     submit(&inst, &sid, "go");
-    drawn(&events, "done");
+    drawn(&inst, "done");
     if !mangle {
         let sup = sup.saw(&inst, &sid, "I.need.your.decision");
         let out = sup.stop();
-        let submitted = lines_when(&subs, 2, HANG);
+        let ev = evidence(&inst, &out);
+        let submitted = submits_when(&inst, &subs, 2);
         assert_eq!(
             submitted,
             ["SUBMIT:go".to_string(), format!("SUBMIT:{want}")],
-            "the loop said:\n{out}"
+            "{ev}"
         );
-        assert!(continued_with(&out, "continue@v1", want), "{out}");
+        assert!(continued_with(&out, "continue@v1", want), "{ev}");
         return;
     }
-    let meta = {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let m = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
-            if m.contains("not%20submitted")
-                || m.contains("not submitted")
-                || Instant::now() >= deadline
-            {
-                break m;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
+    let meta = meta_when(&inst, &sid, |m| {
+        m.contains("not%20submitted") || m.contains("not submitted")
+    });
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     let submitted = lines_when(&subs, 2, Duration::from_millis(500));
-    assert_eq!(submitted, ["SUBMIT:go"], "no Enter; the loop said:\n{out}");
+    assert_eq!(submitted, ["SUBMIT:go"], "no Enter; {ev}");
     assert!(
         meta.contains("not%20submitted") || meta.contains("not submitted"),
-        "escalated: {meta}\nthe loop said:\n{out}"
+        "escalated: {meta}\n{ev}"
     );
-    assert!(!out.contains("CONTINUED"), "{out}");
+    assert!(!out.contains("CONTINUED"), "{ev}");
 }
 
 /// FULL POWER, a WRITE box (the measured 2.1.280 `touch x` box): its
@@ -1035,24 +1131,25 @@ fn a_write_box_gets_its_one_shot_allow_under_full_power() {
 fn write_box(approve: &str) {
     let inst = boot(if approve == "all" { "w" } else { "v" });
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "box");
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "box");
     let mut policy = SupervisorConfig::default();
     policy.set("approve", approve).expect("a level");
     let sup = Supervisor::start_with(&inst, &sid, TurnEndTiming::default(), policy);
     submit(&inst, &sid, "go");
-    drawn(&events, "box");
+    drawn(&inst, "box");
     if approve == "all" {
-        let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+        let submitted = submits_when(&inst, &subs, 2);
         // The loop says `APPROVED` once its press is in, after the worker has
         // logged the press. Stopped at the worker's log, a loop on a loaded
         // machine had not said it yet (load 448: the stop 78 ms after the
         // worker read the `1`, the journal ending `EXIT stopped`).
         let said = journal_when(&inst, |j| j.contains("APPROVED seq="));
         let out = sup.stop();
+        let ev = evidence(&inst, &out);
         assert_eq!(
-            submitted[..2],
+            submitted.iter().take(2).cloned().collect::<Vec<String>>(),
             ["SUBMIT:go", "PRESS:1"],
-            "the loop said:\n{out}"
+            "{ev}"
         );
         assert!(
             said.contains("APPROVED seq=") && out.contains("APPROVED seq="),
@@ -1062,16 +1159,13 @@ fn write_box(approve: &str) {
     }
     let meta = meta_when(&inst, &sid, |m| m.contains("attention_owner=supervisor"));
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert!(
         meta.contains("attention_owner=supervisor"),
-        "escalated: {meta}\nthe loop said:\n{out}"
+        "escalated: {meta}\n{ev}"
     );
     let submitted = lines_when(&subs, 2, Duration::from_millis(500));
-    assert_eq!(
-        submitted,
-        ["SUBMIT:go"],
-        "nothing pressed; the loop said:\n{out}"
-    );
+    assert_eq!(submitted, ["SUBMIT:go"], "nothing pressed; {ev}");
 }
 
 /// FULL POWER, a request for a decision: ANSWERED — `answer_text`, aterm's
@@ -1094,22 +1188,20 @@ fn a_decision_is_answered_with_the_answer_text() {
     );
     submit(&inst, &sid, "go");
     let sup = sup.saw(&inst, &sid, "I.need.your.decision");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let submitted = submits_when(&inst, &subs, 2);
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert_eq!(
-        submitted[..2],
+        submitted.iter().take(2).cloned().collect::<Vec<String>>(),
         [
             "SUBMIT:go".to_string(),
             format!("SUBMIT:{answer} {NEEDS_HINT}")
         ],
-        "the loop said:\n{out}"
+        "{ev}"
     );
-    assert!(out.contains("rule=answer@v1"), "{out}");
-    assert!(
-        !meta.contains("attention_owner=supervisor"),
-        "{meta}\n{out}"
-    );
+    assert!(out.contains("rule=answer@v1"), "{ev}");
+    assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
 /// FULL POWER, a worker whose every turn is short (`min_work` an hour, the
@@ -1118,7 +1210,7 @@ fn a_decision_is_answered_with_the_answer_text() {
 fn a_short_turn_loop_is_continued_and_never_escalates() {
     let inst = boot("b");
     let sid = boot_session(&inst);
-    let (_keys, _subs, events) = start_looping_worker(&inst, &sid, "done");
+    let (_keys, _subs, _events) = start_looping_worker(&inst, &sid, "done");
     let sec = Duration::from_secs(1);
     submit(&inst, &sid, "go");
     await_match(&inst, &sid, "Deliberating|suite.is.green");
@@ -1133,18 +1225,12 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
         },
         SupervisorConfig::default(),
     );
-    let at = stamps_when(&events, "submit", 4, Duration::from_secs(90));
+    let at = stamps_when(&inst, "submit", 4);
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
-    let out = format!("{}\njournal:\n{}", sup.stop(), journal(&inst));
-    assert_eq!(
-        at.len(),
-        4,
-        "`go` and three continuations; the loop said:\n{out}"
-    );
-    assert!(
-        !meta.contains("attention_owner=supervisor"),
-        "{meta}\n{out}"
-    );
+    let out = sup.stop();
+    let ev = evidence(&inst, &out);
+    assert_eq!(at.len(), 4, "`go` and three continuations; {ev}");
+    assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
 /// A PERSON'S KEYSTROKE, live: a turn a person stopped with Esc (the
@@ -1155,7 +1241,7 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
 fn an_esc_interrupt_is_held_then_continued() {
     let inst = boot("i");
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "interrupted");
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "interrupted");
     let sup = Supervisor::start_with(
         &inst,
         &sid,
@@ -1169,19 +1255,17 @@ fn an_esc_interrupt_is_held_then_continued() {
         },
     );
     submit(&inst, &sid, "go");
-    drawn(&events, "interrupted");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    drawn(&inst, "interrupted");
+    let submitted = submits_when(&inst, &subs, 2);
     let meta = ctl_ok(&inst, &[&format!("@{sid}"), "meta"]);
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert_eq!(
-        submitted[..2],
+        submitted.iter().take(2).cloned().collect::<Vec<String>>(),
         ["SUBMIT:go".to_string(), cruise_submit()],
-        "the loop said:\n{out}"
+        "{ev}"
     );
-    assert!(
-        !meta.contains("attention_owner=supervisor"),
-        "{meta}\n{out}"
-    );
+    assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
 /// THE WEEKLY WALL BEHIND A BACKGROUND SHELL
@@ -1190,7 +1274,7 @@ fn an_esc_interrupt_is_held_then_continued() {
 fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
     let inst = boot("c");
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "wall");
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "wall");
     let sup = Supervisor::start(
         &inst,
         &sid,
@@ -1201,7 +1285,7 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
         },
     );
     submit(&inst, &sid, "go");
-    drawn(&events, "wall");
+    drawn(&inst, "wall");
     let deadline = Instant::now() + HANG;
     let mut status = String::new();
     while Instant::now() < deadline {
@@ -1211,20 +1295,21 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let submitted = submits_when(&inst, &subs, 2);
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert!(
         status.contains("agent=wall:usage-weekly"),
-        "published as the wall: {status}\nthe loop said:\n{out}"
+        "published as the wall: {status}\n{ev}"
     );
     assert_eq!(
         submitted,
         ["SUBMIT:go".to_string(), cruise_submit()],
-        "the loop said:\n{out}"
+        "{ev}"
     );
     assert!(
         continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
-        "the loop said:\n{out}"
+        "{ev}"
     );
 }
 
@@ -1252,16 +1337,17 @@ fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_ent
         },
     );
     submit(&inst, &sid, "go");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let submitted = submits_when(&inst, &subs, 2);
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert_eq!(
         submitted,
         ["SUBMIT:go".to_string(), cruise_submit()],
-        "the loop said:\n{out}"
+        "{ev}"
     );
     assert!(
         continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
-        "the loop said:\n{out}"
+        "{ev}"
     );
 }
 
@@ -1288,16 +1374,17 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
         },
     );
     submit(&inst, &sid, "go");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let submitted = submits_when(&inst, &subs, 2);
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert_eq!(
         submitted,
         ["SUBMIT:go", "SUBMIT:"],
-        "the draft is submitted as it stands; the loop said:\n{out}"
+        "the draft is submitted as it stands; {ev}"
     );
     assert!(
         out.contains("rule=usage-resume@v1") && !out.contains("keep going"),
-        "the loop said:\n{out}"
+        "{ev}"
     );
 }
 
@@ -1307,7 +1394,7 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
 fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
     let inst = boot("k");
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "wallscroll");
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "wallscroll");
     let sup = Supervisor::start(
         &inst,
         &sid,
@@ -1318,17 +1405,18 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
         },
     );
     submit(&inst, &sid, "go");
-    drawn(&events, "wallscrolled");
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    drawn(&inst, "wallscrolled");
+    let submitted = submits_when(&inst, &subs, 2);
     let out = sup.stop();
+    let ev = evidence(&inst, &out);
     assert_eq!(
         submitted,
         ["SUBMIT:go".to_string(), cruise_submit()],
-        "the loop said:\n{out}"
+        "{ev}"
     );
     assert!(
         continued_with(&out, "usage-resume@v1", CONTINUE_TEXT),
-        "the loop said:\n{out}"
+        "{ev}"
     );
 }
 
@@ -1342,7 +1430,7 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
 fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset() {
     let inst = boot("o");
     let sid = boot_session(&inst);
-    let (_keys, subs, events) = start_worker(&inst, &sid, "wallscroll");
+    let (_keys, subs, _events) = start_worker(&inst, &sid, "wallscroll");
     let timing = |reset_grace: Duration| TurnEndTiming {
         reset_grace,
         reset_jitter: Duration::ZERO,
@@ -1350,7 +1438,7 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
     };
     let first = Supervisor::start(&inst, &sid, timing(TurnEndTiming::default().reset_grace));
     submit(&inst, &sid, "go");
-    let scrolled_at = drawn(&events, "wallscrolled");
+    let scrolled_at = drawn(&inst, "wallscrolled");
     if let Ok(left) = (scrolled_at + Duration::from_millis(800)).duration_since(SystemTime::now()) {
         std::thread::sleep(left);
     }
@@ -1361,12 +1449,13 @@ fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset
         "the first loop wrote the wall down:\n{ledger}\n{said_first}"
     );
     let second = Supervisor::start(&inst, &sid, timing(Duration::from_secs(1)));
-    let submitted = lines_when(&subs, 2, Duration::from_secs(60));
+    let submitted = submits_when(&inst, &subs, 2);
     let said_second = second.stop();
     assert_eq!(
         submitted,
         ["SUBMIT:go".to_string(), cruise_submit()],
-        "the successor said:\n{said_second}\nthe first said:\n{said_first}"
+        "the successor: {}\nthe first said:\n{said_first}",
+        evidence(&inst, &said_second)
     );
     assert!(
         !said_first.contains("rule=usage-resume@v1"),

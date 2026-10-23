@@ -3,36 +3,11 @@
 // Author: Andrew Yates
 
 //! VT conformance level tracking.
-//!
-//! This module tracks which VT terminal level (VT100, VT220, VT320, VT420, VT520)
-//! each escape sequence belongs to. This enables:
-//!
-//! - Proper DA1/DA2 (Device Attributes) response generation
-//! - DECSCL (Set Conformance Level) handling
-//! - Knowing which features require which terminal level
-//!
-//! ## VT Terminal Evolution
-//!
-//! | Level | Year | Key Features |
-//! |-------|------|--------------|
-//! | VT100 | 1978 | Basic ANSI escape sequences, 80/132 columns |
-//! | VT220 | 1983 | User-defined keys, 8-bit controls, DRCS |
-//! | VT320 | 1987 | 25th status line, locator (mouse) events |
-//! | VT420 | 1990 | Rectangular area operations, macro recording |
-//! | VT520 | 1995 | Session management, printer features |
 
 /// VT terminal conformance level.
 ///
-/// Each level implies support for all features from previous levels.
-/// The integer values match the DA2 (Secondary Device Attributes) response.
-///
-/// # Not Orderable
-///
-/// `VtLevel` intentionally does NOT implement `PartialOrd`/`Ord`. DA2 parameter
-/// values are assigned by DEC across decades with no ordering intent — e.g.,
-/// VT330 (param 18) and VT340 (param 19) are supersets of VT320 (param 24).
-/// Compare the DA2/DECSCL parameters (`da2_param()`, `decscl_param()`) or
-/// match on the variant instead.
+/// `VtLevel` implements neither `PartialOrd` nor `Ord`, because DA2 parameters
+/// carry no capability order:
 ///
 /// ```compile_fail
 /// use aterm_types::VtLevel;
@@ -43,33 +18,31 @@
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum VtLevel {
-    /// VT100 (1978): Basic ANSI sequences, 80/132 columns, smooth scroll
+    /// VT100 (1978): Basic ANSI sequences, 80/132 columns, smooth scroll.
     VT100 = 0,
-    /// VT220 (1983): User-defined keys, 8-bit controls, DRCS soft fonts
+    /// VT220 (1983): User-defined keys, 8-bit controls, DRCS soft fonts.
     VT220 = 1,
-    /// VT240 (1983): VT220 + ReGIS and Sixel graphics
+    /// VT240 (1983): VT220 + ReGIS and Sixel graphics.
     VT240 = 2,
-    /// VT320 (1987): 25th status line, locator (mouse) input
+    /// VT320 (1987): 25th status line, locator (mouse) input.
     VT320 = 24,
-    /// VT330 (1987): VT320 + monochrome Sixel graphics
+    /// VT330 (1987): VT320 + monochrome Sixel graphics.
     VT330 = 18,
-    /// VT340 (1987): VT320 + color Sixel graphics
+    /// VT340 (1987): VT320 + color Sixel graphics.
     VT340 = 19,
-    /// VT420 (1990): Rectangular operations, macro recording, pages
+    /// VT420 (1990): Rectangular operations, macro recording, pages.
     #[default]
     VT420 = 41,
-    /// VT510 (1993): Enhanced character sets
+    /// VT510 (1993): Enhanced character sets.
     VT510 = 61,
-    /// VT520 (1995): Session management, enhanced printing
+    /// VT520 (1995): Session management, enhanced printing.
     VT520 = 64,
-    /// VT525 (1995): VT520 + color
+    /// VT525 (1995): VT520 + color.
     VT525 = 65,
 }
 
 impl VtLevel {
     /// Get the DA2 (Secondary Device Attributes) parameter for this level.
-    ///
-    /// This is the first parameter in the response to `CSI > c`.
     #[inline]
     #[must_use]
     pub const fn da2_param(self) -> u8 {
@@ -77,8 +50,6 @@ impl VtLevel {
     }
 
     /// Get the DECSCL (Set Conformance Level) parameter for this level.
-    ///
-    /// Used in `CSI Ps ; Ps " p` sequence.
     #[inline]
     #[must_use]
     pub const fn decscl_param(self) -> u8 {

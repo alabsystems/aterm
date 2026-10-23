@@ -286,6 +286,14 @@ impl DeskFields {
     }
 
     /// What these desks leave uncovered, one `<record> <field> (<why>)` each:
+    ///
+    /// * every field or variant a desk here passes over and no desk writes, unless
+    ///   `unhanded` names it, as `(record, field)`: one no handoff writes;
+    /// * every field or variant `baseline`'s desks wrote that no desk here writes,
+    ///   reached or not, unless `unhanded` names it (retired since);
+    /// * every `unhanded` row of `manifest`, `layout`, `meta` or `control` that a desk
+    ///   here writes, or that names no field a desk here passes over or `baseline`'s
+    ///   desks wrote.
     pub(crate) fn uncovered(
         &self,
         baseline: Option<&Recorded>,

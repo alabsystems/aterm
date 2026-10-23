@@ -76,7 +76,8 @@ impl PetChrome {
         }
     }
 
-    /// As [`PetChrome::note`], for a TRANSIENT overlay (the Autopilot menu's card): protected alike, but never ground the pet's rest seat is solved on (module docs).
+    /// As [`PetChrome::note`], for a TRANSIENT overlay (the Autopilot menu's card): protected
+    /// alike, but never ground the pet's rest seat is solved on.
     pub(crate) fn note_overlay(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
         if let Some(rect) = self.pane_local(row, col, rows, cols) {
             self.next_overlays.push(rect);

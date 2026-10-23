@@ -1088,11 +1088,6 @@ fn a_browser_is_placed_where_the_lane_looks() {
     assert_eq!(names(&m.browser), ["chrome-headless-shell-0.0.1-mac-arm64"]);
 }
 
-/// The wasm drivers' browser is the pin exactly as `verify provision` placed it: nothing
-/// placed, a copy laid by hand with no stamp, and one stamped for another pin are each no
-/// browser (the browser lane's `find` would take the hand-laid copy, or an installed
-/// Chrome), and `ATERM_BROWSER` is the one override. NEGATIVE CONTROL: the same copy with
-/// the pin's own stamp is found.
 #[test]
 fn the_drivers_browser_is_only_the_pin_provision_placed() {
     use crate::browser::chromium::pinned_from;

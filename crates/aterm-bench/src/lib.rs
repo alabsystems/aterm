@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm performance harnesses: the examples `verify perf` runs. This lib holds
-//! the deterministic corpora shared between them.
+//! Deterministic corpora and helpers shared across `verify perf` benchmark harnesses.
 
-/// Trigram-diverse corpus: line counter + rotating 40-glyph body. Every line
-/// differs and trigram space is saturated: the worst case for the search index,
-/// and real (compressible) work for the scroll-scrub tiers.
+/// Generate a trigram-diverse corpus of `lines` with a rotating 40-glyph body.
 #[must_use]
 pub fn rotating_corpus(lines: usize) -> Vec<u8> {
     const GLYPHS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/-=";
@@ -22,9 +19,7 @@ pub fn rotating_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// Repetitive-log corpus: 8 real-shaped service-log templates cycling, only
-/// digits varying. The trigram map stays small while per-line postings do
-/// not, the shape where a regression hidden by a shrinking map would show.
+/// Generate a repetitive service-log corpus of `lines` cycling through 8 templates.
 #[must_use]
 pub fn replog_corpus(lines: usize) -> Vec<u8> {
     let templates: [&str; 8] = [
@@ -39,8 +34,6 @@ pub fn replog_corpus(lines: usize) -> Vec<u8> {
     ];
     let mut out = Vec::with_capacity(lines * 110);
     for line in 0..lines {
-        // Timestamp-ish prefix + latency suffix: digits vary per line, the
-        // template text (and its trigrams) repeats.
         out.extend_from_slice(b"2026-07-22T12:");
         out.extend_from_slice(format!("{:02}:{:02}", (line / 60) % 60, line % 60).as_bytes());
         out.extend_from_slice(format!(".{:03}Z ", line % 1000).as_bytes());
@@ -51,13 +44,7 @@ pub fn replog_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// Hyperlink-heavy corpus: package-registry fetch logs where every line prints
-/// a long URL wrapped in an OSC 8 hyperlink (the URL as its own visible text).
-/// Exercises punctuation-dense high-entropy trigrams, lines that soft-wrap at
-/// 80 columns, and the OSC 8 parser path in the fill itself.
-///
-/// `lines` counts logical lines; at 80 columns each occupies 2 grid rows, so
-/// callers sizing a ring must budget `2 * lines` rows.
+/// Generate a hyperlink-heavy corpus of `lines` with OSC 8 URLs.
 #[must_use]
 pub fn linkheavy_corpus(lines: usize) -> Vec<u8> {
     let pkgs: [&str; 8] = [
@@ -90,19 +77,9 @@ pub fn linkheavy_corpus(lines: usize) -> Vec<u8> {
     out
 }
 
-/// The throughput lane's workload, at least `bytes` long: a repeating mix of plain
-/// text, SGR colour/style runs, CSI cursor moves + erases, and newline-driven
-/// scrolling. Deterministic byte-for-byte across machines (no RNG, no clock) so
-/// the corpus — and therefore the work performed — is identical everywhere.
-/// Shared by `perf_harness` (the `throughput` lane) and `crash_restore_harness`
-/// (the tail tap's overhead on the same bytes).
+/// Generate the throughput lane's mixed-traffic workload of at least `bytes` length.
 #[must_use]
 pub fn throughput_corpus(bytes: usize) -> Vec<u8> {
-    // One "frame" of mixed traffic. Hand-built so the proportions are stable:
-    //   - plain printable ASCII (the cheap path),
-    //   - SGR runs (parser-heavy: params + dispatch),
-    //   - CSI cursor positioning + erase-in-line (state mutation),
-    //   - explicit newlines so the 24-row window scrolls constantly.
     let frame: &[&[u8]] = &[
         b"the quick brown fox jumps over the lazy dog 0123456789\r\n",
         b"\x1b[1;38;5;202mERROR\x1b[0m \x1b[4;48;5;19mwarning\x1b[0m normal text here\r\n",

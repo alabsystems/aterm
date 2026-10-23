@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Decoders for `libproc` descriptor layouts and `kinfo_proc` ([`SDK_ROWS`], [`kinfo`]).
+//! Decoders for `libproc` descriptor layouts, `proc_archinfo` and `kinfo_proc` ([`SDK_ROWS`], [`kinfo`]).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// `PROC_PIDLISTTHREADS`: a process's thread handles (`uint64_t` each).
 pub const PROC_PIDLISTTHREADS: i32 = 6;
+/// `PROC_PIDARCHINFO`: a process's CPU type and subtype (`struct proc_archinfo`).
+pub const PROC_PIDARCHINFO: i32 = 19;
+/// `sizeof(struct proc_archinfo)`.
+pub const ARCHINFO_SIZE: usize = 8;
+/// `offsetof(struct proc_archinfo, p_cputype)` (`cpu_type_t`).
+pub const ARCHINFO_CPUTYPE_AT: usize = 0;
+/// `CPU_TYPE_X86_64`: an x86_64 process, which an arm64 Mac runs under Rosetta.
+pub const CPU_TYPE_X86_64: i32 = 0x0100_0007;
+/// `SSTOP` in `pbi_status`: stopped (a start-suspended spawn, `SIGSTOP`, a tracer).
+pub const SSTOP: u32 = 4;
+/// `PROC_FLAG_TRACED` in `pbi_flags`: a debugger traces the process.
+pub const PROC_FLAG_TRACED: u32 = 0x2;
 /// `PROC_PIDFDVNODEPATHINFO`: a vnode descriptor with its path.
 pub const PROC_PIDFDVNODEPATHINFO: i32 = 2;
 /// `PROC_PIDFDSOCKETINFO`: a socket descriptor.
@@ -147,6 +159,15 @@ pub const KNOTE_FILTER_AT: usize = 8;
 /// Public struct sizes, field offsets, and constants verified against the macOS SDK.
 pub const SDK_ROWS: &[(&str, i64)] = &[
     ("PROC_PIDLISTTHREADS", PROC_PIDLISTTHREADS as i64),
+    ("PROC_PIDARCHINFO", PROC_PIDARCHINFO as i64),
+    ("sizeof(struct proc_archinfo)", ARCHINFO_SIZE as i64),
+    (
+        "offsetof(struct proc_archinfo, p_cputype)",
+        ARCHINFO_CPUTYPE_AT as i64,
+    ),
+    ("CPU_TYPE_X86_64", CPU_TYPE_X86_64 as i64),
+    ("SSTOP", SSTOP as i64),
+    ("PROC_FLAG_TRACED", PROC_FLAG_TRACED as i64),
     ("PROC_PIDFDVNODEPATHINFO", PROC_PIDFDVNODEPATHINFO as i64),
     ("PROC_PIDFDSOCKETINFO", PROC_PIDFDSOCKETINFO as i64),
     ("PROC_PIDFDPIPEINFO", PROC_PIDFDPIPEINFO as i64),
@@ -528,6 +549,15 @@ pub fn kinfo(b: &[u8]) -> Option<Kinfo> {
         session_leader: u32_at(b, KINFO_EFLAG_AT)? & EPROC_SLEADER != 0,
         comm: String::from_utf8_lossy(&comm[..end]).into_owned(),
     })
+}
+
+/// Decode a `proc_archinfo`'s `p_cputype`; `None` when `b` is shorter than the struct.
+#[must_use]
+pub fn archinfo_cputype(b: &[u8]) -> Option<i32> {
+    if b.len() < ARCHINFO_SIZE {
+        return None;
+    }
+    i32_at(b, ARCHINFO_CPUTYPE_AT)
 }
 
 /// Decode a `kqueue_fdinfo`'s `kq_state`; `None` when `b` is short.

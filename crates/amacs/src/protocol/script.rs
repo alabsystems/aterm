@@ -474,7 +474,7 @@ impl Script {
         }
     }
 
-    /// Read an edit script (the module docs give the grammar).
+    /// Read an edit script (each [`Op`] variant names its op's form).
     pub fn parse(input: &str) -> Result<Self, ScriptError> {
         let lines = script_lines(input);
         let mut ops = Vec::new();

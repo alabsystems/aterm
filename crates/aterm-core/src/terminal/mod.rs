@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Terminal emulator: the parser driving the grid. Per-sequence behaviour is documented in the
-//! handler modules (`handler_csi.rs`, `handler_esc.rs`, `handler_osc.rs`, …).
+//! Terminal emulator: the parser driving the grid.
 
-/// The alt-screen scroll-off archive: rows a fullscreen app scrolled off its top.
 mod alt_archive;
 /// Tier-1 conformance of the alt-screen selection park to `AltSelectionPark`.
 #[cfg(test)]
 mod alt_selection_park_conformance;
-/// UAX #9 BiDi visual-reordering bridge (`aterm-bidi`).
 mod bidi_reorder;
 mod bidi_stubs;
 mod blocks_api;
@@ -56,23 +53,17 @@ mod holder_fence;
 mod holder_fence_conformance;
 pub(crate) mod host_traits;
 pub(crate) mod hyperlink_auth;
-/// Inline-image survival across a width-changing reflow (see its module docs).
 mod image_reflow;
 mod keyboard_mode;
-/// Kitty placements relative to a virtual placement, placed each frame where
-/// its placeholders show.
 mod kitty_floating;
 /// Kitty graphics protocol (APC `G`) command parser.
 pub mod kitty_graphics;
-/// Kitty graphics Unicode placeholder (U+10EEEE) diacritic decoding.
 mod kitty_placeholder;
 mod mode_mirror;
 #[cfg(test)]
 pub mod mouse;
 #[cfg(not(test))]
 mod mouse;
-/// The Observation Kernel (L0): event-driven `await`/quiescence primitive over
-/// `content_seq`. Ephemeral, surface-non-mutating, checkpoint-excluded.
 mod observe;
 mod policy_bridge;
 mod policy_gates;
@@ -90,15 +81,10 @@ mod shell;
 pub(crate) mod shell_integration_auth;
 mod window_auth;
 
-/// The private field of every capability token (`ClipboardWriteCapability`,
-/// `ResponseCapability`, `WindowOpsCapability`): the field is private to the
-/// token's module, so nothing outside it can build one, and `Seal` has no
-/// `Clone` or `Default`, so a token deriving either does not compile — a mint
-/// is spent, never copied or conjured.
+/// Non-Copy, non-Default seal field for capability tokens.
 #[derive(Debug)]
 struct Seal;
 
-// Block model, process detection, and the shell-facing API.
 mod shell_api;
 
 pub mod scrollback_shared_budget;
@@ -114,10 +100,6 @@ mod state_accessors;
 mod terminal_modes_conformance;
 mod transient_state;
 mod types;
-
-// The source-to-spec cross-reference gate lives in aterm-models' test build: it
-// links every anchored crate, including this crate's `terminal_modes` anchors,
-// which expand in every test and debug build.
 
 pub use callbacks::ColorTarget;
 use callbacks::{
@@ -177,8 +159,6 @@ pub use observe::{
     FRAME_HANG, Frame, GONE_SETTLE, RowMatch, RowRange, RowVerdict, Satisfaction, SurfaceSource,
     WatchId, WatcherSet, WatcherSpec, first_matching_row,
 };
-// `ClockReading`: the injected-clock seam, so an out-of-crate replay harness can
-// feed a fixed clock and get bit-deterministic state.
 pub use processing::{ClockReading, KittyAnimationStep};
 pub use render_cells::{RenderCell, Script, UnderlineStyle};
 pub use resize_journal::{RESIZE_JOURNAL_CAP, RenderDebt, ResizeReport};
@@ -216,13 +196,10 @@ pub(crate) type UserVarsMap = std::collections::HashMap<String, String>;
 
 pub(crate) type PendingNotificationsMap = std::collections::HashMap<String, types::Notification>;
 
-/// Maximum decoded clipboard bytes answered to an OSC 52 query (`Pd = ?`); larger clipboard data
-/// is dropped, not answered. Far below the parser's 8 MiB `MAX_OSC_DATA`, to limit accidental
-/// exfiltration.
+/// Maximum decoded clipboard bytes answered to an OSC 52 query (`Pd = ?`).
 pub(crate) const MAX_OSC52_QUERY_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Maximum bytes in the terminal response buffer (DSR/DA/DECRQSS/OSC replies
-/// waiting for `take_response()`).
+/// Maximum bytes in the terminal response buffer.
 pub(crate) const MAX_RESPONSE_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Maximum title/icon-name length in bytes for OSC 0/1/2 and `set_title`.
@@ -231,14 +208,10 @@ const MAX_TITLE_BYTES: usize = 1024;
 /// Maximum OSC 8 hyperlink URL length in bytes; longer URLs are ignored.
 const MAX_HYPERLINK_URL_BYTES: usize = 8192;
 
-/// Maximum working-directory path length in bytes for OSC 7 and OSC 633 `P` Cwd (the
-/// conventional `PATH_MAX`). Longer paths are rejected: they would be retained in the
-/// `osc_events` queue and in the shell mark/block fields, which are count-capped, not byte-capped.
+/// Maximum working-directory path length in bytes for OSC 7 and OSC 633 `P` Cwd.
 pub(crate) const MAX_CWD_PATH_BYTES: usize = 4096;
 
-/// Maximum command-line text length in bytes for OSC 633 `E` and `F`/`G`/`H` payloads. The `E`
-/// text is retained in the count-capped, not byte-capped, shell mark/block `commandline` fields;
-/// the cap also bounds the unescape work.
+/// Maximum command-line text length in bytes for OSC 633 `E` and `F`/`G`/`H` payloads.
 pub(crate) const MAX_COMMANDLINE_BYTES: usize = 64 * 1024;
 
 /// An SGR color parameter as a palette index; values above 255 saturate.

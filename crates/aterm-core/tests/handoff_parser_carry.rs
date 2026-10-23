@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A seamless update carries the parser's partial state: the outgoing engine stops wherever
-//! the last PTY read ended (inside an SGR, mid-glyph, halfway through an OSC title), and a
-//! successor restored from `checkpoint_carry_abandoning_partial` continues the rest of the
-//! sequence exactly as one engine fed the whole stream.
+//! Tests for parser and engine state preservation across seamless handoff checkpoints.
 
 use aterm_core::terminal::Terminal;
 
 const ROWS: u16 = 4;
 const COLS: u16 = 20;
 
-/// Park `head` in an outgoing engine, hand it to a successor the way the
-/// seamless update does, and feed the successor `tail`.
 fn handed_over(head: &[u8], tail: &[u8]) -> Terminal {
     let mut outgoing = Terminal::new(ROWS, COLS);
     outgoing.process(head);
@@ -23,9 +18,6 @@ fn handed_over(head: &[u8], tail: &[u8]) -> Terminal {
     successor
 }
 
-/// As [`handed_over`], but the successor is rebuilt whole from the checkpoint
-/// (`Terminal::from_checkpoint`, the other restore door) rather than adopted
-/// into a configured engine.
 fn rebuilt_from_carry(head: &[u8], tail: &[u8]) -> Terminal {
     let mut outgoing = Terminal::new(ROWS, COLS);
     outgoing.process(head);
@@ -35,7 +27,6 @@ fn rebuilt_from_carry(head: &[u8], tail: &[u8]) -> Terminal {
     successor
 }
 
-/// The same bytes through one engine, never handed over.
 fn never_handed_over(head: &[u8], tail: &[u8]) -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
     t.process(head);
@@ -51,19 +42,10 @@ fn row(t: &Terminal, row: usize) -> String {
     t.row_text(row).unwrap_or_default().trim_end().to_string()
 }
 
-/// Every row's text, top to bottom.
 fn screen(t: &Terminal) -> Vec<String> {
     (0..usize::from(ROWS)).map(|r| row(t, r)).collect()
 }
 
-/// A DCS string split in its header is read after the handoff as it would have been: the
-/// header rides as itself, so split at every byte up to the final byte, through either
-/// restore door, the successor replies exactly as one engine fed the whole stream does
-/// (a DECRQSS or XTGETTCAP query is answered) and draws the same screen, cursor included.
-///
-/// The third stream is a sixel header holding an 8-bit ST, which the engine drops (C1
-/// controls are off): the reference draws the image on row 0 and `after` below it, and
-/// the payload is never text.
 #[test]
 fn a_dcs_string_split_in_its_header_is_read_as_it_would_have_been() {
     for (stream, query) in [
@@ -105,8 +87,6 @@ fn a_dcs_string_split_in_its_header_is_read_as_it_would_have_been() {
     }
 }
 
-/// Every split point of a stream that mixes the shapes, carried the seamless
-/// way, lands on exactly the screen one engine fed the whole stream draws.
 #[test]
 fn every_split_of_a_mixed_stream_lands_on_the_same_screen() {
     let stream: &[u8] = b"\x1b[1;38;5;196mred\x1b[0m \x1b]0;t\x07\xe6\xbc\xa2\x1b[?25l\
@@ -127,8 +107,6 @@ fn every_split_of_a_mixed_stream_lands_on_the_same_screen() {
     }
 }
 
-/// A hostile carry — one that reads but that the parser refuses — costs the
-/// partial sequence and nothing else: the successor resumes at Ground.
 #[test]
 fn a_refused_carry_resumes_at_ground() {
     let mut outgoing = Terminal::new(ROWS, COLS);
@@ -147,13 +125,6 @@ fn a_refused_carry_resumes_at_ground() {
     );
 }
 
-/// Engine state that output still to come relies on. The parser carry continues a sequence
-/// split at the park, but these states live in the engine: the character REP (`CSI b`)
-/// repeats, an open OSC 8 link, an SGR 58 underline colour, a VT52 `ESC Y` waiting for its
-/// address bytes, a ZWJ waiting for the emoji it joins, the XTPUSHSGR stack, the XTSAVE'd
-/// modes, and a complete flag (else the next regional indicator joins its cell). Each
-/// split, through either restore door, must land on the screen one engine fed the whole
-/// stream draws: same cells (underline colour included), text, links and cursor.
 #[test]
 fn split_at_park_matches_unsplit() {
     let mut lost = Vec::new();
@@ -228,7 +199,6 @@ fn split_at_park_matches_unsplit() {
         "the handed-over screen differs from the unsplit one for: {lost:?}"
     );
 
-    // Non-vacuity: each reference really shows the state the split must keep.
     assert_eq!(row(&never_handed_over(b"X", b"\x1b[5b"), 0), "XXXXXX");
     let link = never_handed_over(b"\x1b]8;id=p;http://a\x1b\\ab", b"cd\x1b]8;;\x1b\\");
     assert_eq!(link.hyperlink_at(0, 3), Some("http://a"), "d is linked");
@@ -274,16 +244,10 @@ fn split_at_park_matches_unsplit() {
     assert_eq!(row(&wrapped, 1), "UVWXY", "autowrap is back on");
 }
 
-/// 👨 then a ZWJ (U+200D); the tail's 💻 joins them into one glyph.
 const ZWJ_HEAD: &str = "\u{1F468}\u{200D}";
 const ZWJ_TAIL: &str = "\u{1F4BB}x";
-
-/// A complete flag, two regional indicators (U+1F1FA U+1F1F8): an RI after it
-/// starts a pair of its own.
 const FLAG: &str = "\u{1F1FA}\u{1F1F8}";
 
-/// `payload` in tmux's passthrough wrapper, every ESC doubled, as a program that finds
-/// `TMUX` in its environment writes it.
 fn tmux_wrapped(payload: &[u8]) -> Vec<u8> {
     let mut out = b"\x1bPtmux;".to_vec();
     for &byte in payload {
@@ -296,13 +260,6 @@ fn tmux_wrapped(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A tmux passthrough wrapper that reached aterm itself (a tab that inherited `TMUX`
-/// with no tmux in it; `aterm_parser::TmuxPassthrough`) rides the handoff wherever the
-/// outgoing read stopped: in the wrapper's head, inside it, at the ESC whose follower
-/// decides, inside the payload's own sequence. Through either restore door the successor
-/// draws the same screen and title as one engine fed the whole stream, and answers the
-/// wrapped query once. A cut inside that query is left out of the comparison: no carry
-/// holds a query's reply, and the handoff abandons it as it abandons a bare one.
 #[test]
 fn a_tmux_wrapper_split_anywhere_is_read_as_it_would_have_been() {
     let stream = [

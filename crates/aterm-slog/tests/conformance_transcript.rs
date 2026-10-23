@@ -18,8 +18,6 @@ use aterm_spec::rng::XorShift;
 use crate::conformance_turn::path_to;
 use crate::support::{WALL0, agent_session, at};
 
-/// The Claude Code process started a minute before aterm saw its run open:
-/// a row between the two is history this log never saw (S1).
 const PROCESS_START: u64 = WALL0 - 60_000;
 
 /// A broken join, for the negative controls.
@@ -191,8 +189,6 @@ impl Join {
         self.call(ev, pos)
     }
 
-    /// What every step appended: turn opens, transcript steps, and a
-    /// `confirmed=` or `vref=` the screen wrote (ghost 2).
     fn read(&mut self, recs: &[Rec]) {
         for r in recs {
             if r.op == Op::Open && r.node.lvl == Lvl::Turn {
@@ -228,18 +224,15 @@ impl Join {
         self.floor = self.floor.max(self.wall());
     }
 
-    /// The open turn's open time, when one is open.
     fn open_turn(&self) -> Option<(Node, u64)> {
         open_turn(&self.log, self.run)
     }
 }
 
-/// The open turn under `run` and its open time, when one is open.
 fn open_turn(log: &Log, run: Node) -> Option<(Node, u64)> {
     log.open_under(run, Lvl::Turn).next().map(|e| (e.node, e.t))
 }
 
-/// The transcript steps open anywhere under `run`.
 fn open_tools(log: &Log, run: Node) -> Vec<Node> {
     let mut parents = vec![run];
     parents.extend(log.open_under(run, Lvl::Turn).map(|e| e.node));
@@ -331,9 +324,6 @@ pub fn project_parts(
     .collect()
 }
 
-/// The real step from `prev` to `next` is the model's path `actions` with
-/// every law holding along it, and the turn records appended after `seq0`
-/// are that path's turn opens and closes.
 fn admitted(
     m: &Model,
     j: &Join,
@@ -725,7 +715,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
     Ok(Some(path))
 }
 
-/// The walk's step mix: rows and screen moves the join meets often more.
 const POOL: &[Step] = &[
     Step::Busy,
     Step::Busy,
@@ -816,8 +805,6 @@ fn transcript_join_conforms_to_derived_model() {
     assert!(ran.contains("(a row the join ignored)"));
 }
 
-/// NEGATIVE CONTROLS: each broken join is rejected by the walks that pass
-/// the shipping one.
 #[test]
 fn transcript_join_conformance_rejects_each_broken_join() {
     for (broken, law) in [
@@ -838,8 +825,6 @@ fn transcript_join_conformance_rejects_each_broken_join() {
     }
 }
 
-/// NEGATIVE CONTROLS, per mutant: the state its broken call leaves is not
-/// the model's step, is exactly the Buggy model's, and breaks its law.
 #[test]
 fn transcript_join_conformance_rejects_each_mutant_state() {
     let m = transcript_join_model();
@@ -924,8 +909,6 @@ fn transcript_join_conformance_rejects_each_mutant_state() {
     }
 }
 
-/// The projection is load-bearing: a real tool step the join opened, seen
-/// as if its turn had closed, breaks the law the cascade keeps.
 #[test]
 fn transcript_join_projection_sees_an_orphan_step() {
     let m = transcript_join_model();

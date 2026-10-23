@@ -7,19 +7,11 @@
 use super::{ColdPage, ColdTier};
 
 impl ColdTier {
-    /// Remove the newest `n` lines from the back of the cold tier.
-    ///
-    /// Whole pages drop without decompression; the boundary page is
-    /// decompressed, trimmed and re-compressed.
-    ///
-    /// Error safety: the boundary page is decompressed and re-encoded before
-    /// any state is modified, so a failure leaves the tier unchanged.
+    /// Removes the newest `n` lines from the back of the cold tier.
     ///
     /// # Panics
     ///
     /// Debug-asserts that `n <= self.line_count`.
-    // Skip: the unmodeled drain/iterator class plus the boundary rebuild's
-    // alloc.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back_lines(&mut self, n: usize) -> Result<(), crate::ScrollbackError> {
         if n == 0 {
@@ -31,12 +23,9 @@ impl ColdTier {
             self.line_count
         );
 
-        // Phase 1: Count whole pages to drop from the back and identify boundary.
         let mut whole_pages = 0;
         let mut remaining = n;
         for page in self.pages.iter().rev() {
-            // Saturating ops: the guards prove the bounds, but the verifier's model
-            // does not carry them to the ops.
             let page_idx_from_back = whole_pages;
             let actual_idx = self
                 .pages
@@ -57,7 +46,6 @@ impl ColdTier {
         }
         let boundary_trim = remaining;
 
-        // Phase 2: Pre-decompress boundary page if needed (before modifying state).
         let boundary_replacement = if boundary_trim > 0 {
             let boundary_idx = self
                 .pages
@@ -90,7 +78,6 @@ impl ColdTier {
             None
         };
 
-        // Phase 3: Commit — all decompressions succeeded.
         for _ in 0..whole_pages {
             if let Some(page) = self.pages.pop_back() {
                 self.bytes_used = self.bytes_used.saturating_sub(page.compressed.len());
@@ -115,14 +102,10 @@ impl ColdTier {
         }
         self.line_count = self.line_count.saturating_sub(n);
 
-        // With no page left, a stale front_offset would skip lines of the next
-        // page appended (as in tier_back_removal.rs).
         if self.pages.is_empty() {
             self.front_offset = 0;
         }
 
-        // A full rebuild rebases the index to zero, so the front-drop cursor
-        // and base reset with it.
         self.cumulative_lines.clear();
         self.cum_start = 0;
         self.cumulative_base = 0;

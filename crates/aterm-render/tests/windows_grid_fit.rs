@@ -2,18 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows system variable-font grid-fitting tests.
-//!
-//! Verifies that Windows 11's variable `CascadiaMono.ttf` (or another
-//! `%WINDIR%\Fonts` variable face with a bold `wght` instance) is grid-fitted
-//! at both its regular and bold (`wght` ≈ 700) `fvar` instance coordinates
-//! without altering cell box dimensions.
 
 #![cfg(all(windows, feature = "embedded-font"))]
 
 use aterm_render::{Renderer, StyleBits, Theme};
 
-/// Locate `CascadiaMono.ttf` or another `%WINDIR%\Fonts` variable font whose
-/// `wght` axis reaches a bold instance (`vf_bold_coords`).
 fn variable_system_face() -> (String, Vec<u8>) {
     let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
     let mut candidates: Vec<String> = vec![format!("{dir}\\Fonts\\CascadiaMono.ttf")];
@@ -52,10 +45,6 @@ fn variable_system_face() -> (String, Vec<u8>) {
     );
 }
 
-/// Coverage histogram of one rasterized glyph: `(solid, fringe, inked, mass)`.
-/// `solid` = texels at >= 240/255 (a whole pixel of ink), `fringe` = the
-/// 40..=215 mid-greys a smeared stem is made of, `mass` = total coverage,
-/// which grid fitting redistributes but must not manufacture.
 fn histogram(cov: &[u8]) -> (usize, usize, usize, u64) {
     let mut solid = 0;
     let mut fringe = 0;
@@ -75,7 +64,6 @@ fn histogram(cov: &[u8]) -> (usize, usize, usize, u64) {
     (solid, fringe, inked, mass)
 }
 
-/// The coverage mask the renderer would blit for `ch` at the current mode.
 fn coverage(r: &mut Renderer, ch: char, style: StyleBits) -> Vec<u8> {
     let key = r.glyph_key_styled(ch, style);
     match r.glyph_image(key) {
@@ -84,17 +72,12 @@ fn coverage(r: &mut Renderer, ch: char, style: StyleBits) -> Vec<u8> {
     }
 }
 
-/// Build a renderer on the variable system face at `px`, in `mode`.
 fn renderer(bytes: &[u8], px: f32, mode: &str) -> Renderer {
     let mut r = Renderer::from_bytes(bytes, px, Theme::default()).expect("system face parses");
     r.set_font_hinting(mode);
     r
 }
 
-/// The headline: on Windows 11's VARIABLE Cascadia Mono (what
-/// `font_family = "Cascadia Mono"` names), at the desktop 12px, grid fitting
-/// concentrates the stem — more whole-ink texels, fewer
-/// mid-grey ones — instead of the raw outline fill.
 #[test]
 fn variable_primary_is_grid_fitted_at_12px() {
     let (path, bytes) = variable_system_face();
@@ -112,8 +95,6 @@ fn variable_primary_is_grid_fitted_at_12px() {
             "{path} @{px}px: grid fitting must raise whole-ink texels \
              (off {s_off} -> full {s_full})"
         );
-        // Smooth hinting snaps stem edges while preserving fractional stem
-        // width: fringe texels must decrease at 12px and never increase.
         if px == 12.0 {
             assert!(
                 f_full < f_off,
@@ -127,8 +108,6 @@ fn variable_primary_is_grid_fitted_at_12px() {
                  (off {f_off} -> full {f_full})"
             );
         }
-        // Ink is REDISTRIBUTED, not invented: a "crisper" raster that simply
-        // painted more would be a weight change wearing crispness' clothes.
         let ratio = m_full as f64 / m_off.max(1) as f64;
         assert!(
             (0.75..=1.25).contains(&ratio),
@@ -137,21 +116,16 @@ fn variable_primary_is_grid_fitted_at_12px() {
     }
 }
 
-/// Verify `hinted_glyph` grid-fits the bold `fvar` instance (`wght` ≈ 700)
-/// rather than the default weight, preserving the bold-to-regular ink ratio.
 #[test]
 fn bold_stays_bold_when_grid_fitted() {
     let (path, bytes) = variable_system_face();
     let px = 12.0f32;
     let mut off = renderer(&bytes, px, "off");
     let mut full = renderer(&bytes, px, "full");
-    // 'M' has two diagonals plus two stems: the most weight-sensitive ASCII
-    // glyph, and one every mono face draws.
     let (.., m_reg_off) = histogram(&coverage(&mut off, 'M', StyleBits::REGULAR));
     let (.., m_bold_off) = histogram(&coverage(&mut off, 'M', StyleBits::BOLD));
     let (.., m_reg_full) = histogram(&coverage(&mut full, 'M', StyleBits::REGULAR));
     let (.., m_bold_full) = histogram(&coverage(&mut full, 'M', StyleBits::BOLD));
-    // Precondition: this face really does have a heavier bold cut to lose.
     assert!(
         m_bold_off > m_reg_off,
         "{path}: fixture precondition — the unhinted bold must out-ink regular \
@@ -165,7 +139,6 @@ fn bold_stays_bold_when_grid_fitted() {
          instance to the fvar default (bold/regular ink ratio {gain_off:.3} unhinted \
          vs {gain_full:.3} hinted)"
     );
-    // And it is genuinely grid-fitted, not merely unchanged.
     assert_ne!(
         coverage(&mut off, 'M', StyleBits::BOLD),
         coverage(&mut full, 'M', StyleBits::BOLD),
@@ -173,10 +146,6 @@ fn bold_stays_bold_when_grid_fitted() {
     );
 }
 
-/// Grid fitting is a COVERAGE change only: the cell box the grid is laid out
-/// on must be identical in every mode, at every size. (The advance the hinted
-/// path reports is the linear `hmtx` value by construction — see
-/// `hinted::hinted_glyph_raster` — and this is the renderer-level twin.)
 #[test]
 fn grid_geometry_is_mode_invariant() {
     let (path, bytes) = variable_system_face();

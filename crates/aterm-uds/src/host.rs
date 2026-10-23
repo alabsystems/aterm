@@ -84,7 +84,8 @@ pub fn open_file_room(want: u64) -> std::io::Result<OpenFileRoom> {
                 rlim_cur: soft,
                 rlim_max: hard,
             };
-            // SAFETY: A valid resource and initialized storage.
+            // SAFETY: a valid resource and initialized storage; only the
+            // soft value changes, within the observed hard ceiling.
             if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }

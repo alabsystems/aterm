@@ -7,7 +7,6 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{DamageOutcome, RenderInput};
 
-/// A selection with anchors `(r0,c0)`..`(r1,c1)`, completed or not.
 fn selection(
     r0: u16,
     c0: u16,
@@ -29,8 +28,6 @@ fn selection(
     sel
 }
 
-/// No selection folds to 0; any change of a pane's selection, its state, or which pane holds it
-/// changes the fold.
 #[test]
 fn the_pane_selection_fold_changes_with_any_panes_selection() {
     let none = aterm_core::selection::TextSelection::default();
@@ -80,8 +77,6 @@ pub(super) fn frame_key(
         grid_top: 0,
         blink_phase,
         invert,
-        // Unit frames are single-pane with no host-driven chrome or animation: every visual
-        // fingerprint is its idle 0/false sentinel.
         drag_hover: false,
         cursor_override,
         cursor_row: term.cursor().row as usize,
@@ -116,8 +111,6 @@ pub(super) fn frame_key(
     }
 }
 
-/// `selection_inactive` is host state: a focus flip invalidates both the repaint gate and the
-/// raster cache, an explicit inactive background appears unfocused, and focus restores it.
 #[test]
 fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
     const INACTIVE_BG: u32 = 0x0001_7AC4;
@@ -235,7 +228,6 @@ fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
     );
 }
 
-/// Drives the `AsymmetricPadLayout` cache actions against the real `RepaintKey` comparison.
 #[test]
 fn the_real_asymmetric_pad_layout_conforms() {
     crate::conformance_support::on_conformance_stack(
@@ -266,8 +258,6 @@ fn run_asymmetric_pad_layout_conformance() {
     let mut cached = frame_key(&mut term, true, false, None);
     cached.grid_top = initial["grid_top"] as usize;
 
-    // `PrimeLayoutCache` primes the real seam, `WindowState::stamp_present_decision`, not a
-    // hand-built key; the stored key projects onto the model's `cached_grid_top`.
     let mut app = App::headless_for_test();
     app.backend.set_pad(picked["pad"] as usize);
     app.backend.set_head(picked["head"] as usize);
@@ -295,7 +285,6 @@ fn run_asymmetric_pad_layout_conformance() {
         "identical layout may reuse the GUI present cache"
     );
 
-    // Only the effective grid origin changes.
     let mut current = cached;
     current.grid_top = changed["grid_top"] as usize;
     assert_ne!(current.grid_top, cached.grid_top);
@@ -303,8 +292,6 @@ fn run_asymmetric_pad_layout_conformance() {
     assert_eq!(usize::from(!repaint), decided["cache_hit"] as usize);
     assert_eq!(usize::from(repaint), decided["full_repaint"] as usize);
 
-    // Negative control: without the `grid_top` term the gate falsely hits, which
-    // `LayoutChangeForcesFullRepaint` rejects.
     let mut mutant_without_grid_top = current;
     mutant_without_grid_top.grid_top = cached.grid_top;
     assert!(!should_repaint(Some(cached), mutant_without_grid_top));
@@ -314,8 +301,6 @@ fn run_asymmetric_pad_layout_conformance() {
     );
 }
 
-/// A dropped present (CPU softbuffer acquire/commit error, GPU drawable drop) unstamps its key
-/// so the identical frame repaints on the next redraw; a retained stamp wedges a black window.
 #[test]
 fn dropped_surface_attempt_unstamps_same_key_for_retry() {
     let mut term = Terminal::new(2, 8);
@@ -344,14 +329,10 @@ fn dropped_surface_attempt_unstamps_same_key_for_retry() {
     );
 }
 
-/// A bare caret move changes the `RepaintKey`, so the redraw after a torn caret cannot
-/// early-out. (The other half: `Wake::Output` clears its latch before its work, so a chunk
-/// landing mid-redraw re-arms.)
 #[test]
 fn a_bare_caret_move_moves_the_repaint_key() {
     let mut term = Terminal::new(4, 10);
     let settled = frame_key(&mut term, true, false, None);
-    // CUP: move the caret, write nothing.
     term.process(b"\x1b[3;7H");
     let moved = frame_key(&mut term, true, false, None);
     assert_eq!(
@@ -364,14 +345,10 @@ fn a_bare_caret_move_moves_the_repaint_key() {
     );
 }
 
-/// At the split compose call site, an identical key composes again while a recovery redraw is
-/// outstanding.
 #[test]
 fn split_compose_recovery_bypasses_identical_key_at_shipping_callsite() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // Split through the App so `tab_set` (which `redraw_compose` plans from) and
-    // `ws.layouts` agree.
     app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Vertical);
     let (rows, cols) = {
         let ws = app.windows.get(&wid).expect("fixture window");
@@ -409,8 +386,6 @@ fn split_compose_recovery_bypasses_identical_key_at_shipping_callsite() {
     );
 }
 
-/// A zoomed split has one visible pane, so its live implicit background (OSC 11/DECSCNM)
-/// feeds both the presented frame (padding included) and the `image` capture.
 #[test]
 fn zoomed_split_live_and_capture_use_the_visible_panes_effective_background() {
     let mut app = App::headless_for_test();
@@ -477,14 +452,11 @@ fn zoomed_split_live_and_capture_use_the_visible_panes_effective_background() {
     );
 }
 
-/// With no terminal mutation and unchanged visual state since the last present, the next
-/// redraw skips.
 #[test]
 fn steady_screen_skips_rerasterize_after_present() {
     let mut term = Terminal::new(4, 10);
     term.process(b"steady");
 
-    // Present: record the key and consume the damage, as `redraw()` does.
     let k1 = frame_key(&mut term, true, false, None);
     assert!(should_repaint(None, k1), "first present");
     term.take_damage();
@@ -497,9 +469,6 @@ fn steady_screen_skips_rerasterize_after_present() {
     );
 }
 
-/// An OS appearance flip under a plain theme moves only `system_dark` (via the real
-/// `sync_app_theme_to_appearance` and `repaint_system_dark`), which must defeat the early-out.
-/// The all-window nudge: `app_colorscheme::tests::appearance_flip_nudges_every_window`.
 #[test]
 fn os_appearance_flip_repaints() {
     let mut term = Terminal::new(4, 10);
@@ -524,7 +493,6 @@ fn os_appearance_flip_repaints() {
     );
 }
 
-/// A selection change marks no grid damage, so only the key's selection fingerprint carries it.
 #[test]
 fn a_selection_change_still_repaints() {
     let mut term = Terminal::new(4, 10);
@@ -546,13 +514,6 @@ fn a_selection_change_still_repaints() {
     );
 }
 
-/// A QUESTION ALONE REACHES THE GLASS: the multi-line paste confirmation and
-/// the close/quit confirm paint whole rows over the grid and dirty no engine
-/// cell, so the repaint key carries each (`RepaintKey::question`). Posting,
-/// answering and replacing one with nothing else moving each present a
-/// frame; a repeat with nothing changed is still proved unchanged (the
-/// control that the gate is not simply open). Before the term, the frames
-/// after posting and answering were proved unchanged (commits stayed at 1).
 #[test]
 fn a_question_posted_or_answered_alone_reaches_the_glass() {
     use super::scripted_redraw_fixture::{scripted_app, surface};
@@ -594,13 +555,6 @@ fn a_question_posted_or_answered_alone_reaches_the_glass() {
     presents(&mut app, "and its answer takes it away", 1);
 }
 
-/// The split twin of [`a_question_posted_or_answered_alone_reaches_the_glass`]:
-/// a composed window keys its own repaint gate (`redraw_compose`), and the
-/// question term must be in that key too.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping `question` from the composed key proves the frames after
-/// posting and answering unchanged and fails this test.
 #[test]
 fn a_question_alone_reaches_a_split_windows_glass() {
     use super::scripted_redraw_fixture::{scripted_app, surface};
@@ -608,7 +562,6 @@ fn a_question_alone_reaches_a_split_windows_glass() {
     let mut app = scripted_app();
     app.split_active_stub_tab(wid);
     assert!(app.windows[&wid].is_split(), "the window composes");
-    // A fresh split presents twice before its key settles.
     app.redraw_window(wid);
     app.redraw_window(wid);
     let presents = |app: &mut App, what: &str, expect: usize| {

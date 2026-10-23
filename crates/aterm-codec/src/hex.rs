@@ -2,17 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Hexadecimal encode and decode shared by the workspace.
-//!
-//! Encoding writes two digits per byte, high nibble first, lowercase unless the
-//! name says `upper`; decoding accepts either case. No `fmt` machinery: each
-//! function uses shapes the Trust verifier discharges locally.
-//!
-//! `aterm_uds::rand::hex_encode` is a separate copy because `aterm-uds` has no
-//! dependencies. A few Trust-verified crates keep local copies for their own
-//! proofs and say so.
 
-/// Lowercase hex digit for a nibble (the low four bits of `n`; every caller
-/// passes a value already `<= 15`).
+/// Lowercase hex digit for the low four bits of `n`.
 #[inline]
 pub(crate) const fn digit_lower(n: u8) -> char {
     match n & 0x0f {
@@ -58,12 +49,10 @@ const fn digit_upper(n: u8) -> char {
     }
 }
 
-/// Append the lowercase hex of `bytes` to `out`, equal to `{b:02x}` per byte
-/// without `core::fmt` (hot in the styled-screen frame).
+/// Append the lowercase hex of `bytes` to `out`.
 #[inline]
 pub fn push_lower(out: &mut String, bytes: &[u8]) {
     for &b in bytes {
-        // div/rem of a byte value: both nibbles are <= 15.
         out.push(digit_lower(b / 16));
         out.push(digit_lower(b % 16));
     }
@@ -73,7 +62,6 @@ pub fn push_lower(out: &mut String, bytes: &[u8]) {
 #[must_use]
 #[inline]
 pub fn encode_lower(bytes: &[u8]) -> String {
-    // The capacity is a hint only; `saturating_mul` keeps it overflow-free.
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     push_lower(&mut out, bytes);
     out
@@ -91,8 +79,7 @@ pub fn encode_upper(bytes: &[u8]) -> String {
     out
 }
 
-/// The value (`0..=15`) of one ASCII hex digit of either case, or `None`. Same
-/// as `char::to_digit(16)`, with provably underflow-free arithmetic.
+/// The value (`0..=15`) of one ASCII hex digit of either case, or `None`.
 #[must_use]
 #[inline]
 pub const fn nibble(c: u8) -> Option<u8> {
@@ -108,22 +95,15 @@ pub const fn nibble(c: u8) -> Option<u8> {
 #[inline]
 const fn byte(hi: u8, lo: u8) -> Option<u8> {
     match (nibble(hi), nibble(lo)) {
-        // Masks are no-ops; shift-or equals `* 16 +` without an overflow
-        // obligation.
         (Some(hi), Some(lo)) => Some(((hi & 0x0f) << 4) | (lo & 0x0f)),
         _ => None,
     }
 }
 
-/// Decode exactly `2 * out.len()` hex digits of either case into `out`.
-///
-/// `false` for any other length or any non-hex digit; `out` may then hold a
-/// partial decode, so a caller discards it.
+/// Decode `2 * out.len()` hex digits of either case into `out`, returning `false` on mismatch.
 #[must_use]
 #[inline]
 pub fn decode_into(text: &[u8], out: &mut [u8]) -> bool {
-    // `out.len() * 2` written overflow-free: a real slice can never be long
-    // enough to overflow, so `checked_mul` is behavior-identical.
     if Some(text.len()) != out.len().checked_mul(2) {
         return false;
     }
@@ -136,8 +116,7 @@ pub fn decode_into(text: &[u8], out: &mut [u8]) -> bool {
     true
 }
 
-/// Decode an even number of hex digits of either case: `None` for an odd
-/// length or a non-hex digit, `Some(empty)` for empty input.
+/// Decode an even number of hex digits of either case.
 #[must_use]
 #[inline]
 pub fn decode_vec(text: &[u8]) -> Option<Vec<u8>> {
@@ -187,7 +166,6 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
-    /// Every byte and every digit against the std spellings.
     #[test]
     fn every_byte_and_digit_matches_std() {
         let all: Vec<u8> = (0..=255).collect();
@@ -227,7 +205,6 @@ mod tests {
         assert_eq!(decode_vec(b""), Some(Vec::new()));
         assert_eq!(decode_vec(b"5"), None);
         assert_eq!(decode_vec(b"5G"), None);
-        // `u8::from_str_radix` takes a sign; hex does not.
         assert_eq!(decode_vec(b"+a"), None);
         assert_eq!(decode_vec(b"544E"), Some(b"TN".to_vec()));
 

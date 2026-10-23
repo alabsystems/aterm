@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release-credentials profile (`--release-credentials`) and its resolution, its
-//! permission refusals against real files, and the notarization preflights (no ad-hoc,
-//! Developer ID authority, hardened runtime on a .app) against captured
-//! `codesign -dv --verbose=2` output.
+//! Tests for the release-credentials profile and notarization preflights.
 
 use crate::sign;
 
-// --- conf parsing ------------------------------------------------------------
-
 #[test]
 fn a_profile_yields_the_derived_public_identity() {
-    // The profile carries only the private key; the public identity is derived from it.
     let dir = tempdir("creds-ok");
     let (pkcs8, pubkey) = keypair_b64();
     let path = write_profile(&dir, &format!("signing_key = \"{pkcs8}\"\n"), 0o600);
-    let creds = sign::ReleaseCredentials::load(&path).expect("a 0600 profile loads");
+    let creds = sign::ReleaseCredentials::load(&path, None).expect("a 0600 profile loads");
     assert_eq!(creds.pubkey(), pubkey, "identity is derived from the key");
     let sig = creds.sign(b"manifest bytes").expect("signs in-process");
     assert_eq!(sig.len(), 64, "a detached Ed25519 signature is 64 bytes");
@@ -28,7 +22,7 @@ fn a_group_or_other_readable_profile_is_refused() {
     let dir = tempdir("creds-0644");
     let (pkcs8, _) = keypair_b64();
     let path = write_profile(&dir, &format!("signing_key = \"{pkcs8}\"\n"), 0o644);
-    let err = sign::ReleaseCredentials::load(&path).expect_err("0644 must be refused");
+    let err = sign::ReleaseCredentials::load(&path, None).expect_err("0644 must be refused");
     assert!(err.contains("group/other-accessible"), "{err}");
     assert!(
         err.contains("private key"),
@@ -39,21 +33,19 @@ fn a_group_or_other_readable_profile_is_refused() {
 
 #[test]
 fn a_missing_profile_is_a_hard_error_not_a_silent_none() {
-    // A named path that does not exist is a mistake, never "unsigned is fine".
-    let err = sign::ReleaseCredentials::load(std::path::Path::new(
-        "/nonexistent/aterm-release-credentials.toml",
-    ))
+    let err = sign::ReleaseCredentials::load(
+        std::path::Path::new("/nonexistent/aterm-release-credentials.toml"),
+        None,
+    )
     .expect_err("a named-but-missing profile must not read as unsigned");
     assert!(err.contains("read"), "{err}");
 }
 
 #[test]
 fn a_raw_binary_key_is_refused_by_name() {
-    // atpkg-keys writes binary PKCS#8, which TOML cannot carry: the refusal names the
-    // encoding instead of surfacing as a parse error.
     let dir = tempdir("creds-raw");
     let path = write_profile(&dir, "signing_key = \"not base64 at all!!\"\n", 0o600);
-    let err = sign::ReleaseCredentials::load(&path).expect_err("raw bytes must be refused");
+    let err = sign::ReleaseCredentials::load(&path, None).expect_err("raw bytes must be refused");
     assert!(
         err.contains("base64"),
         "the refusal must name the encoding: {err}"
@@ -65,7 +57,7 @@ fn a_raw_binary_key_is_refused_by_name() {
 fn a_profile_without_a_signing_key_is_refused() {
     let dir = tempdir("creds-empty");
     let path = write_profile(&dir, "# nothing here\n", 0o600);
-    let err = sign::ReleaseCredentials::load(&path).expect_err("no key must be refused");
+    let err = sign::ReleaseCredentials::load(&path, None).expect_err("no key must be refused");
     assert!(err.contains("signing_key"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -75,7 +67,7 @@ fn the_private_key_never_reaches_a_debug_line() {
     let dir = tempdir("creds-debug");
     let (pkcs8, pubkey) = keypair_b64();
     let path = write_profile(&dir, &format!("signing_key = \"{pkcs8}\"\n"), 0o600);
-    let creds = sign::ReleaseCredentials::load(&path).unwrap();
+    let creds = sign::ReleaseCredentials::load(&path, None).unwrap();
     let rendered = format!("{creds:?}");
     assert!(
         rendered.contains(&pubkey),
@@ -89,10 +81,6 @@ fn the_private_key_never_reaches_a_debug_line() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---- helpers -------------------------------------------------------------
-
-/// A fresh scratch dir, emptied first: the name repeats with the pid, and a stale
-/// `.aterm/machine.key` would make the unprovisioned case resolve credentials.
 fn tempdir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("aterm-signconf-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -108,7 +96,6 @@ fn write_profile(dir: &std::path::Path, body: &str, mode: u32) -> std::path::Pat
     path
 }
 
-/// A fresh Ed25519 keypair as (base64 PKCS#8, base64 public key).
 fn keypair_b64() -> (String, String) {
     use ring::signature::KeyPair as _;
     let rng = ring::rand::SystemRandom::new();
@@ -127,7 +114,6 @@ const ADHOC_INFO: &str = "Executable=/tmp/dist/aterm.app/Contents/MacOS/aterm\n\
      Signature=adhoc\n\
      Info.plist entries=15\n";
 
-/// Developer-ID signed with the hardened runtime (notarizable).
 const DEVID_RUNTIME_INFO: &str = "Executable=/tmp/dist/aterm.app/Contents/MacOS/aterm\n\
      Identifier=com.aterm.aterm\n\
      CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=38+7 location=embedded\n\
@@ -137,7 +123,6 @@ const DEVID_RUNTIME_INFO: &str = "Executable=/tmp/dist/aterm.app/Contents/MacOS/
      Authority=Apple Root CA\n\
      Timestamp=6 Jul 2026 at 12:00:00\n";
 
-/// Developer-ID signed without the hardened runtime (Apple rejects it).
 const DEVID_NO_RUNTIME_INFO: &str = "Executable=/tmp/dist/aterm.app/Contents/MacOS/aterm\n\
      Identifier=com.aterm.aterm\n\
      CodeDirectory v=20400 size=1234 flags=0x0(none) hashes=38+7 location=embedded\n\
@@ -156,17 +141,14 @@ fn preflight_rejects_adhoc_signature() {
 
 #[test]
 fn preflight_rejects_missing_devid_authority() {
-    // Unsigned / non-Dev-ID output has no Authority line at all.
     let err = sign::devid_preflight("code object is not signed at all\n", false).unwrap_err();
     assert!(err.contains("not Developer-ID signed"), "{err}");
 }
 
 #[test]
 fn preflight_requires_hardened_runtime_for_an_app() {
-    // A .app without "(runtime)" in the CodeDirectory flags is refused before notarizing.
     let err = sign::devid_preflight(DEVID_NO_RUNTIME_INFO, true).unwrap_err();
     assert!(err.contains("hardened runtime"), "{err}");
-    // The same signature on a DMG passes: the runtime flag is an app property.
     sign::devid_preflight(DEVID_NO_RUNTIME_INFO, false).expect("dmg without runtime flag is ok");
 }
 
@@ -176,21 +158,15 @@ fn preflight_accepts_a_notarizable_devid_app() {
     sign::devid_preflight(DEVID_RUNTIME_INFO, false).expect("devid dmg");
 }
 
-// --- resolution: flag, then machine state, then none -------------------------
-
-/// Drives `resolve_with` (the injected-home seam) on scratch dirs, so this machine's real
-/// provisioning never leaks in.
 #[test]
 fn resolution_prefers_the_flag_then_machine_state_then_none() {
     use std::os::unix::fs::PermissionsExt as _;
     let home = tempdir("resolve-home");
     let repo = tempdir("resolve-repo");
-    // Nothing provisioned: None, not an error (the ordinary unsigned cut).
     let none = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
         .expect("an unprovisioned machine resolves clean");
     assert!(none.is_none(), "no flag + no machine key = no credentials");
 
-    // Provisioned: the machine key is picked up, identity derived from the raw PKCS#8 bytes.
     let aterm = home.join(".aterm");
     std::fs::create_dir_all(&aterm).unwrap();
     let rng = ring::rand::SystemRandom::new();
@@ -216,7 +192,6 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
         "no staged roster in the repo means none is claimed"
     );
 
-    // A staged roster in the repo becomes the default roster path.
     std::fs::create_dir_all(repo.join("dist")).unwrap();
     std::fs::write(repo.join("dist/aterm-machines.toml"), "x").unwrap();
     let with_roster = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
@@ -228,7 +203,6 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
         "the staged roster is the default — the same one the atpkg tools ship"
     );
 
-    // The flag wins over machine state.
     let (pkcs8_b64, flag_pub) = keypair_b64();
     let profile = write_profile(&home, &format!("signing_key = \"{pkcs8_b64}\"\n"), 0o600);
     let flagged = sign::ReleaseCredentials::resolve_with(Some(&profile), &repo, home.to_str())
@@ -243,8 +217,6 @@ fn resolution_prefers_the_flag_then_machine_state_then_none() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// A machine key that exists but is group/other-readable is an error naming the file, never a
-/// fall-through to an unsigned cut.
 #[test]
 fn a_present_but_unsafe_machine_key_is_an_error_not_a_fallthrough() {
     use std::os::unix::fs::PermissionsExt as _;

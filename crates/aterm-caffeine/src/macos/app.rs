@@ -405,7 +405,7 @@ aterm_objc::declare_class! {
                 return Bool::YES;
             }
             cancel_performs_of(self.as_id(), sel!(openMenu:));
-            // SAFETY: as `schedule_stop`.
+            // SAFETY: as `schedule_stop`; `openMenu:` is a method the target declares.
             unsafe {
                 send_v_sel_id_f64(
                     self.as_id(),
@@ -432,7 +432,7 @@ aterm_objc::declare_class! {
             if sender.is_null() || MainThread::new().is_none() {
                 return;
             }
-            // SAFETY: `sender` is the live NSMenuItem AppKit passed.
+            // SAFETY: `sender` is the live NSMenuItem AppKit passed; `-tag` is `q16@0:8`.
             let tag = unsafe { send_isize(sender, sel!(tag)) };
             let Some(action) = MenuAction::from_tag(tag) else {
                 return;
@@ -582,7 +582,8 @@ fn quit_by_sigterm(sender: libc::pid_t) {
 
 /// The running application, which [`run`] made before any of this can be sent.
 fn shared_app() -> Id {
-    // SAFETY: `+sharedApplication` is `@16@0:8`.
+    // SAFETY: `+sharedApplication` is `@16@0:8`; every caller is on the main thread, and the app
+    // it answers (+0) lives as long as the process.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }
 
@@ -592,7 +593,9 @@ fn current_event() -> Option<EventKey> {
     if app.is_null() {
         return None;
     }
-    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or nil.
+    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or
+    // nil; on that event `-type` and `-modifierFlags` are both `Q16@0:8` and `-timestamp`
+    // `d16@0:8`, read only.
     unsafe {
         let event = send_id(app, sel!(currentEvent));
         (!event.is_null()).then(|| EventKey {
@@ -611,6 +614,9 @@ type AttributeFn = unsafe extern "C-unwind" fn(Id, Sel, u32) -> Id;
 /// names a logout, a restart or a shutdown in its `keyAEQuitReason` ([`SYSTEM_REASONS`]).
 fn terminate_is_the_systems() -> bool {
     // SAFETY: main-thread Foundation sends, inside `applicationShouldTerminate:`.
+    // `+sharedAppleEventManager` and `-currentAppleEvent` are `@16@0:8` and answer borrowed
+    // objects (the event nil outside one); `AttributeFn`'s prototype answers a borrowed
+    // descriptor or nil; `-enumCodeValue` is `I16@0:8`, an `OSType`.
     let reason = autoreleasepool(|_| unsafe {
         let manager = send_id(
             class(c"NSAppleEventManager").as_id(),
@@ -649,7 +655,9 @@ type PerformInModesFn = unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id);
 fn common_modes() -> Option<Obj> {
     let mode = aterm_objc::ns_string(COMMON_MODES)?;
     let modes = [mode.id()];
-    // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`.
+    // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`; it reads `count` live,
+    // non-nil objects (the string, alive for the call) and answers the array at +0, which
+    // `Obj::retain` retains for the caller.
     unsafe {
         Obj::retain(send_id_idptr_usize(
             class(c"NSArray").as_id(),
@@ -669,7 +677,10 @@ fn arm_tick(target: Id, secs: u64) {
     autoreleasepool(|_| {
         let modes = common_modes();
         cancel_performs_of(target, sel!(tick:));
-        // SAFETY: main-thread sends on the live target.
+        // SAFETY: main-thread sends on the live target. The perform is `PerformInModesFn`'s
+        // prototype, its modes array live across the send (the perform keeps its own copy), or
+        // `-performSelector:withObject:afterDelay:`, `v40@0:8:16@24d32`; `tick:` is a method
+        // the target declares.
         unsafe {
             if let Some(modes) = &modes {
                 let perform: PerformInModesFn = aterm_objc::checked_msg();
@@ -697,7 +708,7 @@ fn arm_tick(target: Id, secs: u64) {
 /// Drop the delayed performs of `selector` (with a nil object) `target` has queued, in any mode;
 /// the others stay (a scheduled `stopRun:` too).
 fn cancel_performs_of(target: Id, selector: Sel) {
-    // SAFETY: a main-thread class send.
+    // SAFETY: a main-thread class send; `CancelFn`'s prototype, its target live.
     unsafe {
         let cancel: CancelFn = aterm_objc::checked_msg();
         cancel(
@@ -712,7 +723,7 @@ fn cancel_performs_of(target: Id, selector: Sel) {
 
 /// Send `target` `stopRun:` from the main run loop as soon as it next runs its default mode.
 fn schedule_stop(target: Id) {
-    // SAFETY: as `arm_tick`.
+    // SAFETY: as `arm_tick`; `stopRun:` is a method the target declares.
     unsafe {
         send_v_sel_id_f64(
             target,
@@ -744,7 +755,11 @@ fn stop_app() {
     if app.is_null() {
         return;
     }
-    // SAFETY: main-thread sends on the live app.
+    // SAFETY: main-thread sends on the live app. `-stop:` is `v24@0:8@16` (the nil sender);
+    // `+otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:
+    // data1:data2:` is `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q76q84`, the helper's
+    // prototype, answering the event at +0, retained across `-postEvent:atStart:`
+    // (`v28@0:8@16B24`).
     unsafe {
         send_v_id(app, sel!(stop:), Id::NIL);
         let raw = send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
@@ -788,7 +803,8 @@ fn observe_wake(target: Id) -> bool {
     if center.is_null() {
         return false;
     }
-    // SAFETY: `-addObserver:selector:name:object:` is `v48@0:8@16:24@32@40`.
+    // SAFETY: `-addObserver:selector:name:object:` is `v48@0:8@16:24@32@40`; the selector
+    // is one the target declares; a nil object is "from any sender".
     unsafe {
         send_v_id_sel_id_id(
             center,
@@ -891,6 +907,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     };
     let changed = {
         let target = target.clone_retained();
+        // SAFETY (in the hook): `stateChanged:` is `v@:@` on the live target it retains.
         ChangedObserver::register(move || unsafe {
             send_v_id(target.as_id(), sel!(stateChanged:), Id::NIL);
         })
@@ -924,7 +941,8 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     };
     let woke = observe_wake(target.as_id());
     arm_tick(target.as_id(), first_tick);
-    // SAFETY: `-setDelegate:` is `v24@0:8@16`.
+    // SAFETY: `-setDelegate:` is `v24@0:8@16`; the app holds its delegate unretained, and the
+    // target outlives `-run`, after which it is taken back.
     unsafe { send_v_id(app, sel!(setDelegate:), target.as_id()) };
     SIGTERMED.set(Some(target.clone_retained()));
     let sigterm = term::watch(quit_by_sigterm);
@@ -1513,7 +1531,8 @@ mod tests {
         let cls = CaffeineTarget::class();
         assert!(!cls.is_null());
         assert_eq!(class(c"ATermCaffeineTarget"), cls);
-        // SAFETY: `cls` is the class this module registered.
+        // SAFETY: `cls` is the class this module registered: it and its superclass are live,
+        // immortal class objects; the queries are side-effect free.
         unsafe {
             assert_eq!(class_name(cls), c"ATermCaffeineTarget");
             assert_eq!(class_name(aterm_objc::superclass_of(cls)), c"NSObject");
@@ -1696,7 +1715,8 @@ mod tests {
         for (name, sel, class_method, want) in rows {
             let cls = class(name);
             assert!(!cls.is_null(), "{name:?}");
-            // SAFETY: `cls` is a live, registered class, and so is its metaclass.
+            // SAFETY: `cls` is a live, registered class, and so is its metaclass; reading a
+            // method's encoding has no side effects.
             let got = unsafe {
                 let cls = if *class_method {
                     aterm_objc::class_of(cls.as_id())

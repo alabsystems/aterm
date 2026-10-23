@@ -1,35 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A TURN'S SUBMIT INTO CLAUDE CODE, VERIFIED BY ITS COMPOSER, through the one
-//! `aterm` binary against a real `aterm --headless` (P2 of the rl review;
-//! `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.4). Claude Code
-//! 2.1.301 animates its logo's colours at an idle prompt, so a content
-//! advance after the Enter — AUTO's `seq` verify at a program's prompt — is
-//! no proof the line landed. On a session the server reads as Claude Code,
-//! whose composer shows the typed line, the submit is verified by the line
-//! LEAVING the composer.
-//!
-//! A STAND-IN (a POSIX `sh` script run as `claude` with `exec -a`) draws a
-//! Claude Code prompt — the logo row, the composer between its two rules, the
-//! mode row — recolours the logo every 0.1 s, and echoes what it is typed into
-//! its composer. One that IGNORES the Enter keeps the line there, and the
-//! manager's follow-up (`turn typed=1 settle=submitted`) answers
-//! `submitted=0`; one that TAKES it moves the line above and empties its
-//! composer, and answers `submitted=1` — each the negative control of the
-//! other. NEGATIVE CONTROL of the verify itself: the ignoring script run as
-//! plain `sh` is no agent, keeps AUTO's `seq`, and the animation alone answers
-//! `submitted=1` with the line still in its composer: the false proof the
-//! composer verify closes.
-//!
-//! Every wait for something that must happen is a one-minute hang detector;
-//! the one short `submit_window=` is the window under test, whose close is the
-//! answer, never a latency budget.
-//!
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs`
-//! (scratch HOME and XDG roots, a private control socket, `[harness] enabled =
-//! false`, so nothing but the test types into the stand-ins); a refused boot
-//! is COULD NOT RUN (`boot_with`), never a pass.
+//! Verifies that turn submission into Claude Code settles only when the typed line leaves the
+//! composer.
 
 #![cfg(unix)]
 
@@ -39,16 +12,9 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_line};
 
-/// A wait for something that MUST happen (AGENTS.md: a hang detector).
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
 
-/// The stand-in: `$1` is `takes` or `ignores`. Raw mode first, so a line typed
-/// once the composer is drawn reaches the loop byte for byte. One read may hold
-/// the line's last letters and the Enter together (a loaded host), so the
-/// Enter's branch draws the whole draft too: one that ignores it keeps showing
-/// what it was typed, as Claude Code's composer does (it drew `❯ carry o` for
-/// good when the `n` came with the Enter).
 const COMPOSER: &str = r#"#!/bin/sh
 mode="$1"
 stty raw -echo 2>/dev/null
@@ -95,7 +61,6 @@ while :; do
 done
 "#;
 
-/// The follow-up the skills teach, the window `window_ms` per press.
 fn follow_up(inst: &Instance, sid: &str, presses: u32, window_ms: u64) -> String {
     let presses = format!("presses={presses}");
     let window = format!("submit_window={window_ms}");
@@ -125,7 +90,6 @@ fn follow_up(inst: &Instance, sid: &str, presses: u32, window_ms: u64) -> String
         .to_string()
 }
 
-/// The sid a `spawn` minted.
 fn spawn(inst: &Instance) -> String {
     let body = ctl_ok(inst, &["spawn"]);
     body.split_whitespace()
@@ -134,9 +98,6 @@ fn spawn(inst: &Instance) -> String {
         .to_string()
 }
 
-/// Start the stand-in in `sid` as `program` (`claude`: `exec -a`; else plain
-/// `sh`) in `mode`, once the shell has drawn its prompt, and return once its
-/// composer is drawn — and, as `claude`, the server reads it as an agent.
 fn start(inst: &Instance, sid: &str, script: &std::path::Path, claude: bool, mode: &str) {
     ctl_ok(
         inst,
@@ -165,7 +126,6 @@ fn start(inst: &Instance, sid: &str, script: &std::path::Path, claude: bool, mod
     }
 }
 
-/// The composer's row (21 of 24), as `text` shows it.
 fn composer(inst: &Instance, sid: &str) -> String {
     let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
     screen
@@ -193,12 +153,7 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
     start(&inst, &takes, &script, true, "takes");
     start(&inst, &plain, &script, false, "ignores");
 
-    // The three follow-ups are three sessions' own turns, asked side by side:
-    // each one's verdict is its session's alone, and the composer's animation
-    // never lets a turn's echo settle, so each runs to the echo's cap (5 s,
-    // the same in every one) before its press.
     std::thread::scope(|scope| {
-        // Claude Code that ignores the Enter: the line stays, nothing verified.
         let ignored = scope.spawn(|| {
             let verdict = follow_up(&inst, &ignores, 1, 2_000);
             assert!(
@@ -209,7 +164,6 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
             assert_eq!(composer(&inst, &ignores), "❯ carry on");
         });
 
-        // Claude Code that takes it: the composer empties, the turn answers.
         let taken = scope.spawn(|| {
             let verdict = follow_up(&inst, &takes, 1, 60_000);
             assert!(
@@ -225,7 +179,6 @@ fn a_follow_up_into_claude_code_is_submitted_only_when_its_composer_takes_it() {
             );
         });
 
-        // NEGATIVE CONTROL: no agent read, AUTO's `seq`: the animation answers.
         let plained = scope.spawn(|| {
             let verdict = follow_up(&inst, &plain, 1, 60_000);
             assert!(

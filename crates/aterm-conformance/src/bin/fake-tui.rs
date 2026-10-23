@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `fake-tui --shape <claude|streamer|cold-streamer|repainter>`: the stand-in
-//! programs the paint and spin scenes run inside a headless aterm. Each writes
-//! one byte choreography a real program writes, and nothing else; Ctrl-C quits
-//! every shape.
-//!
-//! * `claude`: alt screen; every repaint hides the caret inside a DEC-2026
-//!   bracket; a spinner line repaints every 150 ms on its own; each typed key
-//!   rewrites the input row. Typed into, it is the fake-Claude scene; left
-//!   alone, the dark control.
-//! * `streamer`: alt screen; token chunks land at row 1 several times a second
-//!   through ESC 7 / CUP / ESC 8, away from a caret that echoes each key.
-//! * `cold-streamer`: alt screen; an append-shaped stream walks a shown caret
-//!   (desaturated over OSC 12, so the caret itself is not ink) one cell at a
-//!   time, folding and scrolling; the alphabet is nonsense so no word
-//!   decoration fires.
-//! * `repainter`: one second of real writes, then a DEC-2026 bracket around a
-//!   bare cursor position ~6x/s: output that marks no cell, so the session
-//!   stays Running while the grid's movement clock goes stale.
+//! Stand-in TUI binary (`--shape <claude|streamer|cold-streamer|repainter>`) for headless paint and spin scenes.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -44,14 +27,12 @@ mod shapes {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// Write and flush at once: each call is one batch the terminal parses.
     fn w(bytes: &str) {
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(bytes.as_bytes());
         let _ = out.flush();
     }
 
-    /// The terminal in raw mode (no echo, no line discipline) until dropped.
     struct Raw(libc::termios);
 
     impl Raw {
@@ -78,8 +59,6 @@ mod shapes {
         }
     }
 
-    /// Input that arrives within `timeout`, or `None`. End of input reads as an
-    /// empty chunk.
     fn read_within(timeout: Duration) -> Option<Vec<u8>> {
         let mut pfd = libc::pollfd {
             fd: 0,
@@ -98,7 +77,6 @@ mod shapes {
         Some(buf[..usize::try_from(n).unwrap_or(0)].to_vec())
     }
 
-    /// Hide the caret, redraw, show it, all inside one synchronized-output bracket.
     fn bracket(body: &str) {
         w(&format!("\x1b[?2026h\x1b[?25l{body}\x1b[?25h\x1b[?2026l"));
     }
@@ -163,7 +141,6 @@ mod shapes {
     fn streamer() {
         w("\x1b[?1049h\x1b[2J\x1b[H");
         w("streamer-shape: type below; streamer runs above\r\n\r\n> ");
-        // One writer at a time, so a token chunk and an echo never interleave.
         let out = Arc::new(Mutex::new(()));
         let stop = Arc::new(AtomicBool::new(false));
         let tokens = {
@@ -206,12 +183,9 @@ mod shapes {
 
     fn cold_streamer() {
         const TOKENS: &[u8] = b"qxv7 zt4m ph9k rw2n bd6f jg3s lc8v mx5q vk1r nz0w tf2h dp5y ";
-        // Raw only to silence the line discipline's own echo: nothing is typed.
         let raw = Raw::enter();
-        // The caret colour is set before any output, so frame 0 carries it.
         w("\x1b]12;rgb:d0/d0/d0\x07\x1b[?1049h\x1b[2J\x1b[H\x1b[?25h");
         w("cold-streamer :: caret walks, nothing typed");
-        // Start near the bottom, so the folds scroll the alt screen within seconds.
         w("\x1b[18;1H");
         let mut n = 0_usize;
         loop {
@@ -236,8 +210,6 @@ mod shapes {
     }
 
     fn repainter() {
-        // A synchronized-output bracket around a bare cursor position: no cell is
-        // written, erased or scrolled, so no content mark lands.
         const SPLIT: &str = "\x1b[?2026h\x1b[3;20H\x1b[?2026l";
         const WARM_LINES: usize = 10;
         let quit = |timeout: Duration| {

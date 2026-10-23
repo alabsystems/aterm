@@ -953,7 +953,7 @@ fn a_pending_stub_says_whether_a_person_asked() {
     assert_eq!(done.code(), Some(127));
     assert_eq!(bump(), "trust unattended\n", "a script asked");
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-    // SAFETY: `master` and `slave` are fresh descriptors from `open_pty_pair`.
+    // SAFETY: both descriptors were just opened above and are owned by nothing else.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let child = Command::new(fx.layout.bin_dir().join("targo"))
         .arg("--version")

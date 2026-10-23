@@ -62,7 +62,6 @@ impl Row {
         self.flags |= RowFlags::DIRTY;
         self.note_write_through(cols);
         if old_len == 0 || col >= old_len {
-            // Nothing was shifted. A BCE fill's blanks at [col, fill_end) are
             if !fill.is_empty() {
                 self.recalculate_len_up_to(fill_end);
             }
@@ -127,7 +126,6 @@ impl Row {
         self.flags |= RowFlags::DIRTY;
         self.note_write_through(cols);
         if old_len == 0 || col >= old_len {
-            // Nothing was shifted. A BCE fill's blanks at [fill_start, cols)
             if !fill.is_empty() {
                 self.recalculate_len_up_to(cols);
             }
@@ -330,7 +328,6 @@ impl Row {
 
         for c in col..end {
             if !self.is_cell_protected(c as u16) {
-                // A cleared WIDE head takes its continuation with it.
                 if self.cells[c].flags().contains(CellFlags::WIDE) && c + 1 < cols {
                     self.cells[c + 1] = fill;
                 }

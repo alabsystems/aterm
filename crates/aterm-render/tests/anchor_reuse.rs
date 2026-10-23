@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The damage precheck's reuse arms: frames whose absolute anchor (`base_y −
-//! display_offset`) or whose `display_offset` is unchanged take the row-diff path, so
-//! streaming while reading history, or a uniform bottom-pinned flood, gate-hits when
-//! nothing else moved. Each case (selection, cursor, images, reflow, fractional scroll)
-//! is checked byte-for-byte against a fresh full repaint.
+//! Damage precheck reuse arm tests across streaming, flood, selection, reflow, image, and fractional scroll frames.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
@@ -19,8 +15,6 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// Render through the warm damage cache, assert byte-identity against a fresh full
-/// repaint, and return the warm path's damage outcome.
 fn render_both(
     warm: &mut Renderer,
     wc: &mut WindowCpu,
@@ -42,8 +36,6 @@ fn render_both(
     outcome
 }
 
-/// Streaming while scrolled back: the auto-pin advances `display_offset` with `base_y`,
-/// the anchor holds, and the pixel-identical frames gate-hit.
 #[test]
 fn streaming_while_scrolled_gate_hits_on_the_anchor() {
     let mut warm = renderer();
@@ -64,7 +56,6 @@ fn streaming_while_scrolled_gate_hits_on_the_anchor() {
     );
     let offset_before = term.grid().display_offset();
 
-    // Stream whole lines while scrolled: each advances base_y AND the pin.
     for burst in 0..3 {
         term.process(format!("streamed {burst}\r\n").as_bytes());
         assert!(
@@ -87,17 +78,12 @@ fn streaming_while_scrolled_gate_hits_on_the_anchor() {
     }
 }
 
-/// A uniform bottom-pinned flood keeps `display_offset` at 0 while `base_y` advances:
-/// the anchor moves but the offsets are equal and every row is identical, so the frames
-/// gate-hit on the equal-offset arm.
 #[test]
 fn uniform_bottom_flood_gate_hits_on_equal_offsets() {
     let mut warm = renderer();
     let mut wc = WindowCpu::new();
     let (rows, cols) = (6usize, 32usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Identical lines everywhere, so each flood line scrolls in a row that renders
-    // exactly like the one it displaces.
     for _ in 0..30 {
         term.process(b"flood line\r\n");
     }
@@ -107,8 +93,6 @@ fn uniform_bottom_flood_gate_hits_on_equal_offsets() {
     for burst in 0..3i64 {
         term.process(b"flood line\r\n");
         let frame = term.cell_frame(rows, cols);
-        // Precondition: bottom-pinned (both offsets 0) with a moving anchor, so the
-        // equal-anchor arm alone cannot admit these frames.
         assert_eq!(
             frame.display_offset, 0,
             "a bottom-pinned flood never scrolls"
@@ -133,8 +117,6 @@ fn uniform_bottom_flood_gate_hits_on_equal_offsets() {
     }
 }
 
-/// Repin traffic with a live selection and a moving cursor stays byte-identical and off
-/// the full-repaint path.
 #[test]
 fn selection_and_cursor_survive_anchor_reuse() {
     let mut warm = renderer();
@@ -145,7 +127,6 @@ fn selection_and_cursor_survive_anchor_reuse() {
         term.process(format!("selectable {i}\r\n").as_bytes());
     }
     term.scroll_display(10);
-    // Select a word inside the scrolled viewport (live coords).
     {
         use aterm_core::selection::{SelectionSide, SelectionType};
         let sel = term.text_selection_mut();
@@ -179,13 +160,11 @@ fn selection_and_cursor_survive_anchor_reuse() {
         );
     }
 
-    // Cursor churn while scrolled: still never a spurious full repaint.
     term.process(b"\x1b[2;3H");
     let outcome = render_both(&mut warm, &mut wc, &mut term, rows, cols, "cursor move");
     assert_ne!(outcome, DamageOutcome::Full, "cursor move is row damage");
 }
 
-/// A reflow takes the full path (never a stale anchor reuse) and stays byte-exact.
 #[test]
 fn reflow_forces_full_and_stays_byte_exact() {
     let mut warm = renderer();
@@ -206,8 +185,6 @@ fn reflow_forces_full_and_stays_byte_exact() {
     );
 }
 
-/// Images ride `row_differs`: across anchor-equal offset-shifted frames, an image lane
-/// change dirties exactly its row.
 #[test]
 fn image_lane_change_dirties_its_row_under_anchor_shift() {
     let (rows, cols) = (4usize, 8usize);
@@ -218,8 +195,6 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
     term.scroll_display(5);
     let prev = term.cell_frame(rows, cols);
 
-    // Anchor-equal successor: offset +1, base_y +1 (the repin shape), with a
-    // synthetic image cell landing on row 2.
     let mut next = prev.clone();
     next.display_offset += 1;
     next.base_y += 1;
@@ -261,13 +236,10 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
         DirtyDecision::FullRepaint => panic!("anchor-equal frames must not full-repaint"),
         DirtyDecision::Rows(_) => {
             assert!(dirty[2], "the image row repaints");
-            // Row 1 has no content/image/selection change (row 3 is the shown
-            // cursor's row, which the cursor arm always marks).
             assert!(!dirty[1], "unchanged rows stay clean");
         }
     }
 
-    // Negative control: an anchor-UNEQUAL offset shift stays a full repaint.
     let mut skewed = prev.clone();
     skewed.display_offset += 1; // base_y unchanged → anchor moved
     let decision = compute_dirty_rows(
@@ -286,8 +258,6 @@ fn image_lane_change_dirties_its_row_under_anchor_shift() {
     );
 }
 
-/// A frac-carrying repin frame presents byte-identically to a fresh pipeline: the
-/// sub-row translate is a present-time step over the untranslated damage cache.
 #[test]
 fn fractional_present_over_anchor_reuse_is_byte_exact() {
     let mut warm = renderer();

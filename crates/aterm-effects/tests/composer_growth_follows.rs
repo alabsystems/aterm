@@ -562,7 +562,7 @@ impl Host {
     }
 
     /// The whole box repainted with `self.lines`, bottom-anchored, in the
-    /// captured first-wrap shape generalised to `n` text rows (module doc).
+    /// captured first-wrap shape generalised to `n` text rows.
     fn box_bytes(&self) -> Vec<u8> {
         let tr = text_row(self.s);
         let rule_row = tr - self.lines.len();

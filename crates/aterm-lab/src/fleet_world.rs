@@ -275,7 +275,8 @@ impl World {
     /// Starts instance `i` on fleet port `port` and waits until its control socket listens.
     ///
     /// # Errors
-    /// Returns an error if the world cannot be created, the instance fails to start, or its socket does not listen within [`HANG`].
+    /// Its world could not be made, it could not start, it died, or its
+    /// socket did not listen within the hang detector ([`HANG`]).
     pub fn start(&self, i: usize, port: u16) -> Result<Inst, String> {
         let root = self.root_of(i);
         make_world(&root).map_err(|e| format!("m{i:02}: cannot make its world: {e}"))?;

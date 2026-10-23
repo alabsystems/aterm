@@ -711,7 +711,8 @@ fn wait(fds: &[RawFd], timeout: Option<Duration>) -> io::Result<Vec<bool>> {
         libc::c_int::try_from(ms).unwrap_or(libc::c_int::MAX)
     });
     loop {
-        // SAFETY: `polls` is an initialized array of `count` pollfd records alive for the call.
+        // SAFETY: `polls` is an initialized array of `count` pollfd records, alive and
+        // exclusively borrowed for the call.
         let n = unsafe { libc::poll(polls.as_mut_ptr(), count, millis) };
         if n >= 0 {
             return Ok(polls.iter().map(|p| p.revents != 0).collect());

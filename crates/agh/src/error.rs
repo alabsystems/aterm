@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Kinds, sub-kinds, errors, the exit table and the two-line rendering (design §7, §8.5).
+//! Error kinds, sub-kinds, exit table, and two-line diagnostic formatting.
 
 use aterm_json::{Map, Value};
 
@@ -173,8 +173,7 @@ impl Kind {
         }
     }
 
-    /// True for CouldNotRun, Pending, RateLimited, Server and OutcomeUnknown (exits 3, 8, 11,
-    /// 12, 13).
+    /// True for `CouldNotRun`, `Pending`, `RateLimited`, `Server`, and `OutcomeUnknown`.
     #[inline]
     #[must_use]
     pub const fn retriable(self) -> bool {
@@ -240,7 +239,7 @@ pub fn exit_rows() -> Vec<ExitRow> {
     rows
 }
 
-/// Whether a write may have taken effect. Always `None` in M1.
+/// Whether a write may have taken effect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SideEffect {
     /// Nothing was written.
@@ -265,8 +264,7 @@ impl SideEffect {
     }
 }
 
-/// Which permission GitHub refused (a 403 or 451 that is not a rate limit), or a writer agh
-/// will not trust to see drafts. `#[non_exhaustive]`, so M2 adds variants additively.
+/// Permission refusal sub-kind (403/451 or untrusted draft writer).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Forbid {
@@ -375,8 +373,7 @@ impl Replay {
     }
 }
 
-/// The sub-kind: what exactly, within the kind. `#[non_exhaustive]`, so M2 adds variants
-/// additively; a match outside agh carries a `_` arm.
+/// The sub-kind: what exactly, within the kind.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Sub {
@@ -514,17 +511,13 @@ pub struct GithubBody {
     pub accepted_oauth_scopes: Option<String>,
 }
 
-/// The longest `message` kept from GitHub's error body, in characters.
 const MESSAGE_CAP: usize = 500;
-/// The longest permission header value kept, in characters.
 const HEADER_CAP: usize = 200;
 
-/// `text` cut to at most `cap` characters.
 fn cap_chars(text: &str, cap: usize) -> String {
     text.chars().take(cap).collect()
 }
 
-/// Truncates `text` to at most `cap` characters without splitting a non-whitespace run.
 fn cap_whole_runs(text: &str, cap: usize) -> String {
     let Some((end, next)) = text.char_indices().nth(cap) else {
         return text.to_string();
@@ -537,7 +530,6 @@ fn cap_whole_runs(text: &str, cap: usize) -> String {
     kept[..back].to_string()
 }
 
-/// A string field of a JSON object.
 fn string_at(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_string)
 }
@@ -581,8 +573,7 @@ impl GithubBody {
         }
     }
 
-    /// The three permission headers' first values (names ASCII case-insensitive), each capped
-    /// at 200 characters; an absent header leaves its field `None`.
+    /// Extracts the three permission headers (capped at 200 characters each).
     #[must_use]
     pub fn with_headers(mut self, headers: &[(String, String)]) -> GithubBody {
         let first =
@@ -669,9 +660,7 @@ pub enum Tried {
     },
 }
 
-/// An agh error: one pointer wide, so that every `Result<T>` stays under clippy's
-/// `result_large_err` threshold (128 bytes), which agh may not silence. Its fields are read
-/// through `Deref` (`err.kind`, `err.why`) and set through the builders.
+/// Pointer-wide boxed [`ErrorData`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(Box<ErrorData>);
 
@@ -780,8 +769,7 @@ impl Error {
         Error::could_not_run(why).with_sub(Sub::Protocol)
     }
 
-    /// The same error (its exchange, identity, rate, `sub`, `next` and `tried` kept) recast as
-    /// `kind` with `why`; the caller sets whatever else the new verdict changes.
+    /// Recasts this error to `kind` and `why`, keeping exchange, identity, rate, and trace fields.
     #[must_use]
     pub(crate) fn recast(mut self, kind: Kind, why: impl Into<String>) -> Error {
         self.kind = kind;
@@ -789,8 +777,7 @@ impl Error {
         self
     }
 
-    /// The same error, its why replaced by `why()` when it is NotFound: how a resource names
-    /// the thing a 404 left absent.
+    /// The same error, its why replaced by `why()` when it is NotFound.
     #[must_use]
     pub(crate) fn why_if_not_found(mut self, why: impl FnOnce() -> String) -> Error {
         if self.kind == Kind::NotFound {
@@ -799,9 +786,7 @@ impl Error {
         self
     }
 
-    /// A replay's stop: `Sub::Replay(what)` with `why`; Usage for `Replay::Argv`, CouldNotRun
-    /// (exit 3) for every other. `next` is `re-record the tape: agh --replay OLD --record NEW`
-    /// for `RequestDiverged`, `OutputDiverged` and `Unconsumed`, and the kind's next otherwise.
+    /// A replay's stop: `Sub::Replay(what)` with `why`.
     pub fn replay(what: Replay, why: impl Into<String>) -> Error {
         let kind = if what == Replay::Argv {
             Kind::Usage
@@ -906,7 +891,7 @@ impl Error {
         self.kind.retriable()
     }
 
-    /// Formats the first stderr line (`agh: {kind} exit={exit} verb={verb} ...`) with redacted values.
+    /// Formats the redacted first stderr diagnostic line.
     #[must_use]
     pub fn line(&self, verb: &str, redactor: &Redactor) -> String {
         let clean = |text: &str| redactor.apply(text);
@@ -966,8 +951,7 @@ impl Error {
         parts.join(" ")
     }
 
-    /// The second stderr line's object, `{"error": {...}}` with its 19 keys (design §8.5),
-    /// every string through `redactor.apply`.
+    /// Formats the redacted JSON diagnostic line.
     #[must_use]
     pub fn to_json(&self, redactor: &Redactor) -> Value {
         let text = |s: &str| Value::String(redactor.apply(s));
@@ -1068,8 +1052,7 @@ impl Error {
     }
 }
 
-/// `text` in double quotes with the line's escapes: `\` → `\\`, `"` → `\"`, newline → `\n`,
-/// carriage return → `\r`, tab → `\t`, any other byte below 0x20 → `\xHH`.
+/// `text` in double quotes with the line's escapes.
 pub(crate) fn quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len().saturating_add(2));
     out.push('"');

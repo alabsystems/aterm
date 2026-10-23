@@ -23,18 +23,18 @@ use super::shell_startup::ShellStartup;
 use super::trace::{NoTrace, Outcome, Trace, note};
 use crate::harness::lights::Mode;
 use crate::supervise::classify::{
-    classify_command_with, classify_except_rm, command_words, glob_match, plain_zsh_line, program,
-    runs,
+    brace_expansion, classify_command_with, classify_except_rm, command_words, glob_match,
+    path_operands, plain_zsh_line, program, runs, unquoted_glob,
 };
 
-/// Rule identifier for the read-only Bash classifier approval rule. v6 reads the flag-and-option write-or-run forms on the shell's argv words too, so a quoted or escaped flag no longer launders a write (`docs/measured/classifier-quoted-flags-2026-10-22.md`). A reading that may open a network connection or holds a brace expansion is refused too ([`network_free`], [`brace_free`]: stricter, so the id stays).
-pub const RULE_READ_ONLY: &str = "read-only@classify-v6";
-/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (anchor `box.note_no_rule`, `This command requires approval`), plus [`no_rule_clear`]: Claude Code 2.1.308 draws that note when no allow rule matched and its own checks did not clear the command, which over a line of reads also covers an assignment, an unquoted glob word for a program off its glob-safe list and `xargs` under a Read deny rule, none of which aterm's proof covers, so each stays with a person (`docs/measured/box-notes-2026-10-22.md`). Any other note, or a second one, stays with a person.
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v1";
-/// The rm circuit-breaker rule's id. v5 reads the rest of the line with classify-v6, and refuses a line that may open a network connection or holds a brace expansion ([`network_free`], [`brace_free`]: stricter, so the id stays).
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v5";
-/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm. v5 judges by classify-v6. v6 reads no transcript: v4's call could only add a reading, so it decided nothing and cost each such box its lag retries and a 1 s settle; v6 judges the screen's readings alone, reads no socket and proves no brace expansion (`docs/measured/box-notes-2026-10-22.md`).
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v6";
+/// Rule identifier for the read-only Bash classifier approval rule. v7 (classifier audit 2, `docs/measured/classifier-audit-2-2026-10-22.md`) moves both ways from v6. It refuses `sed` scripts hidden behind an attached, clustered or GNU-abbreviated `-e`/`-f` or a bracket-expression delimiter, `sysctl -f FILE` / `-p` (sets the kernel from a file), a `git cat-file --t…` textconv abbreviation, `git remote show NAME` in any spelling (`-v` included: it contacts the remote), a bare INPUT redirection with no command (zsh runs `$READNULLCMD`), an assignment to `CDPATH`/`PYTHONHOME`/`FPATH`, a `/dev/tcp`·`/dev/udp` network read, a brace expansion that can reach a flag or path through its head-aware option-slot scan (`sort x {-o,y}`; an operand-only brace such as `echo {a,b}` stays a read), and, at the box, a read of a secret ([`secrets_free`], the Read box's matcher on the Bash path). It newly approves genuine reads v6 refused only because it could not parse them: a `sed` script after macOS's valueless `-l`, an attached `-e` script, a bracket expression that holds the delimiter (`sed -l 's/a/b/p' f`, `sed -e's/a/b/' f`, `sed 's/[^/]/x/p' f`), and `git remote show` or `git remote -v show` with no remote named, which only list the remotes (MEASURED: no contact) and which v6's box refused (a box with a description row still escalates them: the reading that joins that row names a remote). v6 added the argv-word flag scan (`docs/measured/classifier-quoted-flags-2026-10-22.md`); [`network_free`] still runs in the proof (stricter only, and names the reading in the box message), and [`brace_free`] adds a conservative box-level refusal of every brace expansion.
+pub const RULE_READ_ONLY: &str = "read-only@classify-v7";
+/// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (anchor `box.note_no_rule`, `This command requires approval`), plus [`no_rule_clear`]: Claude Code 2.1.308 draws that note when no allow rule matched and its own checks did not clear the command, which over a line of reads also covers an assignment, an unquoted glob word for a program off its glob-safe list and `xargs` under a Read deny rule, none of which aterm's proof covers, so each stays with a person (`docs/measured/box-notes-2026-10-22.md`). v2 reads the classifier at v7, refusing and approving as [`RULE_READ_ONLY`] says, and refuses a secret read ([`secrets_free`]). Any other note, or a second one, stays with a person.
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v2";
+/// The rm circuit-breaker rule's id. v6 reads the rest of the line with classify-v7 (`classify_except_rm`), refuses a secret read ([`secrets_free`]) and still refuses a network reach or a brace expansion ([`network_free`], [`brace_free`]); the id moves from v5 with the classifier, which refuses and approves as [`RULE_READ_ONLY`] says.
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v6";
+/// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm. v6 judged by classify-v6 and read no transcript (v4's call decided nothing and cost each box its lag retries and a 1 s settle); v7 judges the screen's readings through classify-v7 (refusing and approving as [`RULE_READ_ONLY`] says) and the secret matcher (`docs/measured/classifier-audit-2-2026-10-22.md`).
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v7";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
 /// The Read-outside-cwd rule's id.
@@ -1514,6 +1514,9 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         if let Err(why) = git_reads_clear(&readings, None, ctx) {
             return Decision::escalate(format!("rm circuit breaker: {why}"));
         }
+        if let Err(why) = secrets_free(&readings, &ctx.secrets, ctx.home.as_deref()) {
+            return Decision::escalate(format!("rm circuit breaker: {why}"));
+        }
         return match once_choice(prompt) {
             Ok(choice) => Decision::Approve {
                 rule_id: RULE_RM_BREAKER,
@@ -1547,6 +1550,7 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
         .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
+        .and_then(|()| secrets_free(&readings, &ctx.secrets, ctx.home.as_deref()))
         .and_then(|()| once_choice(prompt));
     match proven {
         Ok(choice) => Decision::Approve {
@@ -1613,8 +1617,9 @@ const GLOB_SAFE: &[&str] = &[
 /// * an assignment anywhere the classifier's own walk to a segment's
 ///   program passes ([`runs`]: past keywords, `time`, redirects and
 ///   wrappers), or a `for`/`select` loop's variable: the classifier vets
-///   one only against its list of hazards, which names neither
-///   `PYTHONHOME` nor `CDPATH`;
+///   one only against its list of hazards, which no list can complete
+///   (since classify-v7 it names `CDPATH`, `PYTHONHOME` and `FPATH`, but no
+///   program's own configuration variable);
 /// * `env`, `export` or `xargs` on that walk or as the program: an
 ///   assignment `env` makes, and the files `xargs` reads, which the
 ///   owner's Read deny rules never see;
@@ -1684,23 +1689,6 @@ fn no_rule_clear(readings: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// The first glob character the shell may expand in `line`: an unquoted,
-/// unescaped `*`, `?` or `[` (Claude Code's own test of a word,
-/// `/[*?]|\[[^\]]*\]/`, read in its bundle; a lone `[` counted too). Quoted
-/// text and a backslash's character are characters, and a `$(…)` or a
-/// backquoted command is scanned as shell text wherever it stands
-/// ([`scan_unquoted`]).
-fn unquoted_glob(line: &str) -> Option<char> {
-    let c: Vec<char> = line.chars().collect();
-    let mut found = None;
-    scan_unquoted(&c, 0, None, &mut |c, i| {
-        if found.is_none() && matches!(c[i], '*' | '?' | '[') {
-            found = Some(c[i]);
-        }
-    });
-    found
 }
 
 fn git_reads_clear(
@@ -1775,6 +1763,12 @@ pub(crate) fn read_only_every_reading(
     if readings.is_empty() {
         return Err("a Bash box with no command".to_string());
     }
+    // network_free and brace_free first, so their reading-named messages win
+    // over the classifier's own (the classifier now refuses both forms too, so
+    // the CLI, the presence word and these rules agree; `approval` keeps these
+    // two for the reading name and for the rm-breaker arm, which calls them
+    // directly after `classify_except_rm`).
+    network_free(readings).and_then(|()| brace_free(readings))?;
     for line in readings {
         let v = classify_command_with(line, python_allow);
         if !v.read_only {
@@ -1785,7 +1779,7 @@ pub(crate) fn read_only_every_reading(
             ));
         }
     }
-    network_free(readings).and_then(|()| brace_free(readings))
+    Ok(())
 }
 
 /// `Ok` unless a reading of a Bash box's command may open a network
@@ -1872,148 +1866,6 @@ fn brace_free(readings: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The first brace expansion bash may perform in `line`, from its `{` to its
-/// `}`: an unquoted, unescaped `{` not right after a `$` whose matching `}`
-/// closes it with an unquoted `,` or `..` at its own level, before an
-/// unquoted blank, newline, `;`, `|`, `&`, `<`, `>` or an unopened `)` ends
-/// the word ([`brace_close`]). Quoted text (`'…'`, `"…"`, `$'…'` with its
-/// escapes) and a backslash's character are characters, but a `$(…)` or a
-/// backquoted command is a command of its own wherever it stands, inside
-/// double quotes too, and is scanned as one (`"$(sort x "a" {-o,y})"` runs
-/// the brace expansion). A `{` inside `${…}` is scanned all the same, a tie
-/// broken toward refusal. `{}`, `{a}` and a lone `{` are none.
-fn brace_expansion(line: &str) -> Option<String> {
-    let c: Vec<char> = line.chars().collect();
-    let mut found = None;
-    scan_unquoted(&c, 0, None, &mut |c, i| {
-        if found.is_none() && c[i] == '{' && (i == 0 || c[i - 1] != '$') {
-            found = brace_close(c, i).map(|end| c[i..=end].iter().collect());
-        }
-    });
-    found
-}
-
-/// Scans `c` from `i` as unquoted shell text up to `close` (the `)` of a
-/// `$(`, the backquote of a backquoted command, or `None`: the end), handing
-/// `visit` the index of each unquoted, unescaped character in order (a `(`
-/// or `)` of the text's own nesting aside); the index past `close`.
-fn scan_unquoted(
-    c: &[char],
-    mut i: usize,
-    close: Option<char>,
-    visit: &mut dyn FnMut(&[char], usize),
-) -> usize {
-    let mut parens = 0usize;
-    while i < c.len() {
-        let ch = c[i];
-        if Some(ch) == close && (ch != ')' || parens == 0) {
-            return i + 1;
-        }
-        i = match ch {
-            '\\' => i + 2,
-            '\'' => past_single(c, i + 1, false),
-            '$' if c.get(i + 1) == Some(&'\'') => past_single(c, i + 2, true),
-            '"' => scan_double(c, i + 1, visit),
-            '$' if c.get(i + 1) == Some(&'(') => scan_unquoted(c, i + 2, Some(')'), visit),
-            '`' if close != Some('`') => scan_unquoted(c, i + 1, Some('`'), visit),
-            '(' => {
-                parens += 1;
-                i + 1
-            }
-            ')' => {
-                parens = parens.saturating_sub(1);
-                i + 1
-            }
-            _ => {
-                visit(c, i);
-                i + 1
-            }
-        };
-    }
-    c.len()
-}
-
-/// Scans `c` from `i` inside double quotes, where only a `$(…)` or a
-/// backquoted command is shell text ([`scan_unquoted`], handed `visit`); the
-/// index past the closing `"`.
-fn scan_double(c: &[char], mut i: usize, visit: &mut dyn FnMut(&[char], usize)) -> usize {
-    while i < c.len() {
-        i = match c[i] {
-            '\\' => i + 2,
-            '"' => return i + 1,
-            '$' if c.get(i + 1) == Some(&'(') => scan_unquoted(c, i + 2, Some(')'), visit),
-            '`' => scan_unquoted(c, i + 1, Some('`'), visit),
-            _ => i + 1,
-        };
-    }
-    c.len()
-}
-
-/// The index past the `'` that closes single-quoted text starting at
-/// `c[i]`; `ansi` (`$'…'`): a backslash escapes its next character.
-const fn past_single(c: &[char], mut i: usize, ansi: bool) -> usize {
-    while i < c.len() {
-        match c[i] {
-            '\\' if ansi => i += 2,
-            '\'' => return i + 1,
-            _ => i += 1,
-        }
-    }
-    c.len()
-}
-
-/// The index of the `}` that closes the brace opening at `c[open]` as a
-/// brace expansion ([`brace_expansion`]), if it does: depth-matched, with a
-/// separator at its own level, before the word ends. Quoted text and a
-/// command of its own inside are skipped whole (each is scanned for braces
-/// of its own by [`scan_unquoted`]).
-fn brace_close(c: &[char], open: usize) -> Option<usize> {
-    let (mut depth, mut parens, mut sep) = (1usize, 0usize, false);
-    let mut skip = |_: &[char], _: usize| {};
-    let mut j = open + 1;
-    while j < c.len() {
-        j = match c[j] {
-            '\\' => j + 2,
-            '\'' => past_single(c, j + 1, false),
-            '$' if c.get(j + 1) == Some(&'\'') => past_single(c, j + 2, true),
-            '"' => scan_double(c, j + 1, &mut skip),
-            '$' if c.get(j + 1) == Some(&'(') => scan_unquoted(c, j + 2, Some(')'), &mut skip),
-            '`' => scan_unquoted(c, j + 1, Some('`'), &mut skip),
-            '(' => {
-                parens += 1;
-                j + 1
-            }
-            ')' if parens == 0 => return None,
-            ')' => {
-                parens -= 1;
-                j + 1
-            }
-            ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>' if parens == 0 => return None,
-            '{' => {
-                depth += 1;
-                j + 1
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return sep.then_some(j);
-                }
-                j + 1
-            }
-            ',' if depth == 1 => {
-                sep = true;
-                j + 1
-            }
-            '.' if depth == 1 && c.get(j + 1) == Some(&'.') => {
-                sep = true;
-                j + 2
-            }
-            _ => j + 1,
-        };
-    }
-    None
-}
-
 /// THE READ-ONLY RULE'S VERDICT ON A BASH BOX'S COMMAND ALONE: `Ok` when
 /// every reading of it classifies read-only, reads no socket and holds no
 /// brace expansion ([`read_only_every_reading`]) and none turns on a blank the screen cannot
@@ -2082,7 +1934,8 @@ fn breaker_read_only(
     let proven = readings_read_only(&readings, &ctx.python_allow)
         .and_then(|()| shell_models_hold(&readings, runs_on.as_deref(), ctx))
         .and_then(|()| plain_under_zsh(&readings, ctx))
-        .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx));
+        .and_then(|()| git_reads_clear(&readings, runs_on.as_deref(), ctx))
+        .and_then(|()| secrets_free(&readings, &ctx.secrets, ctx.home.as_deref()));
     if let Err(why) = proven {
         return refused(why);
     }
@@ -2460,19 +2313,100 @@ fn read_comps_allowed(comps: &[String], shown: &str, ctx: &ApprovalCtx) -> Resul
     if !ctx.read_roots.iter().any(|r| r.holds(comps)) {
         return Err(format!("a Read outside every allowed root: {path}"));
     }
-    for rule in &ctx.secrets {
-        let hit = match rule {
-            SecretRule::Under(dir) => abs_components(&dir.to_string_lossy()).is_some_and(|d| {
-                comps.len() >= d.len()
-                    && d.iter().zip(comps).all(|(a, b)| a.eq_ignore_ascii_case(b))
-            }),
-            SecretRule::Component(name) => comps.iter().any(|c| c.eq_ignore_ascii_case(name)),
-            SecretRule::Basename(glob) => comps
-                .last()
-                .is_some_and(|c| glob_match(&glob.to_ascii_lowercase(), &c.to_ascii_lowercase())),
-        };
-        if hit {
-            return Err(format!("a Read of a secret ({rule:?}): {path}"));
+    if let Some(rule) = secret_hit(comps, &ctx.secrets) {
+        return Err(format!("a Read of a secret ({rule:?}): {path}"));
+    }
+    Ok(())
+}
+
+/// The first rule in `secrets` the absolute path components `comps` match (case
+/// folded), the one matcher the Read box ([`read_comps_allowed`]) and the Bash
+/// secret-operand check ([`secrets_free`]) share: a secret directory it lies
+/// under, a secret path component (`.ssh`), or a secret basename glob
+/// (`id_rsa*`, `*.pem`).
+fn secret_hit<'a>(comps: &[String], secrets: &'a [SecretRule]) -> Option<&'a SecretRule> {
+    secrets.iter().find(|rule| match rule {
+        SecretRule::Under(dir) => abs_components(&dir.to_string_lossy()).is_some_and(|d| {
+            comps.len() >= d.len() && d.iter().zip(comps).all(|(a, b)| a.eq_ignore_ascii_case(b))
+        }),
+        SecretRule::Component(name) => comps.iter().any(|c| c.eq_ignore_ascii_case(name)),
+        SecretRule::Basename(glob) => comps
+            .last()
+            .is_some_and(|c| glob_match(&glob.to_ascii_lowercase(), &c.to_ascii_lowercase())),
+    })
+}
+
+/// The path components a Bash operand `op` may stand for, for [`secret_hit`]:
+/// `~` and `~/` resolved against `home`, an absolute path normalised (`..`
+/// folded), a relative or bare word split on `/` (so a basename or a secret
+/// component still matches without a cwd). A path this cannot make absolute
+/// still carries its own components, enough for the component and basename
+/// rules. A word that starts with an expansion (`$HOME/.secrets/t`, `$…/x`)
+/// also stands for that expansion read as `home`, so a rule under it matches.
+fn operand_comps(op: &str, home: Option<&Path>) -> Vec<Vec<String>> {
+    let split = |s: &str| -> Vec<String> {
+        s.split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .map(str::to_string)
+            .collect()
+    };
+    let home_text = home.map(|h| h.to_string_lossy().trim_end_matches('/').to_string());
+    let resolve = |full: &str| {
+        if full.starts_with('/') {
+            abs_components(full).unwrap_or_else(|| split(full))
+        } else {
+            split(full)
+        }
+    };
+    let mut out = Vec::new();
+    match (op.strip_prefix('~'), &home_text) {
+        (Some(""), Some(h)) => out.push(resolve(h)),
+        (Some(rest), Some(h)) if rest.starts_with('/') => out.push(resolve(&format!("{h}{rest}"))),
+        _ => out.push(resolve(op)),
+    }
+    if let (Some((lead, rest)), Some(h)) = (op.split_once('/'), &home_text)
+        && lead.starts_with('$')
+    {
+        out.push(resolve(&format!("{h}/{rest}")));
+    }
+    out
+}
+
+/// `Ok` unless a reading of a Bash box's command reads a path any secret rule
+/// in `secrets` names ([`secret_hit`] over [`path_operands`]): `cat
+/// ~/.ssh/id_rsa`, `grep x id_rsa`, `cat < .env`, `awk 'NR<3' ~/.aws/credentials`,
+/// `git config --file ~/.ssh/config --list`, `echo "$(<~/.gnupg/secring.gpg)"`,
+/// `git show HEAD:.env`. The same matcher the Read box uses, on the Bash
+/// path. [`path_operands`] keeps to the words a command reads as paths: a
+/// pattern, a jq filter, echoed text, a name `which` looks up or a file `ls`,
+/// `stat`, `wc` or `du` only lists or measures is no read (`grep -rn
+/// credentials src/`, `jq .key f.json`, `ls -la ~/.ssh`), unless the line may
+/// turn that output into a path another command reads (`find ~/.ssh | xargs
+/// cat`). A secret reached by recursion or a glob the tool expands (`grep -r x
+/// ~`, `find . -name '*.pem' -exec cat {} +`'s files) is not named, as the
+/// Read box never sees one either. A line the classifier cannot read is
+/// refused.
+fn secrets_free(
+    readings: &[String],
+    secrets: &[SecretRule],
+    home: Option<&Path>,
+) -> Result<(), String> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    for line in readings {
+        let operands = path_operands(line)
+            .map_err(|why| format!("not read-only ({}): {why}", reading_name(line)))?;
+        for op in &operands {
+            let hit = operand_comps(op, home)
+                .iter()
+                .find_map(|comps| secret_hit(comps, secrets));
+            if let Some(rule) = hit {
+                return Err(format!(
+                    "a read of a secret ({rule:?}) ({}): {op}",
+                    reading_name(line)
+                ));
+            }
         }
     }
     Ok(())

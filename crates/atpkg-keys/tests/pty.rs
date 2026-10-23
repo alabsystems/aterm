@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A real controlling terminal for `provision_cli`: `atpkg-keys setup` and `join` talk to
-//! `/dev/tty` and refuse to run without one, so this builds a pty pair and makes its slave
-//! the child's controlling terminal while stdout and stderr stay pipes.
-//!
-//! The pair is aterm-pty's `open_pty_pair`: both ends are close-on-exec from the open, and a
-//! `/dev/ptmx` open that lost XNU's race for a pty minor (`EREDRIVEOPEN`, -6) is redriven
-//! rather than failed. The child takes the slave by descriptor, not path, so nothing calls
-//! `ptsname(3)` and its static buffer needs no lock.
+//! Controlling pseudo-terminal helper for `provision_cli`.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -19,8 +12,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
 
-/// The master side of a pseudo-terminal, and the slave a child takes as its controlling
-/// terminal.
+/// Master and slave descriptors of a pseudo-terminal pair.
 pub struct Pty {
     master: std::fs::File,
     slave: OwnedFd,
@@ -37,19 +29,11 @@ impl Pty {
                 OwnedFd::from_raw_fd(slave),
             )
         };
-        // Non-blocking, so a drain loop can poll with a deadline instead of parking forever
-        // if the child never says anything.
         aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("a non-blocking master");
         Self { master, slave }
     }
 
-    /// Spawn `cmd` with a null stdin and this pty as its controlling terminal, its stdout and
-    /// stderr left as `cmd` made them (pipes, for every caller): the shape of
-    /// `atpkg-keys setup | tee log`.
-    ///
-    /// The strip (`inherit_nothing`) goes before the hook, so the child holds its stdio, its
-    /// terminal and nothing else of this process; otherwise a child waiting at its prompt
-    /// could hold another test thread's unflagged pipe for as long as it waits.
+    /// Spawn `cmd` with a null stdin and this pty as its controlling terminal.
     pub fn spawn(&self, mut cmd: Command) -> Child {
         use aterm_uds::spawnfd::InheritNothing as _;
         let slave = self.slave.as_raw_fd();
@@ -59,9 +43,6 @@ impl Pty {
         // fork until its exec closes it.
         unsafe {
             cmd.pre_exec(move || {
-                // A brand-new session, the slave its controlling terminal, and a copy of
-                // the slave that outlives the exec (`dup` clears close-on-exec): the child
-                // holds its terminal open itself, as one that opened it by path would.
                 if libc::setsid() < 0
                     || libc::ioctl(slave, libc::c_ulong::from(libc::TIOCSCTTY), 0) < 0
                     || libc::dup(slave) < 0
@@ -81,8 +62,6 @@ impl Pty {
             match self.master.read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => into.push_str(&String::from_utf8_lossy(&buf[..n])),
-                // EAGAIN: nothing more right now. EIO: the terminal hung up. Both mean
-                // "stop reading"; neither is a failure.
                 Err(_) => return,
             }
         }

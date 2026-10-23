@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance for the message verbs `messages` (the log's text face) and
-//! `notice` (the outside world's voice on the band) over a real headless instance's control
-//! socket: the control thread's refusals (never a wake), the owner token, the main thread's
-//! `wire::apply` replies, `OK recorded` for a note, one id across progress restates, `done`
-//! then `how=gone`, `dismiss` then `act` finding nothing, and `appstatus` never listing a
-//! script's rows.
-//!
-//! The socket round trip is what the engine and host unit tests cannot see:
-//! the control thread's refusals (never a wake), the owner token, the main
-//! thread's `wire::apply` replies, `OK recorded` for a note, the same id on
-//! every progress restate, `done` then `how=gone`, `dismiss` then `act`
-//! finding nothing, and `appstatus` never listing a script's rows.
-//!
-//! The client speaks the wire directly (`TOKEN <owner token> <verb …>`, the
-//! status line, then `<n>` rows for a Lines verb), so every assertion is on
-//! the exact bytes a script reads.
-//!
-//! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
-//! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance opens no window. FAIL
-//! when the instance cannot boot; COULD NOT RUN only on an environment refusal
-//! (`support/headless_boot.rs`).
+//! Live-headless conformance for the `messages` and `notice` control-socket verbs.
 
 #![cfg(unix)]
 
@@ -35,9 +14,6 @@ use crate::headless_boot;
 
 use headless_boot::Instance;
 
-/// Boot one headless instance, 40x120, ready once its owner token file is
-/// written ([`headless_boot::boot_with`]: an environment refusal is COULD NOT RUN;
-/// a product that cannot start fails the test).
 fn boot(tag: &str) -> Instance {
     headless_boot::boot_with(
         &format!("atms{tag}"),
@@ -48,7 +24,6 @@ fn boot(tag: &str) -> Instance {
     )
 }
 
-/// How long a reply may take before it is read as a hang.
 const REPLY_DEADLINE: Duration = Duration::from_secs(60);
 
 fn token_path(inst: &Instance) -> PathBuf {
@@ -57,7 +32,6 @@ fn token_path(inst: &Instance) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// The instance's owner token: `notice` is `OwnerOnly`.
 fn token(inst: &Instance) -> String {
     std::fs::read_to_string(token_path(inst))
         .expect("the owner token file")
@@ -65,7 +39,6 @@ fn token(inst: &Instance) -> String {
         .to_string()
 }
 
-/// A Lines verb: its status line is `OK <n> …` and `<n>` rows follow.
 fn is_lines_verb(line: &str) -> bool {
     matches!(
         line.split_whitespace().next(),
@@ -73,8 +46,6 @@ fn is_lines_verb(line: &str) -> bool {
     )
 }
 
-/// One request over the raw socket with the owner token: the status line and,
-/// for a Lines verb answering `OK <n>`, its `<n>` rows.
 fn ctl(inst: &Instance, line: &str) -> (String, Vec<String>) {
     let mut stream = UnixStream::connect(&inst.sock).expect("connect the control socket");
     stream.set_read_timeout(Some(REPLY_DEADLINE)).unwrap();
@@ -104,19 +75,16 @@ fn ctl(inst: &Instance, line: &str) -> (String, Vec<String>) {
     (status, rows)
 }
 
-/// The status line alone.
 fn status(inst: &Instance, line: &str) -> String {
     ctl(inst, line).0
 }
 
-/// `key=value` out of a row.
 fn field<'a>(row: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key}=");
     row.split_whitespace()
         .find_map(|t| t.strip_prefix(prefix.as_str()))
 }
 
-/// A `messages` row's id.
 fn row_id(row: &str) -> u64 {
     row.strip_prefix("message ")
         .and_then(|r| r.split_whitespace().next())
@@ -124,7 +92,6 @@ fn row_id(row: &str) -> u64 {
         .unwrap_or_else(|| panic!("not a message row: {row}"))
 }
 
-/// The id at the end of `OK message=<id>` / `OK recorded message=<id>`.
 fn minted(reply: &str) -> u64 {
     reply
         .rsplit_once("message=")
@@ -132,8 +99,6 @@ fn minted(reply: &str) -> u64 {
         .unwrap_or_else(|| panic!("no minted id in {reply:?}"))
 }
 
-/// The rows above `after` (ids start at 1 and `since=0` is a usage error, so a reader that
-/// has seen nothing reads bare).
 fn rows_after(inst: &Instance, after: u64) -> Vec<String> {
     let line = if after == 0 {
         "messages 512".to_string()
@@ -145,7 +110,6 @@ fn rows_after(inst: &Instance, after: u64) -> Vec<String> {
     rows.into_iter().filter(|r| row_id(r) > after).collect()
 }
 
-/// The live row with `id`, from `messages live`.
 fn live_row(inst: &Instance, id: u64) -> String {
     let (st, rows) = ctl(inst, "messages live");
     assert!(st.starts_with("OK "), "messages live: {st}");
@@ -158,17 +122,13 @@ fn live_row(inst: &Instance, id: u64) -> String {
 fn the_message_verbs_round_trip_on_a_live_instance() {
     let inst = boot("m");
 
-    // 1. The log as it stands; the last id seen.
     let (st, rows) = ctl(&inst, "messages");
     assert_eq!(st, format!("OK {}", rows.len()), "{st}");
     let b = rows.last().map_or(0, |r| row_id(r));
 
-    // 2. A note from a script is a record, never a row.
     let a = status(&inst, "notice post script hello from a script");
     assert!(a.starts_with("OK recorded message="), "{a}");
     let a = minted(&a);
-    // aterm's own boot reports (a config note) may land beside it: the
-    // script's rows are the wire's.
     let after: Vec<String> = rows_after(&inst, b)
         .into_iter()
         .filter(|r| field(r, "origin") != Some("host"))
@@ -180,7 +140,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(field(rec, "state"), Some("recorded"), "{rec}");
     assert_eq!(field(rec, "glass"), Some("-"), "{rec}");
 
-    // 3. A failure is a held row, its detail in the log.
     let w = status(
         &inst,
         "notice post script sev=warn key=deploy Deploy failed -- connection refused",
@@ -192,7 +151,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(field(&row, "key"), Some("wire.deploy"), "{row}");
     assert_eq!(field(&row, "detail"), Some("connection%20refused"), "{row}");
 
-    // 4. Progress: one row per key, the same id on every restate.
     let p = status(&inst, "notice progress build pct=40 Building aterm");
     assert!(p.starts_with("OK message="), "{p}");
     let p = minted(&p);
@@ -213,7 +171,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(field(&row, "busy"), Some("1"), "{row}");
     assert_eq!(field(&row, "progress"), None, "{row}");
 
-    // 5. `done` ends it with its finish; a second `done` finds nothing.
     assert_eq!(
         status(&inst, "notice done build ok Built aterm"),
         format!("OK done={p} how=resolved-ok")
@@ -226,7 +183,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(field(&ended, "title"), Some("Built%20aterm"), "{ended}");
     assert_eq!(status(&inst, "notice done build"), "OK done=- how=gone");
 
-    // 6. Dismiss takes the failure down; a press then finds no row.
     assert_eq!(
         status(&inst, &format!("notice dismiss {w}")),
         format!("OK dismissed={w}")
@@ -236,7 +192,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
         format!("ERR notice: no live message {w}")
     );
 
-    // 7. Refusals, every one answered on the control thread.
     assert!(
         status(&inst, "notice progress").starts_with("ERR usage: notice progress "),
         "a bare progress"
@@ -258,7 +213,6 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
         "a zero count"
     );
 
-    // 8. `appstatus` is aterm's own initiative: no script row, ever.
     let (st, rows) = ctl(&inst, "appstatus");
     assert!(st.starts_with("OK "), "appstatus: {st}");
     for row in &rows {

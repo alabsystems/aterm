@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One persistent control connection to a live headless instance (`aterm_agent::RelayClient`,
-//! authenticated with the token beside the socket), and the typed readings the live lanes
-//! assert on.
-//!
-//! A request is one round trip on the open connection, so a poll costs no
-//! process launch and two requests reach the server in the order written.
-//! Every reply is read under a hang detector ([`READ_HANG`]); a reply that
-//! never comes fails the test naming the request.
+//! Persistent control connection and typed readings for live headless tests.
 
 #![allow(dead_code)]
 
@@ -18,8 +11,6 @@ use std::time::Duration;
 use aterm_agent::RelayClient;
 use aterm_uds::CtlStream;
 
-/// A reply not read by now is a hung instance: past the longest server-side
-/// wait any request here asks for ([`AWAIT_MS`]).
 const READ_HANG: Duration = Duration::from_secs(120);
 
 /// The server-side bound on every `await` here, in ms: a minute, a hang detector
@@ -45,10 +36,6 @@ pub struct Ctl {
 
 impl Ctl {
     /// Connect to the instance listening at `sock` and authenticate.
-    ///
-    /// # Panics
-    /// When the socket refuses or its token cannot be read: the instance was
-    /// booted ready, so either is a failure of the instance.
     pub fn connect(sock: &str) -> Self {
         let client = RelayClient::connect_local_beside(sock)
             .unwrap_or_else(|e| panic!("connect to the instance at {sock}: {e}"));

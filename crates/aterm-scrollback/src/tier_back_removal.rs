@@ -7,25 +7,14 @@
 use super::{WarmBlock, WarmTier};
 
 impl WarmTier {
-    /// Remove the newest `n` lines from the back of the warm tier.
-    ///
-    /// Drops whole blocks from the back without decompression. For the
-    /// boundary block (partially within the remove range), decompresses it,
-    /// trims the consumed lines from the back, and re-compresses the survivors.
-    ///
-    /// Error safety: the boundary block is decompressed before any state is
-    /// modified, so a decompression failure leaves the state unchanged.
+    /// Remove the newest `n` lines from the back of the warm tier, decompressing
+    /// the boundary block before modifying state so errors leave the tier unchanged.
     ///
     /// # Panics
     ///
     /// Debug-asserts that `n <= self.line_count`.
-    // Skip: with it removed the check falsely refutes `&lines[..keep]` (the
-    // verifier does not relate `keep`, derived from `lines.len()`, to the Vec
-    // `decompress()` returned) and leaves Overflow(Add) in the `.sum()`
-    // closures, the front trim's `pop_front().expect` and the dealloc contract
-    // unknown. Drop it once Trust follows a slice bound through a local derived
-    // from the slice's own `len()`, Overflow(Add) inside a `sum` closure, and
-    // `Option::expect` panic-freedom from a preceding `front()` guard.
+    // Skip: Trust does not yet relate `keep` to `lines.len()` or prove `sum`
+    // overflow and `pop_front().expect`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back_lines(&mut self, n: usize) -> Result<(), crate::ScrollbackError> {
         if n == 0 {
@@ -37,12 +26,9 @@ impl WarmTier {
             self.line_count
         );
 
-        // Phase 1: Count whole blocks to drop from the back and identify boundary.
         let mut whole_blocks = 0;
         let mut remaining = n;
         for block in self.blocks.iter().rev() {
-            // Saturating: the loop bounds `whole_blocks` and the available-line
-            // guard bounds each subtraction.
             let actual_idx = self
                 .blocks
                 .len()
@@ -62,7 +48,6 @@ impl WarmTier {
         }
         let boundary_trim = remaining;
 
-        // Phase 2: Pre-decompress boundary block (before modifying state).
         let boundary_replacement = if boundary_trim > 0 {
             let boundary_idx = self
                 .blocks
@@ -89,7 +74,6 @@ impl WarmTier {
             None
         };
 
-        // Phase 3: Commit — all decompressions succeeded.
         for _ in 0..whole_blocks {
             self.blocks.pop_back();
         }
@@ -105,9 +89,7 @@ impl WarmTier {
             self.front_offset = 0;
         }
 
-        // Drop any front blocks now fully consumed by front_offset.
-        // Back-removal may leave the front block with fewer physical lines
-        // than front_offset when both ends are truncated simultaneously.
+        // Drop front blocks fully consumed by front_offset.
         while let Some(front) = self.blocks.front() {
             if self.front_offset >= front.line_count() {
                 let block = self
@@ -123,15 +105,12 @@ impl WarmTier {
             self.front_offset = 0;
         }
 
-        // Recalculate derived state from blocks (O(blocks), rare path).
-        // Subtract front_offset since those lines are logically consumed.
         let physical: usize = self.blocks.iter().map(|b| b.line_count()).sum();
         self.line_count = physical.saturating_sub(self.front_offset);
         self.budgeted_bytes = self.blocks.iter().map(|b| b.compressed_size()).sum();
         self.rebuild_cumulative();
         self.clear_cache();
         let base = std::mem::size_of::<Self>();
-        // saturating byte-total chain (cannot overflow usize for real data).
         self.bytes_used.set(
             base.saturating_add(self.budgeted_bytes)
                 .saturating_add(self.index_bytes())

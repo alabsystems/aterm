@@ -56,6 +56,8 @@ pub(super) mod consts {
     pub(crate) const NS_EVENT_MODIFIER_FLAG_OPTION: usize = 1 << 19;
     pub(crate) const NS_EVENT_MODIFIER_FLAG_COMMAND: usize = 1 << 20;
 
+    // LOCAL PATCH (aterm): only the event types `app.rs` reads; upstream's mouse types left with
+    // the override's device-event dispatch.
     pub(crate) const NS_EVENT_TYPE_KEY_UP: usize = 11;
     pub(crate) const NS_EVENT_TYPE_APPLICATION_DEFINED: usize = 15;
 

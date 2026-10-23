@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `_Static_assert` probe behind both constant censuses, `winit_seam_constants.rs` (the
-//! vendored fork's seam) and `gui_appkit_constants.rs` (`aterm-gui`'s `consts`): the parser
-//! grammar, the compiler call and the verdicts live here once; each census keeps its own table,
-//! scope and probe source.
+//! `_Static_assert` probe helper for SDK constant censuses.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -12,20 +9,13 @@
 
 use std::process::Command;
 
-/// A `const` declaration's body, at any visibility (`pub`, `pub(crate)`, `pub(super)`,
-/// `pub(in path)` or none): a parser that matched one spelling would let a constant spelled
-/// another way pass every census test unparsed.
 fn strip_const_decl(line: &str) -> Option<&str> {
     let mut s = line.trim();
     if let Some(rest) = s.strip_prefix("pub") {
-        // `pub(crate)`, `pub(super)`, `pub(in crate::x)` — skip the qualifier,
-        // then the whitespace before `const`.
         s = match rest.strip_prefix('(') {
             Some(q) => q.split_once(')')?.1,
             None => rest,
         };
-        // A bare `pub` must be followed by whitespace, or this matched the
-        // prefix of some other identifier (`pubfoo`).
         if !s.is_empty() && !s.starts_with(char::is_whitespace) {
             return None;
         }
@@ -34,8 +24,7 @@ fn strip_const_decl(line: &str) -> Option<&str> {
     s.strip_prefix("const ")
 }
 
-/// `(name, literal)` of a `const` declaration line, at any visibility; `None`
-/// for any other line. The literal is the Rust spelling, `;` dropped.
+/// Parses `(name, literal)` from a `const` declaration line.
 pub fn parse_const_decl(line: &str) -> Option<(String, String)> {
     let rest = strip_const_decl(line)?;
     let (name, rest) = rest.split_once(':').expect("a typed const");
@@ -46,17 +35,12 @@ pub fn parse_const_decl(line: &str) -> Option<(String, String)> {
     ))
 }
 
-/// A Rust integer literal as C: only `_` separators differ (`0x7fff_ffff…`).
+/// Formats a Rust integer literal as a C literal.
 pub fn as_c_literal(rust: &str) -> String {
     rust.replace('_', "")
 }
 
-/// Compile `body` as Objective-C for `arch`, syntax only, in a fresh scratch directory labelled
-/// with `scratch`, `tag` and `arch` and removed afterwards (the two censuses run concurrently
-/// and share tags). `Ok(())` if clang accepted it, `Err(stderr)` if not.
-///
-/// A `cc` that cannot start panics: an oracle that cannot run is not a pass. A `cc` that cannot
-/// fold a `static const` is [`green_verdict`]'s and [`inverted_verdict`]'s case.
+/// Compiles `body` as Objective-C for `arch` (`-fsyntax-only`).
 pub fn compile(scratch: &str, arch: &str, body: &str, tag: &str) -> Result<(), String> {
     let dir = aterm_tempfile::Builder::new()
         .prefix(&format!("{scratch}-{tag}-{arch}-"))
@@ -66,9 +50,6 @@ pub fn compile(scratch: &str, arch: &str, body: &str, tag: &str) -> Result<(), S
     std::fs::write(&path, body).expect("the probe is writable");
     let out = Command::new("cc")
         .args(["-arch", arch, "-fsyntax-only"])
-        // A wrong-but-vacuous `SDK == a | b` assertion warns `-Wparentheses`, so that one
-        // warning is fatal; a blanket `-Werror` fails the probe on unrelated deprecations
-        // (`NSWindowFullScreenButton`).
         .arg("-Werror=parentheses")
         .arg(&path)
         .output()
@@ -123,9 +104,7 @@ fn unfolded_rows(stderr: &str) -> Option<Vec<String>> {
     saw_error.then_some(rows)
 }
 
-/// The green arm's verdict on `compile`'s answer — `assert!`-shaped: a clean
-/// compile is the pass, anything else is `what` on `arch` with clang's text.
-/// On every target but x86_64 macOS that is the whole function.
+/// Asserts that `compile` succeeded on `arch`.
 #[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
 #[track_caller]
 pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
@@ -134,11 +113,7 @@ pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
     }
 }
 
-/// x86_64 macOS, the one host measured with a clang that cannot fold a `static const` (see
-/// [`FOLD_DIAGNOSTIC`]): a compile whose every error is that diagnostic is reported in one
-/// stderr line naming the rows, not failed; every other row was asserted by the same compile.
-/// Any other error panics as on every other target. The waiver keys on clang's text: an Intel
-/// Mac with a folding clang asserts every row.
+/// Asserts that `compile` succeeded on `arch`, waiving `static const` fold limits on x86_64 macOS.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 #[track_caller]
 pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
@@ -151,8 +126,7 @@ pub fn green_verdict(arch: &str, what: &str, result: Result<(), String>) {
     }
 }
 
-/// The inverted arm's verdict: the probe with one row flipped must fail for that row's value on
-/// `arch`. On every target but x86_64 macOS any failure is the pass.
+/// Asserts that the inverted probe for `row` failed on `arch`.
 #[cfg(not(all(target_arch = "x86_64", target_os = "macos")))]
 #[track_caller]
 pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {
@@ -160,10 +134,7 @@ pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuo
     assert!(result.is_err(), "{vacuous}");
 }
 
-/// x86_64 macOS: a clang that cannot fold makes the inverted probe fail whatever the values
-/// are, so the pass is clang's value diagnostic (`static_assert failed due to requirement …`,
-/// `static assertion` on a newer clang) on the inverted `row` itself; fold errors on the other
-/// rows are reported and never counted.
+/// Asserts that the inverted probe for `row` failed for its value on `arch`.
 #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
 #[track_caller]
 pub fn inverted_verdict(arch: &str, row: &str, result: Result<(), String>, vacuous: &str) {

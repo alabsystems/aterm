@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Adversarial probes: each test asserts the designed behaviour
-//! (docs/DESIGN-unified-messages-2026-09-21.md §1, §2.4).
+//! Adversarial message-center and glass-layout tests.
 
 use crate::center::MessageCenter;
 use crate::glass::{
@@ -53,8 +52,6 @@ fn caps(intents: &[Intent]) -> Vec<CapsuleSpec> {
     v
 }
 
-/// A carried held row still queued at the handoff commit gets no `fold_at`, so
-/// it never folds unpainted.
 #[test]
 fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     let now = t0();
@@ -88,8 +85,6 @@ fn a_queued_carried_held_row_is_not_folded_as_read_after_commit() {
     );
 }
 
-/// Narrowing an unmetered row, an excerpt once dropped never comes back, even
-/// where two capsules' long→short switch frees room for it.
 #[test]
 fn the_excerpt_never_comes_back_while_narrowing() {
     let spec = RowSpec {
@@ -133,8 +128,6 @@ fn the_excerpt_never_comes_back_while_narrowing() {
     );
 }
 
-/// §1.6 "the log keeps it": a live row on glass keeps its record through
-/// LOG_CAP LogOnly posts.
 #[test]
 fn a_live_row_keeps_its_log_record() {
     let now = t0();
@@ -162,8 +155,6 @@ fn a_live_row_keeps_its_log_record() {
     );
 }
 
-/// Empty detail lines are dropped at ingress (the builder, `normalized`,
-/// `restate`), so the live row, its Posted line and the decoded record agree.
 #[test]
 fn a_single_empty_detail_line_round_trips() {
     let now = t0();
@@ -186,8 +177,6 @@ fn a_single_empty_detail_line_round_trips() {
     assert_eq!(c.live(id).unwrap().msg.detail, vec!["re".to_string()]);
 }
 
-/// Never a panic, rows exactly `cols` cells, at every width below the
-/// design's own test floor (0..8).
 #[test]
 fn layout_never_panics_below_eight_cols() {
     let fixtures: Vec<_> = crate::glass::tests::fixtures()
@@ -217,9 +206,6 @@ fn layout_never_panics_below_eight_cols() {
     }
 }
 
-/// Under a measure that is not `chars().count()` (uppercase is two cells), no
-/// element reaches past `cols` and the capsules stay right-aligned at every
-/// non-degenerate width.
 #[test]
 fn the_width_law_holds_under_a_two_cell_measure() {
     let wide = |s: &str| -> usize {
@@ -245,7 +231,6 @@ fn the_width_law_holds_under_a_two_cell_measure() {
                 assert!(*c >= end + 3, "{name}@{cols}: excerpt overlaps");
                 end = c + wide(d);
             }
-            // The meter is the row's surface, under every piece: never a span.
             if let Some(meter) = row.meter {
                 assert_eq!(
                     (meter.0, meter.1),
@@ -269,7 +254,6 @@ fn the_width_law_holds_under_a_two_cell_measure() {
                 assert!(*c >= end + 2, "{name}@{cols}: stats overlap");
                 end = c + wide(s);
             }
-            // The load slot is the tail of the words.
             if let Some((c, w)) = row.load_slot {
                 assert!(c >= end + 2, "{name}@{cols}: load slot overlaps");
                 end = c + w;
@@ -277,8 +261,6 @@ fn the_width_law_holds_under_a_two_cell_measure() {
             if let (Some((c, w)), Some((slot, sw))) = (row.load, row.load_slot) {
                 assert_eq!(c + wide(w), slot + sw, "{name}@{cols}: right-aligned words");
             }
-            // Both clear cells, save the second where the degenerate step
-            // spent it on a whole word of the title.
             assert!(
                 first.col >= end + 2
                     || first.col == end + 1
@@ -298,11 +280,6 @@ fn the_width_law_holds_under_a_two_cell_measure() {
     }
 }
 
-// Decisions where the design's wording is loose or literal, pinned.
-
-/// `after_handoff_commit` arms each carried row's own hold (`arm`'s span), not
-/// its severity's (§1.8's wording), so an Ask keeps its ten minutes across a
-/// handoff.
 #[test]
 fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     let now = t0();
@@ -341,9 +318,6 @@ fn a_carried_ask_row_keeps_its_own_hold_after_the_commit() {
     assert!(HOLD_ASK > HOLD_INFO);
 }
 
-/// §1.4: a keyless post with equal (tag, title, detail) is a Duplicate whatever
-/// its severity, so an Error re-post of a live Info row bumps `repeats` and the
-/// row stays Info.
 #[test]
 fn a_duplicate_post_keeps_the_live_severity() {
     let now = t0();
@@ -359,9 +333,6 @@ fn a_duplicate_post_keeps_the_live_severity() {
     assert_eq!(c.live(a.id).unwrap().repeats, 2);
 }
 
-/// A carried row its parent ended still ends when another writer of the shared
-/// `messages.log` took its number first: each aterm mints ids from its own
-/// counter, so the file loads the parent's record under a fresh id.
 #[test]
 fn a_carried_row_the_parent_ended_ends_though_another_writer_took_its_number() {
     let now = t0();
@@ -382,7 +353,6 @@ fn a_carried_row_the_parent_ended_ends_though_another_writer_took_its_number() {
         theirs, resolved,
         "PRECONDITION: both minted the same number"
     );
-    // The shared file: the other writer's line first, then the parent's.
     let mut lines = other.drain_new_for_persist();
     lines.extend(parent.drain_new_for_persist());
     let mut disk = MessageLog::empty();
@@ -409,10 +379,6 @@ fn a_carried_row_the_parent_ended_ends_though_another_writer_took_its_number() {
     assert!(child.live(resolved).is_none());
 }
 
-/// A carried row its parent ended after the capture (a resolve, a press) ends
-/// in the successor at Commit with the file's ending and no second line; a
-/// row whose hold ran out on the parent's glass, one the successor restated,
-/// and one nobody ended stay live.
 #[test]
 fn a_carried_row_the_parent_ended_after_the_capture_ends_in_the_successor() {
     let now = t0();
@@ -427,7 +393,6 @@ fn a_carried_row_the_parent_ended_after_the_capture_ends_in_the_successor() {
     parent.commit_rows(now, 5);
     let carry = parent.carried();
     assert_eq!(carry.live.len(), 4, "PRECONDITION: all four cross");
-    // The parent runs on after the capture.
     assert!(parent.resolve(resolved, crate::Outcome::Ok, now + secs(1)));
     assert!(parent.withdraw(restated, now + secs(1)));
     let _ = parent.settle(now + HOLD_WARN + secs(1), true);

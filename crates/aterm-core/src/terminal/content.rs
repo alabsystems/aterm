@@ -11,10 +11,6 @@ use super::Terminal;
 
 #[inline]
 fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
-    // Live-frame (screen-row) reads: the extras lookups are keyed by the live
-    // visible row, and callers pass terminal-relative rows (the renderer's
-    // `sel_row = viewport_row - display_offset`). Display-mapped cells would
-    // pair scrolled cells with live extras.
     if let Some(cells) = grid.row_at_screen(row) {
         push_row_cell_text(grid, row, cells, col, out);
     }
@@ -31,7 +27,6 @@ fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut St
         return;
     }
     if cell.is_complex() {
-        // Use full string for text extraction (handles multi-char HashMap entries)
         if !grid.push_complex_char_at(row, col, out) {
             out.push('\u{FFFD}');
         }
@@ -103,9 +98,6 @@ pub(crate) fn visible_row_written(grid: &Grid, row: u16) -> (String, LineCells) 
     (text, cells)
 }
 
-/// [`visible_row_bounds_to_string`] appended to `out`, recording into `cells`,
-/// when given, the cell each piece of the text was read from: its column counted
-/// from the range's first, its bytes from where the append began.
 fn push_visible_row_text(
     grid: &Grid,
     row: u16,
@@ -187,7 +179,8 @@ impl Terminal {
         self.grid.row_text(row_u16(row))
     }
 
-    /// Append visible row `row`'s text into `out`, reusing its capacity, and report whether the row was in bounds: the non-allocating counterpart of [`row_text`](Self::row_text).
+    /// Writes visible row `row`'s text into `out` (replacing its contents) and returns whether
+    /// `row` was in bounds.
     #[inline]
     #[must_use]
     pub fn row_text_into(&self, row: usize, out: &mut String) -> bool {
@@ -199,7 +192,7 @@ impl Terminal {
         self.grid.row_text_into(row_u16(row), out)
     }
 
-    /// Fill `out` with visible row `row` as per-column chars and return the row's fill (one past the last non-blank column; `0` for an empty or out-of-range row).
+    /// Fills `out` with visible row `row` as per-column chars and returns the row's fill length.
     #[inline]
     pub fn row_cols_into(&self, row: usize, out: &mut Vec<char>) -> u16 {
         let rows = usize::from(self.grid.rows());
@@ -210,7 +203,7 @@ impl Terminal {
         self.grid.row_cols_into(row_u16(row), out)
     }
 
-    /// The combining-aware grapheme text of visible cell `(row, col)`: the base character plus any complex-cluster string and combining marks, the same content the selection and `row_text`/`get_line_text` produce (NFD accents and ZWJ clusters included).
+    /// Returns the combining-aware grapheme text of visible cell `(row, col)`.
     #[inline]
     #[must_use]
     pub fn cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
@@ -226,7 +219,7 @@ impl Terminal {
         Some(out)
     }
 
-    /// The combining-aware grapheme text of a display cell, accounting for `display_offset`: the per-cell counterpart of [`display_row_text`](Self::display_row_text), where row 0 is the top of the current viewport (a scrollback line when scrolled back).
+    /// Returns the combining-aware grapheme text of display cell `(row, col)`.
     #[inline]
     #[must_use]
     pub fn display_cell_grapheme(&self, row: usize, col: usize) -> Option<String> {
@@ -276,7 +269,6 @@ impl Terminal {
     #[must_use]
     pub fn display_row_text(&self, display_row: usize) -> Option<String> {
         if self.grid.display_offset() == 0 {
-            // Fast path: no scrollback scroll — display row == live grid row.
             return self.row_text(display_row);
         }
         self.get_line_text(self.display_terminal_row(display_row)?, None)
@@ -306,7 +298,7 @@ impl Terminal {
         }
     }
 
-    /// Smart word boundaries `(start_col, end_col)` at `(row, col)` on a display-relative row (`0` = viewport top), matching URLs, file paths, emails, git hashes, and quoted strings before falling back to word boundaries.
+    /// Returns smart word boundaries `(start_col, end_col)` at `(row, col)` on a display-relative row.
     #[inline]
     #[must_use]
     pub fn smart_word_at(
@@ -397,9 +389,6 @@ mod tests {
         );
     }
 
-    /// display_row_text returns exactly what each display row shows when the
-    /// viewport straddles the history/live boundary (live rows are not
-    /// shifted again by display_offset).
     #[test]
     fn display_row_text_straddling_viewport_reads_each_displayed_row() {
         let mut term = Terminal::new(5, 20);
@@ -435,8 +424,6 @@ mod tests {
         }
     }
 
-    /// A straddling read keeps live-frame extras (combining marks) paired with
-    /// their base cells.
     #[test]
     fn display_row_text_straddling_keeps_combining_marks_paired() {
         let mut term = Terminal::new(5, 20);
@@ -454,9 +441,6 @@ mod tests {
         );
     }
 
-    /// The display-relative cell reader tracks the scroll position like
-    /// display_row_text (row 0 is the top displayed row), and equals
-    /// cell_grapheme at display_offset == 0.
     #[test]
     fn display_cell_grapheme_reads_the_displayed_row() {
         let mut term = Terminal::new(5, 20);
@@ -496,9 +480,6 @@ mod tests {
         assert_eq!(term.display_cell_grapheme(0, 999), None);
     }
 
-    /// A scrolled-off row's complex cluster and combining marks stay paired
-    /// with their cells when read back per-cell from history (the ring extras
-    /// materializer), and a wide lead's continuation reads as the empty spacer.
     #[test]
     fn display_cell_grapheme_keeps_history_extras_paired() {
         let mut term = Terminal::new(5, 20);

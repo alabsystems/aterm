@@ -6,9 +6,6 @@
 
 use super::*;
 
-// Performance Tests (complexity verification)
-
-/// Verify erase-to-end-of-screen extras clears are O(E), not O(rows*E).
 #[test]
 fn erase_to_end_of_screen_extras_clear_is_batch_o_e() {
     fn measure_erase_to_end_ops(extras_count: usize, cursor_row: u16) -> usize {
@@ -48,7 +45,6 @@ fn erase_to_end_of_screen_extras_clear_is_batch_o_e() {
     );
 }
 
-/// Verify erase-rect extras clears are O(E), independent of rectangle height.
 #[test]
 fn erase_rect_extras_clear_is_batch_o_e() {
     fn measure_erase_rect_ops(extras_count: usize, rect_height: u16) -> usize {
@@ -81,10 +77,6 @@ fn erase_rect_extras_clear_is_batch_o_e() {
     );
 }
 
-// Region shift complexity tests
-
-/// `entries` combining-mark extras at (`i % rows`, `i / rows + col0`), then the
-/// shift ops `shift` performs on them.
 fn measure_shift(
     entries: usize,
     rows: usize,
@@ -104,9 +96,6 @@ fn measure_shift(
     take_extras_shift_ops()
 }
 
-/// O(E): `measure(entries, n)` must not grow from `small_n` to `large_n` (the
-/// region size or shift count; `grown` names that growth) and must ~double with
-/// twice the entries.
 fn assert_shift_ops_o_e(
     grown: &str,
     small_n: u16,
@@ -132,8 +121,6 @@ fn assert_shift_ops_o_e(
     );
 }
 
-/// The region shifts are O(E), independent of the region size, and the column
-/// shifts O(E), independent of the shift count.
 #[test]
 fn extras_shifts_are_o_e_not_o_region_or_count() {
     assert_shift_ops_o_e("up_by: 10x larger region", 10, 100, |entries, region| {
@@ -160,9 +147,6 @@ fn extras_shifts_are_o_e_not_o_region_or_count() {
     );
 }
 
-// Rapid scroll allocation stress test
-
-/// Verify that rapid sequential scrolls do not cause unbounded extras overhead.
 #[test]
 fn rapid_scroll_extras_cost_bounded() {
     let rows = 24u16;
@@ -198,10 +182,6 @@ fn rapid_scroll_extras_cost_bounded() {
     );
 }
 
-// Reflow complexity verification
-
-/// Reflow row ops for a `num_rows`-row grid of full `ch` rows resized
-/// `old_cols` -> `new_cols`: 2x rows must ~2x the ops.
 fn assert_reflow_row_ops_linear(old_cols: u16, new_cols: u16, ch: char) {
     let measure_reflow_rows = |num_rows: u16| {
         let mut grid = Grid::with_scrollback(num_rows, old_cols, 0);
@@ -227,13 +207,11 @@ fn assert_reflow_row_ops_linear(old_cols: u16, new_cols: u16, ch: char) {
     );
 }
 
-/// Verify reflow grow-columns processes O(rows) row operations.
 #[test]
 fn reflow_grow_row_ops_linear_in_rows() {
     assert_reflow_row_ops_linear(40, 80, 'A');
 }
 
-/// Verify reflow shrink-columns processes O(rows) row operations.
 #[test]
 fn reflow_shrink_row_ops_linear_in_rows() {
     assert_reflow_row_ops_linear(80, 40, 'B');

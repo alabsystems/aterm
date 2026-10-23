@@ -36,7 +36,7 @@ pub(super) fn end_once(s: &WinSession) {
 }
 
 /// End the programs below session `s`'s first process that its job does not
-/// hold (the [module docs](self)).
+/// hold.
 fn end(s: &WinSession) {
     if s.job == 0 {
         return;
@@ -49,7 +49,8 @@ fn end(s: &WinSession) {
         held_by(h.raw(), s.job)
     });
     for (_, process) in &taken {
-        // SAFETY: a process handle the walk opened with PROCESS_TERMINATE and holds.
+        // SAFETY: a process handle the walk opened with PROCESS_TERMINATE and holds; it names the
+        // process the walk vouched for.
         unsafe { ffi::TerminateProcess(process.raw(), ENDED) };
     }
 }
@@ -101,7 +102,7 @@ fn select<H>(
 /// read.
 fn open(pid: u32) -> Option<Opened<Handle>> {
     let access = ffi::PROCESS_QUERY_LIMITED_INFORMATION | ffi::PROCESS_TERMINATE;
-    // SAFETY: plain OpenProcess.
+    // SAFETY: plain OpenProcess; the handle is owned by the guard.
     let handle = Handle::new(unsafe { ffi::OpenProcess(access, 0, pid) });
     if handle.raw() == 0 {
         return None;
@@ -120,7 +121,8 @@ fn open(pid: u32) -> Option<Opened<Handle>> {
 /// when it cannot be read.
 fn parent_of(process: HANDLE) -> Option<u32> {
     let mut info = ffi::PROCESS_BASIC_INFORMATION::default();
-    // SAFETY: a process handle the caller holds and an out-buffer of the stated size.
+    // SAFETY: a process handle the caller holds and an out-buffer of the
+    // stated size; no return length is asked for.
     let status = unsafe {
         ffi::NtQueryInformationProcess(
             process,
@@ -265,14 +267,15 @@ mod tests {
             let line = format!(r#""{system}\System32\cmd.exe" /d /c ping -n 600 127.0.0.1 >nul"#);
             let mut line: Vec<u16> = line.encode_utf16().chain([0]).collect();
             let mut attr = AttrList::new(1).expect("an attribute list");
-            // SAFETY: plain OpenProcess.
+            // SAFETY: plain OpenProcess; the handle is owned by the guard.
             let parent = parent.map(|pid| {
                 Handle::new(unsafe { ffi::OpenProcess(PROCESS_CREATE_PROCESS, 0, pid) })
             });
             let mut parent_raw = parent.as_ref().map_or(0, Handle::raw);
             if parent.is_some() {
                 assert_ne!(parent_raw, 0, "the parent opens to start a child under it");
-                // SAFETY: an initialized list.
+                // SAFETY: an initialized list; the value points at a live
+                // handle that outlives the CreateProcessW below.
                 let ok = unsafe {
                     ffi::UpdateProcThreadAttribute(
                         attr.ptr(),
@@ -286,14 +289,15 @@ mod tests {
                 };
                 assert_ne!(ok, 0, "the parent attribute is set");
             }
-            // SAFETY: zeroed STARTUPINFOEXW is valid.
+            // SAFETY: zeroed STARTUPINFOEXW is valid; cb and the list are set.
             let mut si: ffi::STARTUPINFOEXW = unsafe { std::mem::zeroed() };
             si.StartupInfo.cb = std::mem::size_of::<ffi::STARTUPINFOEXW>() as u32;
             si.StartupInfo.dwFlags = ffi::STARTF_USESTDHANDLES;
             si.lpAttributeList = attr.ptr();
             // SAFETY: PROCESS_INFORMATION is POD out-memory.
             let mut pi: ffi::PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: a NUL-terminated, writable command line.
+            // SAFETY: a NUL-terminated, writable command line; the list and
+            // the parent handle live across the call.
             let created = unsafe {
                 ffi::CreateProcessW(
                     std::ptr::null(),
@@ -329,7 +333,7 @@ mod tests {
                     let access = SYNCHRONIZE
                         | ffi::PROCESS_QUERY_LIMITED_INFORMATION
                         | ffi::PROCESS_TERMINATE;
-                    // SAFETY: plain OpenProcess.
+                    // SAFETY: plain OpenProcess; the handle is owned by the guard.
                     let process = Handle::new(unsafe { ffi::OpenProcess(access, 0, pid) });
                     let ours = process.raw() != 0
                         && parent_of(process.raw()) == Some(self.pid)
@@ -386,7 +390,7 @@ mod tests {
     /// A tab running an interactive `cmd.exe`, its output read to the end on a
     /// thread of its own; the receiver hears when the end comes.
     fn tab() -> (crate::SpawnedShell, mpsc::Receiver<()>) {
-        // SAFETY: test-process mint.
+        // SAFETY: test-process mint; the trusted-launcher contract trivially holds.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);

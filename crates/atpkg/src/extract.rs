@@ -1221,7 +1221,8 @@ fn extract_stream(
             EntryKind::Directory => layer.directory(&raw, declared, mode)?,
             EntryKind::Regular => {
                 // The reader hands out content bytes through the CappedReader; the
-                // per-file cap and the structural refund happen in write_capped.
+                // content cap and the structural refund happen in write_capped (or
+                // drain_capped, for an entry the strip skips).
                 layer.regular(&raw, mode, &mut entry)?;
             }
             EntryKind::Other if opts.allow_global_pax && entry.header().is_global_pax() => {
@@ -1872,7 +1873,8 @@ mod tests {
         let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
             return;
         };
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+        // process runs this one test (`--exact`), so no other create sees the mask.
         unsafe { libc::umask(0) };
         let d = PathBuf::from(dir);
         let root = d.join("staging");

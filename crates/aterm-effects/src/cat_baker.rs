@@ -69,6 +69,9 @@ pub struct CatBaker {
     /// Per-slot write stamp (parallel to `slots`): the `version` this slot's
     /// band in `rgba` was last baked at.
     slot_version: Vec<u64>,
+    /// Reusable destination tile and open-eye reflection mask across cache-miss bakes.
+    scratch: Option<Tile>,
+    eye_mask_scratch: Option<Tile>,
     /// LRU clock, advanced once per tick by [`CatBaker::begin_frame`].
     clock: u64,
     bakes_left: u32,
@@ -120,6 +123,8 @@ impl CatBaker {
     /// Wholesale clear and version bump (config reload, toggle, metric change).
     #[inline]
     pub fn clear(&mut self) {
+        self.scratch = None;
+        self.eye_mask_scratch = None;
         if self.slots.iter().all(Option::is_none) && self.published.is_none() {
             return;
         }
@@ -215,9 +220,14 @@ impl CatBaker {
             return Some(tile);
         }
         let i = self.bake_slot()?;
-        let tile = key.bake();
+        let mut scratch = self.scratch.take();
+        let mut eye_mask_scratch = self.eye_mask_scratch.take();
+        let tile = key.bake_scratch(&mut scratch, &mut eye_mask_scratch);
         let tw = tile.width() as usize;
-        Some(self.install(i, slot_key, tile.pixels(), tw, usize::from(key.h)))
+        let out = self.install(i, slot_key, tile.pixels(), tw, usize::from(key.h));
+        self.scratch = scratch;
+        self.eye_mask_scratch = eye_mask_scratch;
+        Some(out)
     }
 
     /// Look up a resident `BakeKeyV4` tile and stamp it used this frame without spending bake budget on a miss.
@@ -475,15 +485,18 @@ pub(crate) fn paint_dark_masked_disc(
             if !dark_eye {
                 continue;
             }
+            let dx2: [f32; 4] = std::array::from_fn(|sx| {
+                let fx = x as f32 + (sx as f32 + 0.5) * 0.25;
+                let dx = fx - cx;
+                dx * dx
+            });
             let mut hit = 0u32;
             for &dy2 in &dy2 {
                 if dy2 > rr {
                     continue;
                 }
-                for sx in 0..4 {
-                    let fx = x as f32 + (sx as f32 + 0.5) * 0.25;
-                    let dx = fx - cx;
-                    if dx * dx + dy2 <= rr {
+                for &dx2 in &dx2 {
+                    if dx2 + dy2 <= rr {
                         hit = hit.saturating_add(1);
                     }
                 }
@@ -858,55 +871,111 @@ impl EyesFrame {
 
 /// The eye line (mean path y in the 0..1 frame) of an `Eye`-role layer, which
 /// blink and squint squash toward.
-fn layer_eye_line(layer: &Layer) -> Option<f32> {
+const fn layer_eye_line(layer: &Layer) -> Option<f32> {
     let mut lo = u16::MAX;
     let mut hi = 0u16;
     let mut seen = false;
-    let mut take = |y: u16| {
-        lo = lo.min(y);
-        hi = hi.max(y);
-        seen = true;
-    };
-    for path in layer.paths {
-        for seg in *path {
-            match *seg {
-                PathSeg::Move(_, y) | PathSeg::Line(_, y) => take(y),
+    let mut p = 0;
+    while p < layer.paths.len() {
+        let path = layer.paths[p];
+        let mut s = 0;
+        while s < path.len() {
+            match path[s] {
+                PathSeg::Move(_, y) | PathSeg::Line(_, y) => {
+                    if y < lo {
+                        lo = y;
+                    }
+                    if y > hi {
+                        hi = y;
+                    }
+                    seen = true;
+                }
                 PathSeg::Cubic(_, y1, _, y2, _, y) => {
-                    take(y1);
-                    take(y2);
-                    take(y);
+                    let ys = [y1, y2, y];
+                    let mut k = 0;
+                    while k < 3 {
+                        let yk = ys[k];
+                        if yk < lo {
+                            lo = yk;
+                        }
+                        if yk > hi {
+                            hi = yk;
+                        }
+                        k += 1;
+                    }
+                    seen = true;
                 }
                 PathSeg::Close => {}
             }
+            s += 1;
         }
+        p += 1;
     }
-    seen.then(|| (f32::from(lo) + f32::from(hi)) * 0.5 / f32::from(FIXED_ONE))
+    if seen {
+        Some((lo as f32 + hi as f32) * 0.5 / FIXED_ONE as f32)
+    } else {
+        None
+    }
 }
 
 /// Normalized control-hull bounds `(x0, y0, x1, y1)` of one subpath.
-pub(crate) fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
+#[must_use]
+pub(crate) const fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
     let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
     let mut seen = false;
-    let mut take = |x: u16, y: u16| {
-        x0 = x0.min(x);
-        y0 = y0.min(y);
-        x1 = x1.max(x);
-        y1 = y1.max(y);
-        seen = true;
-    };
-    for seg in path {
-        match *seg {
-            PathSeg::Move(x, y) | PathSeg::Line(x, y) => take(x, y),
+    let mut i = 0;
+    while i < path.len() {
+        match path[i] {
+            PathSeg::Move(x, y) | PathSeg::Line(x, y) => {
+                if x < x0 {
+                    x0 = x;
+                }
+                if y < y0 {
+                    y0 = y;
+                }
+                if x > x1 {
+                    x1 = x;
+                }
+                if y > y1 {
+                    y1 = y;
+                }
+                seen = true;
+            }
             PathSeg::Cubic(ax, ay, bx, by, x, y) => {
-                take(ax, ay);
-                take(bx, by);
-                take(x, y);
+                let pts = [(ax, ay), (bx, by), (x, y)];
+                let mut k = 0;
+                while k < 3 {
+                    let (px, py) = pts[k];
+                    if px < x0 {
+                        x0 = px;
+                    }
+                    if py < y0 {
+                        y0 = py;
+                    }
+                    if px > x1 {
+                        x1 = px;
+                    }
+                    if py > y1 {
+                        y1 = py;
+                    }
+                    k += 1;
+                }
+                seen = true;
             }
             PathSeg::Close => {}
         }
+        i += 1;
     }
-    let norm = |v: u16| f32::from(v) / f32::from(FIXED_ONE);
-    seen.then(|| (norm(x0), norm(y0), norm(x1), norm(y1)))
+    if seen {
+        Some((
+            x0 as f32 / FIXED_ONE as f32,
+            y0 as f32 / FIXED_ONE as f32,
+            x1 as f32 / FIXED_ONE as f32,
+            y1 as f32 / FIXED_ONE as f32,
+        ))
+    } else {
+        None
+    }
 }
 
 /// Pair a catch-light centre with its closest eye path. Returns the path index
@@ -934,9 +1003,35 @@ fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransfo
         && !(eye_w > 0.0 && eye_h < OPEN_EYE_SHALLOW_ASPECT * eye_w)
 }
 
+pub(crate) fn prepare_scratch_tile(slot: &mut Option<Tile>, w: u32, h: u32) -> &mut Tile {
+    match slot {
+        Some(tile) => {
+            tile.reset(w, h);
+            tile
+        }
+        None => slot.insert(Tile::new(w, h)),
+    }
+}
+
+#[inline]
+pub(crate) fn take_or_new_tile(recycled: Option<Tile>, w: u32, h: u32) -> Tile {
+    match recycled {
+        Some(mut tile) => {
+            tile.reset(w, h);
+            tile
+        }
+        None => Tile::new(w, h),
+    }
+}
+
 /// Reinforce the authored upper catch-light and add a smaller lower-right echo
 /// to each open eye.
-fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTransform) {
+fn paint_open_eye_reflections(
+    tile: &mut Tile,
+    layers: &[Layer],
+    xform: PathTransform,
+    mask_scratch: &mut Option<Tile>,
+) {
     if xform.scale_x.min(xform.scale_y) < OPEN_EYE_REFLECTION_MIN_PX {
         return;
     }
@@ -949,7 +1044,7 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
     else {
         return;
     };
-    let mut eye_mask: Option<Tile> = None;
+    let mut painted_mask = false;
 
     for catch_light in catch_lights.paths {
         let Some((cx0, cy0, cx1, cy1)) = path_bounds(catch_light) else {
@@ -962,11 +1057,14 @@ fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTran
         if !open_eye_reflection_eligible(eye_bounds, xform) {
             continue;
         }
-        let eye_mask = eye_mask.get_or_insert_with(|| {
-            let mut mask = Tile::new(tile.width(), tile.height());
-            fill_path_fixed(&mut mask, eyes.paths, (0.0, 0.0, 0.0), 1.0, xform);
-            mask
-        });
+        if !painted_mask {
+            let mask = prepare_scratch_tile(mask_scratch, tile.width(), tile.height());
+            fill_path_fixed(mask, eyes.paths, (0.0, 0.0, 0.0), 1.0, xform);
+            painted_mask = true;
+        }
+        let Some(eye_mask) = mask_scratch.as_ref() else {
+            continue;
+        };
         let (ex0, ey0, ex1, ey1) = eye_bounds;
         let eye_w = (ex1 - ex0) * xform.scale_x;
         let eye_h = (ey1 - ey0) * xform.scale_y;
@@ -1017,6 +1115,7 @@ fn paint_glyph(
     xform: PathTransform,
     eyes: EyesFrame,
     reflections: bool,
+    mask_scratch: &mut Option<Tile>,
 ) {
     let def = &GLYPHS[id as usize];
     let coat_recolored = def
@@ -1061,8 +1160,44 @@ fn paint_glyph(
         fill_path_fixed(tile, layer.paths, col, alpha, lxform);
     }
     if reflections && matches!(eyes, EyesFrame::Open) {
-        paint_open_eye_reflections(tile, def.layers, xform);
+        paint_open_eye_reflections(tile, def.layers, xform, mask_scratch);
     }
+}
+
+fn paint_variant_onto(
+    tile: &mut Tile,
+    id: CatGlyphId,
+    accessory: Option<CatGlyphId>,
+    fills: &ResolvedFills,
+    (w, h): (u32, u32),
+    eyes: EyesFrame,
+    mask_scratch: &mut Option<Tile>,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    paint_glyph(
+        tile,
+        id,
+        fills,
+        PathTransform::fit(w, h),
+        eyes,
+        true,
+        mask_scratch,
+    );
+    if let Some(acc) = accessory {
+        paint_glyph(
+            tile,
+            acc,
+            fills,
+            accessory_transform(acc, w, h),
+            EyesFrame::Open,
+            false,
+            mask_scratch,
+        );
+    }
+    let r = f32::from(PATCH_STRIP) * 0.5;
+    tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
 }
 
 /// Bake one authored glyph variant to an exact-size RGBA [`Tile`]: the glyph's 0..1 frame fills a `w × h` box at the origin, and the tile is `w + PATCH_STRIP` wide with a white catch-light dot at `(w, 0)`.
@@ -1083,22 +1218,7 @@ pub fn bake_variant_with(
     eyes: EyesFrame,
 ) -> Tile {
     let mut tile = Tile::new(w + u32::from(PATCH_STRIP), h);
-    if w == 0 || h == 0 {
-        return tile;
-    }
-    paint_glyph(&mut tile, id, fills, PathTransform::fit(w, h), eyes, true);
-    if let Some(acc) = accessory {
-        paint_glyph(
-            &mut tile,
-            acc,
-            fills,
-            accessory_transform(acc, w, h),
-            EyesFrame::Open,
-            false,
-        );
-    }
-    let r = f32::from(PATCH_STRIP) * 0.5;
-    tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
+    paint_variant_onto(&mut tile, id, accessory, fills, (w, h), eyes, &mut None);
     tile
 }
 
@@ -1143,6 +1263,27 @@ impl BakeKeyV4 {
             u32::from(self.h),
             self.eyes,
         )
+    }
+
+    fn bake_scratch<'a>(
+        &self,
+        scratch: &'a mut Option<Tile>,
+        mask_scratch: &mut Option<Tile>,
+    ) -> &'a Tile {
+        let w = u32::from(self.w);
+        let h = u32::from(self.h);
+        let tw = w + u32::from(PATCH_STRIP);
+        let tile = prepare_scratch_tile(scratch, tw, h);
+        paint_variant_onto(
+            tile,
+            self.variant,
+            self.accessory,
+            &self.fills(),
+            (w, h),
+            self.eyes,
+            mask_scratch,
+        );
+        tile
     }
 }
 
@@ -1429,6 +1570,7 @@ mod tests {
             PathTransform::fit(w, h),
             eyes,
             reflections,
+            &mut None,
         );
         let r = f32::from(PATCH_STRIP) * 0.5;
         tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
@@ -2011,5 +2153,71 @@ mod tests {
             assert!(transform.scale_x <= scale * w as f32 + f32::EPSILON);
             assert!(transform.scale_y <= scale * h as f32 + f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn get_v4_reuses_scratch_tiles_and_matches_direct_bake() {
+        let mut baker = CatBaker::default();
+        baker.begin_frame(10, 20);
+        let first = BakeKeyV4 {
+            variant: CatGlyphId::S121,
+            eyes: EyesFrame::Open,
+            ..vk(2)
+        };
+        let t0 = baker.get_v4(&first).expect("first bake fits");
+        let scratch_ptr = baker
+            .scratch
+            .as_ref()
+            .expect("scratch tile retained")
+            .pixels()
+            .as_ptr();
+        let mask_ptr = baker
+            .eye_mask_scratch
+            .as_ref()
+            .expect("eye mask scratch retained")
+            .pixels()
+            .as_ptr();
+
+        for (coat, eyes, w) in [
+            (2, EyesFrame::Happy, 40),
+            (2, EyesFrame::Blink, 40),
+            (7, EyesFrame::Open, 40),
+            (9, EyesFrame::Open, 34),
+        ] {
+            baker.begin_frame(10, 20);
+            let key = BakeKeyV4 {
+                variant: CatGlyphId::S121,
+                coat,
+                w,
+                eyes,
+                ..vk(coat)
+            };
+            let placed = baker.get_v4(&key).expect("subsequent bake fits");
+            assert_eq!(
+                baker.scratch.as_ref().unwrap().pixels().as_ptr(),
+                scratch_ptr,
+                "same-or-smaller bake must reuse destination scratch tile buffer"
+            );
+            assert_eq!(
+                baker.eye_mask_scratch.as_ref().unwrap().pixels().as_ptr(),
+                mask_ptr,
+                "open-eye reflection mask scratch buffer must stay resident and reused"
+            );
+            let direct = key.bake();
+            let tw = direct.width() as usize;
+            let atlas_w = usize::from(baker.slot_w);
+            for row in 0..usize::from(key.h) {
+                let d = (usize::from(placed.ay) + row) * atlas_w * 4;
+                let s = row * tw * 4;
+                assert_eq!(
+                    &baker.rgba[d..d + tw * 4],
+                    &direct.pixels()[s..s + tw * 4],
+                    "reused scratch bake must match fresh key.bake() texels (coat={coat}, eyes={eyes:?}, w={w}, row={row})"
+                );
+            }
+        }
+        let _ = t0;
+        baker.clear();
+        assert!(baker.scratch.is_none() && baker.eye_mask_scratch.is_none());
     }
 }

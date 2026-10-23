@@ -2,9 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rows-only resize retention on ring-only grids (the wasm engines' shape): the ring is the
-//! retention, so a rows-only resize never sheds ring history. Identity law: history, viewport
-//! and absolute-row numbering match what the same writes and resize produce on a tiered grid.
+//! Rows-only resize retention tests for ring-only and tiered grids.
 
 use super::super::super::*;
 use aterm_scrollback::Scrollback;
@@ -19,7 +17,6 @@ fn write_numbered_lines(grid: &mut Grid, n: usize) {
     }
 }
 
-/// The identity-law key: (history oldest-first, viewport, `oldest_absolute_row`).
 fn logical_buffer(grid: &Grid) -> (Vec<String>, Vec<String>, u64) {
     let history: Vec<String> = (0..grid.scrollback_lines())
         .map(|i| {
@@ -73,8 +70,6 @@ fn rows_only_shrink_preserves_ring_history_and_matches_tiered() {
         "identity law: same history sequence, viewport, and absolute numbering"
     );
 
-    // The shrink anchors at the cursor: the top 5 viewport rows become the newest history, so
-    // reading order stays the write order and the cursor's line stays visible.
     let (history, viewport, oldest_abs) = logical_buffer(&ring);
     assert_eq!(history.len(), 26);
     assert_eq!(history[0], "N0");
@@ -102,7 +97,6 @@ fn rows_only_grow_reveals_history_and_matches_tiered() {
         "identity law: same history sequence, viewport, and absolute numbering"
     );
 
-    // 5 history lines re-enter the viewport; the rest stay history.
     let (history, viewport, oldest_abs) = logical_buffer(&ring);
     assert_eq!(history.len(), 21);
     assert_eq!(history[0], "N0");
@@ -116,9 +110,6 @@ fn rows_only_grow_reveals_history_and_matches_tiered() {
     assert_eq!(oldest_abs, 0);
 }
 
-/// The cursor follows its content through a rows-grow reveal: every pre-resize viewport row sits
-/// `revealed` rows further down, so a TUI's post-SIGWINCH repaint and CPR answers anchor. Both
-/// grid shapes.
 #[test]
 fn rows_only_grow_cursor_follows_its_content_line() {
     for tiered in [false, true] {
@@ -129,7 +120,6 @@ fn rows_only_grow_cursor_follows_its_content_line() {
             Grid::with_scrollback(5, 40, 10_000)
         };
         write_numbered_lines(&mut grid, 30);
-        // The cursor is parked on the row below "N29".
         let before_row = grid.cursor().row;
         let before_text = grid
             .row_text(before_row)
@@ -149,7 +139,6 @@ fn rows_only_grow_cursor_follows_its_content_line() {
             "tiered={tiered}: the cursor must stay on its logical line \
              through the reveal (was row {before_row}, now {after_row})"
         );
-        // Grow 5 -> 10 with ample history reveals 5 lines.
         assert_eq!(
             after_row,
             before_row + 5,
@@ -158,8 +147,6 @@ fn rows_only_grow_cursor_follows_its_content_line() {
     }
 }
 
-/// A shrink whose demoted rows overflow the retention cap evicts only past the cap, oldest first,
-/// like `scroll_up`'s at-capacity reuse.
 #[test]
 fn rows_only_shrink_at_cap_evicts_only_beyond_the_limit() {
     let mut grid = Grid::with_scrollback(5, 20, 30);
@@ -170,7 +157,6 @@ fn rows_only_shrink_at_cap_evicts_only_beyond_the_limit() {
     grid.resize(3, 20);
     grid.assert_invariants();
 
-    // 2 demoted rows push history to 32; the cap evicts the 2 oldest.
     assert_eq!(grid.scrollback_lines(), 30, "capped, not wiped");
     assert_eq!(
         grid.oldest_absolute_row(),
@@ -179,8 +165,6 @@ fn rows_only_shrink_at_cap_evicts_only_beyond_the_limit() {
     );
 }
 
-/// The alt-screen configuration (ring cap 0) keeps no scrollback through a
-/// rows-only shrink: demoted rows are evicted by the zero cap.
 #[test]
 fn rows_only_shrink_with_zero_cap_still_retains_nothing() {
     let mut grid = Grid::with_scrollback(5, 20, 0);
@@ -197,13 +181,11 @@ fn rows_only_shrink_with_zero_cap_still_retains_nothing() {
     assert_eq!(grid.rows(), 3);
 }
 
-/// Ring history extras survive a rows-only resize, side table and all.
 #[test]
 fn rows_only_resize_keeps_ring_history_extras() {
     use std::sync::Arc;
 
     let mut grid = Grid::with_scrollback(3, 20, 10_000);
-    // A linked "Hello" on row 0, then enough lines to push it into ring history.
     let url: Arc<str> = Arc::from("https://example.com/rows-only");
     for c in "Hello".chars() {
         grid.write_char(c);
@@ -241,8 +223,6 @@ fn rows_only_resize_keeps_ring_history_extras() {
     );
 }
 
-/// Every retained line oldest-first, then the viewport (trailing blanks
-/// trimmed): the transcript a reader of history plus screen sees.
 fn transcript(grid: &Grid) -> Vec<String> {
     let mut all = crate::grid::test_support::history_trimmed(grid);
     all.extend((0..grid.rows()).map(|r| {
@@ -253,9 +233,6 @@ fn transcript(grid: &Grid) -> Vec<String> {
     all
 }
 
-/// A rows-only grow that reveals history raises a wrapped ring's cap without adding a row, so the
-/// next line feed appends (see `linearize_ring`): every line feed after the grow scrolls every
-/// row, on both grid shapes, and the transcript stays the write order.
 #[test]
 fn line_feeds_after_a_wrapped_ring_grows_in_rows_scroll_every_row() {
     for tiered in [false, true] {
@@ -265,7 +242,6 @@ fn line_feeds_after_a_wrapped_ring_grows_in_rows_scroll_every_row() {
         } else {
             Grid::with_scrollback(5, 20, 10)
         };
-        // 40 lines through a 15-row ring: full and wrapped.
         crate::grid::test_support::feed_numbered_lines(&mut grid, 0, 40);
         grid.resize(8, 20);
         grid.assert_invariants();
@@ -300,11 +276,6 @@ fn line_feeds_after_a_wrapped_ring_grows_in_rows_scroll_every_row() {
     }
 }
 
-/// The same for a top-anchored partial region with fixed rows below it (Codex's inline history
-/// above its input rows), which archives through the same ring append
-/// (`scroll_top_anchored_region_up_with_history`): after a rows-only grow of a wrapped ring, a
-/// region scroll (a line feed at its bottom margin, or SU 2) moves every region row, blanks the
-/// vacated rows, leaves the footer and archives the displaced rows as the newest history.
 #[test]
 fn top_anchored_region_scrolls_after_a_wrapped_ring_grows_in_rows() {
     let screen = |grid: &Grid| -> Vec<String> {
@@ -325,7 +296,6 @@ fn top_anchored_region_scrolls_after_a_wrapped_ring_grows_in_rows() {
             } else {
                 Grid::with_scrollback(5, 20, 10)
             };
-            // A full, wrapped 15-row ring; the grow reveals three lines (rows 0..=6: L33..L39).
             crate::grid::test_support::feed_numbered_lines(&mut grid, 0, 40);
             grid.resize(8, 20);
             grid.assert_invariants();

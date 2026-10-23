@@ -5,15 +5,12 @@
 
 use super::*;
 
-/// Hot-tier lines come back as `Cow::Borrowed`, warm-tier lines as `Cow::Owned`.
 #[test]
 fn get_line_returns_borrowed_for_hot_tier() {
     use std::borrow::Cow;
 
-    // Small limits to force tier promotion: block_size=2, hot_limit=4, warm_limit=10.
     let mut sb = Scrollback::with_block_size(4, 10, 10_000_000, 2);
 
-    // Push 6 lines: 2 will be promoted to warm (1 block), 4 remain in hot.
     for i in 0..6 {
         sb.push_str(&format!("line-{i}"));
     }
@@ -21,7 +18,6 @@ fn get_line_returns_borrowed_for_hot_tier() {
     assert_eq!(sb.hot_line_count(), 4, "4 lines in hot tier");
     assert_eq!(sb.warm_line_count(), 2, "2 lines promoted to warm");
 
-    // Lines 0-1 are in warm tier → Cow::Owned (decompressed from LZ4).
     for idx in 0..2 {
         let cow = sb.get_line(idx).unwrap().expect("warm line present");
         assert!(
@@ -31,7 +27,6 @@ fn get_line_returns_borrowed_for_hot_tier() {
         assert_eq!(cow.to_string(), format!("line-{idx}"));
     }
 
-    // Lines 2-5 are in hot tier → Cow::Borrowed (zero-copy).
     for idx in 2..6 {
         let cow = sb.get_line(idx).unwrap().expect("hot line present");
         assert!(
@@ -41,7 +36,6 @@ fn get_line_returns_borrowed_for_hot_tier() {
         assert_eq!(cow.to_string(), format!("line-{idx}"));
     }
 
-    // Reverse access: rev_idx 0 = most recent = hot tier → Borrowed.
     let newest = sb.get_line_rev(0).unwrap().expect("newest line present");
     assert!(
         matches!(newest, Cow::Borrowed(_)),
@@ -49,8 +43,6 @@ fn get_line_returns_borrowed_for_hot_tier() {
     );
     assert_eq!(newest.to_string(), "line-5");
 }
-
-// Streaming-iterator parity oracles
 
 fn streaming_parity_line(i: u16) -> Line {
     use std::sync::Arc;
@@ -79,13 +71,8 @@ fn streaming_parity_line(i: u16) -> Line {
     line
 }
 
-/// Differential oracle: the block-streaming forward iterator yields exactly
-/// what a per-line `get_line` walk yields, over all three tiers and after a
-/// front truncation (non-zero front offsets). Serialized comparisons cover
-/// styles, links/IDs, underline colours and wrap flags, not just text.
 #[test]
 fn streaming_iter_matches_get_line_walk_memory() {
-    // Small limits force all three tiers + multiple blocks/pages.
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
     let mut original = Vec::new();
     for i in 0..60 {
@@ -93,12 +80,10 @@ fn streaming_iter_matches_get_line_walk_memory() {
         original.push(line.serialize());
         sb.push_line(line);
     }
-    // The untrimmed walk visits complete pages and blocks at offset zero.
     assert_eq!(
         sb.iter().map(|l| l.serialize()).collect::<Vec<_>>(),
         original
     );
-    // Front-truncate to a non-block-aligned boundary: cold front_offset > 0.
     sb.truncate(53).unwrap();
     assert!(
         sb.cold_line_count() > 0,
@@ -123,20 +108,15 @@ fn streaming_iter_matches_get_line_walk_memory() {
     assert_eq!(via_iter, via_get, "streaming iter must match get_line walk");
     assert_eq!(via_iter, original[7..], "trim must keep the exact suffix");
 
-    // And through the storage facade (its own streaming iterator).
     let mut storage: ScrollbackStorage = sb.into();
     let via_storage: Vec<_> = storage.iter().map(|l| l.serialize()).collect();
     assert_eq!(via_storage, via_get);
-    // Removing the cold tier and one warm prefix exercises the partial-block
-    // arm beside full blocks, while retaining the same styles and identities.
     storage.set_line_limit(Some(13));
     assert_eq!(storage.cold_line_count(), 0);
     let via_storage: Vec<_> = storage.iter().map(|l| l.serialize()).collect();
     assert_eq!(via_storage, original[47..]);
 }
 
-/// A corrupt warm block is skipped whole, and `skipped_lines()` reports exactly
-/// its line count.
 #[test]
 fn streaming_iter_skips_corrupt_block_with_same_totals() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -161,14 +141,6 @@ fn streaming_iter_skips_corrupt_block_with_same_totals() {
     );
 }
 
-// Dense walk (`ScrollbackStorage::dense_from`) against the per-line oracle.
-// Product readers key every line by its absolute row, so the dense walk yields
-// exactly one item per logical line: `Some` wherever `get_line` answers a line,
-// `None` wherever it errors or answers nothing.
-
-/// The per-line oracle: what `get_line(i)` answers for every `i` from `start`,
-/// with a read failure folded to `None` — exactly how the product readers
-/// (`Grid::get_history_line` → empty text) treat one.
 fn dense_oracle(storage: &ScrollbackStorage, start: usize) -> Vec<Option<Vec<u8>>> {
     (start..storage.line_count())
         .map(|i| storage.get_line(i).ok().flatten().map(|l| l.serialize()))
@@ -185,8 +157,6 @@ fn dense_walk(storage: &ScrollbackStorage, start: usize) -> Vec<Option<Vec<u8>>>
     iter.map(|l| l.map(|l| l.serialize())).collect()
 }
 
-/// Every start position (tier boundaries, block interiors, the hot tail) over
-/// all three tiers, before and after a non-block-aligned front truncation.
 #[test]
 fn dense_walk_matches_per_line_oracle_across_tiers_and_front_truncation() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -204,15 +174,12 @@ fn dense_walk_matches_per_line_oracle_across_tiers_and_front_truncation() {
                 "keep={keep} start={start}"
             );
         }
-        // A healthy store has no placeholders at all.
         let mut iter = storage.dense_from(0);
         assert!(iter.by_ref().all(|l| l.is_some()));
         assert_eq!(iter.placeholders(), 0);
     }
 }
 
-/// The hot tail is borrowed: the dense walk clones no hot line (the streaming
-/// `iter()` clones each one into a one-line segment).
 #[test]
 fn dense_walk_borrows_hot_lines() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -234,12 +201,6 @@ fn dense_walk_borrows_hot_lines() {
     }
 }
 
-/// A corrupt warm block between the cold tier and the healthy warm blocks: the
-/// dense walk yields one placeholder per line it spans and keeps every later
-/// line on its own coordinate, for every start, including starts inside it.
-///
-/// Negative control: keying the skipping streaming walk by position puts later
-/// lines on the wrong rows.
 #[test]
 fn dense_walk_yields_placeholders_for_a_corrupt_segment_and_keeps_coordinates() {
     let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
@@ -270,7 +231,6 @@ fn dense_walk_yields_placeholders_for_a_corrupt_segment_and_keeps_coordinates() 
         "the placeholders sit exactly on the corrupt block's rows"
     );
 
-    // Negative control: position-keying the skipping walk misplaces rows.
     let skipping: Vec<_> = storage.iter().map(|l| Some(l.serialize())).collect();
     let oracle = dense_oracle(&storage, 0);
     assert_eq!(skipping.len(), total - corrupt_lines);

@@ -920,7 +920,6 @@ pub fn fixture_header(run: &Run, door: &Door<'_>, what: &str) -> String {
                  `base_url=http://127.0.0.1:<port>/v1` with `requires_openai_auth`"
             }
             _ => {
-                //127.0.0.1:<port>/v1`, `wire_api = \"responses\"`, a fake `env_key`"
                 "the lab provider `base_url=http://127.0.0.1:<port>/v1`, `wire_api = \"responses\"`, a fake `env_key`"
             }
         };

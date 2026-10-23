@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A small, dependency-free Markdown → plain-text renderer for the staged update's changelog,
-//! which the Settings `/updates` route shows as plain lines. Headings lose their `#` markers,
-//! bullets become `•`, rules are dropped, and inline emphasis, code and link syntax is
-//! unwrapped to its text.
+//! Dependency-free Markdown to plain-text renderer for changelogs.
 
-/// Render a Markdown changelog to plain text. Other lines pass through with inline syntax
-/// unwrapped; runs of blank lines collapse to one and the result is trimmed.
+/// Render a Markdown changelog to plain text: headings lose their `#` markers, bullets become
+/// `•` and rules are dropped. Other lines pass through with inline syntax unwrapped; runs of
+/// blank lines collapse to one and the result is trimmed.
 pub(crate) fn to_plain_text(md: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for raw in md.lines() {
         let line = raw.trim_end();
         let trimmed = line.trim_start();
-        // The indent is kept so a nested "  - x" stays nested.
         let indent = &line[..line.len() - trimmed.len()];
 
         if trimmed.is_empty() {
@@ -24,7 +21,6 @@ pub(crate) fn to_plain_text(md: &str) -> String {
             continue;
         }
 
-        // ATX heading: keep the text, set off by a preceding blank line.
         if let Some(text) = atx_heading(trimmed) {
             if !out.is_empty() && !out.last().map(String::is_empty).unwrap_or(false) {
                 out.push(String::new());
@@ -33,7 +29,6 @@ pub(crate) fn to_plain_text(md: &str) -> String {
             continue;
         }
 
-        // Horizontal rule: dropped; the blank lines around it already separate sections.
         if is_hrule(trimmed) {
             continue;
         }
@@ -63,12 +58,10 @@ pub(crate) fn to_plain_text(md: &str) -> String {
     out.join("\n")
 }
 
-/// `# text` .. `###### text` → `Some("text")` (trailing `#`s stripped); else `None`.
 fn atx_heading(s: &str) -> Option<&str> {
     let hashes = s.len() - s.trim_start_matches('#').len();
     if (1..=6).contains(&hashes) {
         let rest = &s[hashes..];
-        // A real ATX heading needs a space after the `#`s (else it's e.g. `#123`).
         if let Some(text) = rest.strip_prefix(' ') {
             return Some(text.trim().trim_end_matches('#').trim_end());
         }
@@ -76,7 +69,6 @@ fn atx_heading(s: &str) -> Option<&str> {
     None
 }
 
-/// A markdown thematic break: 3+ of `-`, `*`, or `_` (optionally spaced), nothing else.
 fn is_hrule(s: &str) -> bool {
     for mark in ['-', '*', '_'] {
         let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -87,7 +79,6 @@ fn is_hrule(s: &str) -> bool {
     false
 }
 
-/// `12. text` or `12) text` → `Some("12. text")` with inline syntax unwrapped; else `None`.
 fn ordered_item(s: &str) -> Option<String> {
     let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     if digits == 0 {
@@ -100,13 +91,8 @@ fn ordered_item(s: &str) -> Option<String> {
     Some(format!("{}. {}", &s[..digits], inline(sep)))
 }
 
-/// Unwrap inline Markdown to its text: `**b**`/`__b__` → `b`, `*i*`/`_i_` → `i`,
-/// `` `code` `` → `code`, `[text](url)` → `text`. Not a CommonMark inline parser: it strips
-/// only the syntax a changelog uses.
 fn inline(s: &str) -> String {
-    // Links first: the URL is noise in plain text.
     let delinked = strip_links(s);
-    // The 2-char markers go before the 1-char ones so `**` isn't seen as two `*`.
     let mut t = delinked;
     for marker in ["**", "__", "*", "_", "`"] {
         t = strip_paired(&t, marker);
@@ -114,7 +100,6 @@ fn inline(s: &str) -> String {
     t
 }
 
-/// Remove balanced `[text](url)` spans, keeping `text`. Unbalanced brackets pass through.
 fn strip_links(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -129,7 +114,6 @@ fn strip_links(s: &str) -> String {
             i = paren + 1;
             continue;
         }
-        // Not a link: copy this char (respecting UTF-8 boundaries).
         let ch = s[i..].chars().next().unwrap();
         out.push(ch);
         i += ch.len_utf8();
@@ -137,8 +121,6 @@ fn strip_links(s: &str) -> String {
     out
 }
 
-/// Delete a `marker` (e.g. `**`) when it occurs an even number of times, so `**bold**` →
-/// `bold`; an odd count is left alone so a lone `*` in prose stays literal.
 fn strip_paired(s: &str, marker: &str) -> String {
     let count = s.matches(marker).count();
     if count >= 2 && count.is_multiple_of(2) {
@@ -190,7 +172,6 @@ mod tests {
             inline("see [the docs](https://x.y) now"),
             "see the docs now"
         );
-        // A lone asterisk in prose is left literal (odd count).
         assert_eq!(inline("2 * 3 = 6"), "2 * 3 = 6");
     }
 

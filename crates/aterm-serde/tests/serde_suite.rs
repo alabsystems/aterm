@@ -1,30 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Upstream serde's own test suite (serde 1.0.228 `test_suite/tests`, on the
-//! `serde_test` token harness), ported onto the surface this crate keeps
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.4).
-//!
-//! A test was ported when everything it touches is still here: the trait
-//! defaults and their error text, the std impls aterm's models use, and the
-//! `Content` buffering behind `tag`, `untagged` and `flatten`. A test of a
-//! type this crate no longer implements (NonZero, Rc, net, time, ranges,
-//! atomics, the ffi strings, sets), of an attribute aterm never writes
-//! (`borrow`, `with`/`serialize_with`, `from`/`into`, `other`, `content`,
-//! `expecting`, the one-direction `skip_*` and `rename(serialize = ..)`, and
-//! `untagged`, `skip` or `alias` on a variant), or of a helper deserializer it
-//! dropped stayed behind; a few were cut down to their in-set half, and say
-//! so. The suite writes only the keys, positions and forms in
-//! docs/measured/third-party-2026-10-15/serde-attrs.tsv: aterm-serde-derive
-//! refuses every other one at compile time, so this suite compiling is the
-//! check.
-//!
-//! The derives are aterm-serde-derive's (SP.5). Their output names the crate
-//! `::serde`, and a crate cannot name itself that through Cargo (a self
-//! dev-dependency's rename is dropped), so the two `extern crate` lines below
-//! put `serde` and `serde_derive` in this crate's extern prelude: the derive
-//! output resolves, and every ported file keeps upstream's
-//! `use serde_derive::...`.
+//! Ported upstream `serde` test suite for `aterm-serde` and `aterm-serde-derive`.
 
 #![allow(
     clippy::cast_lossless,

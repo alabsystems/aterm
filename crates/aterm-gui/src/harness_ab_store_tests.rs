@@ -7,8 +7,6 @@ use crate::harness_ab::AbArm;
 const DAY: i64 = 20_002;
 const HOUR: u64 = 3_600_000;
 
-/// A day whose Cruise arm was busy `busy_ms` and saw `boxes` boxes in
-/// bucket 3, and `boxes` landings.
 fn day_of(day: i64, first_unix_ms: i64, busy_ms: u64, boxes: u32) -> AbDay {
     let mut kept = AbDay::new(day, first_unix_ms);
     kept.arms[AbArm::Cruise.index()].busy_ms = busy_ms;
@@ -21,7 +19,6 @@ fn day_of(day: i64, first_unix_ms: i64, busy_ms: u64, boxes: u32) -> AbDay {
     kept
 }
 
-/// A ring holding `days`.
 fn ring_of(days: &[AbDay]) -> AbRing {
     let mut ring: AbRing = [None; DAYS];
     for day in days {
@@ -30,10 +27,6 @@ fn ring_of(days: &[AbDay]) -> AbRing {
     ring
 }
 
-/// A FILE ROUND TRIP: what one process writes another reads back day for
-/// day — every arm's six times and every histogram — and the file is the
-/// owner's alone (0600), named for its process. NEGATIVE CONTROL: the
-/// writer's own file is skipped by its own reading (the live book holds it).
 #[test]
 fn a_book_written_is_read_back_whole() {
     let state = aterm_tempfile::tempdir().expect("scratch state");
@@ -56,10 +49,6 @@ fn a_book_written_is_read_back_whole() {
     assert_eq!(own_name(), own_name(), "one name per process");
 }
 
-/// TWO PROCESSES' FILES ARE SUMMED BY DAY, AND NOTHING TWICE: a seamless
-/// update's outgoing book and another instance's are added day by day,
-/// the earlier first stretch kept. NEGATIVE CONTROL: the reader's own file
-/// (a third, same days) adds nothing.
 #[test]
 fn two_processes_books_are_summed_by_day_once() {
     let state = aterm_tempfile::tempdir().expect("scratch state");
@@ -77,11 +66,6 @@ fn two_processes_books_are_summed_by_day_once() {
     assert_eq!(others[1].holds[0][0][3], 7);
 }
 
-/// A FILE WITH NO DAY IN THE LAST 8 IS REMOVED, and counts nothing; a
-/// newer schema and an unreadable file are passed over and kept; a name
-/// that is no book's, or a directory, is left alone. NEGATIVE CONTROL: a
-/// file whose oldest day is 8 days back but holds one 7 back is kept, and
-/// only that day is counted.
 #[test]
 fn an_old_file_is_removed_and_a_strange_one_passed_over() {
     let state = aterm_tempfile::tempdir().expect("scratch state");
@@ -113,9 +97,6 @@ fn an_old_file_is_removed_and_a_strange_one_passed_over() {
     );
 }
 
-/// A BOOK WITH NOTHING TO KEEP WRITES NO FILE and removes its old one: a
-/// process whose days all left the last 8. NEGATIVE CONTROL: with a day in
-/// them it writes.
 #[test]
 fn a_book_with_nothing_to_keep_leaves_no_file() {
     let state = aterm_tempfile::tempdir().expect("scratch state");
@@ -128,8 +109,6 @@ fn a_book_with_nothing_to_keep_leaves_no_file() {
     write_own(state.path(), "1-1.json", &ring, DAY + 8, 0).expect("nothing to remove");
 }
 
-/// Snapshot order, not worker arrival order, decides this book's file. Both
-/// arrival orders use actual atomic replacement and another book's real reader.
 #[test]
 fn a_late_snapshot_cannot_replace_the_newer_book_written_at_exit() {
     for old_first in [true, false] {
@@ -199,15 +178,6 @@ struct StrictBookFile {
     days: Vec<StrictDayFile>,
 }
 
-/// THE ENDS ARE AN ADDITIVE FIELD OF SCHEMA 1 (§11.6.3 item 4, §11.9
-/// "Schema-1 additive fields"): a book written now round-trips its ends; a
-/// file written before them reads with none; a file written now parses in
-/// the older build's `DayFile`, which skips them, its other numbers whole;
-/// and a day with no end writes no `ends` at all. An older build's `done`
-/// and `quiet` counts (Cruise's dones and Land's quiet ends, neither of
-/// which Autopilot Cruise / Land has) are passed over, its landings
-/// read whole. NEGATIVE CONTROL: the older struct with `deny_unknown_fields`
-/// refuses the newer file.
 #[test]
 fn the_ends_read_across_builds() {
     let state = aterm_tempfile::tempdir().expect("scratch state");
@@ -216,7 +186,6 @@ fn the_ends_read_across_builds() {
     assert_eq!(read_others(state.path(), "9-9.json", DAY), [day]);
     let text = std::fs::read_to_string(dir_of(state.path()).join("1-1.json")).unwrap();
     assert!(text.contains("\"ends\""), "{text}");
-    // The older build reads the newer file, and skips the ends.
     let old: OldBookFile = aterm_json::from_str(&text).expect("an older build reads it");
     assert_eq!(old.schema, SCHEMA);
     assert_eq!(old.days[0].arms[AbArm::Cruise.index()][0], HOUR);
@@ -225,7 +194,6 @@ fn the_ends_read_across_builds() {
         aterm_json::from_str::<StrictBookFile>(&text).is_err(),
         "CONTROL: a reader that denies unknown fields would not"
     );
-    // The newer build reads an older file, with no end.
     let older = BookFile {
         schema: SCHEMA,
         pid: 2,
@@ -247,13 +215,11 @@ fn the_ends_read_across_builds() {
     let mut want = day;
     want.ends = AbEnds::default();
     assert_eq!(read, [want], "an older file reads as no end");
-    // A day with no end writes none.
     let mut quiet = day_of(DAY, 100, HOUR, 0);
     quiet.ends = AbEnds::default();
     write_own(state.path(), "3-3.json", &ring_of(&[quiet]), DAY, 0).unwrap();
     let text = std::fs::read_to_string(dir_of(state.path()).join("3-3.json")).unwrap();
     assert!(!text.contains("\"ends\""), "{text}");
-    // An older build's done and quiet counts are passed over.
     let older_ends = aterm_tempfile::tempdir().expect("scratch state");
     let two = day_of(DAY, 100, HOUR, 2);
     write_own(older_ends.path(), "4-4.json", &ring_of(&[two]), DAY, 0).unwrap();

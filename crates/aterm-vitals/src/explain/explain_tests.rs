@@ -1120,10 +1120,10 @@ fn the_memory_account_reads_the_tabs_footprint() {
         "not the largest"
     );
 
-    let beside = |fp: Option<u64>| {
+    let readings = |tab: u64| {
         let mut scene = spotlight_1032();
         for p in scene.procs.iter_mut().filter(|p| p.pid == 1210) {
-            *p = p.clone().holding(4 << 30);
+            *p = p.clone().holding(tab);
         }
         scene.mem = Some(MemSample {
             total: 128 << 30,
@@ -1132,24 +1132,58 @@ fn the_memory_account_reads_the_tabs_footprint() {
             compressed: Some(0),
             ..MemSample::default()
         });
-        let mut readings = scene.samples();
-        for r in readings[2]
-            .coalitions
-            .iter_mut()
-            .flat_map(|c| &mut c.rows)
-            .filter(|r| r.id == 1092 || r.id == 1100)
-        {
-            r.footprint = fp;
+        scene.samples()
+    };
+    let beside = |tab: u64, a: Option<u64>, b: Option<u64>| {
+        let mut readings = readings(tab);
+        for r in readings[2].coalitions.iter_mut().flat_map(|c| &mut c.rows) {
+            match r.id {
+                1092 => r.footprint = a,
+                1100 => r.footprint = b,
+                _ => {}
+            }
         }
         account(WhySubject::Mem, Some(1), &last(&readings)).you.role
     };
+    let both = |fp| beside(4 << 30, fp, fp);
     assert_eq!(
-        beside(Some(5 << 29)),
+        both(Some(5 << 29)),
         Role::Main,
         "2.5 GiB each, 5 GiB in all"
     );
-    assert_eq!(beside(Some(9 << 29)), Role::Part, "4.5 GiB, larger");
-    assert_eq!(beside(None), Role::Part, "unread");
+    assert_eq!(both(Some(9 << 29)), Role::Part, "4.5 GiB, larger");
+    // A role that turns on a coalition whose footprint is unread is unread
+    // (main if the tab is the largest part, else part); one read larger
+    // settles it, and one that holds either way stands.
+    assert_eq!(both(None), Role::Unavailable("not_sampled"), "unread");
+    assert_eq!(
+        beside(4 << 30, Some(5 << 29), None),
+        Role::Unavailable("not_sampled"),
+        "one unread"
+    );
+    assert_eq!(
+        beside(4 << 30, Some(9 << 29), None),
+        Role::Part,
+        "one read larger"
+    );
+    assert_eq!(
+        beside(900 << 20, None, None),
+        Role::Minor,
+        "under 1 GiB either way"
+    );
+    // Before the lane's first window no coalition is read yet: warming, as
+    // the CPU's role is then, the tab's own footprint read.
+    let cold = last(&readings(4 << 30)[..2]);
+    assert!(
+        cold.why.is_none() && cold.coal_lane.on(),
+        "CONTROL: no window"
+    );
+    let you = account(WhySubject::Mem, Some(1), &cold).you;
+    assert_eq!(
+        (you.role, you.figure.is_some()),
+        (Role::Unavailable("warming"), true),
+        "before the first window"
+    );
 }
 
 /// The bare `sys why`: memory under pressure or swapping first; then the CPU

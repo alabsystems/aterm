@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pet keeps one distance from the caret, not two.
-//!
-//! The escort seats the pet `STATION_LEAD` (one cell) past the caret. The console
-//! layer's resident (the pet watching a running command's output beside a parked
-//! caret) takes the escort's stand as its home, so the pet does not shift when a
-//! command starts printing. The oracle is a twin brain with
-//! `set_console_presentable(false)`, as in `pet_escort_primacy`.
+//! Resident output-watching pets settle at the same station as the escort.
 
 use std::time::{Duration, Instant};
 
@@ -30,7 +24,6 @@ struct Scene {
 }
 
 impl Scene {
-    /// `presentable == false` is the escort with no console layer.
     fn new(presentable: bool, ink: bool, home: &[u8]) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b]11;#000000\x07");
@@ -124,9 +117,6 @@ struct Settled {
     attention: PetAttention,
 }
 
-/// `pet_position_authority`'s streaming case with a shell-integration block left
-/// executing, so the console layer's output watcher answers; then output pauses
-/// with the caret parked, and the body is left until it stops moving.
 fn watch(presentable: bool, ink: bool, park: Park) -> Settled {
     let mut now = Instant::now();
     let mut scene = Scene::new(
@@ -178,12 +168,10 @@ fn watch(presentable: bool, ink: bool, park: Park) -> Settled {
     }
 }
 
-/// The escort station, computed from its law.
 fn escort_station(caret_col: u16) -> f32 {
     PetBrain::station(caret_col, COLS, art_cols(CELL_W, CELL_H))
 }
 
-/// Every cell of the standoff, laid out so a failure message reads as data.
 fn report(tag: &str, s: &Settled) -> String {
     format!(
         "{tag}: gap={:.2} body_gap={:?} caret={:?} col={:.2} row={:.2} alpha={} frames={} \
@@ -201,8 +189,6 @@ fn report(tag: &str, s: &Settled) -> String {
     )
 }
 
-/// For every way output can leave the caret parked, with and without the ink seam
-/// fed, the resident settles within one cell of the escort, on the same row.
 #[test]
 fn the_resident_settles_where_the_escort_settles() {
     let mut table = Vec::new();
@@ -214,8 +200,6 @@ fn the_resident_settles_where_the_escort_settles() {
             let tag = format!("ink={ink} park={park:?}");
             table.push(report(&format!("escort   {tag}"), &bare));
             table.push(report(&format!("resident {tag}"), &live));
-            // Preconditions against a vacuous pass: both bodies on glass, the
-            // same caret, and the live brain on the resident path.
             assert!(
                 bare.frame.alpha > 0 && live.frame.alpha > 0,
                 "{tag}: a body is off glass"
@@ -240,8 +224,6 @@ fn the_resident_settles_where_the_escort_settles() {
                     live.gap, bare.gap, live.frame.row, bare.frame.row,
                 ));
             }
-            // The resident stands on the escort's ladder, with
-            // `pet_escort_primacy`'s half cell of slack.
             let want = escort_station(live.caret.1);
             if (live.frame.col - want).abs() > 0.5 {
                 failures.push(format!(

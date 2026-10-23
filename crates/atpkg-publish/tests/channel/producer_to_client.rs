@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The producer and the client verifier in one process. The producer self-checks with the
-//! client's own chain (`quad::verify_dir`), so a producer that emits what clients refuse
-//! cannot finish: the real indexer's quad verifies, every plausible mutation is refused, and
-//! the pre-checks refuse the common mistakes before anything is signed, naming the fix.
+//! End-to-end producer and client quad-verification tests.
 
 use atpkg_publish::api::{Baseline, Delta, IndexRequest};
 use atpkg_publish::channel::index::{parse_delta, publish_with, render};
@@ -51,7 +48,6 @@ fn the_real_producer_emits_a_quad_the_real_client_accepts() {
         !index.contains("[keys]") && !index.contains("release_key"),
         "{index}"
     );
-    // The client agrees, run independently of the producer.
     let q = quad::verify_dir(&rig.ctx, &req.out).expect("the client accepts it");
     assert_eq!(q.index.attribution().machine_id, "m3");
     assert_eq!(q.index.index_build, o.published.index_build);
@@ -62,8 +58,6 @@ fn the_real_producer_emits_a_quad_the_real_client_accepts() {
     );
 }
 
-/// The mutations: each is the producer's own output with one plausible edit, signed as
-/// the producer signs, and each is refused by the verifier the producer self-checks with.
 #[test]
 fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
     let rig = Rig::new("p2c-mutants");
@@ -75,8 +69,6 @@ fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
     let seq_line = format!("roster_seq = {}\n", rig.keys.roster.roster_seq);
     assert!(good.contains(id_line) && good.contains(&seq_line));
 
-    // (a) the retired schema-1 shape: a [keys] table, no attribution. The schema number alone
-    // stops nothing (SUPPORTED_SCHEMA rejects only newer); the attribution bind does.
     let retired = good
         .replace("schema = 2\n", "schema = 1\n")
         .replace(id_line, "")
@@ -85,7 +77,6 @@ fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
             "\n[programs.",
             "\n[keys]\nrelease_key_id = \"rk-7\"\n\n[programs.",
         );
-    // (b) no machine_id: an index nobody can be held to.
     let unattributed = good.replace(id_line, "");
     for (label, text) in [("retired shape", retired), ("no machine_id", unattributed)] {
         let dir = rig.path(&format!("mutant-{}", label.replace(' ', "-")));
@@ -95,7 +86,6 @@ fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
             "{label} must be refused"
         );
     }
-    // (c) signed by a key nobody rostered: a flawless body, a foreign signature.
     let (outsider, _) = atpkg_keys::generate().expect("keypair");
     let dir = rig.path("mutant-outsider");
     rig.keys.write_quad(&dir, &good);
@@ -108,7 +98,6 @@ fn every_retired_or_broken_shape_is_refused_by_the_self_check() {
         quad::verify_dir(&rig.ctx, &dir).is_err(),
         "an unrostered key's index"
     );
-    // Non-vacuity: the unmutated bytes verify.
     let dir = rig.path("control");
     rig.keys.write_quad(&dir, &good);
     quad::verify_dir(&rig.ctx, &dir).expect("the control verifies");
@@ -143,9 +132,6 @@ fn an_unarmed_anchor_stops_the_publish_rather_than_signing_into_the_void() {
     assert!(!req.out.join("index.toml").exists());
 }
 
-/// The index's own horizon is the client's freshness gate, which `atpkg verify-index` does not
-/// check: a lapsed or unreadable stamp is refused before a signature, because the upload
-/// consumes a tag.
 #[test]
 fn a_lapsed_or_malformed_horizon_never_reaches_a_signature() {
     let rig = Rig::new("p2c-horizon");
@@ -162,8 +148,6 @@ fn a_lapsed_or_malformed_horizon_never_reaches_a_signature() {
     }
 }
 
-/// The roster generation is a no-downgrade floor too: an older pair on this machine never
-/// replaces the generation already published beside the head.
 #[test]
 fn the_roster_shipped_is_the_newest_and_never_below_the_heads() {
     let rig = Rig::new("p2c-roster");
@@ -172,7 +156,6 @@ fn the_roster_shipped_is_the_newest_and_never_below_the_heads() {
     let newer = atpkg_keys::roster_ops::add(rig.keys.roster.clone(), "m4", &m4, now).expect("add");
     let newer_bytes = newer.to_toml().expect("emit").into_bytes();
     let newer_sig = rig.keys.master_sign(&newer_bytes);
-    // The head ships the newer generation; this machine still has the older pair installed.
     let head = rig.path("head");
     rig.keys
         .write_quad(&head, &Doc::new(6, &[("ay", 5)]).render(&rig.keys));
@@ -199,8 +182,6 @@ fn the_roster_shipped_is_the_newest_and_never_below_the_heads() {
     );
 }
 
-/// A baseline from before the roster scheme carries no `roster_seq`: the client chain
-/// refuses it, so nothing is built over it.
 #[test]
 fn a_pre_roster_baseline_is_refused() {
     let rig = Rig::new("p2c-preroster");
@@ -256,7 +237,6 @@ fn a_revoked_machine_is_diagnosed_as_revoked_and_not_sent_to_rejoin() {
     assert!(!req.out.join("index.toml").exists());
 }
 
-/// No `$HOME` in anything an operator will paste beside a public release.
 #[test]
 fn a_successful_publish_prints_no_absolute_home_path() {
     let rig = Rig::new("p2c-home");

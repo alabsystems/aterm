@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/randr.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): RandR's requests are aterm-x11's encoders and `Xft.dpi` comes from
+// aterm-x11's resource database, where upstream used x11rb's.
+
 use std::str::FromStr;
 use std::{env, str};
 

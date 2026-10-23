@@ -67,7 +67,9 @@ pub const fn pad_to(pos: usize, align: usize) -> usize {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Invalid`] if `values` or `offset` violate D-Bus marshalling limits.
+/// [`Error::Invalid`] for a value the specification forbids, among them
+/// values whose types no signature can carry (see [`decode`]) and an offset
+/// past the longest message.
 pub fn encode(values: &[Value], endian: Endian, offset: usize) -> Result<Vec<u8>> {
     check_types(
         &values.iter().map(Value::type_of).collect::<Vec<_>>(),
@@ -89,7 +91,11 @@ pub(crate) fn encode_checked(values: &[Value], endian: Endian, offset: usize) ->
 ///
 /// # Errors
 ///
-/// Returns [`Error::Invalid`], [`Error::Malformed`], or [`Error::Unsupported`] on invalid input.
+/// [`Error::Invalid`] for `types` no signature can carry (an empty struct, a
+/// dict keyed by a container, past the length or nesting limits of [`sig`])
+/// or an offset past the longest message; [`Error::Malformed`] unless `bytes`
+/// hold exactly one value of each type; [`Error::Unsupported`] for a variant
+/// holding a unix descriptor.
 pub fn decode(bytes: &[u8], types: &[Type], endian: Endian, offset: usize) -> Result<Vec<Value>> {
     check_types(types, offset)?;
     decode_checked(bytes, types, endian, offset)

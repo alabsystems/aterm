@@ -171,7 +171,11 @@ impl<'a> Raw<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error if `req.method` is not a read, `req.path` is invalid, or the call fails.
+    /// A `req.method` other than GET and HEAD → Refused `policy.method_not_read`; Usage for a
+    /// `req.path` holding a `#`, which the wire would cut, so the route would be decided for
+    /// one path and another sent, or a `.` or `..` segment (typed or percent-encoded), which
+    /// a normalising server would resolve off the route. Both before any request, `all`'s
+    /// owner-id lookup included; else its calls' errors.
     pub fn get(&self, req: &RawGet) -> Result<RawOutcome> {
         self.get_with_end(req, false).map(|(outcome, _)| outcome)
     }

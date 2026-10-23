@@ -3291,7 +3291,8 @@ pub(crate) mod live {
         };
         aterm_objc::autoreleasepool(|_| {
             let target = live.target.as_id();
-            // SAFETY: main thread; the target is live until `live` drops below.
+            // SAFETY: main thread; the target is live until `live` drops below. `-setDelegate:` and
+            // `-orderOut:` are `-(void)(id)` on the live panel, nil meaning "none" and "no sender".
             unsafe {
                 cancel_reveal_soon(target);
                 stop_observing(target);
@@ -3368,6 +3369,8 @@ pub(crate) mod live {
         order_in(live);
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn frame_and_level(live: &Live) -> (Rect, isize) {
         let panel = live.panel.id();
         // SAFETY: main thread; `-frame` is `-(NSRect)` and `-level` `-(NSInteger)` on the live panel.
@@ -3392,6 +3395,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn note_placed(live: &mut Live, screens: &Screens) {
         // SAFETY: main thread; `-frame` is `-(NSRect)` on the live panel.
         live.placed = Some(unsafe { appkit::send_rect(live.panel.id(), sel!(frame)) });
@@ -3446,6 +3451,8 @@ pub(crate) mod live {
         live.visible = false;
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn place_now(live: &mut Live, screens: &Screens, settings: Option<Rect>) {
         if live.moved {
             return;
@@ -3476,6 +3483,8 @@ pub(crate) mod live {
         primary_h: f64,
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn screens() -> Screens {
         let mut visible = Vec::new();
         let mut frames = Vec::new();
@@ -3505,6 +3514,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Any thread; read-only NSRunningApplication queries.
     unsafe fn settings_pid() -> Option<i32> {
         let id = appkit::nsstring(SETTINGS_ID)?;
         // SAFETY: `+runningApplicationsWithBundleIdentifier:` is `+(NSArray *) (NSString *)`, +0; `-activationPolicy` is `-(NSInteger)` and `-processIdentifier` `-(pid_t)` on each element.
@@ -3529,12 +3540,16 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn settings_window(screens: &Screens) -> Option<Rect> {
         // SAFETY: the caller's main thread; read-only queries.
         let windows = unsafe { settings_windows(screens) };
         settings_main(&windows).map(|i| windows[i].bounds)
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn settings_windows(screens: &Screens) -> Vec<SettingsWindow> {
         // SAFETY: read-only, as `settings_pid` says.
         let Some(pid) = (unsafe { settings_pid() }) else {
@@ -3589,6 +3604,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn frontmost_is_settings() -> bool {
         // SAFETY: `+sharedWorkspace` and `-frontmostApplication` are `-(id)` accessors, +0.
         unsafe {
@@ -3598,6 +3615,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// `app` is nil or a live `NSRunningApplication`.
     unsafe fn is_settings(app: Id) -> bool {
         if app.is_null() {
             return false;
@@ -3609,6 +3628,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// `note` is nil or the live NSNotification the workspace centre delivered.
     unsafe fn activated_settings(note: Id) -> bool {
         let Some(key) = appkit::nsstring(WORKSPACE_NAMES[1]) else {
             return false;
@@ -3623,6 +3644,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn workspace_center() -> Id {
         // SAFETY: both `-(id)` accessors, +0.
         unsafe {
@@ -3634,6 +3657,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread; `target` is a live [`HelperTarget`].
     unsafe fn observe_activation(target: Id) -> bool {
         let Some(name) = appkit::nsstring(WORKSPACE_NAMES[0]) else {
             return false;
@@ -3656,6 +3681,8 @@ pub(crate) mod live {
         true
     }
 
+    /// # Safety
+    /// Main thread; `target` is live.
     unsafe fn stop_observing(target: Id) {
         // SAFETY: `-removeObserver:` is `-(void)(id)`.
         unsafe {
@@ -3666,6 +3693,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread; `target` is a live [`HelperTarget`].
     unsafe fn reveal_soon(target: Id) {
         // SAFETY: `-performSelector:withObject:afterDelay:` is `-(void)(SEL, id, NSTimeInterval)`; the run loop retains the target until it fires, and `hide` and `close` cancel it.
         unsafe {
@@ -3680,6 +3709,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread; `target` is a live [`HelperTarget`].
     unsafe fn cancel_reveal_soon(target: Id) {
         // SAFETY: `+cancelPreviousPerformRequestsWithTarget:` is `+(void)(id)`; a target with nothing scheduled is a no-op.
         unsafe {
@@ -3691,6 +3722,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn activate_aterm() {
         // SAFETY: `+currentApplication` is `+(NSRunningApplication *)`, +0; `-activateWithOptions:` is `-(BOOL)(NSApplicationActivationOptions)`.
         unsafe {
@@ -3760,6 +3793,8 @@ pub(crate) mod live {
         });
     }
 
+    /// # Safety
+    /// Main thread; `tile` is the live tile view.
     unsafe fn dropped_in_settings(tile: Id, at: CGPoint) -> bool {
         // SAFETY: main thread; read-only window and screen queries, and `-bounds` is `-(NSRect)` on the live tile.
         let (settings, image) = unsafe {
@@ -3772,6 +3807,8 @@ pub(crate) mod live {
         drop_landed(settings, at.x, at.y, image.size.width, image.size.height)
     }
 
+    /// # Safety
+    /// `view` is a live NSView and `event` nil or a live NSEvent, main thread.
     unsafe fn point_in(view: Id, event: Id) -> CGPoint {
         if event.is_null() {
             return CGPoint::default();
@@ -3783,6 +3820,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     pub(crate) unsafe fn pasteboard_item(bundle: &Path) -> Option<Obj> {
         let path = appkit::nsstring(bundle.to_str()?)?;
         let [file_url, url, text] = [TYPE_FILE_URL, TYPE_URL, TYPE_TEXT].map(appkit::nsstring);
@@ -3815,6 +3854,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread, inside AppKit's `mouseDragged:` dispatch with its event.
     unsafe fn begin_drag(tile: &TileView, event: Id) -> bool {
         let ivars = tile.ivars();
         // SAFETY: the payload as `pasteboard_item` says; `+alloc` and `-initWithPasteboardWriter:` (`-(id)(id<NSPasteboardWriting>)`) give a +1 NSDraggingItem, adopted; `-setDraggingFrame:contents:` is `-(void)(NSRect, id)`; `+arrayWithObject:` +0; and `-beginDraggingSessionWithItems:event:source:` is `-(NSDraggingSession *)(NSArray *, NSEvent *, id<NSDraggingSource>)`, +0 — the session runs in the event loop and returns at once (no nested tracking loop).
@@ -3913,6 +3954,9 @@ pub(crate) mod live {
         });
     }
 
+    /// # Safety
+    /// Main thread; `delegate` is a live [`HelperTarget`] that outlives the panel's
+    /// use of it (`close` clears it first).
     unsafe fn new_panel(delegate: Id) -> Option<Obj> {
         let title = appkit::nsstring(TITLE)?;
         // SAFETY: `+alloc` then the designated initializer `-initWithContentRect:styleMask:backing:defer:` (`-(id)(NSRect, NSUInteger, NSUInteger, BOOL)`), which consumes the +1 and returns +1; every setter after it is `-(void)(BOOL)`, `-(void)(NSInteger)`, `-(void)(NSUInteger)` or `-(void)(id)` on the fresh panel.
@@ -3948,6 +3992,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread; `panel` live.
     unsafe fn size_to_content(panel: Id, (width, height): (f64, f64)) {
         // SAFETY: `-frame` is `-(NSRect)`; `-frameRectForContentRect:` `-(NSRect)(NSRect)`; `-setFrame:display:` `-(void)(NSRect, BOOL)`.
         unsafe {
@@ -3970,6 +4016,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread; `view` is a live [`ContentView`] and `target` a live [`HelperTarget`].
     unsafe fn fill(
         mtm: MainThread,
         view: Id,
@@ -4043,6 +4091,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn font(tone: Tone) -> Id {
         let (size, bold) = match tone {
             Tone::Title => (13.0, true),
@@ -4062,6 +4112,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn color(tone: Tone) -> Id {
         let color = class(c"NSColor").as_id();
         // SAFETY: a `+(NSColor *)` system colour, +0.
@@ -4075,6 +4127,8 @@ pub(crate) mod live {
         }
     }
 
+    /// # Safety
+    /// Main thread.
     unsafe fn label(text: &str, tone: Tone) -> Option<Obj> {
         let words = appkit::nsstring(&shown(text, tone))?;
         // SAFETY: `+wrappingLabelWithString:` is the documented non-raising factory, +0, retained here; `-setFont:`/`-setTextColor:` are `-(void)(id)` and `-setSelectable:` `-(void)(BOOL)`.
@@ -4149,6 +4203,8 @@ pub(crate) mod live {
     }
 
     impl HelperButton {
+        /// # Safety
+        /// Main thread.
         unsafe fn titled(mtm: MainThread, title: &str, link: bool) -> Option<Retained<Self>> {
             let words = appkit::nsstring(title)?;
             // SAFETY: `alloc_ivars` then `-initWithFrame:`, as for the content view; then `-setTitle:` `-(void)(NSString *)`, `-setBezelStyle:` `-(void)(NSUInteger)`, `-setBordered:` `-(void)(BOOL)`, `-setFont:`/ `-setContentTintColor:` `-(void)(id)` and `-setAlignment:` `-(void)(NSInteger)` on the fresh button.
@@ -4180,8 +4236,11 @@ pub(crate) mod live {
             }
         }
 
+        /// # Safety
+        /// Main thread; `target` outlives the button's use of it (AppKit holds a control's target
+        /// weakly; `Live` or the `Preview` keeps it).
         unsafe fn wire(&self, target: Id, action: Sel, tag: isize) {
-            // SAFETY: `-setTarget:` `-(void)(id)`, `-setAction:` `-(void)(SEL)`, `-setTag:` `-(void)(NSInteger)`.
+            // SAFETY: `-setTarget:` is `-(void)(id)`, `-setAction:` `-(void)(SEL)`, `-setTag:` `-(void)(NSInteger)`.
             unsafe {
                 appkit::send_v_id(self.as_id(), sel!(setTarget:), target);
                 appkit::send_v_sel(self.as_id(), sel!(setAction:), action);

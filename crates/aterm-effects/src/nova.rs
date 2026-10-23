@@ -708,6 +708,12 @@ mod tests {
     }
 
     /// Budget invariance at ch ∈ {14, 20, 40, 56} with the genome-max features:
+    ///
+    ///   * band count == 30,
+    ///   * 15 ray samples per ray (all 8 rays' samples emit ≥ 1 quad),
+    ///   * total quads ≤ 392 at every 10 ms step to 1400 ms,
+    ///   * the caps never bind: the 512-capped emission equals the unbounded
+    ///     one, and 3 active novas × 392 ≤ 1536 (checked at compile time).
     #[test]
     fn nova_budget_geometry_invariant() {
         for ch in [14i32, 20, 40, 56] {

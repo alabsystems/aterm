@@ -242,7 +242,8 @@ mod imp {
         use std::os::unix::ffi::OsStrExt as _;
 
         let mut path = [0_i8; libc::PATH_MAX as usize];
-        // SAFETY: The retained descriptor is live and `path` is writable storage large enough.
+        // SAFETY: the retained descriptor is live and `path` is writable
+        // storage large enough for Darwin's F_GETPATH contract.
         if unsafe {
             libc::fcntl(
                 directory.as_fd().as_raw_fd(),
@@ -1417,7 +1418,8 @@ mod imp {
         let mut buffer = vec![0_u16; 512];
         loop {
             let capacity = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-            // SAFETY: `file` owns a live handle and `buffer` has `capacity` writable UTF-16 units.
+            // SAFETY: `file` owns a live handle and `buffer` has `capacity`
+            // writable UTF-16 units; the return value is checked below.
             let written = unsafe {
                 GetFinalPathNameByHandleW(
                     file.as_raw_handle().cast(),
@@ -1450,7 +1452,8 @@ mod imp {
     /// Flush a retained directory's entries: `FlushFileBuffers`, Windows' only
     /// flush, on the handle itself.
     fn flush_directory(directory: &std::fs::File) -> io::Result<()> {
-        // SAFETY: `directory` owns a live handle for the duration of the call.
+        // SAFETY: `directory` owns a live handle for the duration of the call;
+        // the call dereferences no pointer of ours.
         if unsafe { FlushFileBuffers(directory.as_raw_handle().cast()) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1466,7 +1469,8 @@ mod imp {
 
     fn file_identity(file: &std::fs::File) -> io::Result<FileIdentity> {
         let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
-        // SAFETY: `file` owns a live kernel handle and the out pointer addresses writable storage.
+        // SAFETY: `file` owns a live kernel handle and the out pointer addresses
+        // writable storage for exactly one BY_HANDLE_FILE_INFORMATION value.
         let ok = unsafe {
             GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
         };
@@ -2501,7 +2505,8 @@ mod imp {
         };
 
         let information = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: `file` owns a live handle opened with delete access.
+        // SAFETY: `file` owns a live handle opened with DELETE access; the
+        // information pointer and exact structure size match FileDispositionInfo.
         set_information(unsafe {
             SetFileInformationByHandle(
                 file.as_raw_handle(),
@@ -2586,7 +2591,9 @@ mod imp {
             / std::mem::size_of::<usize>();
         let mut buffer = vec![0_usize; words];
         let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        // SAFETY: `Vec<usize>` provides at least pointer alignment and enough bytes for the header.
+        // SAFETY: `Vec<usize>` provides at least pointer alignment and enough bytes for the
+        // header plus the UTF-16 payload including its NUL terminator, so both a length-driven
+        // and a terminator-driven reader stay inside this allocation.
         unsafe {
             std::ptr::write(information, FILE_RENAME_INFO::default());
             (*information).Anonymous.ReplaceIfExists = replace;

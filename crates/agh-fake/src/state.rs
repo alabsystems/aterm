@@ -229,7 +229,6 @@ pub(crate) struct State {
     next_asset: u64,
 }
 
-/// `owner/name` split; a slug without a `/` is a test's mistake.
 fn split_slug(slug: &str) -> (&str, &str) {
     slug.split_once('/')
         .unwrap_or_else(|| panic!("agh-fake: {slug:?} is not owner/name"))
@@ -273,7 +272,6 @@ impl State {
         }
     }
 
-    /// The owner named `login`, added when new.
     fn owner(&mut self, login: &str) -> u64 {
         if let Some(o) = self
             .owners
@@ -326,7 +324,6 @@ impl State {
         self.repos.iter().position(|r| r.id == id)
     }
 
-    /// The repository now named `slug`; a test naming one it never added is a mistake.
     fn repo_mut(&mut self, slug: &str) -> &mut Repo {
         let index = self
             .repo_index(slug)
@@ -482,7 +479,6 @@ impl State {
         self.apply_held(change);
     }
 
-    /// What `change` names that the fake does not hold, if anything.
     fn missing(&self, change: &Change) -> Option<String> {
         match change {
             Change::Publish { release_id }
@@ -498,7 +494,6 @@ impl State {
         }
     }
 
-    /// Apply `change`, which `missing` has passed; it never panics.
     fn apply_held(&mut self, change: Change) {
         match change {
             Change::Publish { release_id } => {
@@ -558,8 +553,6 @@ impl State {
         });
     }
 
-    /// A due change with its repository's name as it now is (the repository it named when
-    /// registered, whatever it has been renamed to since).
     fn rebind(&self, change: Change, repo: Option<u64>) -> Change {
         let current = repo
             .and_then(|id| self.repo_by_id(id))

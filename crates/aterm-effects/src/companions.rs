@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The companions a window keeps beside its resident pet: the earned flying
-//! head, its sing-along and music notes, the typed-word detectors (kitty summon,
-//! tone of typing) and the typed dog. The host feeds them from its
-//! committed key-press path and performs what they hand back (a Kitty Log row, a
-//! notice, a sound). None reads a clock: every call takes `now`.
-//!
-//! The kitty-command listener ([`crate::typed_tricks`]) has its own feed cascade
-//! and Serious Mode rule, so the host drives it separately.
+//! Window companion state for typed-word detectors, sing-along notes, and cameos.
 
 use aterm_lexicon::{Lexicon, ScanOptions};
 use aterm_time::Instant;
@@ -19,14 +12,12 @@ use crate::kitty_sing::{KittySing, MusicNotes};
 use crate::kitty_summon::{TypedHit, TypedKittySummon};
 use crate::tone_infer::ToneTracker;
 
-/// One classified key press from the host's committed key path, the only input
-/// the typed detectors have. PTY output and pastes never make one, so nothing
-/// on screen can steer a detector.
+/// One classified key press from the host's committed key path, the only input the typed detectors
+/// have.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TypedPress<'ev> {
-    /// A key that edits or moves beyond one glyph (Enter, Tab, Escape,
-    /// Delete, navigation, a kill or nav chord, raw controller bytes): every
-    /// detector's window resets.
+    /// A key that edits or moves beyond one glyph (Enter, Tab, Escape, Delete, navigation, a kill
+    /// or nav chord, raw controller bytes): every detector's window resets.
     pub brk: bool,
     /// A plain Backspace: each window pops one glyph.
     pub backspace: bool,
@@ -37,9 +28,7 @@ pub struct TypedPress<'ev> {
 }
 
 impl<'ev> TypedPress<'ev> {
-    /// The brk → backspace → glyphs cascade every feed takes: `on_char` runs
-    /// for the bare glyph and for each char of the IME run; `target` threads
-    /// the feed's receiver through so no two callbacks borrow it at once.
+    /// The brk → backspace → glyphs cascade every feed takes.
     #[inline]
     pub fn feed<T>(
         self,
@@ -74,57 +63,39 @@ pub struct PressFeed<'a> {
     /// The session the press went to.
     pub session: u64,
     pub now: Instant,
-    /// The compiled vocabulary and its scan options, while sparkle words
-    /// are on. `None`: glyphs skip the summon detector and nothing fires;
-    /// a break or a Backspace still maintains its window.
+    /// The compiled vocabulary and its scan options, while sparkle words are on.
     pub words: Option<(&'a Lexicon, &'a ScanOptions<'a>)>,
-    /// Tone inference may run (the host's `tone_infer_active`); the window
-    /// is maintained either way.
+    /// Tone inference may run (the host's `tone_infer_active`).
     pub tone_active: bool,
-    /// The press was a keyed Enter — the edge an armed `on=enter`
-    /// celebration waits for.
+    /// The press was a keyed Enter — the edge an armed `on=enter` celebration waits for.
     pub keyed_enter: bool,
 }
 
-/// One window's companions, reached through
-/// [`crate::pipeline::EffectsPipeline::companions_mut`].
+/// One window's companions, reached through [`crate::pipeline::EffectsPipeline::companions_mut`].
 #[derive(Default)]
 pub struct Companions {
-    /// The earned cursor cat's decision layer ([`crate::kitty_cursor`]): stamped
-    /// on the input path, ticked each frame.
+    /// The earned cursor cat's decision layer ([`crate::kitty_cursor`]).
     pub cursor_cat: CursorCat,
-    /// Typed-"kitty" summon detector ([`crate::kitty_summon`]): recent printed
-    /// keystrokes keyed to their session, plus the per-window cooldown.
+    /// Typed-"kitty" summon detector ([`crate::kitty_summon`]).
     pub kitty_summon: TypedKittySummon,
-    /// Tone-of-typing tracker ([`crate::tone_infer`]), whose verdict rides every
-    /// trail [`crate::trail_sound::SoundEvent`] as the melody's tone.
+    /// Tone-of-typing tracker ([`crate::tone_infer`]), whose verdict rides every trail
+    /// [`crate::trail_sound::SoundEvent`] as the melody's tone.
     pub tone_tracker: ToneTracker,
     /// Sing-along detector ([`crate::kitty_sing`]): the held-key repeat run.
-    /// Style gating (the rainbow kitty trail) is applied where the drive is
-    /// consumed, not at the feed: the detector is O(1) state, and always
-    /// feeding it keeps arming correct across a mid-hold style switch.
     pub kitty_sing: KittySing,
-    /// The celebration's ♪/♫ music-note ring (bounded at
-    /// [`crate::kitty_sing::MAX_NOTES`]): spawned on the shared beat clock
-    /// while armed, drained through its own lifetimes on wind-down.
+    /// The celebration's ♪/♫ music-note ring (bounded at [`crate::kitty_sing::MAX_NOTES`]).
     pub music_notes: MusicNotes,
-    /// Last riff bar index pushed to the synth — the once-per-bar latch for
-    /// the celebration's riff (cleared when the drive rests).
+    /// Last riff bar index pushed to the synth.
     pub sing_riff_bar: Option<u64>,
-    /// Typed-word dog cameo lifecycle ([`crate::dog_cameo`]), summoned by
-    /// `kitty_summon`. Presentation state only; dogs are never recorded.
+    /// Typed-word dog cameo lifecycle ([`crate::dog_cameo`]), summoned by `kitty_summon`.
     pub dog_cameo: DogCameo,
-    /// The session the live dog visit was summoned in. The pipeline is per
-    /// window and a tab switch retires nothing, so this tag alone keeps a
-    /// visitor summoned in tab A off tab B's glass.
+    /// The session the live dog visit was summoned in.
     pub dog_cameo_session: Option<u64>,
 }
 
 impl Companions {
-    /// Feed one classified press to the tone tracker, the sing-along (with its
-    /// Enter edge) and the summon detector. Returns what completed words ask for
-    /// (a Kitty Log row, a reaction, the dog). The summon detector takes glyphs
-    /// only while `feed` lends it a vocabulary.
+    /// Feed one classified press to the tone tracker, the sing-along (with its Enter edge) and the
+    /// summon detector.
     pub fn note_typed_press(&mut self, press: TypedPress<'_>, feed: PressFeed<'_>) -> TypedHit {
         let PressFeed {
             session,
@@ -139,9 +110,6 @@ impl Companions {
             |tone| tone.note_backspace(session),
             |tone, c| tone.note_char(now, session, c, tone_active),
         );
-        // Printed glyphs extend the same-key run (`SING_ARM_REPEATS` at repeat
-        // cadence arm the song); Backspace and every break release it into a
-        // wind-down, never a hard cut.
         press.feed(
             &mut self.kitty_sing,
             |sing| sing.note_break(now),
@@ -151,8 +119,6 @@ impl Companions {
         if keyed_enter {
             self.kitty_sing.note_keyed_enter(now, session);
         }
-        // `merge` folds one IME commit: a granted record outranks a
-        // cooldown-suppressed one, and both family reactions are kept.
         let mut fired = TypedHit::default();
         press.feed(
             &mut self.kitty_summon,
@@ -167,11 +133,7 @@ impl Companions {
         fired
     }
 
-    /// Serious Mode's drain, the companions' half: the flying head, the dog
-    /// cameo, the sing-along with its notes and riff latch, the summon
-    /// detector, and the tone tracker's partial window return to rest while
-    /// keeping warmed-up buffers and cooldowns intact. Idempotent: it runs
-    /// every frame while Serious Mode holds.
+    /// Serious Mode's drain, the companions' half.
     #[inline]
     pub fn drain_serious(&mut self) {
         self.cursor_cat = CursorCat::default();
@@ -220,8 +182,6 @@ mod tests {
         })
     }
 
-    /// Glyphs extend every window, a Backspace pops one glyph, a break clears
-    /// them all; with no vocabulary nothing fires but the tone window is fed.
     #[test]
     fn one_press_feeds_every_typed_detector_by_the_same_cascade() {
         let now = Instant::now();
@@ -284,14 +244,12 @@ mod tests {
         let words = Some((&lexicon, &opts));
         let mut c = Companions::default();
 
-        // Warm up the canine odometer and fire the Kitty Log cooldown.
         for _ in 0..DOG_SUMMON_KEYS {
             feed_line(&mut c, "a", words, now);
         }
         let first = feed_line(&mut c, " kitty", words, now);
         assert!(first.feline && first.records, "first summon records");
 
-        // Summon a dog cameo, arm an external celebration, and start typing `kitt`.
         c.dog_cameo.on_summon(now, 42);
         c.dog_cameo_session = Some(7);
         assert!(c.dog_cameo.active(now));
@@ -302,7 +260,6 @@ mod tests {
 
         c.drain_serious();
 
-        // Active dog cameo, pending celebration arm, and partial typing window are gone.
         assert!(!c.dog_cameo.active(now));
         assert_eq!(c.dog_cameo_session, None);
         assert_eq!(c.kitty_sing.armed_external(), None);
@@ -316,7 +273,6 @@ mod tests {
             "partial word before drain_serious does not complete after unmute"
         );
 
-        // Cooldowns and the canine keystroke odometer survive across Serious Mode.
         assert!(
             !c.kitty_sing
                 .cooldown_remaining(now + Duration::from_secs(1))

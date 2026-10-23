@@ -37,7 +37,7 @@ pub enum NativeWindow {
 /// # Safety
 /// [`native_window`](Self::native_window) answers `None` or handles that stay live for as long as
 /// `self` does: the display connection stays open, and the X11 window or `wl_surface` is not
-/// destroyed.
+/// destroyed. A caller that keeps a handle past `self` keeps `self` alive with it.
 pub unsafe trait HasNativeWindow {
     /// The window's handles, or `None` when there are none to hand out.
     fn native_window(&self) -> Option<NativeWindow>;

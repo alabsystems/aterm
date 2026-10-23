@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A pinned build number back to its commit. A pack's build is `git rev-list --count` of
-//! the commit packed, strictly monotonic along the first-parent chain, so the chain is
-//! binary-searched; a count that exists only inside a merge (crossed by the merge's jump)
-//! falls back to a bounded scan of the one merge span that brackets it.
+//! Resolves a pinned build number (`rev-list --count`) back to its commit.
 
 use std::path::Path;
 
@@ -15,9 +12,7 @@ use crate::git;
 /// A bracketing merge span longer than this is refused rather than walked.
 pub const SPAN_LIMIT: usize = 4000;
 
-/// The commit in `clone` whose `rev-list --count` is `want`, searched on the first-parent
-/// chain of the clone's origin head (`origin/HEAD`, else `origin/main`, else
-/// `origin/master`).
+/// Resolves the commit in `clone` whose `rev-list --count` equals `want`.
 ///
 /// # Errors
 ///
@@ -46,8 +41,6 @@ pub fn resolve_commit(clone: &Path, want: Build) -> Result<String> {
         .lines()
         .map(str::to_string)
         .collect();
-    // Newest first, so counts fall along the chain: every index below `lo` counts above
-    // `want`, every index above `hi` below it.
     let (mut lo, mut hi) = (0usize, chain.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -61,8 +54,6 @@ pub fn resolve_commit(clone: &Path, want: Build) -> Result<String> {
             hi = mid;
         }
     }
-    // chain[lo - 1] counts above `want` and chain[lo] below it: the pinned commit sits
-    // inside the merge that jumped the count across `want`.
     let (Some(newer), Some(older)) = (lo.checked_sub(1).and_then(|i| chain.get(i)), chain.get(lo))
     else {
         return Err(Error::refused(format!(

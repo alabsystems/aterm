@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Web terminal named themes ([`ThemeSelector::draw_builtin`], [`parse_theme_str`],
-//! [`MAX_USER_THEME_FILE_BYTES`], [`ThemeMeta::admit`],
-//! [`Terminal::rebase_colors`](aterm_core::terminal::Terminal::rebase_colors)).
+//! Web terminal named themes.
 
 use super::*;
 
@@ -348,7 +346,6 @@ impl WebTerminal {
     }
 }
 
-/// The JS-visible theme surface.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
@@ -376,7 +373,6 @@ macro_rules! bind {
                 let id = theme.id.clone();
                 if self.web_theme.selector_names(&id) {
                     if let Some(raw) = self.web_theme.selector.clone() {
-                        // The theme was just registered, so the selector resolves.
                         let _ = self.install_selector(raw);
                     }
                 }
@@ -410,7 +406,6 @@ mod tests {
 
     const MINE: &str = "name = Mine\nbackground = #101820\nforeground = #e0e0e0\n";
 
-    /// A complete minimal theme text (foreground and background are required).
     fn conf(name: &str, bg: &str) -> String {
         format!("name = {name}\nbackground = {bg}\nforeground = #e0e0e0\n")
     }
@@ -682,8 +677,6 @@ mod tests {
         assert_ne!(legacy.term.default_background(), program);
     }
 
-    /// After a named light theme, the host's raw dark `set_theme` hands the
-    /// report back to the host's declared appearance: DSR 996 answers dark.
     #[test]
     fn set_theme_after_a_named_theme_reports_the_host_appearance() {
         let mut t = terminal();

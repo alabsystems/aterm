@@ -13,12 +13,7 @@ use crate::{App, WindowId, term_lock};
 
 const CTL: Source = Source::Controller;
 
-/// An App whose session writes into a pipe, and the pipe's read end.
-///
-/// The sink owns the write end (`new_owned`), as a session owns its PTY master:
-/// a queued `paste_order` job holds an `Arc<SinkWriter>`, so the fd closes only
-/// after that write. A borrowed fd closed at the test's end could send the write
-/// into a parallel test's pipe on the recycled number.
+/// Returns a headless `App` whose session writes into a pipe, and the pipe's read end.
 pub(super) fn observing_app() -> (App, OwnedFd) {
     let mut pipe = [-1; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -43,17 +38,8 @@ fn observed(app: &App) -> (u64, Option<PetInputKind>) {
     (pet.console_input_seq(), pet.console_input_kind())
 }
 
-/// One row of the typed-wake table: what the hand did, the event it
-/// lowers to, and whether that arms `cursor_fx_focus`'s stamp.
 type WakeCase = (&'static str, fn() -> InputEvent, bool);
 
-/// The typed wake (`App::cursor_fx_focus`), stamped in `App::input_to_session`:
-/// a `Source::Controller` key arms it, and so does a paste (`ctl paste`, `ctl
-/// turn`'s text phase, Cmd-V and the X11 paste worker all lower to
-/// `InputEvent::Paste`); a bare modifier does not, or the Cmd-Tab away from a
-/// window would re-arm 60 fps effects on the window being left. Dropping the
-/// stamp from the `Paste` arm, or moving it above the `inert_modifier` guard,
-/// fails this.
 #[test]
 fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifier() {
     use std::time::Duration;
@@ -80,8 +66,6 @@ fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifi
     for (what, build, arms) in cases {
         let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
-        // Unfocused: with OS focus held `cursor_fx_focus` is true whatever the
-        // stamp says.
         app.windows.get_mut(&wid).expect("window").focused = false;
         let before = std::time::Instant::now();
         assert!(
@@ -97,7 +81,6 @@ fn the_typed_wake_is_armed_by_a_controller_key_and_a_paste_but_not_a_bare_modifi
             arms,
             "{what}: the typed wake"
         );
-        // …and an armed wake expires, so an idle unfocused window still demotes.
         if arms {
             assert!(
                 !app.cursor_fx_focus(
@@ -124,8 +107,6 @@ fn human_and_control_input_note_once_without_caret_travel_or_echo_credit() {
             InputOutcome::Ok
         );
         assert_eq!(observed(&app), (before + 1, Some(PetInputKind::Text)));
-        // An overwrite can return the caret to the same cell; neither this
-        // delayed echo nor a later unrelated repaint is another input.
         term_lock(&term).process(b"n\r");
         term_lock(&term).process(b"\x1b[2Kprogram repaint\r");
         assert_eq!(observed(&app), (before + 1, Some(PetInputKind::Text)));
@@ -147,11 +128,6 @@ fn ime_preview_is_silent_and_each_commit_bundle_notes_once() {
     assert_eq!(observed(&app).0, before + 2);
 }
 
-/// An IME composition is a person typing: the preedit sends no bytes and
-/// moves no screen generation, so a non-empty preedit stamps the focused
-/// session's `human_ms=` (keeping a supervisor from acting
-/// mid-composition). Negative control: the empty preedit that ends a
-/// composition stamps nothing new.
 #[test]
 fn an_ime_composition_is_a_person_typing() {
     let (mut app, _reader) = observing_app();
@@ -169,7 +145,6 @@ fn an_ime_composition_is_a_person_typing() {
     app.on_ime_preedit(wid, String::new(), None);
     assert_eq!(human(&app), None, "an empty preedit is nobody");
     app.on_ime_preedit(wid, "にほ".into(), Some((0, 0)));
-    // Stamped now; the minute is a hang detector, not a latency budget.
     assert!(
         human(&app).is_some_and(|ms| ms < 60_000),
         "{:?}",

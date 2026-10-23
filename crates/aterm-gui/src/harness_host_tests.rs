@@ -34044,6 +34044,7 @@ fn an_unread_initial_record_relaunches_only_with_its_validated_line_and_shell() 
             codex_home: None,
             cwd: None,
             twin: None,
+            managed_launch: None,
         };
         let initial = format!(
             r#"{{"v":1,"pid":{},"sessionId":null,"resumeArgv":null,"cwd":null,"state":null,"status":"busy","exit":null,"draftEmpty":true}}"#,

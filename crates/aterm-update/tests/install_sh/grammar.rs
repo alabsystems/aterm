@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The installer's channel grammar against the updater's: tag classification,
-//! release order, the evergreen head pointer and the repository slug, each on a
-//! generated corpus, so a disagreement that would strand or misdirect a fresh
-//! install fails here. The named cases below them are the installer's own
-//! contract where the updater has no twin (the asset allowlist, the manifest
-//! identity bind, the Linux architecture map).
+//! Differential tests comparing `install.sh` channel grammar against the updater.
 
 use aterm_update_core::pointer::{self, canonical_app_tag};
 use aterm_update_core::tag::{TagKind, parse_release_tag};
@@ -16,10 +11,8 @@ use std::path::Path;
 
 use crate::support::{Lib, Rng, Scratch, install_sh, q, s};
 
-/// The locales a `curl … | bash` meets: none set, and a person's UTF-8 shell.
 const LOCALES: [&str; 2] = ["C", "en_US.UTF-8"];
 
-/// Spellings a tag component can take, canonical and not.
 const COMPONENTS: &[&str] = &[
     "0",
     "1",
@@ -81,9 +74,6 @@ fn tag_corpus() -> Vec<String> {
     .iter()
     .map(|t| (*t).to_string())
     .collect();
-    // One spelling of each small-component class (zero, a digit at each end of
-    // the range, two and three digits, a leading zero, a doubled zero) in every
-    // position.
     let small = ["0", "1", "9", "10", "100", "01", "00"];
     for a in small {
         tags.push(format!("v{a}"));
@@ -108,8 +98,6 @@ fn tag_corpus() -> Vec<String> {
     tags
 }
 
-/// What the updater makes of `tag`: its kind, and whether it may be the
-/// channel's elected release.
 fn updater_tag(tag: &str) -> (&'static str, bool) {
     let kind = match parse_release_tag(tag) {
         Ok(TagKind::Candidate(_)) => "candidate",
@@ -119,10 +107,6 @@ fn updater_tag(tag: &str) -> (&'static str, bool) {
     (kind, canonical_app_tag(tag))
 }
 
-/// The tags whose classification differs between the installer and the
-/// updater, with `redefine` (shell code run after sourcing) applied first. The
-/// walk ticks the batch's progress at every tag (`__tick`), so the hang
-/// detector times one tag, never the corpus.
 fn tag_disagreements(scratch: &Scratch, redefine: &str, locale: &str) -> Vec<String> {
     let corpus = tag_corpus();
     let file = scratch.write("tags", corpus.join("\n") + "\n");
@@ -164,8 +148,6 @@ fn tag_grammar_agrees_with_the_updater_on_a_generated_corpus() {
     }
 }
 
-/// Negative control: the corpus reaches the u64 bound, so an installer that
-/// drops it is caught.
 #[test]
 fn the_tag_differential_catches_a_dropped_u64_bound() {
     let scratch = Scratch::new();
@@ -223,8 +205,6 @@ fn tag_order_agrees_with_the_updaters_release_order() {
         };
         pairs.push((a, b));
     }
-    // A noncanonical operand is refused, never ordered. (Two components are
-    // the min_os advisory's macOS versions, ordered below.)
     for bad in ["v0.02.0", "v1.2.18446744073709551616", "x"] {
         pairs.push(("v0.2.0".into(), bad.into()));
         pairs.push((bad.into(), "v0.2.0".into()));
@@ -264,8 +244,6 @@ fn tag_order_agrees_with_the_updaters_release_order() {
     }
 }
 
-/// The min_os advisory compares macOS product versions, which have two or
-/// three components: a shared prefix orders the shorter operand first.
 #[test]
 fn a_shared_prefix_orders_the_shorter_operand_first() {
     let scratch = Scratch::new();
@@ -302,26 +280,8 @@ const OWNER: &str = "example";
 const REPO: &str = "aterm";
 const APPCAST: &str = "aterm-appcast.toml";
 
-/// The redirect codes the updater's pointer reads a `Location` under (one
-/// `301 | 302 | 303 | 307 | 308` arm in `pointer::classify`); the installer's
-/// `channel_head` must read every one of them, and alike.
 const REDIRECTS: [u16; 5] = [301, 302, 303, 307, 308];
 
-/// The answers both sides elect a head from.
-///
-/// EVERY LOCATION UNDER 302, the code the release host sends, and a few under
-/// every other code. Past the code neither side's verdict depends on which code
-/// it was, so the rest would repeat verdicts already made, a forked command
-/// substitution each:
-///
-/// * under 301, 303, 307 and 308 both read the `Location` with the very parser
-///   302 takes (the one redirect arm of `pointer::classify`, the one redirect arm
-///   of install.sh's `channel_head` case). The samples show each code reaches
-///   it: an elected tag, a skipped legacy tag, a refused host, no `Location`;
-/// * under any other code neither reads the `Location` at all: `classify`'s
-///   404, 429/5xx and catch-all arms never touch it, and `channel_head` returns
-///   from its case before the parse. The samples pin that a `Location` there
-///   elects nothing, 300 and 304 (the 3xx that are no redirect) included.
 fn location_corpus() -> Vec<(u16, Option<String>)> {
     let hosts = [
         "https://github.com",
@@ -368,8 +328,6 @@ fn location_corpus() -> Vec<(u16, Option<String>)> {
         )
     };
     let mut locations = Vec::new();
-    // Every variant of one part with the rest canonical (each list's first
-    // entry), then random mixtures.
     for (at, variants) in parts.iter().enumerate() {
         for variant in *variants {
             let mut pick = parts.map(|p| p[0]);
@@ -400,8 +358,6 @@ fn location_corpus() -> Vec<(u16, Option<String>)> {
     corpus
 }
 
-/// The answers on which `script`'s `channel_head` elects a different tag than
-/// the updater's pointer, with `redefine` run after sourcing.
 fn head_disagreements(scratch: &Scratch, script: &Path, redefine: &str) -> Vec<String> {
     let corpus = location_corpus();
     let mut lib = Lib::of(script);
@@ -440,8 +396,6 @@ fn head_disagreements(scratch: &Scratch, script: &Path, redefine: &str) -> Vec<S
     wrong
 }
 
-/// Every answer elects the same tag through the installer's `channel_head` as
-/// through the updater's pointer.
 #[test]
 fn the_head_pointer_elects_what_the_updater_elects() {
     let scratch = Scratch::new();
@@ -449,8 +403,6 @@ fn the_head_pointer_elects_what_the_updater_elects() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Negative control: an installer that elects a retired two-component head is
-/// caught.
 #[test]
 fn the_head_differential_catches_an_elected_legacy_tag() {
     let scratch = Scratch::new();
@@ -462,9 +414,6 @@ fn the_head_differential_catches_an_elected_legacy_tag() {
     assert!(wrong.iter().any(|w| w.contains("/v0.61/")), "{wrong:?}");
 }
 
-/// Negative control: an installer that reads its head from a 302 alone, as
-/// install.sh did until 2026-10-17 while the updater read all five redirect
-/// codes, is caught on each of the other four.
 #[test]
 fn the_head_differential_catches_an_installer_that_reads_only_302() {
     let scratch = Scratch::new();
@@ -483,8 +432,6 @@ fn the_head_differential_catches_an_installer_that_reads_only_302() {
     }
 }
 
-/// `channel_head`'s own classes: elected (0), a skip with its reason (1), a
-/// refusal to interpret the redirect (2) — and the one request it makes.
 #[test]
 fn the_head_pointer_classifies_each_answer() {
     let scratch = Scratch::new();
@@ -544,7 +491,6 @@ fn the_head_pointer_classifies_each_answer() {
             )
         })
         .collect();
-    // curl itself failing is no answer: a skip.
     calls.push(lib.call(
         "STUB_ANSWER='000 ' STUB_STATUS=6; channel_head",
         &["HEAD_TAG", "HEAD_WHY"],
@@ -560,7 +506,6 @@ fn the_head_pointer_classifies_each_answer() {
             );
         }
     }
-    // The last request: ONE redirect-refusing HEAD of the latest pointer.
     let argv = crate::support::read(&args);
     let argv: Vec<&str> = argv.split(' ').collect();
     assert!(argv.contains(&"-I"), "{argv:?}");
@@ -633,9 +578,6 @@ fn slug_grammar_agrees_with_the_updater() {
     }
 }
 
-/// `release_asset_url` decides which names are installable at all: the signed
-/// proofs, the two macOS containers and the signed Linux executables, each by
-/// its tag-specific URL — and nothing else of the release.
 #[test]
 fn the_asset_allowlist_addresses_only_canonical_names() {
     let scratch = Scratch::new();
@@ -715,8 +657,6 @@ fn the_asset_allowlist_addresses_only_canonical_names() {
     );
 }
 
-/// The tag, the manifest's version and `aterm-<version>.dmg` must agree
-/// exactly, under a three-component tag, with a 64-hex digest.
 #[test]
 fn manifest_identity_binds_tag_version_dmg_and_digest() {
     let scratch = Scratch::new();
@@ -750,7 +690,6 @@ fn manifest_identity_binds_tag_version_dmg_and_digest() {
     }
 }
 
-/// Only the two supported Linux architectures are named, never guessed.
 #[test]
 fn linux_architectures_are_named_never_guessed() {
     let scratch = Scratch::new();

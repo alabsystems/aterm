@@ -2,30 +2,19 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`ScrollbackAccess`]: the methods [`Scrollback`] exposes to
-//! [`ScrollbackStorage`], which dispatches to it by matching on the concrete
-//! backend (see `storage.rs` for why it is not `dyn`).
+//! [`ScrollbackAccess`]: shared trait dispatched by [`ScrollbackStorage`] across concrete backends.
 
 use std::borrow::Cow;
 
 use super::{Line, Scrollback, ScrollbackError, WatermarkLevel};
 
-/// Sealed-trait supertrait: callers may name `ScrollbackAccess`, never implement
-/// it. The closed impl set lets the Trust verifier discharge every
-/// `<S as ScrollbackAccess>::m` dispatch over the enumerated impls instead of
-/// failing closed on an unresolvable generic callee.
+/// Sealed supertrait so the Trust verifier can enumerate all [`ScrollbackAccess`] impls.
 mod sealed {
     pub trait Sealed {}
 }
 
-/// Shared interface for scrollback storage backends.
-///
-/// Some methods return `io::Result` or `Result<_, ScrollbackError>`; the
-/// memory backend wraps its infallible calls in `Ok(())`.
-/// Sealed: implementable only inside this crate.
+/// Shared interface for scrollback storage backends (infallible memory operations wrap `Ok(())`).
 pub trait ScrollbackAccess: sealed::Sealed {
-    // --- Read ---
-
     /// Get the total number of lines across all tiers.
     fn line_count(&self) -> usize;
 
@@ -34,8 +23,6 @@ pub trait ScrollbackAccess: sealed::Sealed {
 
     /// Get a line by reverse index (0 = newest).
     fn get_line_rev(&self, rev_idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError>;
-
-    // --- Config (read) ---
 
     /// Get the hot tier limit.
     fn hot_limit(&self) -> usize;
@@ -48,8 +35,6 @@ pub trait ScrollbackAccess: sealed::Sealed {
 
     /// Get the memory budget.
     fn memory_budget(&self) -> usize;
-
-    // --- Metrics ---
 
     /// Get reclaimable storage bytes used for budget enforcement.
     fn budgeted_memory_used(&self) -> usize;
@@ -66,11 +51,8 @@ pub trait ScrollbackAccess: sealed::Sealed {
     /// Get the current memory pressure watermark level.
     fn watermark_level(&self) -> WatermarkLevel;
 
-    /// History lines whose inline image was dropped at the image retention
-    /// horizon (both backends compress at the same boundary, so both count it).
+    /// History lines whose inline image was dropped at the image retention horizon.
     fn image_rows_dropped_by_compression(&self) -> u64;
-
-    // --- Write ---
 
     /// Push a new line to the scrollback.
     fn push_line(&mut self, line: Line) -> std::io::Result<()>;
@@ -158,7 +140,6 @@ impl ScrollbackAccess for Scrollback {
 
     #[inline]
     fn push_line(&mut self, line: Line) -> std::io::Result<()> {
-        // The inherent push_line and clear are infallible.
         Scrollback::push_line(self, line);
         Ok(())
     }

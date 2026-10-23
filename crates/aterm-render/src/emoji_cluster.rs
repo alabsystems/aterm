@@ -2,17 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Emoji grapheme clusters the colour face shapes to more than one glyph.
+//! Layout, compositing, and caching for multi-glyph colour emoji grapheme clusters.
 //!
-//! A cluster (ZWJ sequence, flag, skin tone, keycap) the colour face ligates is drawn as
-//! that glyph ([`GlyphClass::RgbaGid`]). One it shapes to several colour glyphs (ZWJ
-//! members it does not carry, or a flag's regional-indicator letters drawn in colour) is
-//! composited into one image fitted to the cluster's two cells, keyed
-//! [`GlyphClass::RgbaCluster`]: both backends pull it from the shared glyph cache, and it
-//! costs the atlas one emoji.
-//!
-//! [`GlyphClass::RgbaGid`]: crate::GlyphClass::RgbaGid
-//! [`GlyphClass::RgbaCluster`]: crate::GlyphClass::RgbaCluster
+//! Single-glyph ligatures use [`crate::GlyphClass::RgbaGid`]; multi-glyph colour
+//! runs are composited into a two-cell image keyed by [`crate::GlyphClass::RgbaCluster`].
 
 use aterm_hash::FxHashMap;
 
@@ -41,35 +34,22 @@ pub(crate) struct RunGlyph {
 /// The colour glyphs a cluster shaped to, laid out as the shaper placed them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClusterRun {
-    /// The colour-chain face whose glyph ids these are (the renderer's
-    /// `Renderer::color_pick` order); [`layout_run`] leaves it `0`, the head.
+    /// Colour-chain face index (`0` from [`layout_run`]).
     pub(crate) face: u8,
     pub(crate) glyphs: Box<[RunGlyph]>,
     /// The run's total advance.
     pub(crate) width: i32,
-    /// The height the run is fitted by: its widest glyph's advance (colour
-    /// emoji are square).
+    /// Widest glyph advance, used as the run's reference height.
     pub(crate) em: i32,
 }
 
-/// The most colour glyphs one composite holds. A ZWJ family has four; past
-/// eight, members fitted into two cells are too small to read, and a PTY could
-/// otherwise make one cluster's run arbitrarily long.
+/// Maximum colour glyphs in a single composite run.
 pub(crate) const MAX_RUN_GLYPHS: usize = 8;
 
-/// Lay out a shaped cluster as a run, from its glyphs' `(glyph id, x advance, x
-/// offset, y offset)` in order. A glyph the colour face can draw joins the run;
-/// one it cannot draw must advance nothing (a hidden joiner or selector),
-/// otherwise the cluster is not colour and the run is refused. Refused too: a
-/// run of fewer than two colour glyphs (the one-glyph case is
-/// [`ClusterShape::Glyph`], and a lone base keeps its ordinary fallback) or more
-/// than [`MAX_RUN_GLYPHS`].
+/// Lays out a shaped cluster of 2..=[`MAX_RUN_GLYPHS`] colour glyphs into a [`ClusterRun`].
 ///
-/// A colour glyph that advances nothing joins only when `marks`: a face whose
-/// run is painted in one canvas at the shaper's positions (COLR, see
-/// `colr::rasterize_colr_run`) may stand a member by its outline alone, as
-/// Segoe UI Emoji does the children of a ZWJ family; [`composite`] lays each
-/// glyph in a slot as wide as its advance, so for it such a glyph is refused.
+/// Zero-advance colour glyphs are permitted only when `marks` is true (e.g. COLR
+/// runs painted on a shared canvas); non-colour glyphs must have zero advance.
 pub(crate) fn layout_run(
     glyphs: impl IntoIterator<Item = (u32, i32, i32, i32)>,
     drawable: impl Fn(u16) -> bool,
@@ -104,10 +84,7 @@ pub(crate) fn layout_run(
     })
 }
 
-/// Composite `run` into straight-alpha RGBA8 fitted into `box_w × box_h`, the
-/// whole run scaled by one factor so each glyph keeps its aspect. `fit` draws
-/// one glyph into a `(w, h)` slot and returns its RGBA8 and size (at most the
-/// slot); each is centred in its slot. `None` when no glyph drew.
+/// Composites `run` into straight-alpha RGBA8 fitted within `box_w × box_h`.
 pub(crate) fn composite(
     run: &ClusterRun,
     box_w: usize,
@@ -161,7 +138,6 @@ fn over(dst: (&mut [u8], usize, usize), src: (&[u8], usize, usize), x0: i32, y0:
                 d.copy_from_slice(s);
                 continue;
             }
-            // Alphas scaled by 255: out = sa + da·(1 − sa).
             let rest = da * (255 - sa);
             let oa = sa * 255 + rest;
             for c in 0..3 {
@@ -172,13 +148,7 @@ fn over(dst: (&mut [u8], usize, usize), src: (&[u8], usize, usize), x0: i32, y0:
     }
 }
 
-/// The shaping memo for emoji clusters, and the runs it names.
-///
-/// Run ids are never reused: a key naming one outlives it in the CPU glyph cache
-/// and the GPU atlas, so a reused id could serve another cluster's image. At id
-/// exhaustion a new run is refused and the cluster keeps its base-codepoint
-/// fallback. `runs` holds exactly the ids the memo names, so rotating or
-/// clearing the memo frees them too.
+/// Two-generation shaping memo for emoji clusters and their [`ClusterRun`] entries.
 #[derive(Default)]
 pub(crate) struct ClusterShapes {
     /// Cluster text → its shape (`None`: not a colour cluster).
@@ -188,8 +158,7 @@ pub(crate) struct ClusterShapes {
 }
 
 impl ClusterShapes {
-    /// The memoized shape, and whether it was served from the previous
-    /// generation (the caller re-inserts it to promote it).
+    /// Looks up the memoized shape and whether it came from the previous generation.
     #[inline]
     pub(crate) fn get(&self, cluster: &str) -> Option<(Option<ClusterShape>, bool)> {
         self.memo.get(cluster).map(|(&shape, prev)| (shape, prev))
@@ -282,20 +251,14 @@ mod tests {
 
     #[test]
     fn a_run_is_refused_unless_it_is_all_colour_and_two_to_eight_glyphs() {
-        // One colour glyph: the bare base's own fallback draws it.
         assert!(layout_run(joined(1), colour, false).is_none());
         assert!(layout_run(joined(MAX_RUN_GLYPHS as u32), colour, false).is_some());
         assert!(layout_run(joined(MAX_RUN_GLYPHS as u32 + 1), colour, false).is_none());
-        // A visible glyph the colour face cannot draw: text, not an emoji.
         let mut text = joined(2);
         text.push((7, 10, 0, 0));
         assert!(layout_run(text, colour, false).is_none());
-        // `.notdef` is never colour, even with a drawable-looking predicate.
         assert!(layout_run([(0, 10, 0, 0), (100, 10, 0, 0)], |_| true, false).is_none());
-        // A colour glyph that advances nothing cannot be placed in a slot...
         assert!(layout_run([(100, 10, 0, 0), (101, 0, 0, 0)], colour, false).is_none());
-        // ...but stands at its pen where the run is painted in one canvas
-        // (Segoe UI Emoji's family children); a backwards advance never does.
         let marked = layout_run([(100, 10, 0, 0), (101, 0, 0, 0)], colour, true)
             .expect("a member placed by its pen");
         let at: Vec<(u16, i32, i32)> = marked
@@ -307,8 +270,7 @@ mod tests {
         assert!(layout_run([(100, 10, 0, 0), (101, -1, 0, 0)], colour, true).is_none());
     }
 
-    /// Two opaque squares fitted into a 2:1 box land side by side, each in its
-    /// half, and the composite never exceeds the box.
+    /// Two opaque squares fitted into a 2:1 box land side by side within the box.
     #[test]
     fn a_composite_places_each_glyph_in_its_slot_within_the_box() {
         let run = layout_run(joined(2), colour, false).unwrap();
@@ -330,7 +292,6 @@ mod tests {
             "right half: second"
         );
 
-        // Three members in the same box shrink to fit its width, aspect kept.
         let run = layout_run(joined(3), colour, false).unwrap();
         let (_, w, h) = composite(&run, 20, 10, solid).unwrap();
         assert_eq!((w, h), (20, 7));
@@ -346,7 +307,6 @@ mod tests {
         let mut dst = vec![0, 0, 255, 255];
         over((&mut dst, 1, 1), (&[255, 0, 0, 128], 1, 1), 0, 0);
         assert_eq!(dst, [128, 0, 127, 255]);
-        // Off-canvas texels are dropped, not wrapped.
         let mut dst = vec![0u8; 2 * 4];
         over(
             (&mut dst, 2, 1),
@@ -359,8 +319,7 @@ mod tests {
         assert_eq!(dst, [0, 0, 0, 0, 9, 9, 9, 255]);
     }
 
-    /// Ids are never reused, and the run table holds exactly what the memo
-    /// names across rotations and clears.
+    /// Run ids are never reused and stay live only while referenced by the memo.
     #[test]
     fn runs_live_exactly_as_long_as_the_memo_names_them() {
         let mut shapes = ClusterShapes::default();
@@ -377,7 +336,6 @@ mod tests {
             shapes.run(a).is_some() && shapes.run(b).is_some(),
             "prev names both"
         );
-        // "a" is promoted back (a hit from the previous generation); "b" is not.
         let (shape, prev) = shapes.get("a").unwrap();
         assert!(prev);
         shapes.insert("a", shape);

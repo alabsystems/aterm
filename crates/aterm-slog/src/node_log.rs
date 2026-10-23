@@ -156,7 +156,9 @@ impl NodeLog {
 
     /// A point fact on node `n`: a [`NODE_MARKS`] kind.
     /// # Errors
-    /// [`Refused::KindDoesNotFit`] for any other kind.
+    /// [`Refused::KindDoesNotFit`] for any other kind, [`Refused::NotIssued`] for a mark aimed at
+    /// another node, [`Refused::NotOpen`] before [`NodeLog::start`], or a field or encoding
+    /// refusal.
     pub fn mark(&mut self, m: Mark, at: Stamp) -> Result<u64, Refused> {
         if !NODE_MARKS.contains(&m.kind) {
             return Err(Refused::KindDoesNotFit(m.kind));

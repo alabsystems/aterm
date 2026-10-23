@@ -287,7 +287,11 @@ impl BusRec {
 /// A `v=2` bus body back to its record.
 ///
 /// # Errors
-/// [`DecodeError::Opaque`] for a body of another version (a reader keeps it opaque, §3.4).
+/// [`DecodeError::Opaque`] for a body of another version (a reader keeps it
+/// opaque, §3.4); [`DecodeError::Seq`], [`DecodeError::Op`],
+/// [`DecodeError::Node`] or [`DecodeError::Kind`] for a body with no seq, no
+/// operation, no node or no kind; [`DecodeError::TooLong`] past
+/// [`MAX_RECORD_BYTES`].
 pub fn decode_bus(body: &str) -> Result<BusRec, DecodeError> {
     if body.len() > MAX_RECORD_BYTES {
         return Err(DecodeError::TooLong);

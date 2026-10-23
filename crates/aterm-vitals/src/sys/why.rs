@@ -243,19 +243,19 @@ impl<'a> Reading<'a> {
                 };
             }
         };
-        match context {
-            Some(Context::Startup) => format!("{base}, after start-up"),
-            Some(Context::Wake) => format!("{base}, since wake"),
-            _ => base,
-        }
+        words::cause_words(&base, context)
     }
-
     fn tab_clause(&self) -> &'static str {
-        match self.a.you.role {
+        let y = &self.a.you;
+        match y.role {
             Role::Main => "this tab is the main cause",
+
             Role::Part => "this tab is part of the cause",
             Role::Minor => "this tab is not the cause",
             Role::None => "this tab uses none of it",
+            Role::Unavailable(_) if y.figure.is_some() && y.unattributed_mc.is_none() => {
+                "whether this tab is the largest part is not read now"
+            }
             Role::Unavailable(_) => "this tab's share is not read now",
         }
     }
@@ -368,7 +368,7 @@ impl<'a> Reading<'a> {
             (WhySubject::Cpu, Some(fig), Some(u)) => {
                 t.push_str(&format!(" cpu_at_least_mc={fig} unattributed_mc={u}"));
             }
-            (_, Some(fig), _) if !matches!(y.role, Role::Unavailable(_)) => {
+            (_, Some(fig), _) => {
                 let key = match subject {
                     WhySubject::Cpu => "cpu_mc",
                     WhySubject::Mem => "fp_bytes",
@@ -877,7 +877,7 @@ impl Reading<'_> {
                 o.set("cpu_at_least_mc", Jv::u(nonneg(fig)));
                 o.set("unattributed_mc", Jv::u(nonneg(u)));
             }
-            (_, Some(fig), _) if !matches!(y.role, Role::Unavailable(_)) => {
+            (_, Some(fig), _) => {
                 let key = match subject {
                     WhySubject::Cpu => "cpu_mc",
                     WhySubject::Mem => "fp_bytes",

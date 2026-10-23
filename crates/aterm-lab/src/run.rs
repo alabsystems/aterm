@@ -72,8 +72,7 @@ pub struct Run {
     pub mark: String,
     /// `LAB_INSTANCE_ENV` as `up` took it (`K=V K=V`, checked by [`crate::lab::instance_env`]).
     pub instance_env: String,
-    /// `1` when `up` loaded the lab's sleep clock into its instance and its Claude Code
-    /// ([`crate::clock`], [`crate::clock::Layout`]).
+    /// `1` when `up` loaded the lab's sleep clock into its instance and its Claude Code.
     pub clock: String,
     /// `1` when the lab's instance opens a window (`forever --window`, [`crate::lab::windowed`]).
     pub window: String,

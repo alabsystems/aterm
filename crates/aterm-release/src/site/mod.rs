@@ -332,7 +332,7 @@ pub trait Launch {
     /// Spawns `cmd` with its configured stdio and returns its [`Guard`].
     ///
     /// # Errors
-    /// Returns an error if spawning fails or the run was interrupted.
+    /// The spawn's own, or `ErrorKind::Interrupted` once [`Launch::interrupted`] answers.
     fn spawn(&self, cmd: &mut Command) -> std::io::Result<(Child, Guard)>;
 }
 
@@ -386,7 +386,8 @@ pub trait World {
     /// Builds `aterm_wasm.wasm` in `clone` for wasm32 with `pin`'s stock cargo (a STOCK EXCEPTION: Trust ships only its host std).
     ///
     /// # Errors
-    /// Returns an error if the build fails or outputs no module.
+    /// Returns an error for a missing tool (`wasm-opt` is asked before the build), or if the
+    /// build fails or outputs no module.
     fn build_module(
         &mut self,
         clone: &Path,
@@ -690,7 +691,11 @@ fn read_text(path: &Path) -> Option<String> {
 /// Synchronizes the site checkout to the public commit and elected release downloads.
 ///
 /// # Errors
-/// Returns [`Failure`] on refusal, child failure, or interruption.
+/// Returns [`Failure`] (exit 1) on refusal, child failure, or interruption (said as one,
+/// whatever the step it stopped said). A pull or push of the site repo that failed leaves
+/// the sync commit on this machine and nothing deployed; once the pull or push can go
+/// through, a re-run pushes and deploys it. A deploy that fails for a missing or expired
+/// Firebase login is not a failure but [`Outcome::NotDeployed`].
 pub fn sync(
     opts: &Options,
     env: &Env,
@@ -1231,10 +1236,10 @@ fn steps(
     );
     planned.insert("public/install.sh", served);
 
-    // 4. the /terminal engine — the first write into the checkout, so a real run marks
-    //    itself in flight first (until its commit) — built here (engine.rs) on the wasm32
-    //    pin publish/config.sh names (a STOCK EXCEPTION: Trust ships only its host std),
-    //    else rustup's stable, as the site's script did
+    // The /terminal engine — the sync's first write into the checkout, so a real run marks
+    // itself in flight first (until its commit) — is built here (engine.rs) on the wasm32
+    // pin publish/config.sh names (a STOCK EXCEPTION: Trust ships only its host std),
+    // else on rustup's stable.
     if !dry {
         std::fs::write(&in_flight, format!("{commit}\n")).map_err(|e| {
             refusal(

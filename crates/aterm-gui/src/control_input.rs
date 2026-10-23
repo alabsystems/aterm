@@ -2114,7 +2114,9 @@ mod tests {
         for key in aterm_spec::host::SHELL_START_POINTERS {
             shell.env_remove(key);
         }
-        // SAFETY: runs in the forked child before exec, after stdio is in place.
+        // SAFETY: runs in the forked child before exec, after stdio is in
+        // place: `setsid` and `ioctl(TIOCSCTTY)` are async-signal-safe and
+        // touch nothing of the parent's.
         unsafe {
             shell.pre_exec(|| {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {

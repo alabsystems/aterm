@@ -125,17 +125,11 @@ pub fn repetitive(len: usize, seed: u64) -> Vec<u8> {
 /// (literal length code 16, match length code 34, offset code 7, never a
 /// repeat offset), `units` of them. The bytes either side of each copy
 /// differ from those either side of its source, so no match grows past 40.
-///
-/// The units start a block of their own: a first 128 KiB block (zeros, then
-/// 256 bytes of noise for the first copies to reach) comes before them,
-/// since a block's first sequence would otherwise carry its whole prefix as
-/// literals.
 pub fn one_code(units: usize, seed: u64) -> Vec<u8> {
     let mut x = XorShift::new(seed);
     let mut out = vec![0; (128 << 10) - 256];
     out.extend(noise(256, seed));
     let mut recent = [0usize; 3];
-    // The byte after the last copy's source: the next literal must differ.
     let mut after_source = None;
     for _ in 0..units {
         let distance = loop {
@@ -147,8 +141,6 @@ pub fn one_code(units: usize, seed: u64) -> Vec<u8> {
         recent = [distance, recent[0], recent[1]];
         for i in 0..16 {
             let mut byte = x.next() as u8;
-            // The first literal must not extend the last copy forward, the
-            // last must not extend this copy backward.
             let avoid = match i {
                 0 => after_source,
                 15 => Some(out[out.len() - distance]),
@@ -265,7 +257,6 @@ pub fn input(spec: &str) -> Vec<u8> {
 pub const SWEEP: &[u8] = include_bytes!("../recorded/sweep-zstd-1.5.7.zst");
 const SWEEP_ROWS: &str = include_str!("../recorded/sweep-zstd-1.5.7.tsv");
 
-/// One recorded sweep frame.
 #[derive(Debug)]
 pub struct SweepRow {
     pub row: usize,
@@ -326,8 +317,6 @@ pub const FLIP_SEED: u64 = 0xF1_1B;
 
 /// A checksummed frame as the CLI writes it with `--no-check`: the same
 /// blocks, `Content_Checksum_flag` clear and the four checksum bytes gone.
-/// (The flag changes no block: checked against the CLI at every level of
-/// [`FLIP_ROWS`] when the sweep was recorded.)
 pub fn without_checksum(frame: &[u8]) -> Vec<u8> {
     assert_ne!(frame[4] & 0x04, 0, "the frame carries a checksum");
     let mut out = frame[..frame.len() - 4].to_vec();
@@ -343,14 +332,8 @@ pub fn flip_bits(len: usize, x: &mut XorShift) -> Vec<usize> {
     bits
 }
 
-/// `aterm_zstd::frame::MAGIC`, restated: this module is also compiled into
-/// the scratch recorders that run outside the crate.
 const FRAME_MAGIC: u32 = 0xFD2F_B528;
 
-/// What a stream holds, counted by walking its frames, blocks and section
-/// headers. Index by type: blocks `[raw, rle, compressed]`, literals
-/// `[raw, rle, compressed, treeless]`, table modes
-/// `[predefined, rle, fse, repeat]`.
 #[derive(Debug, Default)]
 pub struct Census {
     pub frames: usize,
@@ -426,7 +409,6 @@ impl Census {
         }
     }
 
-    /// The literals type, then (past the literals) the sequences' table modes.
     fn compressed_block(&mut self, b: &[u8]) {
         let kind = usize::from(b[0] & 3);
         self.literals[kind] += 1;
@@ -458,9 +440,6 @@ impl Census {
         for mode in table_modes {
             self.modes[mode] += 1;
         }
-        // The descriptions follow in table order; an RLE one is its code.
-        // The smallest code with extra bits: literal length 16, offset 1,
-        // match length 32 (RFC 8878 §3.1.1.3.2.1.1).
         let mut at = modes_at + 1;
         for (kind, mode) in table_modes.into_iter().enumerate() {
             match mode {
@@ -469,7 +448,6 @@ impl Census {
                     self.rle_extra_bits[kind] += usize::from(s[at] >= first_extra);
                     at += 1;
                 }
-                // An FSE description's length is not walked here.
                 2 => break,
                 _ => {}
             }

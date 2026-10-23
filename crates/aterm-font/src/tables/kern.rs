@@ -262,7 +262,7 @@ impl<'a> Iterator for SubtablesIter<'a> {
     }
 }
 
-/// Whether upstream's `aat::StateTable::parse`.
+/// Whether upstream's `aat::StateTable::parse` accepts `data`.
 fn state_table_parses(data: &[u8]) -> Option<()> {
     let mut s = Stream::new(data);
     s.read::<u16>()?; // number_of_classes

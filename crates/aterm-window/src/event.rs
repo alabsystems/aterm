@@ -82,6 +82,10 @@ pub enum StartCause {
 }
 
 /// Describes an event from a [`Window`].
+///
+/// LOCAL PATCH (aterm): no `PinchGesture`, `DoubleTapGesture`, `RotationGesture`,
+/// `TouchpadPressure`, `PanGesture` or `ActivationTokenDone`: no remaining backend sends them, and
+/// nothing in aterm handled one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowEvent {
     /// The client area size of the window changed.
@@ -238,6 +242,27 @@ pub struct KeyEvent {
     pub state: ElementState,
 
     /// `true` if this event is a key repeat.
+    ///
+    /// ```
+    /// use aterm_window::event::{ElementState, KeyEvent, WindowEvent};
+    /// use aterm_window::keyboard::{KeyCode, PhysicalKey};
+    /// # let window_event = WindowEvent::RedrawRequested; // To make the example compile
+    /// match window_event {
+    ///     WindowEvent::KeyboardInput {
+    ///         event:
+    ///             KeyEvent {
+    ///                 physical_key: PhysicalKey::Code(KeyCode::KeyW),
+    ///                 state: ElementState::Pressed,
+    ///                 repeat: false,
+    ///                 ..
+    ///             },
+    ///         ..
+    ///     } => {
+    ///         // The physical key `W` was pressed, and it was not a repeat
+    ///     },
+    ///     _ => {}, // Handle other events
+    /// }
+    /// ```
     pub repeat: bool,
 
     /// Platform-specific key event fields.
@@ -378,6 +403,38 @@ impl From<ModifiersState> for Modifiers {
 }
 
 /// Input method (composition) events; see [`Window::set_ime_cursor_area`].
+///
+/// ```
+/// use aterm_window::event::Ime;
+///
+/// let events = [
+///     // Press "`" key.
+///     Ime::Preedit("`".into(), Some((0, 0))),
+///     // Press "E" key; clear preedit before committing.
+///     Ime::Preedit(String::new(), None),
+///     Ime::Commit("é".into()),
+/// ];
+/// assert_eq!(events.last(), Some(&Ime::Commit("é".into())));
+/// ```
+///
+/// ```
+/// use aterm_window::event::Ime;
+///
+/// let events = [
+///     // Press "A" key.
+///     Ime::Preedit("a".into(), Some((1, 1))),
+///     // Press "B" key.
+///     Ime::Preedit("a b".into(), Some((3, 3))),
+///     // Press left arrow key.
+///     Ime::Preedit("a b".into(), Some((1, 1))),
+///     // Press space key.
+///     Ime::Preedit("啊b".into(), Some((3, 3))),
+///     // Press space key; clear preedit before committing.
+///     Ime::Preedit(String::new(), None),
+///     Ime::Commit("啊不".into()),
+/// ];
+/// assert_eq!(events.last(), Some(&Ime::Commit("啊不".into())));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ime {
     /// The IME was enabled.

@@ -65,7 +65,12 @@ pub fn gone(checkout: &Path, home: Option<&Path>) -> Result<String, String> {
     gone_placed(checkout, home, None)
 }
 
-/// [`gone`], and where `placing` is given, a workspace whose folder and the folder above it are both missing is gone too when it can be PLACED on the home volume ([`Placing`], the module docs): under `home`, outside every place never looked into, every folder on the way below `home` a real folder (no link), its nearest existing ancestor on `placing.home_dev`, and no mount point of `placing.mounts` on the path between that ancestor and it.
+/// [`gone`], and where `placing` is given, a workspace whose folder and the folder above it
+/// are both missing is gone too when it can be PLACED on the home volume ([`Placing`]): under
+/// `home`, outside every place never looked into, every folder on the way below `home` a real
+/// folder (no link), its nearest existing ancestor on `placing.home_dev` and not empty (an
+/// empty one is what a custom mount point reads while its volume is unplugged), and no mount
+/// point of `placing.mounts` on the path between that ancestor and it.
 /// # Errors
 /// As [`gone`].
 pub fn gone_placed(

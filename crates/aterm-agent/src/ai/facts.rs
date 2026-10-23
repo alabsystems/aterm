@@ -323,12 +323,15 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     let bound = accounts::bound(&roster, &logins);
     let state = store.load(m.now).map(|(s, _)| s).unwrap_or_default();
     let enrolled = accounts::enrolled(&bound);
-    let own_row = bound.row_for_login(None).or_else(|| {
-        bound
-            .rows
-            .iter()
-            .find(|r| r.was.iter().any(Option::is_none))
-    })?;
+    let own_row = bound
+        .row_for_login(None)
+        .or_else(|| {
+            bound
+                .rows
+                .iter()
+                .find(|r| r.was.iter().any(Option::is_none))
+        })
+        .or_else(|| bound.rows.first())?;
     let row_ready = |r: &accounts::Row| {
         let here = r.dir.is_none() || enrolled.contains(&r.label);
         here && matches!(
@@ -356,14 +359,17 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         .is_some_and(|d| accounts::login_made(Path::new(d)));
     let renews = row.email.is_some();
     let binding = logins.get(&row.label);
-    let limited_until = match accounts::condition(&row, &state, true, m.now) {
+    let cond = accounts::condition(&row, &state, true, m.now);
+    let limited_until = match cond {
         accounts::Condition::Limited { until } => Some(until),
         _ => None,
     };
-    let next_sign_in = if limited_until.is_some() {
+    let signed_out = matches!(cond, accounts::Condition::SignedOut);
+    let next_sign_in = if limited_until.is_some() || signed_out {
         accounts::sign_in_next(&bound, &state, &enrolled, Some(&row.label), m.now)
             .filter(|(_, has_email)| *has_email)
             .map(|(label, _)| label)
+            .or_else(|| (signed_out && row.email.is_some()).then(|| row.label.clone()))
     } else {
         None
     };

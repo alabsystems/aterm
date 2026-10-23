@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Formal models for audio trails, input pairing, maintenance lanes, search,
-//! capture, prewarm, and resource budgets.
+//! Formal models for audio trails, input pairing, maintenance lanes, search, capture, and budgets.
 
 use aterm_spec::derive::*;
 

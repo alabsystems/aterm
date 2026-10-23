@@ -2,19 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! A stationary scrolled-back repaint materializes no history rows. A scrolled-back viewport
-//! keeps its rows in a memo keyed by `HistoryEpoch`, so repeated frames (cursor blink,
-//! effects, selection drags) cost nothing and a wheel notch pays only for the rows that
-//! scrolled in. The counts are exact, so they guard the structure (a memo that stops
-//! memoizing, an O(N) walk, a key that stops matching), not constant-factor speed. Every zero
-//! is two-sided: the first scrolled-back frame materializes the whole viewport, and a notch
-//! exactly the rows that moved in.
-//!
-//! Key fields covered: the memo hit and store (all fixtures), `content_gen`
-//! (`output_arriving_…`), `renumber` (`a_kitty_unscroll_…`) and `visible_rows` (all
-//! fixtures, through slot-table collisions). `cols` is an equivalent mutant: a width change
-//! reflows history and bumps `content_gen` anyway; it stays in the key for a future resize
-//! path.
+//! Verifies that stationary scrolled-back repaints hit the `HistoryEpoch` viewport memo
+//! and that wheel notches, new output, and Kitty unscrolls materialize only invalidated rows.
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::Terminal;
@@ -23,33 +12,21 @@ use aterm_scrollback::Scrollback;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-
-/// Deep enough that the whole viewport is history at [`DEPTH`].
 const FILL: usize = 2_000;
-
-/// Where the scrolled-back viewport parks: well past [`ROWS`], so no live row is on screen.
 const DEPTH: i32 = 200;
-
-/// One wheel notch, in lines.
 const NOTCH: i32 = 3;
 
 fn filled_terminal() -> Terminal {
     let mut term = Terminal::new(ROWS, COLS);
     let mut corpus = String::with_capacity(FILL * 24);
     for i in 0..FILL {
-        // Wide enough to be a real row, not a one-cell degenerate case.
         corpus.push_str(&format!("sb {i:05} the quick brown fox jumps over it\r\n"));
     }
     term.process(corpus.as_bytes());
     term
 }
 
-/// [`filled_terminal`]'s twin over a tiered scrollback store, for the one
-/// fixture that needs a Kitty unscroll: that path budgets against the tiered
-/// line count and no-ops on a ring-only grid.
 fn filled_tiered_terminal() -> Terminal {
-    // Ring small enough that the corpus lands in the tiers; tier limits and
-    // budget wide enough to retain all of FILL.
     let store = Scrollback::new(FILL, FILL * 2, 256 * 1024 * 1024);
     let mut term = Terminal::with_scrollback(ROWS, COLS, 8, store);
     let mut corpus = String::with_capacity(FILL * 24);
@@ -69,8 +46,6 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
     let mut term = filled_terminal();
     let mut scratch = RenderInput::empty();
 
-    // Control: at the live bottom no row is history, so the count is zero
-    // regardless of the memo.
     frame(&mut term, &mut scratch);
     let _ = take_viewport_row_materialize();
     for _ in 0..4 {
@@ -82,8 +57,6 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
         "live-bottom control: a frame at the bottom reads no history at all"
     );
 
-    // The first scrolled-back frame finds a cold memo and pays for the viewport plus the
-    // apron row below it (`Terminal::apron_row_into`), read once per offset change.
     term.scroll_display(DEPTH);
     frame(&mut term, &mut scratch);
     assert_eq!(
@@ -94,7 +67,6 @@ fn a_stationary_scrolled_back_repaint_materializes_no_history_rows() {
          reached the SCR-1 path"
     );
 
-    // Every repaint of the motionless viewport after that is free.
     for _ in 0..16 {
         frame(&mut term, &mut scratch);
     }
@@ -115,9 +87,6 @@ fn a_wheel_notch_pays_only_for_the_rows_that_scrolled_in() {
     frame(&mut term, &mut scratch);
     let _ = take_viewport_row_materialize();
 
-    // A notch brings exactly NOTCH new absolute rows into the viewport; the
-    // other ROWS - NOTCH keys must hit. A memo keyed on viewport position
-    // instead of row identity passes the stationary test and fails here.
     term.scroll_display(NOTCH);
     frame(&mut term, &mut scratch);
     let moved = take_viewport_row_materialize();
@@ -128,7 +97,6 @@ fn a_wheel_notch_pays_only_for_the_rows_that_scrolled_in() {
          the rows that scrolled IN and nothing else"
     );
 
-    // …and the frame after the notch is free again.
     frame(&mut term, &mut scratch);
     assert_eq!(
         take_viewport_row_materialize(),
@@ -137,8 +105,6 @@ fn a_wheel_notch_pays_only_for_the_rows_that_scrolled_in() {
     );
 }
 
-/// Output arriving while scrolled back moves the history under the viewport,
-/// so the next frame pays again: the memo must not serve stale glyphs.
 #[test]
 fn output_arriving_while_scrolled_back_reopens_the_bill() {
     let mut term = filled_terminal();
@@ -158,15 +124,8 @@ fn output_arriving_while_scrolled_back_reopens_the_bill() {
     );
 }
 
-/// The `history_renumber_epoch` half of the memo key, which `content_gen` cannot stand in
-/// for: a Kitty CSI `+T` unscroll removes the newest scrollback lines, so older rows keep
-/// their content but their absolute keys shift wholesale, and no content_gen, damage or
-/// row-revision signal tells that from an append. Without `renumber` in `HistoryEpoch` only
-/// this test fails.
 #[test]
 fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
-    // A tiered store with a tiny ring, so most of the corpus sits in the tiers
-    // (`unscroll_from_scrollback` reads the ring, then the store).
     let mut term = filled_tiered_terminal();
     let mut scratch = RenderInput::empty();
     term.scroll_display(DEPTH);
@@ -175,7 +134,6 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
     frame(&mut term, &mut scratch);
     assert_eq!(take_viewport_row_materialize(), 0, "parked and warm");
 
-    // Preconditions: the fixture proves anything only while all four hold.
     let lines_before = term.grid().scrollback_lines();
     let gen_before = term.grid().content_gen();
     let renumber_before = term.grid().history_renumber_epoch();
@@ -207,9 +165,6 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
         "the absolute counter moved, so every memo key shifted on its own and \
          the misses below would prove nothing about the epoch"
     );
-    // The viewport keeps its depth, so the same 24 absolute keys are asked for again while
-    // the line each names has shifted by the three the unscroll pulled back: the collision
-    // `history_renumber_epoch` exists to prevent.
     assert_eq!(
         term.grid().display_offset(),
         usize::try_from(DEPTH).expect("DEPTH is positive"),
@@ -217,8 +172,6 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
          different key set and would miss for reasons of its own"
     );
 
-    // Attribute the count to the frame: whatever the unscroll itself read is
-    // not what this fixture is claiming anything about.
     let _ = take_viewport_row_materialize();
     frame(&mut term, &mut scratch);
     assert!(

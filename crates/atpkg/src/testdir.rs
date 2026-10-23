@@ -1,20 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit-test scratch directories, removed when the test ends however it ends.
-//!
-//! Each is an [`aterm_tempfile::TempDir`] (mode `0700`, the shape the store's ownership
-//! checks require), so a failing assertion unwinds through its drop. The name keeps the
-//! helper's label and is unique per call, so concurrent tests and suite runs never share
-//! a tree. Bound first, a guard drops last, after any runner or host claim whose own drop
-//! still writes into the prefix. A removal that fails (a test took a write bit away and
-//! failed before restoring it) gives the tree's directories their owner bits back and
-//! tries once more.
-//!
-//! Only a borrow of a guard is a path (`&dir`, `&*dir`, `dir.join(…)`): moving one into a
-//! path-taking call would delete the directory there, so it does not compile. An unbound
-//! guard is not caught: `scratch("x").canonicalize()` deletes the directory at the end of
-//! that statement.
+//! Unit-test scratch directories and store prefixes removed on drop.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -48,7 +35,6 @@ pub(crate) fn dir_in(parent: &Path, prefix: &str) -> Dir {
 }
 
 impl Drop for Dir {
-    /// Runs before the `TempDir`'s own removal, which then finds nothing left.
     fn drop(&mut self) {
         if std::fs::remove_dir_all(&self.path).is_err() {
             restore_owner_access(&self.path);
@@ -85,8 +71,6 @@ impl Deref for Dir {
     }
 }
 
-/// The borrow, not the guard: see the module doc for why `Dir` itself is not
-/// `AsRef<Path>`.
 impl AsRef<Path> for &Dir {
     fn as_ref(&self) -> &Path {
         &self.path
@@ -111,8 +95,7 @@ pub(crate) fn layout(prefix: &str) -> ScratchLayout {
     }
 }
 
-/// A store prefix that does not exist yet (`<scratch>/prefix`), inside a fresh scratch
-/// directory removed on drop.
+/// A store prefix that does not exist yet (`<scratch>/prefix`), removed on drop.
 pub(crate) fn absent_layout(prefix: &str) -> ScratchLayout {
     let dir = dir(prefix);
     ScratchLayout {
@@ -130,10 +113,7 @@ impl Deref for ScratchLayout {
     }
 }
 
-/// Run `case` on every item of `items` from up to eight threads, each taking the next
-/// item: cases that share no file, and whose time is the file system's latency (a
-/// durable write waits for its flush), overlap instead of queueing end to end. The
-/// first panic is raised again once every thread has ended.
+/// Runs `case` across `items` on up to eight worker threads and re-raises the first panic.
 pub(crate) fn each_side_by_side<T: Sync>(items: &[T], case: impl Fn(usize, &T) + Sync) {
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {

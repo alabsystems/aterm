@@ -2,13 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The pet follows the caret it cannot see.
-//!
-//! Programs that hide the cursor with DECTCEM while repainting (progress bars,
-//! spinners, pagers, editors, LLM consoles) still have a caret. The host sends the
-//! caret cell and its visibility separately (`PetSense::caret` /
-//! `PetSense::caret_drawn`), so the console's hidden-caret hold is bounded when the
-//! caret is merely unpainted and unbounded only when it is absent (scrollback);
-//! an unbounded hold would freeze the pet for the whole hide, then jump it.
 
 use std::time::{Duration, Instant};
 
@@ -38,8 +31,6 @@ impl Scene {
         }
     }
 
-    /// One frame. The caret's cell is fed whatever DECTCEM says, as the host
-    /// does; `caret_drawn` carries the visibility.
     fn tick(&mut self, millis: u64) -> PetFrame {
         self.now += Duration::from_millis(millis);
         let input = self.term.cell_frame(usize::from(ROWS), usize::from(COLS));
@@ -72,12 +63,9 @@ impl Scene {
     }
 }
 
-/// A caret that moves while the cursor is hidden is still a caret, and the pet
-/// arrives at it.
 #[test]
 fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
     let mut s = Scene::new();
-    // A prompt near the top.
     s.term.process(b"\x1b[1;5H");
     let settled = s.settle(120);
     assert!(settled.alpha > 0, "the pet must be on glass to be judged");
@@ -87,12 +75,9 @@ fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
         settled.row
     );
 
-    // The program hides the cursor and moves the caret to the far side of the
-    // screen, as a TUI does.
     s.term.process(b"\x1b[?25l");
     s.term.process(format!("\x1b[{};40H", ROWS - 3).as_bytes());
 
-    // Two seconds of hidden repaints.
     let mut last = s.tick(16);
     for _ in 0..125 {
         last = s.tick(16);
@@ -111,10 +96,6 @@ fn a_pet_follows_a_caret_that_moves_while_the_cursor_is_hidden() {
     );
 }
 
-/// The tennis watch: a console repainting a row reverses the caret's direction once
-/// per repaint, three reversals is a frolic, and a second frolic inside
-/// `TENNIS_AFTER` latches the watch. The watch must not stop the cat travelling to a
-/// caret rows away.
 #[test]
 fn a_repainting_console_does_not_freeze_the_pet_away_from_the_caret() {
     let mut s = Scene::new();
@@ -126,8 +107,6 @@ fn a_repainting_console_does_not_freeze_the_pet_away_from_the_caret() {
         "cat starts at the top"
     );
 
-    // Repaint a row far below as a console does: to the margin, erase, write, back
-    // to the caret column.
     let far = ROWS - 4;
     for i in 0..140 {
         let col = 12 + (i % 6);

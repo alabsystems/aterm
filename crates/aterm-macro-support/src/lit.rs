@@ -7,8 +7,7 @@ use proc_macro::{Literal, Spacing, Span, TokenStream, TokenTree};
 
 use crate::quote::respan;
 
-/// A string literal's value and the suffix written after its closing quote
-/// (`"x"suffix`; usually empty).
+/// A string literal's resolved value and optional suffix (`"x"suffix`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct StrLit {
     /// The value, escapes resolved.
@@ -17,16 +16,14 @@ pub struct StrLit {
     pub suffix: String,
 }
 
-/// Reads a literal token as a string literal.
-///
-/// `None` for any other literal (a byte string, a C string, a char, a number).
+/// Reads a literal token as a string literal, or `None` for any other literal kind.
 #[inline]
 #[must_use]
 pub fn str_lit(lit: &Literal) -> Option<StrLit> {
     parse_str_source(&lit.to_string())
 }
 
-/// A string literal token with value `value` at `span`.
+/// Constructs a string literal token with `value` at `span`.
 #[inline]
 #[must_use]
 pub fn str_literal(value: &str, span: Span) -> Literal {
@@ -35,11 +32,7 @@ pub fn str_literal(value: &str, span: Span) -> Literal {
     lit
 }
 
-/// Reads the source text of a string literal: `"..."` with its escapes
-/// resolved, or a raw `r"..."` / `r#"..."#` as written.
-///
-/// `None` when `src` is not a well-formed string literal. The compiler has
-/// already lexed the token, so that means another kind of literal.
+/// Parses the source text of a cooked (`"..."`) or raw (`r"..."` / `r#"..."#`) string literal.
 #[must_use]
 pub fn parse_str_source(src: &str) -> Option<StrLit> {
     if let Some(rest) = src.strip_prefix('"') {
@@ -51,7 +44,6 @@ pub fn parse_str_source(src: &str) -> Option<StrLit> {
     }
 }
 
-/// `rest` is a cooked string after its opening quote.
 fn parse_cooked(rest: &str) -> Option<StrLit> {
     let mut value = String::new();
     let mut chars = rest.char_indices();
@@ -108,8 +100,6 @@ fn parse_cooked(rest: &str) -> Option<StrLit> {
                         }
                         value.push(char::from_u32(code)?);
                     }
-                    // A line continuation: the newline and the whitespace
-                    // that starts the next line are not part of the value.
                     '\n' | '\r' => {
                         while let Some((_, next)) = chars.clone().next() {
                             if matches!(next, ' ' | '\t' | '\n' | '\r') {
@@ -128,7 +118,6 @@ fn parse_cooked(rest: &str) -> Option<StrLit> {
     None
 }
 
-/// `rest` is a raw string after its `r`.
 fn parse_raw(rest: &str) -> Option<StrLit> {
     let hashes = rest.bytes().take_while(|&b| b == b'#').count();
     let body = rest.get(hashes..)?.strip_prefix('"')?;
@@ -144,18 +133,17 @@ fn parse_raw(rest: &str) -> Option<StrLit> {
     })
 }
 
-/// An integer literal: its value in base 10, sign included, and the suffix
-/// written after its digits (`0x1F_u8` is `31` and `u8`).
+/// An integer literal's signed base-10 digits and optional suffix (`0x1F_u8` -> `31` and `u8`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct IntLit {
-    /// The value in base 10: `-` and the digits, no leading zeros, no `_`.
+    /// Base-10 digits with optional leading `-`, no leading zeros or `_`.
     pub digits: String,
-    /// The suffix, as written; usually empty.
+    /// The suffix, as written.
     pub suffix: String,
 }
 
 impl IntLit {
-    /// The value as an `i64`, whatever the suffix says.
+    /// Parses the base-10 digits as an `i64`, ignoring the suffix.
     ///
     /// # Errors
     /// The value does not fit; the message is std's ("number too large to
@@ -166,35 +154,20 @@ impl IntLit {
     }
 }
 
-/// Reads a literal token as an integer literal.
-///
-/// `None` for any other literal, a float (`1.0`, `1e3`) included.
+/// Reads a literal token as an integer literal, or `None` for any other literal kind.
 #[inline]
 #[must_use]
 pub fn int_lit(lit: &Literal) -> Option<IntLit> {
-    // The compiler has already validated this token's suffix as a Rust
-    // identifier. char's alphabetic/alphanumeric predicates are not XID and
-    // would reject legal continuation marks if applied a second time here.
     read_int_source(&lit.to_string())
 }
 
-/// Reads the source text of an integer literal, an optional `-` before it:
-/// decimal, `0x`, `0o` or `0b` digits with `_` anywhere after the prefix,
-/// then an optional identifier suffix (`7u8`, and `1f32` too, which is how
-/// syn 2 reads it).
-///
-/// This source-only helper checks suffixes made of letters, numbers and `_`;
-/// [`int_lit`] reads the full Rust identifier grammar from a compiler-lexed
-/// token, including Unicode XID continuation marks.
-///
-/// `None` when `src` is not one: a float, a digit outside the base, no digit.
+/// Parses the source text of an optionally signed decimal, hex, octal, or binary integer literal.
 #[inline]
 #[must_use]
 pub fn parse_int_source(src: &str) -> Option<IntLit> {
     read_int_source(src).filter(|int| valid_suffix(&int.suffix))
 }
 
-/// Decode the numeric portion; the caller establishes suffix validity.
 fn read_int_source(src: &str) -> Option<IntLit> {
     let (negative, unsigned) = match src.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -207,8 +180,6 @@ fn read_int_source(src: &str) -> Option<IntLit> {
         [b'0'..=b'9', ..] => (10, unsigned),
         _ => return None,
     };
-    // Little-endian base-10 digits: a literal may be wider than any integer
-    // type, and only `to_i64` decides whether it fits.
     let mut value: Vec<u8> = Vec::new();
     let mut has_digit = false;
     while let Some(&b) = s.as_bytes().first() {
@@ -220,7 +191,6 @@ fn read_int_source(src: &str) -> Option<IntLit> {
                 s = s.get(1..)?;
                 continue;
             }
-            // A float, not an integer.
             b'.' if base == 10 => return None,
             b'e' | b'E' if base == 10 => {
                 if exponent_follows(s.get(1..)?) {
@@ -253,9 +223,6 @@ fn read_int_source(src: &str) -> Option<IntLit> {
     })
 }
 
-/// Whether `rest`, what follows an `e` after decimal digits, makes the
-/// literal a float: an exponent's digits (with `_`), or a sign. Anything
-/// else, `1em` say, is a suffix.
 fn exponent_follows(rest: &str) -> bool {
     for b in rest.bytes() {
         match b {
@@ -267,7 +234,6 @@ fn exponent_follows(rest: &str) -> bool {
     false
 }
 
-/// `value = value * base + digit`, on little-endian base-10 digits.
 fn mul_add(value: &mut Vec<u8>, base: u8, digit: u8) {
     let mut carry = u16::from(digit);
     for d in value.iter_mut() {
@@ -284,7 +250,6 @@ fn mul_add(value: &mut Vec<u8>, base: u8, digit: u8) {
     }
 }
 
-/// A literal suffix is empty or an identifier.
 fn valid_suffix(suffix: &str) -> bool {
     let mut chars = suffix.chars();
     match chars.next() {
@@ -296,11 +261,7 @@ fn valid_suffix(suffix: &str) -> bool {
     }
 }
 
-/// Parses `src` as an expression path and spans every token at `span` (the
-/// string literal it came from): `f`, `a::b`, `::a::b`, `Vec::<u8>::new`,
-/// `<T as Trait>::f`.
-///
-/// `None` when `src` does not lex or is not a path.
+/// Parses `src` as an expression path (`f`, `a::b`, `Vec::<u8>::new`, `<T as Trait>::f`) spanned at `span`.
 #[must_use]
 pub fn parse_expr_path(src: &str, span: Span) -> Option<TokenStream> {
     let stream: TokenStream = src.parse().ok()?;
@@ -311,7 +272,6 @@ pub fn parse_expr_path(src: &str, span: Span) -> Option<TokenStream> {
     Some(respan(tokens.into_iter().collect(), span))
 }
 
-/// Whether `tokens` spell an expression path (see [`parse_expr_path`]).
 fn is_expr_path(tokens: &[TokenTree]) -> bool {
     let mut i = 0;
     if is_punct_at(tokens, 0, '<') {
@@ -364,7 +324,6 @@ fn is_colon2_at(tokens: &[TokenTree], i: usize) -> bool {
         && is_punct_at(tokens, i + 1, ':')
 }
 
-/// The index of the `>` closing the `<` at `open` (a `->` closes nothing).
 fn matching_angle(tokens: &[TokenTree], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut after_joint_minus = false;
@@ -425,11 +384,8 @@ mod tests {
     fn integer_suffixes_are_kept() {
         assert_eq!(int("7u8"), some("7", "u8"));
         assert_eq!(int("0x10_i64"), some("16", "i64"));
-        // syn 2 reads a float suffix on integer digits as an integer.
         assert_eq!(int("1f32"), some("1", "f32"));
-        // An `e` with no exponent after it starts a suffix.
         assert_eq!(int("1em"), some("1", "em"));
-        // In hex, `e` and `f` are digits.
         assert_eq!(int("0x1e3"), some("483", ""));
     }
 

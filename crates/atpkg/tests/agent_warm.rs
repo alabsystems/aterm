@@ -1,21 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-
 //! The warm of a landed agent build (`atpkg::warm`) at the real process edge: the dev
 //! `atpkg` binary driven as `__warm claude <prefix> <build>`, as a pass that landed that
 //! build starts it, over a temp store whose `claude` is a fake that records its argv,
 //! environment, working directory and whether its stdin is a terminal.
-//!
-//! Pinned here: the verb says nothing and exits 0 whatever the program does; it runs the
-//! `bin/` shim (so the shim's `DISABLE_AUTOUPDATER=1` reaches the program) with the table's
-//! argv verbatim, from HOME, on a stdin that is no terminal, with no variable of a parent
-//! Claude session but with the user's own config home; a stale build, an opted-out user and
-//! an account that never ran claude run nothing; and each warm that ran or was declined is
-//! one `warm` line in the package log. The 30 s deadline is pinned in-process by
-//! `warm.rs`'s own test.
-//!
-//! Never the real store or log: HOME, the config dir and the state dir are temp
-//! directories, and the store is the default prefix under that HOME.
 
 #![cfg(unix)]
 #![allow(
@@ -30,9 +18,6 @@ use std::time::Duration;
 
 use aterm_spec::wait::{MUST_HAPPEN, within};
 
-/// AI variables that must not reach the warm, set on the verb's own environment: a parent
-/// Claude session's markers (a session exports the first four), the switch that would turn
-/// claude's warm into `--bare`, and an API key.
 const SESSION_VARS: &[(&str, &str)] = &[
     ("CLAUDECODE", "1"),
     ("CLAUDE_CODE_ENTRYPOINT", "cli"),
@@ -42,9 +27,6 @@ const SESSION_VARS: &[(&str, &str)] = &[
     ("ANTHROPIC_API_KEY", "not-a-key"),
 ];
 
-/// Variables of the runner's own environment the verb must not inherit, so that what the
-/// program records can only have come from the shim and the warm: the two the warm and the
-/// shim set are given a sentinel instead, and the user's own claude settings are removed.
 const SENTINELS: &[(&str, &str)] = &[
     ("DISABLE_AUTOUPDATER", "0"),
     ("ENABLE_CLAUDEAI_MCP_SERVERS", "true"),
@@ -72,7 +54,6 @@ impl Fixture {
         let home = root.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         let home = home.canonicalize().unwrap();
-        // The account has run claude before: there are caches to refresh.
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         let prefix = atpkg::store::default_prefix(&home);
         let fx = Self {
@@ -91,9 +72,6 @@ impl Fixture {
         }
     }
 
-    /// A managed `claude` at `build`, laid the real way — its `bin/` shim exporting the
-    /// table's `shim_env` as the vendor lane lays it — whose store executable records what
-    /// it was run with into [`Fixture::record`] and exits `code`.
     fn install_claude(&self, build: u64, code: u8) {
         let layout = self.layout();
         let dir = layout.build_dir("claude", build);
@@ -133,9 +111,6 @@ impl Fixture {
             Some(&build),
             "fixture: the build is active"
         );
-        // Pay each fresh executable's first exec before the real warm starts its 30 s
-        // deadline: the stand-in first, then its shim, so two macOS first-exec assessments
-        // do not share one hang detector. The readiness branch records nothing.
         for ready_exe in [exe, layout.shim(&tool)] {
             let mut ready = Command::new(&ready_exe)
                 .arg("--fixture-ready")
@@ -166,16 +141,12 @@ impl Fixture {
         assert!(self.warm_lines().is_empty(), "setup logged a warm");
     }
 
-    /// `atpkg __warm <operands…>`, confined to this fixture, with a parent Claude
-    /// session's variables and `extra` in its environment — an environment born in the
-    /// person's shell (the rc hook's `ATPKG_BIN` set), as a typed pass's is.
     fn warm_with(&self, operands: &[&str], extra: &[(&str, &str)]) -> Output {
         self.command(operands, extra)
             .output()
             .expect("run the dev atpkg")
     }
 
-    /// [`Fixture::warm_with`]'s command, not yet run.
     fn command(&self, operands: &[&str], extra: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_atpkg"));
         cmd.arg(atpkg::warm::HIDDEN_VERB)
@@ -186,7 +157,6 @@ impl Fixture {
             .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env_remove("ATERM_STATE_HOME")
             .env_remove(atpkg::cli::SPAWNER_PID_ENV)
-            // A zsh the warm asks reads its rc under `$ZDOTDIR`, never this HOME's.
             .env_remove("ZDOTDIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -217,7 +187,6 @@ impl Fixture {
         std::fs::read_to_string(format!("{}.{what}", self.record.display())).ok()
     }
 
-    /// The `warm` lines of the package log under this HOME, oldest first.
     fn warm_lines(&self) -> Vec<atpkg::packages_log::Entry> {
         let log = aterm_types::dirs::resolve_logs_dir(
             None,
@@ -238,7 +207,6 @@ impl Fixture {
     }
 }
 
-/// Exit 0 with not one byte on either pipe.
 fn silent_success(out: &Output, label: &str) {
     assert!(out.status.success(), "{label}: {out:?}");
     assert!(out.stdout.is_empty(), "{label}: stdout {:?}", out.stdout);
@@ -264,7 +232,6 @@ fn the_warm_runs_the_bin_shim_silently_with_the_table_argv_and_no_session_variab
     assert_eq!(args, spec.warm.unwrap().argv, "the table's argv, verbatim");
     let env = fx.recorded("env").unwrap();
     let vars: Vec<&str> = env.lines().collect();
-    // Over the sentinels the verb was given: only the shim and the warm set these.
     assert!(
         vars.contains(&"DISABLE_AUTOUPDATER=1"),
         "the shim's own environment: {env}"
@@ -306,9 +273,6 @@ fn a_failing_program_fails_nothing() {
     assert_eq!(lines[0].get("outcome"), Some("exit=5"));
 }
 
-/// A build that is no longer the active one (a later landing, a rollback) runs nothing and
-/// logs nothing; neither does anything but exactly `<warmed program> <absolute prefix>
-/// <build>` — and every one of those endings is silent and exits 0.
 #[test]
 fn a_stale_build_or_a_malformed_request_runs_nothing() {
     let fx = Fixture::new("stale");
@@ -328,16 +292,11 @@ fn a_stale_build_or_a_malformed_request_runs_nothing() {
         assert!(fx.recorded("args").is_none(), "{label}: nothing ran");
     }
     assert!(fx.warm_lines().is_empty(), "nothing logged");
-    // The negative control.
     silent_success(&fx.warm_build(2_001_281), "current");
     assert!(fx.recorded("args").is_some());
     assert_eq!(fx.warm_lines().len(), 1);
 }
 
-/// The user's own config home reaches the warm (the caches it refreshes live there) and is
-/// where the warm looks for claude's state — also when kept only in the person's shell rc
-/// and warmed from the window (no `ATPKG_BIN`), together with a variable the program
-/// honours itself (`DISABLE_TELEMETRY`).
 #[test]
 fn the_users_own_config_home_reaches_the_warm() {
     let fx = Fixture::new("config-home");
@@ -377,10 +336,6 @@ fn the_users_own_config_home_reaches_the_warm() {
     }
 }
 
-/// The user's opt-out of claude's non-essential traffic, and an account that never ran
-/// claude: nothing runs, silently, and the warm's line says why — also for an opt-out kept
-/// only in the person's shell rc and warmed from the window (launchd's environment, no
-/// `ATPKG_BIN`).
 #[test]
 fn an_opted_out_or_never_run_claude_is_not_run() {
     let fx = Fixture::new("declined");
@@ -418,12 +373,6 @@ fn an_opted_out_or_never_run_claude_is_not_run() {
         fx.recorded("args").is_none(),
         "opted out in the rc: nothing ran"
     );
-    // An rc the warm could not read: unread is not unset. Each shape gives the person's own
-    // terminal the opt-out (tmux and the exec'd shell inherit the export, ksh reads
-    // `.profile`) and the warm's probe no environment of theirs: an rc that auto-starts
-    // tmux, which refuses with no terminal; one that greets and execs another shell, which
-    // reads the empty stdin and exits 0 having printed only the greeting; a `$SHELL` the
-    // warm does not ask; no `$SHELL` at all. An opt-out already in hand says so.
     let tmux = fx.root.path().join("tmux");
     std::fs::write(
         &tmux,

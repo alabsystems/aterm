@@ -2,15 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! CAN (0x18) and SUB (0x1A) cancel a control string: an OSC, SOS, PM or APC
-//! string they interrupt ends undelivered, as in xterm and as a DCS ends here
-//! (`dcs_unhook(canceled = true)`), so no truncated OSC 52 write, OSC 8 link or
-//! title dispatches.
+//! Tests for `CAN` (`0x18`), `SUB` (`0x1A`), and `ESC` cancellation of control strings.
 
 use super::*;
 
-/// What a parser fed `bytes` in the chunks `cuts` names (bit `k` set: a chunk
-/// ends after byte `k`) delivered.
 fn feed_chunked(parser: &mut Parser, bytes: &[u8], cuts: u32) -> RecordingSink {
     let mut sink = RecordingSink::default();
     let mut start = 0;
@@ -29,8 +24,6 @@ fn parser(c1: bool) -> Parser {
     parser
 }
 
-/// An OSC interrupted by CAN or SUB dispatches nothing, in every chunking
-/// and both C1 modes; the cancel byte executes and the text after it prints.
 #[test]
 fn can_and_sub_cancel_an_osc_string() {
     for osc in [&b"52;c;aGk="[..], b"8;;a:b", b"2;title"] {
@@ -56,8 +49,6 @@ fn can_and_sub_cancel_an_osc_string() {
     }
 }
 
-/// Negative control: BEL, `ESC \` and (with C1 on) the 8-bit ST still end an
-/// OSC by dispatching it, and a cancel leaves the next OSC whole.
 #[test]
 fn a_terminated_osc_still_dispatches() {
     for (c1, bytes) in [
@@ -82,9 +73,6 @@ fn a_terminated_osc_still_dispatches() {
     );
 }
 
-/// An APC (a kitty graphics command) that CAN or SUB interrupts ends canceled
-/// (`apc_end(true)`); an SOS or PM string, with no consumer, is swallowed.
-/// Negative control: ST still ends the APC as complete.
 #[test]
 fn can_and_sub_cancel_an_apc_string() {
     for cancel in [0x18u8, 0x1A] {
@@ -122,9 +110,6 @@ fn can_and_sub_cancel_an_apc_string() {
     );
 }
 
-/// A canceled OSC is canceled across a seamless update too: the successor
-/// restores the carried head, and a CAN in the tail ends it undelivered —
-/// both for a carried payload and for one carried as over the cap.
 #[test]
 fn a_carried_osc_is_canceled_by_can_in_the_tail() {
     let mut outgoing = Parser::new();
@@ -145,9 +130,6 @@ fn a_carried_osc_is_canceled_by_can_in_the_tail() {
     }
 }
 
-/// What `parser` delivers for `bytes` fed whole, cut once at every byte, and
-/// one byte at a time, through `advance_fast`: every feeding must agree, so
-/// the first answer stands for all of them.
 fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
     let whole = feed_chunked(&mut parser(c1), bytes, 0);
     let shown = String::from_utf8_lossy(bytes).into_owned();
@@ -160,12 +142,6 @@ fn feed_every_way(c1: bool, bytes: &[u8]) -> RecordingSink {
     whole
 }
 
-/// A DCS ends at ST alone. An ESC that does not begin ST (`ESC \`) breaks the
-/// string off, and a broken-off string is canceled as CAN and SUB cancel one
-/// (`dcs_unhook(true)`): xterm answers or applies a DCS only at ST. What the
-/// ESC begins reads exactly as it reads from Ground. The next byte decides,
-/// so an ESC at the end of one read and its follower in the next decide the
-/// same way.
 #[test]
 fn an_escape_that_does_not_begin_st_cancels_a_dcs() {
     let heads: [(&[u8], (Vec<u16>, Vec<u8>, u8), &[u8]); 3] = [
@@ -177,9 +153,7 @@ fn an_escape_that_does_not_begin_st_cancels_a_dcs() {
         b"\x1b[5;7H",
         b"\x1b]2;t\x07",
         b"\x1b7",
-        // A second ESC (a tmux passthrough wrapper doubles every ESC), then ST.
         b"\x1b\x1b\\",
-        // Another DCS, ended at ST: it is answered.
         b"\x1bP$qm\x1b\\",
         b"\x1b_Ga=q\x1b\\",
         b"\x1b\x18",
@@ -206,10 +180,6 @@ fn an_escape_that_does_not_begin_st_cancels_a_dcs() {
     }
 }
 
-/// Negative control: `ESC \` is ST however it is cut, an ESC read at the end
-/// of one chunk and the `\` at the start of the next included, and so is the
-/// 8-bit ST. The string ends complete (`dcs_unhook(false)`) and `ESC \`
-/// dispatches as the ESC sequence it is.
 #[test]
 fn st_still_ends_a_dcs_complete() {
     for c1 in [false, true] {

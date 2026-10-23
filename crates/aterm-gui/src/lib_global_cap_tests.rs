@@ -6,8 +6,6 @@ use super::{
     admits_bulk_scrollback_maintenance, global_scrollback_budget_for, global_shed_order,
 };
 
-/// The aggregate cap scales with physical memory up to its ceiling, which is
-/// also the answer when the size is unknown.
 #[test]
 fn global_scrollback_budget_is_capped_and_unknown_ram_takes_the_ceiling() {
     assert!(global_scrollback_budget_for(Some(8192)) < GLOBAL_SCROLLBACK_BUDGET_BYTES);
@@ -21,18 +19,13 @@ fn global_scrollback_budget_is_capped_and_unknown_ram_takes_the_ceiling() {
     );
 }
 
-/// Under the aggregate cap nothing sheds; at or over it the largest consumers shed first,
-/// stopping once the projected sum is back under the cap.
 #[test]
 fn global_shed_order_picks_largest_until_under_cap() {
     let mib = 1usize << 20;
-    // 3 sessions summing to 300 MiB, cap 250 MiB: shedding the 150 MiB one alone
-    // projects 150 MiB ≤ cap, so only it is chosen.
     let usages = [(1u64, 150 * mib), (2, 100 * mib), (3, 50 * mib)];
     assert_eq!(global_shed_order(&usages, 250 * mib), vec![1]);
     assert!(global_shed_order(&usages, 400 * mib).is_empty());
     assert!(global_shed_order(&[], 10).is_empty());
-    // Cap 120 MiB: shedding 150 leaves 150 (still over), shedding 100 too leaves 50.
     assert_eq!(global_shed_order(&usages, 120 * mib), vec![1, 2]);
 }
 
@@ -51,7 +44,6 @@ fn shipping_lane_admission_matches_the_derived_model() {
     assert_eq!(output["blocking_lock"], 0);
     assert_eq!(output["unbounded_work"], 0);
 
-    // The real App gate leaves the terminal's checkpoint unchanged.
     let mut app = App::headless_for_test();
     let terminal = app
         .pool
@@ -73,9 +65,6 @@ fn shipping_lane_admission_matches_the_derived_model() {
         after, before,
         "ordinary output must be mutation-free in the shipping App"
     );
-    // The output wake's cap check is not replayed: it evicts only past
-    // `global_scrollback_budget_bytes`, a no-op at test sizes. `Buggy=1`'s ObserveOutput (an
-    // eviction on the output path) is pinned in `aterm-spec/tests/derived_ring_ty.rs`.
 
     let mut pressure = model.init_state();
     assert!(model.fire("ObserveMemoryPressure", &mut pressure));
@@ -90,14 +79,8 @@ fn shipping_lane_admission_matches_the_derived_model() {
     assert_eq!(pressure["unbounded_work"], 1);
 }
 
-/// Per-session budget for the alt-screen reclaim tests: small enough that the CRITICAL
-/// eighth lands on the 1 MiB floor, below what 30k lines of history occupy.
 const ALT_TEST_BUDGET: usize = 8 * 1024 * 1024;
 
-/// A headless App whose one session has a real tiered store holding 30k lines of
-/// pseudo-random history, then sits on the alternate screen (`CSI ?1049h`). Returns the App
-/// and the history bytes before any shed: above the 1 MiB floor and under half the budget at
-/// the cold codec's ratio (on LZ4, 30k lines hold about 3.0 MB; 50k would exceed half).
 fn app_with_alt_screen_history() -> (App, usize) {
     let app = App::headless_for_test();
     let session = app.pool.iter().next().expect("headless session");
@@ -154,9 +137,6 @@ fn history_bytes(app: &App) -> usize {
         .expect("history store still attached")
 }
 
-/// The CRITICAL shed reaches an alt-screen session's parked primary history,
-/// frees real bytes and counts the session; the WARN tier (keeping half) reaches
-/// it too but reports it untrimmed.
 #[test]
 fn pressure_shed_trims_the_history_of_an_alt_screen_tab() {
     let (mut app, before) = app_with_alt_screen_history();
@@ -191,12 +171,10 @@ fn pressure_shed_trims_the_history_of_an_alt_screen_tab() {
     );
 }
 
-/// The aggregate cap counts an alt-screen tab's history toward the sum and sheds it.
 #[test]
 fn global_cap_counts_and_sheds_an_alt_screen_tab() {
     let (mut app, before) = app_with_alt_screen_history();
 
-    // Over the cap only by the history of the alt-screen tab.
     let reclaim = app.enforce_scrollback_cap_at(before / 2);
     assert_eq!(
         (reclaim.reached, reclaim.trimmed),
@@ -210,7 +188,6 @@ fn global_cap_counts_and_sheds_an_alt_screen_tab() {
     );
     assert_eq!(reclaim.freed_bytes, before - after);
 
-    // Under the cap: a no-op that reaches nothing.
     let idle = app.enforce_scrollback_cap_at(usize::MAX);
     assert_eq!(idle, super::ScrollbackReclaim::default());
     assert_eq!(history_bytes(&app), after);

@@ -49,7 +49,9 @@ pub const GITHUB_FINGERPRINTS: [&str; 3] = [
 /// git from the Command Line Tools.
 pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
 
-/// For a test that runs the real [`CLT_GIT`], as the code it checks does.
+/// For a test that runs the real [`CLT_GIT`], as the code it checks does: COULD NOT RUN
+/// on a host without it (a Mac before the Command Line Tools; any other unix, where
+/// this crate builds but `aterm` never links it), never a spawn error read as a defect.
 #[cfg(test)]
 pub(crate) fn need_clt_git() {
     if !Path::new(CLT_GIT).is_file() {

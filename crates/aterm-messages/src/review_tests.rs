@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Junk-tolerance and flood nets: a deterministic PRNG drives the codec,
-//! every small decoder, both wire parsers, the text shapers and the words at
-//! random and at extremes, and a 6000-step flood asserts every bound after
-//! every step.
+//! Deterministic PRNG fuzz and flood tests for `aterm-messages`.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +22,6 @@ use crate::{
     PENDING_PERSIST_CAP, TITLE_CAP,
 };
 
-/// xorshift64 — deterministic, no dependency.
 struct Rng(u64);
 
 impl Rng {
@@ -49,9 +45,6 @@ impl Rng {
     }
 }
 
-/// Letters, joints, paths, escapes, controls, US, wide and zero-width
-/// characters, the codec's own separators — everything a hostile reporter
-/// or a corrupt file could carry.
 const ALPHABET: &[&str] = &[
     "a",
     "b",
@@ -116,16 +109,10 @@ fn glass_ids(c: &MessageCenter) -> Vec<MessageId> {
     c.on_glass().map(|l| l.id).collect()
 }
 
-/// The codec's documented shape on the way back: every word clipped to the
-/// model's caps, empty detail lines dropped — the identity for anything the
-/// engine itself encodes.
 fn lossy(line: &LogLine) -> LogLine {
     as_decoded(line)
 }
 
-/// Random bytes and every prefix of every valid line decode or error and
-/// never panic; whatever decodes re-encodes to a line that decodes to the
-/// same value; a replay of the soup keeps the ring bounded.
 #[test]
 fn codec_survives_random_bytes_and_truncations() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -214,8 +201,6 @@ fn codec_survives_random_bytes_and_truncations() {
     assert!(log.len() <= LOG_CAP);
 }
 
-/// Every small decoder and both wire parsers survive junk; what they admit
-/// is within its cap and control-free.
 #[test]
 fn decoders_and_wire_parsers_never_panic_on_junk() {
     let mut rng = Rng(0xdead_beef_cafe_f00d);
@@ -254,11 +239,6 @@ fn decoders_and_wire_parsers_never_panic_on_junk() {
     }
 }
 
-/// `notice` survives junk: random lines after every sub-form never panic the
-/// parser; whatever it accepts applies to a center with a one-line reply, and
-/// every row the wire raised carries no capsule, a control-free title, a
-/// glass title in form and an attention verdict (a record for news; a row
-/// only for a failure or for work with its indicator).
 #[test]
 fn notice_lines_never_panic_and_never_forge_a_row() {
     let mut rng = Rng(0x5eed_0f_a11_0e5);
@@ -329,7 +309,6 @@ fn notice_lines_never_panic_and_never_forge_a_row() {
     assert!(accepted > 200, "the net must reach apply: {accepted}");
 }
 
-/// The shapers never panic and never exceed their cap, whatever the text.
 #[test]
 fn text_shapers_never_panic_and_respect_caps() {
     let mut rng = Rng(0x0bad_5eed_0bad_5eed);
@@ -357,7 +336,6 @@ fn text_shapers_never_panic_and_respect_caps() {
     }
 }
 
-/// The words never panic at the ends of the clock or on odd homes.
 #[test]
 fn words_never_panic_at_extremes() {
     for at in [0u64, 1, 999, 1000, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
@@ -380,13 +358,6 @@ fn words_never_panic_at_extremes() {
     }
 }
 
-/// 6000 random operations — posts with every hold (including absurd spans),
-/// restates, resolves, presses, settles, commits, drains and handoffs —
-/// and every bound holds after each one: the live set, the ring, the
-/// pending queue, the committed rows, the glass (a duplicate-free subset of
-/// the live set, every member anchored), every live string within its cap
-/// and control-free, `presentation` exact at a random width, the carry
-/// re-seeding into a fresh center without growing.
 #[test]
 fn a_flood_keeps_every_bound() {
     let mut rng = Rng(0x5eed_5eed_5eed_5eed);
@@ -568,9 +539,6 @@ fn a_flood_keeps_every_bound() {
             );
         }
         assert_eq!(c.queued(), c.live_rows().count() - glass.len());
-        // The words of every live row are within their caps and control-free;
-        // a row whose title and detail are unchanged since an earlier step
-        // vetted them is not walked again (the checks read only the words).
         let mut still_vetted = BTreeMap::new();
         for l in c.live_rows() {
             let words = match vetted.remove(&l.id) {

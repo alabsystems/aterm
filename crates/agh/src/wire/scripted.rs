@@ -95,7 +95,6 @@ impl ScriptedTransport {
     }
 }
 
-/// A local failure before anything was sent.
 fn local(detail: &str) -> WireError {
     WireError {
         phase: Phase::NotSent,
@@ -104,8 +103,6 @@ fn local(detail: &str) -> WireError {
     }
 }
 
-/// A `Reader` body is read whole into `SeenRequest::body`. An empty queue answers
-/// `WireError { NotSent, Local, "scripted transport: no answer queued" }`.
 impl Transport for ScriptedTransport {
     fn round_trip(&self, req: WireRequest<'_>) -> Result<WireResponse, WireError> {
         let body = match req.body {

@@ -2,23 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! The alt blob of a checkpoint taken on the alternate screen has exactly `rows` records.
-//!
-//! `Terminal::alt_grid` is the inactive grid: while the alternate screen is up it holds
-//! the saved primary, scrollback and all. `CheckpointMeta` carries one `history_lines`,
-//! describing the main blob, so the consumer validates the alt blob with `history = 0` and
-//! `deserialize_lines_strict` refuses any larger count. Only the producer can honour that
-//! shape, so these tests pin it there.
 
 use aterm_core::scrollback::{deserialize_lines_strict, serialize_lines};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 const ROWS: u16 = 49;
 const COLS: u16 = 131;
-/// The producer's real carry target (`seamless::max_handoff_history_lines`).
 const CARRY: usize = 256;
 
-/// The consumer's canonicality check for a grid blob of `expected` records
-/// (aterm-gui's `seamless::checkpoint_grid_is_canonical`), reproduced.
 fn is_canonical(bytes: &[u8], expected: usize, cols: u16) -> bool {
     let content_cap = usize::from(cols).saturating_mul(256);
     let record_cap = 16usize
@@ -28,7 +19,6 @@ fn is_canonical(bytes: &[u8], expected: usize, cols: u16) -> bool {
         .is_some_and(|lines| lines.len() == expected && serialize_lines(&lines) == bytes)
 }
 
-/// A terminal whose primary screen has real scrollback behind it.
 fn primary_with_history() -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
     for i in 0..(usize::from(ROWS) + 400) {
@@ -41,14 +31,6 @@ fn carry(t: &Terminal) -> TerminalCheckpoint {
     t.checkpoint_carry(CARRY).expect("parser is Ground")
 }
 
-/// While the alternate screen is up, `alt_grid` holds the saved primary with
-/// its scrollback, and the wire still allows it exactly `rows` records: the
-/// wire has one `history_lines` and it describes the MAIN blob, so a carried
-/// alt history is unrepresentable and the consumer refuses the whole capture.
-/// 1047 reaches the same parked primary by another path (it reuses the
-/// persistent alternate buffer); after a 1047 exit `alt_grid` holds that
-/// buffer, whose ring cap is 0 (a 1049 exit discards it, so it cannot be the
-/// control).
 #[test]
 fn the_alt_blob_is_exactly_rows_records() {
     for (name, bytes) in [
@@ -70,7 +52,6 @@ fn the_alt_blob_is_exactly_rows_records() {
     }
 }
 
-/// The main blob, which `history_lines` describes, holds `rows + history_lines` records.
 #[test]
 fn the_main_blob_is_rows_plus_its_declared_history() {
     let cp = carry(&primary_with_history());
@@ -86,15 +67,6 @@ fn the_main_blob_is_rows_plus_its_declared_history() {
     );
 }
 
-// After a self-update handoff the adopted engine restores the checkpoint at the old grid
-// size, the app repaints, and the window's first resize converges to the new frame. The
-// restored screen is the archive's baseline; a resize before any chrome height was
-// measured leaves out the rows the new frame still shows at the bottom, so the composer's
-// rule and footer are not archived.
-
-/// A synthetic Claude-Code-shaped screen (never a real capture): transcript
-/// rows, then the composer — a blank, a rule, the prompt, a rule, the footer —
-/// with the rules drawn one short of the screen's width.
 fn claude_screen(start: usize, rows: u16, cols: u16) -> Vec<String> {
     let rule = "─".repeat(usize::from(cols) - 1);
     (start..start + usize::from(rows) - 5)
@@ -109,7 +81,6 @@ fn claude_screen(start: usize, rows: u16, cols: u16) -> Vec<String> {
         .collect()
 }
 
-/// One synchronized-update frame painting every row of `screen` in place.
 fn sync_frame(screen: &[String]) -> Vec<u8> {
     let mut v = b"\x1b[?2026h\x1b[?25l".to_vec();
     for (r, text) in screen.iter().enumerate() {
@@ -119,9 +90,6 @@ fn sync_frame(screen: &[String]) -> Vec<u8> {
     v
 }
 
-/// The adopting side of a handoff: the old process's app ran frames
-/// `0..=last`, the checkpoint crossed the wire the way the producer makes it,
-/// and a fresh engine restored it.
 fn adopted_after(last: usize) -> Terminal {
     let mut old = Terminal::new(ROWS, COLS);
     old.process(b"\x1b[?1049h");
@@ -142,7 +110,6 @@ fn chrome_rows(t: &Terminal) -> Vec<String> {
         .collect()
 }
 
-/// Restore, a frame at the old size, then the resize.
 #[test]
 fn an_adopted_composer_is_never_archived_by_the_first_resize() {
     let transcript = |r: std::ops::Range<usize>| -> Vec<String> {
@@ -150,22 +117,15 @@ fn an_adopted_composer_is_never_archived_by_the_first_resize() {
             .collect()
     };
     let t_old = usize::from(ROWS) - 5; // transcript rows 3..3 + t_old are shown
-    // (new size, the app's first row at it, rows the archive must hold)
     let cases = [
-        // One row shorter: only the top row left the screen.
         ((ROWS - 1, COLS), 4, transcript(3..4)),
-        // One row taller, an older row on top: every row is still shown.
         ((ROWS + 1, COLS), 2, Vec::new()),
-        // Narrower: the transcript re-wrapped and moved up two; the rules were
-        // redrawn at the new width and are still the composer's.
         ((ROWS, COLS - 11), 5, transcript(3..3 + t_old)),
     ];
     for ((rows, cols), first, want) in cases {
         let mut t = adopted_after(3);
-        // The app repaints what it showed, at the old size…
         t.process(&sync_frame(&claude_screen(3, ROWS, COLS)));
         assert!(t.alt_archive().is_empty(), "{rows}x{cols}: a repaint");
-        // …then the window's first resize, and the app redraws at the new size.
         t.resize(rows, cols);
         t.process(&sync_frame(&claude_screen(first, rows, cols)));
         assert_eq!(chrome_rows(&t), Vec::<String>::new(), "{rows}x{cols}");
@@ -173,9 +133,6 @@ fn an_adopted_composer_is_never_archived_by_the_first_resize() {
     }
 }
 
-/// The resize can come first, too: the app's first frame after the adoption
-/// is already at the new size. Diffed against the restored screen, it archives
-/// the rows that screen showed and the new one does not — never the composer.
 #[test]
 fn an_adopted_screen_resized_before_its_first_frame_archives_only_what_left() {
     let mut t = adopted_after(3);
@@ -191,15 +148,8 @@ fn an_adopted_screen_resized_before_its_first_frame_archives_only_what_left() {
     );
 }
 
-// The archive crosses the handoff (`AltArchiveCarry`). The old engine's capture is split
-// as the GUI splits it (the head inside the freeze, beside the checkpoint; the rows
-// afterwards, behind the fence), and the adopting engine imports it right after restoring
-// the checkpoint.
-
 use aterm_core::terminal::{AltArchiveCarry, AltArchiveGapKind, AltArchiveImport, AltArchiveQuery};
 
-/// The old engine after frames `0..=last`, its checkpoint, and its archive
-/// carry (the whole archive when `rows`, the counters alone otherwise).
 fn old_side(last: usize, rows: bool) -> (Terminal, TerminalCheckpoint, AltArchiveCarry) {
     let mut old = Terminal::new(ROWS, COLS);
     old.set_alt_archive_enabled(true);
@@ -229,15 +179,12 @@ fn everything(t: &Terminal) -> aterm_core::terminal::AltArchiveRead {
     t.alt_archive_read(AltArchiveQuery::oldest(0, usize::MAX))
 }
 
-/// With the archive carried, the adopted engine archives every later frame exactly as the
-/// old one would have: same origin, indices and rows, no gap, no chrome.
 #[test]
 fn a_carried_archive_goes_on_exactly_as_the_old_engine_would() {
     let (mut old, cp, archive) = old_side(12, true);
     let (mut new, outcome) = adopt(&cp, archive);
     assert_eq!(outcome, AltArchiveImport::Exact);
     assert_eq!(everything(&new), everything(&old), "at the handoff");
-    // The app repaints what it showed, then goes on scrolling.
     for s in [12, 13, 14, 17, 18, 30] {
         let frame = sync_frame(&claude_screen(s, ROWS, COLS));
         old.process(&frame);
@@ -257,9 +204,6 @@ fn a_carried_archive_goes_on_exactly_as_the_old_engine_would() {
     );
 }
 
-/// The window's first resize after the adoption is a real resize, reported as a `resize`
-/// gap, but nothing is lost: every row that left the top is archived, and the composer
-/// never is.
 #[test]
 fn a_resize_after_a_carried_archive_is_a_gap_that_loses_nothing() {
     let (_old, cp, archive) = old_side(12, true);
@@ -286,10 +230,6 @@ fn a_resize_after_a_carried_archive_is_a_gap_that_loses_nothing() {
     }
 }
 
-/// Counters only (the rows could not be attached): the indices go on and a
-/// reader holding an old mark is told those rows are lost — never handed
-/// another screen's rows under their indices — and the carried differ state
-/// still archives what scrolls off next.
 #[test]
 fn a_counters_only_carry_says_lost_and_goes_on() {
     let (old, cp, archive) = old_side(12, false);
@@ -312,8 +252,6 @@ fn a_counters_only_carry_says_lost_and_goes_on() {
     );
 }
 
-/// No differ state (the freeze had no time for it): the restored screen is
-/// the new baseline after a `restore` gap, as a restore without a carry does.
 #[test]
 fn without_the_differ_state_the_restored_screen_is_the_baseline() {
     let (_old, cp, mut archive) = old_side(12, true);
@@ -339,7 +277,6 @@ fn without_the_differ_state_the_restored_screen_is_the_baseline() {
     assert_eq!(chrome_rows(&new), Vec::<String>::new());
 }
 
-/// An adopting engine whose archive is off drops the carried rows.
 #[test]
 fn an_adopting_engine_with_the_archive_off_drops_the_carry() {
     let (_old, cp, archive) = old_side(12, true);
@@ -350,10 +287,6 @@ fn an_adopting_engine_with_the_archive_off_drops_the_carry() {
     assert!(new.alt_archive().is_empty());
 }
 
-/// A tail carry (what the GUI sends: the rows after its recent turns' marks),
-/// then, at the same size, the app scrolls back past the tail's first row and
-/// forward again. The tail reaches as far back as the differ can point, so the
-/// adopted engine recognizes every re-shown row: nothing archived twice, no gap.
 #[test]
 fn a_tail_carry_recognizes_a_scroll_back_past_its_first_row() {
     let (mut old, cp, _) = old_side(300, false);
@@ -363,7 +296,6 @@ fn a_tail_carry_recognizes_a_scroll_back_past_its_first_row() {
     assert!(archive.first < last - 29, "reaches past the host's tail");
     let (mut new, outcome) = adopt(&cp, archive);
     assert_eq!(outcome, AltArchiveImport::Exact);
-    // Back 90 rows (two screens), three a frame, forward again, three new.
     let mut views: Vec<usize> = (1..=30).map(|k| 300 - 3 * k).collect();
     views.extend((0..30).rev().map(|k| 300 - 3 * k));
     views.push(303);
@@ -386,9 +318,6 @@ fn a_tail_carry_recognizes_a_scroll_back_past_its_first_row() {
     assert!(b.gaps.is_empty(), "{:?}", b.gaps);
 }
 
-/// The freeze had no time for the differ's state: it is taken after the
-/// freeze, behind the fence, and the adopted engine goes on exactly, with no
-/// `restore` gap, so a report across the handoff stays whole.
 #[test]
 fn a_differ_state_taken_after_the_freeze_goes_on_exactly() {
     let (mut old, cp, _) = old_side(12, false);

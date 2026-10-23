@@ -5,6 +5,11 @@
 // takes the Apache-2.0 arm), modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! The named cursor icons.
+//!
+//! LOCAL PATCH (aterm): upstream re-exports `cursor_icon::CursorIcon` (35 icons); this crate
+//! defines the six aterm sets and the eight edge-resize icons its Wayland frame sets. The names are
+//! the CSS `cursor` keywords and the fallbacks cursor-icon 1.2.0's, as `tests/recorded_answers.rs`
+//! records.
 
 /// A named cursor icon.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]

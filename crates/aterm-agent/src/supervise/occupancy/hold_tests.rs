@@ -314,3 +314,41 @@ fn the_ledgers_open_hold_is_its_last_hold_row() {
     assert_eq!(seed(&[&open, &typed, &closed]), None);
     assert_eq!(seed(&[]), None);
 }
+
+/// A HELD VERDICT'S ROW IS NO OTHER LOOP'S WORD (design §6): a `fact-held@v1` row booked after the
+/// hold's own row leaves that row the session's last word on it, so a successor carries the hold.
+/// NEGATIVE CONTROL: read as an act ([`crate::supervise::approvals::with_facts_counted`]), it
+/// follows the hold's row, and the hold would be closed stale.
+#[test]
+fn a_held_row_after_the_holds_row_leaves_it_the_last_word() {
+    use crate::supervise::occupancy::rules::{HELD_RULE, RuleId, held_reason};
+    let open = row(
+        1_000_000,
+        "s-1",
+        crate::supervise::facts::FactKind::Hold.rule(),
+        &row_reason(&RowSaid::Open {
+            held_ms: 600_000,
+            declared: false,
+        }),
+    );
+    let held = row(
+        1_100_000,
+        "s-1",
+        HELD_RULE,
+        &held_reason(
+            RuleId::WaitNudge,
+            0xaa,
+            0,
+            1_800_000,
+            false,
+            crate::supervise::Guard::Person,
+        ),
+    );
+    let body = [open, held].join("\n");
+    let followed = || seed_row_in(&body, Some("@s-1")).map(|s| s.followed);
+    assert_eq!(followed(), Some(false));
+    assert_eq!(
+        crate::supervise::approvals::with_facts_counted(followed),
+        Some(true)
+    );
+}

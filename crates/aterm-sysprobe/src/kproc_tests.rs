@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The kernel's process records, held to `ps` and `lsof` (their oracles, run
-//! here only) on the live machine, and the pure renderings to the ones those
-//! tools were measured to give. `KERN_PROCARGS2`'s layout is
-//! `aterm_uds::procargs`'s, tested there.
+//! Live-machine oracle tests holding `kproc` process records and renderings against `ps` and `lsof`.
 
 #[cfg(target_os = "macos")]
 mod live {
@@ -17,16 +14,12 @@ mod live {
 
     use crate::kproc::*;
 
-    /// The hang detector for what must happen (a child's exec, its exit).
     const HANG: Duration = Duration::from_secs(60);
 
-    /// `/bin/ps` in the C locale and UTC: its lines.
     fn ps(args: &[&str]) -> Vec<String> {
         ps_in("C", args)
     }
 
-    /// `/bin/ps` under `LC_ALL=<locale>` and UTC: its lines (read as the
-    /// readers read theirs, a byte that is no UTF-8 replaced).
     fn ps_in(locale: &str, args: &[&str]) -> Vec<String> {
         let out = Command::new("/bin/ps")
             .args(args)
@@ -41,9 +34,6 @@ mod live {
             .collect()
     }
 
-    /// `ps -o pid=,<one column>=`'s rows under `LC_ALL=<locale>`: the pid,
-    /// then the rest of the line after its one separating space, byte for
-    /// byte.
     fn column(locale: &str, args: &[&str]) -> BTreeMap<u32, String> {
         ps_in(locale, args)
             .into_iter()
@@ -54,8 +44,6 @@ mod live {
             .collect()
     }
 
-    /// `ps -o lstart=` (C locale, UTC: `Tue Oct 20 02:01:00 2026`) in unix
-    /// seconds.
     fn lstart_secs(words: &[&str]) -> u64 {
         const MONTHS: [&str; 12] = [
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -65,7 +53,6 @@ mod live {
         };
         let m = MONTHS.iter().position(|n| n == month).expect("month") as i64 + 1;
         let (d, y): (i64, i64) = (day.parse().expect("day"), year.parse().expect("year"));
-        // Days from the civil date (Howard Hinnant's algorithm).
         let y = if m <= 2 { y - 1 } else { y };
         let era = y.div_euclid(400);
         let yoe = y - era * 400;
@@ -82,7 +69,6 @@ mod live {
         rows.into_iter().map(|r| (r.pid, r)).collect()
     }
 
-    /// Wait (a hang detector, never a budget) until `pid`'s record holds.
     fn until(pid: u32, what: &str, holds: impl Fn(&Record) -> bool) -> Record {
         let start = Instant::now();
         loop {
@@ -94,8 +80,6 @@ mod live {
         }
     }
 
-    /// A child that has exited and is not reaped: `waitid(WNOWAIT)` returns
-    /// once it exits and leaves it a zombie.
     fn zombie() -> Child {
         let child = Command::new("/usr/bin/true").spawn().expect("spawn true");
         let pid = libc::id_t::try_from(child.id()).expect("pid");
@@ -114,8 +98,6 @@ mod live {
         child
     }
 
-    /// A `sleep` on a pty `script` opened: a process whose terminal is not
-    /// this test's.
     fn on_a_pty() -> (Child, u32) {
         let script = Command::new("/usr/bin/script")
             .args(["-q", "/dev/null", "/bin/sleep", "120"])
@@ -148,16 +130,6 @@ mod live {
         let _ = c.wait();
     }
 
-    /// EVERY RECORD IS THE ONE `ps` READS, for every user's process: parent,
-    /// group, terminal, uid, start time and whether it is a zombie, and the
-    /// terminal's foreground group wherever no other program can move it
-    /// inside the window (no terminal, or the pty this test holds). A process
-    /// that changed between the two reads that sandwich `ps` is not compared;
-    /// most are, and the fixtures always are (this process, a zombie, a
-    /// process on another terminal), so the check can never pass having
-    /// compared nothing. `ps` prints a terminal's name and a record its
-    /// device: they agree when each name stands for exactly one device and
-    /// `??` for none.
     #[test]
     fn every_record_is_the_one_ps_reads() {
         let dead = zombie();
@@ -195,10 +167,6 @@ mod live {
                 Some(r.pgid),
                 "pgid: {line} vs {r:?}"
             );
-            // A terminal's foreground group is moved by whoever runs a job on
-            // it, and a short job is gone again before the second read (the
-            // group back where it was, the record equal), so it is compared
-            // where nothing else moves it: no terminal, or this test's pty.
             if r.tty.is_none() || r.tty == own_pty {
                 assert_eq!(
                     w[3].parse::<i32>().ok(),
@@ -206,8 +174,6 @@ mod live {
                     "tpgid: {line} vs {r:?}"
                 );
             }
-            // `ps` prints a uid as a signed number: `nobody` (4294967294,
-            // macOS's dhcp6d runs as it) reads `-2`.
             assert_eq!(
                 w[4].parse::<u32>()
                     .ok()
@@ -249,12 +215,6 @@ mod live {
         );
     }
 
-    /// The fixtures' words after `bash -c 'read x'`, every escape `ps` makes
-    /// in each locale. The first: characters beyond ASCII that print and
-    /// that do not (a UTF-8 locale keeps the one and escapes the other's code
-    /// point), then every ASCII control and printable byte. The second: every
-    /// high byte alone, no UTF-8, so a UTF-8 locale writes its whole string
-    /// out byte by byte while the C locale escapes each.
     fn every_escape() -> [Vec<Vec<u8>>; 2] {
         let mut words: Vec<Vec<u8>> = [
             "na\u{ef}ve\nline",
@@ -283,7 +243,6 @@ mod live {
         [words, (0x80..=0xffu8).map(|b| vec![b]).collect()]
     }
 
-    /// A `bash` blocked in `read`, named `arg0`, holding `words`.
     fn holding(arg0: &str, words: &[Vec<u8>]) -> Child {
         let mut shell = Command::new("/bin/bash");
         shell.arg0(arg0).args(["-c", "read x"]);
@@ -297,26 +256,14 @@ mod live {
             .expect("spawn bash")
     }
 
-    /// A live process (no zombie) whose `KERN_PROCARGS2` record the kernel will not hand
-    /// over whole: [`argv`] reads it as unread, where `ps` prints the record's tail.
     fn past_what_the_kernel_hands_over(pid: u32) -> bool {
         crate::procargs::read(pid).is_none() && record(pid).is_some_and(|r| !r.zombie)
     }
 
-    /// `ps`'s `comm` and `args` columns, in the C locale and in a UTF-8 one,
-    /// for every process of this uid: `argv[0]` and the argument words as
-    /// `ps` escapes them, a zombie's `<defunct>`. Another user's process is
-    /// `ps`'s (setuid root) alone to read, and is not compared. The fixture's
-    /// `argv[0]` is no program's name and its words hold every escape
-    /// ([`every_escape`]). The one row that may differ is a live process whose
-    /// record is past what the kernel hands over ([`argv`]: `ps` prints its
-    /// tail as words), such as aterm-uds's `procargs` test's own stage.
     #[test]
     fn the_comm_and_args_columns_are_the_ones_ps_prints() {
         type Columns = (String, String, String, String);
         let dead = zombie();
-        // `bash` itself: macOS's `/bin/sh` execs another shell in place, and
-        // a read across that exec would see neither.
         let [printable, raw] = every_escape();
         let mut odd = holding("odd name\u{1}", &printable);
         let mut bytes = holding("raw", &raw);
@@ -411,9 +358,6 @@ mod live {
         let defunct = DEFUNCT.to_string();
         let zombie_columns = (defunct.clone(), defunct.clone(), defunct.clone(), defunct);
         assert_eq!(a[&fixtures[2]], zombie_columns);
-        // Another user's process (launchd, root's): its words are `ps`'s
-        // alone (setuid root), and it is named by its image's path, which
-        // `ps` prints as `comm` where `argv[0]` is that path, as launchd's is.
         let launchd = record(1).expect("launchd");
         let named = (ps_comm(&launchd, Locale::C), ps_args(&launchd, Locale::C));
         assert_eq!(
@@ -429,8 +373,6 @@ mod live {
         );
     }
 
-    /// `lsof -d txt`'s first inode, as this uid reads it: this process's
-    /// image, a child's, and none for a process it may not read (launchd).
     #[test]
     fn the_image_inode_is_lsofs_first_txt() {
         use std::os::unix::fs::MetadataExt as _;

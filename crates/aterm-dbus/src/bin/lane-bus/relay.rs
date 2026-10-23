@@ -18,7 +18,7 @@ pub(crate) trait Filter: Send {
     /// Length of the message `buf` starts with once its header is in, or `Ok(None)` / `Err`.
     fn len(&mut self, buf: &[u8]) -> Result<Option<usize>, String>;
 
-    /// One whole message, which the filter may rewrite in place.
+    /// One whole message, which the filter may rewrite in place: whether it is passed on.
     fn pass(&mut self, msg: &mut [u8]) -> bool;
 }
 

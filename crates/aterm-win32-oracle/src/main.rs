@@ -15,6 +15,8 @@ use std::process::{ExitCode, Output};
 type Result<T> = std::result::Result<T, String>;
 const VERSION: &str = "0.61.2";
 const TRIPLES: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
+/// The generator each emitted Rust file's seal line names ([`aterm_census::seal`]).
+const GENERATOR: &str = "`aterm-win32-oracle gen`";
 const HELP: &str = "\
 aterm-win32-oracle — generated declaration closure and independent Windows ABI oracle
 
@@ -222,9 +224,11 @@ fn formatted(
         let p = out.join(rel);
         std::fs::create_dir_all(p.parent().ok_or("output has no parent")?)
             .map_err(|e| e.to_string())?;
-        std::fs::write(&p, text).map_err(|e| e.to_string())?;
         if p.extension().is_some_and(|e| e == "rs") {
+            std::fs::write(&p, with_seal_line(rel, text)?).map_err(|e| e.to_string())?;
             paths.push(p)
+        } else {
+            std::fs::write(&p, text).map_err(|e| e.to_string())?;
         }
     }
     if format && !paths.is_empty() {
@@ -244,7 +248,26 @@ fn formatted(
             ));
         }
     }
+    for p in &paths {
+        let sealed =
+            aterm_census::seal::stamp(&read(p)?).map_err(|e| format!("{}: {e}", p.display()))?;
+        std::fs::write(p, sealed).map_err(|e| e.to_string())?;
+    }
     Ok(())
+}
+/// `text` with the unstamped seal line ([`aterm_census::seal::line`]) after its SPDX line;
+/// [`formatted`] stamps it once the file is in its final form.
+fn with_seal_line(rel: &Path, text: &str) -> Result<String> {
+    let at = text
+        .find("SPDX-License-Identifier:")
+        .and_then(|spdx| text[spdx..].find('\n').map(|end| spdx + end + 1))
+        .ok_or_else(|| format!("{}: no SPDX line to put the seal under", rel.display()))?;
+    Ok(format!(
+        "{}{}\n{}",
+        &text[..at],
+        aterm_census::seal::line("//", GENERATOR),
+        &text[at..]
+    ))
 }
 /// Returns whether `path` is a hand-written file under `crates/aterm-win32/src`.
 fn hand_written(root: &Path, path: &Path) -> bool {

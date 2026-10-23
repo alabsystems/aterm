@@ -8,6 +8,9 @@
 //!
 //! Keyboard events arrive decoded from `aterm_wayland::seat`, and key repeat is driven by a
 //! deadline polled in `EventLoop::poll_events_with_timeout` (`delay` after press, then every `gap`).
+//!
+//! LOCAL PATCH (aterm): upstream registered a calloop timer for key repeat; the deadline keeps
+//! its timing, each repeat `gap` after the previous one fired.
 
 use std::time::{Duration, Instant};
 

@@ -305,7 +305,9 @@ pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String
 /// Validate `token` against `account` and [`KEY_SCOPE`], then store it in the login keychain.
 ///
 /// # Errors
-/// Returns a message if validation or keychain storage fails.
+/// One line (not a login, no CLT git, GitHub refused the token, it is another account's or
+/// lacks the scope, or the keychain did not hand it back). Nothing is stored on an error
+/// before the store, and no error carries the token.
 pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), String> {
     let git = keychain(sys, account)?;
     let session = Session { token };

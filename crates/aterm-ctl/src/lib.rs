@@ -1953,6 +1953,49 @@ fn orphan_kill<'a>(foreign: impl Iterator<Item = (u32, &'a ForeignFacts)>) -> Op
     ))
 }
 
+/// Who stands behind a process, from its parent and, when that parent is launchd, its lineage
+/// (flavors 17 and 18).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Parent {
+    /// Its parent is not launchd or init, or could not be read: nothing is said.
+    Other,
+    /// launchd started it.
+    Launchd,
+    /// Its launcher exited and launchd adopted it.
+    Adopted,
+    /// Its parent is launchd or init and nothing says which: flavors 17 and 18 unread, a lineage
+    /// of another birth, or Linux, which keeps no original parent.
+    Unjudged,
+}
+
+impl Parent {
+    /// The judgment for a process whose parent reads `ppid`, born at `birth`, with `lineage` read
+    /// of the same pid and launchd's pid version `launchd`: a lineage proves something only when
+    /// it is of the same birth and still names launchd as the parent.
+    pub(crate) fn of(
+        ppid: Option<u32>,
+        lineage: Option<&aterm_uds::process::Lineage>,
+        birth: Option<aterm_uds::process::ProcessBirth>,
+        launchd: Option<i32>,
+    ) -> Self {
+        if ppid != Some(1) {
+            return Self::Other;
+        }
+        let Some(lineage) = lineage else {
+            return Self::Unjudged;
+        };
+        if Some(lineage.identity.birth) != birth || lineage.parent != 1 {
+            Self::Unjudged
+        } else if lineage.launchd_started(launchd) {
+            Self::Launchd
+        } else if lineage.orphaned(launchd) {
+            Self::Adopted
+        } else {
+            Self::Unjudged
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum ForeignFacts {
     #[default]
@@ -1960,7 +2003,7 @@ enum ForeignFacts {
     Stale,
     NotAterm(String),
     Writer {
-        orphaned: bool,
+        parent: Parent,
         binary_deleted: bool,
         up: Option<std::time::Duration>,
     },
@@ -1971,31 +2014,48 @@ struct ProcessReading {
     birth: aterm_uds::process::ProcessBirth,
     slack: std::time::Duration,
     parent: Option<u32>,
-    exe: Option<(PathBuf, io::Result<bool>)>,
+    /// Its lineage, read only when its parent is launchd or init.
+    lineage: Option<aterm_uds::process::Lineage>,
+    /// launchd's pid version, read with the lineage.
+    launchd: Option<i32>,
+    /// Its executable image, as the census reads it ([`census::image_of`]).
+    exe: Option<census::Image>,
     birth_after: Option<aterm_uds::process::ProcessBirth>,
+}
+
+impl ProcessReading {
+    /// What [`ForeignFacts::judge`] judges of the live process `pid`, between two reads of its
+    /// birth; `None` when the first reads nothing.
+    fn read(pid: u32) -> Option<Self> {
+        use aterm_uds::process::{launchd_idversion, read_lineage, read_process_parent};
+        let p = i32::try_from(pid).ok()?;
+        let clocks = graph_hygiene::Clocks::default();
+        let birth = graph_hygiene::read_birth(p, &clocks)?;
+        let parent = read_process_parent(p);
+        let (lineage, launchd) = if parent == Some(1) {
+            (read_lineage(p), launchd_idversion())
+        } else {
+            (None, None)
+        };
+        Some(Self {
+            birth: birth.at,
+            slack: birth.slack,
+            parent,
+            lineage,
+            launchd,
+            exe: census::image_of(pid),
+            birth_after: graph_hygiene::read_birth(p, &clocks).map(|b| b.at),
+        })
+    }
 }
 
 impl ForeignFacts {
     fn read(pid: u32, written: Option<std::time::SystemTime>) -> Self {
-        use aterm_uds::process::{read_process_parent, read_process_path};
-        let (Ok(p), Some(_)) = (i32::try_from(pid), written) else {
+        if written.is_none() {
             return Self::Unknown;
-        };
-        let clocks = graph_hygiene::Clocks::default();
-        let Some(birth) = graph_hygiene::read_birth(p, &clocks) else {
+        }
+        let Some(reading) = ProcessReading::read(pid) else {
             return Self::Unknown;
-        };
-        let parent = read_process_parent(p);
-        let exe = read_process_path(p).map(|path| {
-            let exists = path.try_exists();
-            (path, exists)
-        });
-        let reading = ProcessReading {
-            birth: birth.at,
-            slack: birth.slack,
-            parent,
-            exe,
-            birth_after: graph_hygiene::read_birth(p, &clocks).map(|b| b.at),
         };
         Self::judge(written, std::time::SystemTime::now(), reading)
     }
@@ -2013,32 +2073,39 @@ impl ForeignFacts {
         if r.birth_after != Some(r.birth) {
             return Self::Unknown;
         }
-        let binary_deleted = match &r.exe {
-            None => true,
-            Some((path, exists)) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if name != "aterm" && !name.starts_with("aterm-") {
-                    return Self::NotAterm(name);
-                }
-                matches!(exists, Ok(false))
-            }
+        let Some(image) = &r.exe else {
+            return Self::Unknown;
         };
+        if !census::is_aterm(&image.path) {
+            let name = image
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Self::NotAterm(name);
+        }
         let up = now
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|now| now.checked_sub(std::time::Duration::from_secs(r.birth.seconds)));
         Self::Writer {
-            orphaned: r.parent == Some(1),
-            binary_deleted,
+            parent: Parent::of(r.parent, r.lineage.as_ref(), Some(r.birth), r.launchd),
+            binary_deleted: image.deleted,
             up,
         }
     }
 
+    /// Whether `kill` is offered for it: only an instance its lineage proves launchd adopted.
+    /// One whose parent is launchd or init and nothing says which keeps its words and gets no
+    /// `kill`: it may be one launchd started.
     const fn orphaned(&self) -> bool {
-        matches!(self, Self::Writer { orphaned: true, .. })
+        matches!(
+            self,
+            Self::Writer {
+                parent: Parent::Adopted,
+                ..
+            }
+        )
     }
 
     const fn writer_gone(&self) -> bool {
@@ -2046,7 +2113,7 @@ impl ForeignFacts {
     }
 
     fn describe(&self) -> Option<String> {
-        let (orphaned, binary_deleted, up) = match self {
+        let (parent, binary_deleted, up) = match self {
             Self::Unknown => return None,
             Self::Stale => {
                 return Some(
@@ -2060,18 +2127,21 @@ impl ForeignFacts {
                 ));
             }
             Self::Writer {
-                orphaned,
+                parent,
                 binary_deleted,
                 up,
-            } => (*orphaned, *binary_deleted, *up),
+            } => (*parent, *binary_deleted, *up),
         };
         let mut said = Vec::new();
-        if orphaned {
-            said.push(if cfg!(target_vendor = "apple") {
+        match parent {
+            Parent::Other => {}
+            Parent::Launchd => said.push("launchd started it".to_string()),
+            Parent::Adopted => said.push("its launcher exited and launchd adopted it".to_string()),
+            Parent::Unjudged => said.push(if cfg!(target_vendor = "apple") {
                 "its parent is launchd (its launcher exited, or launchd started it)".to_string()
             } else {
                 "its parent is init (its launcher exited)".to_string()
-            });
+            }),
         }
         if binary_deleted {
             said.push("running a deleted binary".to_string());

@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A shell's `133;B` prompt mark reads back as its prompt row, whatever height changes the
-//! grid went through.
-//!
-//! A mark is recorded through `visible_to_absolute` (`counter − visible + r`) and read back
-//! through `oldest_absolute_row()` (`counter − visible − scrollback`, saturating at 0) plus
-//! the history count. The two agree only while the counter covers every retained row: a
-//! rows-only grow that appends blank rows must advance it, or on a grid whose counter sits
-//! at its floor (a fresh tab, an adopted grid) each appended row shifts every mark one row
-//! above where it was recorded. The tests drive real bytes: a fullscreen Claude Code's
-//! SIGTERM exit and zsh's prompt with aterm's integration marks.
+//! A shell's `133;B` prompt mark reads back as its prompt row across height changes.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
@@ -18,13 +9,10 @@ use aterm_core::terminal::Terminal;
 const COLS: u16 = 137;
 const PROMPT: &str = "me@a-studio-of-128gb aterm % ";
 
-/// A terminal built as the window builds one: a ring and a tiered store.
 fn live(rows: u16) -> Terminal {
     Terminal::with_scrollback(rows, COLS, 1000, Scrollback::with_defaults())
 }
 
-/// zsh's prompt as recorded: `PROMPT_SP` across the full width, the integration's
-/// `133;D`/`133;A`, the prompt, then `133;B` (from `zle-line-init`, after the prompt).
 fn prompt(t: &mut Terminal) {
     let mut v = Vec::new();
     v.extend_from_slice(b"\x1b[1m\x1b[7m%\x1b[27m\x1b[1m\x1b[0m");
@@ -36,13 +24,11 @@ fn prompt(t: &mut Terminal) {
     t.process(&v);
 }
 
-/// A command typed at the prompt and run: its echo, Enter, `133;C`.
 fn run(t: &mut Terminal, line: &str) {
     t.process(line.as_bytes());
     t.process(b"\r\n\x1b]133;C\x07");
 }
 
-/// Claude Code in fullscreen: the alternate screen, repainted in place.
 fn fullscreen(t: &mut Terminal) {
     t.process(b"\x1b[?1049h\x1b[2J\x1b[H");
     for r in 1..=t.rows() {
@@ -50,8 +36,6 @@ fn fullscreen(t: &mut Terminal) {
     }
 }
 
-/// Claude Code 2.1.286's bytes after a SIGTERM, verbatim from a recording: the mouse modes
-/// off, `?1049l`, the scroll region reset inside DECSC/DECRC, and the two-line resume hint.
 fn sigterm_exit(t: &mut Terminal) {
     t.process(b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     t.process(b"\x1b[?2026h\x1b[?25h\x1b[?2026l");
@@ -70,8 +54,6 @@ fn sigterm_exit(t: &mut Terminal) {
     );
 }
 
-/// The newest block's `133;B` row, read back the way `line` reads it, must be
-/// the row the cursor sits on — the prompt — and its column the cursor's.
 fn assert_mark_is_the_prompt(t: &Terminal, label: &str) {
     let block = t.all_blocks().last().expect("a block");
     let cmd = block.command_start_row.expect("133;B recorded");
@@ -89,7 +71,6 @@ fn assert_mark_is_the_prompt(t: &Terminal, label: &str) {
     assert_eq!(block.command_start_col, Some(cursor.col), "{label}");
 }
 
-/// The smallest shape: a tab that grows before it has any history.
 #[test]
 fn a_tab_that_grew_before_it_had_history_reads_its_marks_back() {
     let mut t = live(30);
@@ -101,9 +82,6 @@ fn a_tab_that_grew_before_it_had_history_reads_its_marks_back() {
     assert_mark_is_the_prompt(&t, "after a grow of a fresh tab");
 }
 
-/// A grid adopted while an agent is fullscreen, its numbering at its floor, grown while
-/// parked; then the agent's exit, a relaunch, another fullscreen session, a resize and a
-/// SIGTERM exit, and three resizes while the prompt waits.
 #[test]
 fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
     for (adopt_rows, parked) in [(52u16, [53u16, 53]), (52, [53, 52]), (51, [53, 54])] {
@@ -117,8 +95,6 @@ fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
             "claude --dangerously-skip-permissions --resume 253a40df",
         );
         fullscreen(&mut old);
-        // Adopt a carry without row counters (visible rows only), so the primary grid's
-        // numbering starts at its floor.
         let mut carry = old.checkpoint_visible().expect("parser at ground");
         carry.absolute_row_counter = 0;
         carry.alt_absolute_row_counter = 0;
@@ -139,7 +115,6 @@ fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
         assert_mark_is_the_prompt(&t, "the prompt the relaunch reads");
         for rows in [54u16, 53, 52] {
             t.resize(rows, COLS);
-            // zsh redraws its prompt in place on SIGWINCH; no new mark.
             t.process(b"\r\r\x1b[0m\x1b[27m\x1b[24m\x1b[J");
             t.process(PROMPT.as_bytes());
             assert_mark_is_the_prompt(&t, &format!("after a resize to {rows} rows"));
@@ -147,10 +122,6 @@ fn the_prompt_after_a_fullscreen_agents_exit_reads_back_as_the_prompt() {
     }
 }
 
-/// The invariant behind both (the grid's `KeysCoverRetained`): the primary grid's counter
-/// covers every retained row through output, `3J`, the alternate screen, synchronous and
-/// offloaded resizes, and adopts, in any order. While it holds, the two maps of an absolute
-/// row agree. A fixed walk of 300 scripts of 40 steps.
 #[test]
 fn the_counter_covers_every_retained_row() {
     let mut state: u64 = 0x2026_1001;
@@ -190,8 +161,6 @@ fn the_counter_covers_every_retained_row() {
                         .clamp(8, 40)
                         .try_into()
                         .unwrap_or(24);
-                    // Half keep the width; the rest rewrap too, synchronously
-                    // or offloaded as the window resizes.
                     let cols = match next(4) {
                         0 | 1 => t.cols(),
                         _ => 60 + u16::try_from(next(90)).unwrap_or(0),

@@ -1147,7 +1147,6 @@ impl crate::App {
             }
             StatusAction::PeerScreen(_) | StatusAction::MacScreen(_) => {
                 if let Some(host) = host.and_then(host_word) {
-                    // {host}"));
                     let _ = self.apprt.open_url(&format!("vnc://{host}"));
                 }
             }

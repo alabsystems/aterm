@@ -2,42 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Emits every registered `ty_model!` model as a Trust `ScalarModel` (Clean source), one file
-//! per model, for Trust's kernel-evaluated checker (`safetyVerdict`, `reachRows`):
-//!
-//! ```text
-//! targo --unverified run -p aterm-models --example emit_clean_models -- <out-dir>
-//! ```
-//!
-//! Each file states as theorems the kernel decides by evaluation what this crate's interpreter
-//! found: the model is safe, has the reachable-state count `interp::bmc` reports, and each
-//! `mutantK` (the model at a `Buggy = K` dial that breaks an invariant here) is caught. A dial
-//! that breaks only liveness is listed, not emitted. `manifest.tsv` lists every model: emitted
-//! with its mutants' dials, or why it has no faithful scalar counterpart. `islands/` holds the
-//! same models as bare declarations in `Trust.Protocol`'s short names (the text of a
-//! `clean { }` island, the input of Trust's `TRUST_MODEL_CORPUS` test); `progress/` holds the
-//! liveness obligations.
-//!
-//! Integers versus naturals: a `ty_model!` model is over the integers, `ScalarModel` over the
-//! naturals, where `a - b` stops at zero (so `x <= y - 1`, this DSL's `x < y`, holds at
-//! `x = y = 0` there). Two steps make the translation faithful:
-//!
-//! 1. every comparison is transposed: subtrahends move across as addends (`x <= y - 1` becomes
-//!    `x + 1 <= y`), leaving no subtraction directly under a comparison;
-//! 2. the model is emitted only if no remaining subtraction underflows on a reachable state
-//!    (taken `if` branches only), so every expression has the same value under both readings
-//!    and the two machines have the same runs.
-//!
-//! Nondeterminism: an update `x' \in lo..hi` ([`Expr::InRange`]) has no scalar counterpart, so
-//! its action is split into one deterministic action per choice `k` (guard `lo + k <= hi`,
-//! update `x = lo + k`) up to the widest range the action meets on a reachable state;
-//! `interp::bmc` must find the same reachable-state count for the split model.
-//!
-//! Progress: `progress/` holds each liveness obligation as `ScalarProgress` claims (`[]<> goal`
-//! under its fairness), named for what this crate's audit found: `holds`,
-//! `fails_without_<Action>` (one fairness assumption dropped) and `fails_mutant_<Action>` (that
-//! mutant added to the `Buggy = 1` baseline). `progress.tsv` lists them with the design's state
-//! count.
+//! Emits registered `ty_model!` models, `islands/`, and `progress/` obligations as Trust `ScalarModel` and `ScalarProgress` files.
+//! Splits `InRange` updates into deterministic actions, transposes subtractions out of comparisons, and rejects models that underflow on reachable states.
 
 use std::fmt::Write as _;
 
@@ -52,16 +18,13 @@ fn nat(value: i64, what: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("negative {what} {value}"))
 }
 
-/// How a model is spelled: the constructors (the standalone `.lean` files,
-/// checked against the module's text alone) or `Trust.Protocol`'s short names
-/// and operators (the islands, which import it).
+/// Output spelling: standalone `ScalarModel` constructors or `Trust.Protocol` operators.
 #[derive(Clone, Copy)]
 enum Style {
     Constructors,
     Protocol,
 }
 
-/// `text` as one argument: parenthesized unless it already is.
 fn arg(text: String) -> String {
     if text.starts_with('(') {
         text
@@ -125,7 +88,7 @@ fn expr(e: &Expr, style: Style) -> Result<String, String> {
     }
 }
 
-/// `e` as atoms: the sum of `plus` minus the sum of `minus` (integers).
+/// Partition `e` into positive (`plus`) and negated (`minus`) additive atoms.
 fn linear(e: &Expr, positive: bool, plus: &mut Vec<Expr>, minus: &mut Vec<Expr>) {
     match e {
         Expr::Add(a, b) => {
@@ -153,7 +116,7 @@ fn sum(atoms: Vec<Expr>) -> Expr {
         .unwrap_or(Expr::Int(0))
 }
 
-/// Step 1 of the module docs: no subtraction directly under a comparison.
+/// Transpose subtrahends across comparisons so no subtraction sits directly under a comparison.
 fn transpose(e: &Expr) -> Expr {
     let compare = |build: fn(Box<Expr>, Box<Expr>) -> Expr, a: &Expr, b: &Expr| {
         let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -184,9 +147,7 @@ fn transpose(e: &Expr) -> Expr {
     }
 }
 
-/// `e` with every name spelled for what the model declares it as: this DSL
-/// reads a variable and a constant through one environment, so `Var("Cap")`
-/// may name a constant; the scalar model language keeps the two apart.
+/// Rewrite identifiers in `e` as [`Expr::Var`] when declared in `vars` and [`Expr::ConstRef`] otherwise.
 fn resolved(e: &Expr, vars: &BTreeSet<&'static str>) -> Expr {
     let both = |build: fn(Box<Expr>, Box<Expr>) -> Expr, a: &Expr, b: &Expr| {
         build(Box::new(resolved(a, vars)), Box::new(resolved(b, vars)))
@@ -222,7 +183,6 @@ fn variables(m: &Model) -> BTreeSet<&'static str> {
     m.vars.iter().map(|var| var.name).collect()
 }
 
-/// Names resolved, then every comparison transposed.
 fn scalar_form(e: &Expr, vars: &BTreeSet<&'static str>) -> Expr {
     transpose(&resolved(e, vars))
 }
@@ -257,8 +217,7 @@ fn truth(e: &Expr, env: &BTreeMap<&'static str, i64>) -> bool {
     }
 }
 
-/// Whether evaluating `e` in `env` takes a subtraction below zero (only the
-/// taken branch of an `if` counts: the other has no bearing on the value).
+/// Return whether evaluating `e` in `env` performs a negative subtraction on a taken branch.
 fn underflows(e: &Expr, env: &BTreeMap<&'static str, i64>) -> bool {
     match e {
         Expr::Sub(a, b) => underflows(a, env) || underflows(b, env) || int(a, env) < int(b, env),
@@ -278,7 +237,7 @@ fn underflows(e: &Expr, env: &BTreeMap<&'static str, i64>) -> bool {
     }
 }
 
-/// Every reachable state of `m` (integer semantics), or `None` past `limit`.
+/// Collect reachable states of `m` under integer semantics, returning `None` past `limit`.
 fn reachable(m: &Model, limit: usize) -> Option<Vec<BTreeMap<&'static str, i64>>> {
     let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut order = Vec::new();
@@ -303,8 +262,7 @@ fn reachable(m: &Model, limit: usize) -> Option<Vec<BTreeMap<&'static str, i64>>
     Some(order)
 }
 
-/// The module docs' nondeterminism step: `m` with every `InRange` update split into one
-/// deterministic action per choice.
+/// Split every [`Expr::InRange`] update in `m` into one deterministic action per choice.
 fn determinized(m: &Model) -> Result<Model, String> {
     const MAX_CHOICES: usize = 4096;
     let ranged = |action: &Action| {
@@ -323,7 +281,6 @@ fn determinized(m: &Model) -> Result<Model, String> {
             actions.push(action.clone());
             continue;
         }
-        // The widest `hi - lo` each range update meets where the action is enabled.
         let mut widest: Vec<Option<i64>> = vec![None; action.updates.len()];
         for state in &states {
             let env = m.eval_env(state);
@@ -341,8 +298,6 @@ fn determinized(m: &Model) -> Result<Model, String> {
                 }
             }
         }
-        // One action per combination of choices; none if a range is never met
-        // (the action never fires).
         let mut combinations: Vec<Vec<i64>> = vec![Vec::new()];
         for (slot, update) in action.updates.iter().enumerate() {
             let choices: Vec<i64> = match (&update.expr, widest[slot]) {
@@ -388,7 +343,6 @@ fn determinized(m: &Model) -> Result<Model, String> {
                 });
                 let _ = write!(label, "_{choice}");
             }
-            // A one-shot tool: the split action's name lives for the run.
             let name: &'static str = Box::leak(format!("{}{label}", action.name).into_boxed_str());
             actions.push(Action {
                 name,
@@ -402,8 +356,7 @@ fn determinized(m: &Model) -> Result<Model, String> {
     Ok(split)
 }
 
-/// Step 2 of the module docs. `Err` names where a subtraction underflows on a
-/// reachable state (or that the space is too large to say).
+/// Verify that no subtraction underflows on any reachable state of `m`.
 fn natural_on_every_reachable_state(m: &Model) -> Result<(), String> {
     const MAX_STATES: usize = 200_000;
     let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
@@ -496,7 +449,6 @@ fn scalar_model(m: &Model, def: &str, style: Style) -> Result<String, String> {
             });
         }
         let updates = match style {
-            // One line per action's updates: `["x" ≔ n 1, "reset" ≔ n 0]`.
             Style::Protocol => format!("[{}]", updates.join(", ")),
             Style::Constructors => list(&updates),
         };
@@ -553,8 +505,7 @@ fn names(actions: &[&'static str]) -> String {
     )
 }
 
-/// One liveness obligation as an island of `ScalarProgress` claims, with the
-/// design's state count; `Err` says why it has no faithful scalar counterpart.
+/// Emit one liveness obligation as an island of `ScalarProgress` claims with its reachable-state count.
 fn progress_island(index: usize, m: &Model, live: &Liveness) -> Result<(String, usize), String> {
     let faithful = |m: &Model| -> Result<Model, String> {
         let split = transposed(&determinized(m)?);
@@ -598,8 +549,6 @@ fn progress_island(index: usize, m: &Model, live: &Liveness) -> Result<(String, 
         ));
     }
     for mutant in &live.mutants {
-        // The audit's isolation: `Buggy = 1`, the actions that fire at the
-        // committed config, and this one mutant.
         let mut isolated = interp::with_buggy(m, 1);
         isolated
             .actions
@@ -628,8 +577,7 @@ fn progress_island(index: usize, m: &Model, live: &Liveness) -> Result<(String, 
     ))
 }
 
-/// `interp::bmc`, with a space past the interpreter's limit (which panics)
-/// reported as `None`, quietly.
+/// Run [`interp::bmc`], returning `None` if state-space exploration exceeds the interpreter's limit.
 fn bounded_check(m: &Model) -> Option<Result<usize, String>> {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -647,7 +595,6 @@ fn main() {
     std::fs::create_dir_all(format!("{out}/islands")).expect("create the output directory");
     let mut manifest = String::from("index\tname\tstates\tmutants\tstatus\tother dials\n");
     for (index, model) in aterm_spec::xref::model_registry().iter().enumerate() {
-        // Spell the model before `bmc`: the interpreter refuses a function-valued model.
         let original = model;
         let model = &match determinized(original) {
             Ok(split) => transposed(&split),
@@ -696,8 +643,6 @@ fn main() {
             );
             continue;
         }
-        // One mutant per dial that breaks an invariant here; the others are
-        // listed with the reason (a dial that breaks only liveness is safe).
         let mut mutants: Vec<(i64, Model)> = Vec::new();
         let mut others: Vec<String> = Vec::new();
         for dial in original.mutant_dials() {

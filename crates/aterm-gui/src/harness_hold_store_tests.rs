@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LAND'S HOLD, STORED ON THE LOOP'S THREAD
-//! (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.3.3 item 3):
-//! the window's host hears the hold from its loop (`IdleHost::land_held`),
-//! stores it on the session's timeline before the call returns
-//! (`Hooks::hold`, `store_land_held`, `SessionTimeline::set_land_held`),
-//! where `status` reads it, and wakes the window with a fact that carries
-//! nothing (`HarnessFact::LandHeld`) only where it moved. A run's end takes
-//! it down: nobody tells it any more.
-//!
-//! The host here is the real one (`HostHandle`, its `WorkerIdle`), its
-//! `hold` hook the live `store_land_held` over a real headless App's store;
-//! the worker's body stands in for the loop. Each test names its NEGATIVE
-//! CONTROL: the mutant it was run against, and what failed.
+//! Tests for storing and clearing [`LandHeld`] on the session timeline from the worker loop.
 
 use std::sync::mpsc;
 
@@ -22,7 +10,6 @@ use aterm_agent::harness::acts::{HoldLeg, LandHeld};
 use super::*;
 use crate::App;
 
-/// What the worker's body does, one step at a time, at the test's word.
 enum Step {
     /// The loop tells the hold (`IdleHost::land_held`). Answered with what
     /// the session's timeline held as the call returned.
@@ -31,9 +18,6 @@ enum Step {
     End,
 }
 
-/// The real host supervising a headless App's session 0 (a Claude Code
-/// under Land), its `hold` hook the live [`store_land_held`] over the App's
-/// store and its hold facts kept on a channel the test drains.
 struct Desk {
     app: App,
     host: HostHandle,
@@ -118,8 +102,6 @@ impl Desk {
         }
     }
 
-    /// The loop tells `held`; wait for it (a hang detector): what the
-    /// timeline held as the call returned.
     fn tell(&self, held: Option<LandHeld>) -> Option<LandHeld> {
         self.steps.send(Step::Tell(held)).expect("the body listens");
         self.done
@@ -127,19 +109,16 @@ impl Desk {
             .expect("not within 60 s: the hold told")
     }
 
-    /// The next run's start (a hang detector): what the timeline held.
     fn run_started(&self) -> Option<LandHeld> {
         self.runs
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("not within 60 s: a run started")
     }
 
-    /// The hold facts the host has sent the window since the last call.
     fn woken(&self) -> usize {
         self.facts.try_iter().count()
     }
 
-    /// The hold on session 0's timeline now.
     fn stored(&self) -> Option<LandHeld> {
         self.app
             .pool
@@ -153,7 +132,6 @@ impl Desk {
     }
 }
 
-/// A hold after a yield: two unpushed commits, a nudge.
 fn held() -> LandHeld {
     LandHeld {
         since_ms: Some(1_792_159_320_000),
@@ -165,13 +143,7 @@ fn held() -> LandHeld {
     }
 }
 
-/// THE HOLD IS ON THE TIMELINE AS THE LOOP'S CALL RETURNS, AND WAKES ONLY
-/// WHERE IT MOVED (§12.3.3 item 3): a hold told is stored by the call
-/// itself, on the loop's thread, and the window woken once; told again as
-/// it stands, nothing is woken; a nudge moves it and wakes; `None` takes it
-/// down and wakes, and `None` again wakes nothing. NEGATIVE CONTROL (as
-/// run): `WorkerIdle::land_held` waking whatever the hook said wakes the
-/// window for the hold told again.
+/// The host stores the hold synchronously on the timeline and wakes the window only on change.
 #[test]
 fn the_host_stores_the_hold_and_wakes_only_where_it_moved() {
     let desk = Desk::new();
@@ -193,12 +165,7 @@ fn the_host_stores_the_hold_and_wakes_only_where_it_moved() {
     assert_eq!(desk.stored(), None);
 }
 
-/// A RUN'S END TAKES ITS HOLD DOWN (§12.3.3 item 3): a loop whose run ended
-/// without telling `None` (a failure, a panic) leaves no hold standing —
-/// the next run starts with none on the timeline, and the window was woken
-/// for it; the host's shutdown, which ends the last run the same way, takes
-/// down one told since. NEGATIVE CONTROL (as run): `worker_run` without its
-/// hold clear starts the next run with the old hold standing.
+/// Ending a worker run clears any standing hold from the timeline.
 #[test]
 fn a_runs_end_takes_its_hold_down() {
     let desk = Desk::new();
@@ -209,7 +176,6 @@ fn a_runs_end_takes_its_hold_down() {
     assert_eq!(desk.run_started(), None, "the old run's hold went with it");
     assert_eq!(desk.woken(), 1, "and the window was told");
     assert_eq!(desk.tell(Some(held())), Some(held()));
-    // `Drop` joins again: the join is taken once.
     desk.host.shutdown_and_join();
     assert_eq!(desk.stored(), None, "the shutdown took it down");
 }

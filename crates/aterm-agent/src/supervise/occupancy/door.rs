@@ -5,7 +5,9 @@
 //! red-team's F1, F10 and F11): the pure parts of typing a due line at a drawn break, once the
 //! owner's grant is in hand.
 
-use super::rules::RuleId;
+use super::reading::OccupancyReading;
+use super::rules::{self, HoldSeen, RuleId};
+use super::templates::FactLine;
 use crate::supervise::Guard;
 use crate::supervise::facts::{EpisodeKey, FactKind, SeedOutcome};
 use crate::supervise::screen::HumanInput;
@@ -132,18 +134,36 @@ impl PaceRefusal {
 
 /// THE HOST'S ANSWER FOR A LINE'S PACE (`IdleHost::occupancy_pace`, design §4.2): the machine-wide
 /// pace and, for a slot rule, one free slot reserved for the line's session, taken together — or
-/// what holds the line.
+/// what holds the line. For a slot rule ([`RuleId::slot`]) the host re-reads the board first
+/// (design §3.1: the call that types reads the terms again): the figures the line types are
+/// that re-read's ([`Self::Room`]), and terms it finds no longer met ([`Self::Unmet`]) or
+/// figures it cannot read [`FACT_FRESH_MS`] fresh ([`Self::Stale`]) hold the line.
+///
+/// [`FACT_FRESH_MS`]: crate::supervise::facts::FACT_FRESH_MS
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaceGrant {
     /// The host keeps no machine pace (the default host): the session's own pace, which the decider
-    /// judged, is the line's.
+    /// judged, is the line's. It keeps no board either, so a slot rule's line, which types the
+    /// board's figures, has none re-read and waits ([`Self::slot_answer`]).
     Local,
-    /// Taken: the machine's pace, and the reservation where the rule needs a slot.
+    /// Taken: the machine's pace, for a line that types no figure of the board's. A slot rule's
+    /// bare grant is an older build's (slice 1's pace re-read nothing): its line types the
+    /// figures it was decided on, as that build typed them, so its tape replays as recorded.
     Granted,
+    /// Taken for a slot rule: the machine's pace and the slot's reservation, on the board the host
+    /// re-read for the write (stamped when its oldest figure was read), whose figures the line
+    /// types.
+    Room(OccupancyReading),
     /// The machine's pace holds the line: the lines of the last hour across the machine.
     Machine,
     /// No free slot is left to reserve: others hold them, or an older hold waits for one.
     Reserved,
+    /// A slot rule's figures could not be re-read [`FACT_FRESH_MS`] fresh: the line waits.
+    ///
+    /// [`FACT_FRESH_MS`]: crate::supervise::facts::FACT_FRESH_MS
+    Stale,
+    /// Re-read, a slot rule's terms no longer hold (a slot taken since the look): the line waits.
+    Unmet,
     /// The host refuses the line ([`PaceRefusal`]).
     Refused(PaceRefusal),
 }
@@ -152,22 +172,29 @@ impl PaceGrant {
     /// Whether the line may go.
     #[must_use]
     pub const fn lets(self) -> bool {
-        matches!(self, PaceGrant::Local | PaceGrant::Granted)
+        matches!(
+            self,
+            PaceGrant::Local | PaceGrant::Granted | PaceGrant::Room(_)
+        )
     }
 
-    /// Its word (the journal's, the tape's).
+    /// Its word (the journal's, the tape's): a re-read board's answer is `room`, which a tape
+    /// carries with its reading.
     #[must_use]
     pub fn word(self) -> String {
         match self {
             PaceGrant::Local => "local".to_string(),
             PaceGrant::Granted => "granted".to_string(),
+            PaceGrant::Room(_) => "room".to_string(),
             PaceGrant::Machine => "machine".to_string(),
             PaceGrant::Reserved => "reserved".to_string(),
+            PaceGrant::Stale => "stale".to_string(),
+            PaceGrant::Unmet => "unmet".to_string(),
             PaceGrant::Refused(why) => format!("refused:{}", why.word()),
         }
     }
 
-    /// The answer `word` names ([`Self::word`]).
+    /// The answer `word` names ([`Self::word`]); `room`, which needs its reading, is none.
     #[must_use]
     pub fn of_word(word: &str) -> Option<Self> {
         Some(match word {
@@ -175,8 +202,38 @@ impl PaceGrant {
             "granted" => PaceGrant::Granted,
             "machine" => PaceGrant::Machine,
             "reserved" => PaceGrant::Reserved,
+            "stale" => PaceGrant::Stale,
+            "unmet" => PaceGrant::Unmet,
             _ => PaceGrant::Refused(PaceRefusal::of_word(word.strip_prefix("refused:")?)?),
         })
+    }
+
+    /// THE ANSWER FOR A SLOT RULE'S LINE `line`, decided on `hold` at `now_ms` (the loop's
+    /// clock) and written at a break whose wall time is `at_ms`, with the line it types: on a
+    /// re-read board ([`Self::Room`]) the rule's terms judged again on it ([`rules::line`]), its
+    /// figures read no more than [`FACT_FRESH_MS`] before the break ([`Stale`](Self::Stale)
+    /// otherwise), and the line made from them ([`Unmet`](Self::Unmet) where the terms no
+    /// longer hold); a host with no board re-read nothing ([`Stale`](Self::Stale)); an older
+    /// build's bare grant types the line as decided. Any other answer, and its line unchanged.
+    ///
+    /// [`FACT_FRESH_MS`]: crate::supervise::facts::FACT_FRESH_MS
+    #[must_use]
+    pub fn slot_answer(
+        self,
+        line: &FactLine,
+        hold: HoldSeen,
+        now_ms: i64,
+        at_ms: Option<i64>,
+    ) -> (Self, FactLine) {
+        match self {
+            PaceGrant::Room(r) if !r.typeable_at(at_ms) => (PaceGrant::Stale, line.clone()),
+            PaceGrant::Room(r) => match rules::line(line.rule(), &r, hold, now_ms) {
+                Some(reread) => (self, reread),
+                None => (PaceGrant::Unmet, line.clone()),
+            },
+            PaceGrant::Local => (PaceGrant::Stale, line.clone()),
+            _ => (self, line.clone()),
+        }
     }
 }
 

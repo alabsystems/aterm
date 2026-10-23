@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the real roster body/signature redo transaction. The derived
-//! [`RosterPairRedo`](aterm_spec::derive::roster_pair_redo_model) model is proved
-//! exhaustively in `aterm-spec`; these tests bind it to the shipping filesystem operations:
-//! byte-exact snapshot CAS, pair publication, recovery from every durable crash cut,
-//! fail-closed handling of an unrelated half, and the read-only lock's refusal to replay.
-//!
-//! The derived [`RosterPairRedo`](aterm_models_release::roster_pair_redo_model)
-//! model is proved exhaustively in `aterm-spec`.  These tests bind its decisions
-//! to the shipping `atpkg-keys` filesystem operations: byte-exact snapshot CAS,
-//! end-to-end pair publication, recovery from every durable crash cut, fail-closed
-//! handling of an unrelated half, and the read-only lock's refusal to replay.
-//!
-//! Every crash premise is produced by the production commit path
-//! (`commit_roster_pair`, then dropping the `CommittedRoster` instead of completing
-//! it) — exactly what a killed publisher leaves on disk — so nothing in this file
-//! spells the redo directory's layout, and a format change cannot leave the bind
-//! quietly exercising a replica.
+//! Conformance tests binding roster body/signature redo transactions to the `RosterPairRedo`
+//! model (aterm-models-release).
 
 #![cfg(unix)]
 
@@ -82,9 +67,6 @@ impl Fixture {
         })
     }
 
-    /// Run the production snapshot CAS and redo commit under a real writer lock, then die:
-    /// drop the `CommittedRoster` uncompleted, as a killed publisher would. The lock is
-    /// returned so the caller can promote halves as the dead process would have.
     fn commit_and_die(&self, predecessor: Option<&RosterSnapshot>) -> RosterLock {
         let lock = lock_roster(self.roster_str()).expect("acquire real roster writer lock");
         let committed = commit_roster_pair(
@@ -128,8 +110,6 @@ fn classify(path: &Path, predecessor: Option<&[u8]>, target: &[u8]) -> i64 {
     }
 }
 
-/// Project only observable shipping state: exact file identities, fixed redo-name
-/// presence, held guard, and outcomes/counters from calls the test actually made.
 fn project(
     model: &Model,
     fixture: &Fixture,
@@ -274,9 +254,6 @@ fn every_durable_crash_cut_recovers_forward_through_real_lock_acquisition() {
         let mut events = Events::default();
         let initial = project(&model, &fixture, Some(&predecessor), events);
 
-        // The snapshot CAS and the redo commit are one production call
-        // (`commit_roster_pair`); the model names the accepted snapshot as its own
-        // step and exposes the commit only through the durable crash cuts below.
         let lock = fixture.commit_and_die(Some(&predecessor));
         events.writer_lock = true;
         events.snapshot_checked = true;
@@ -284,7 +261,6 @@ fn every_durable_crash_cut_recovers_forward_through_real_lock_acquisition() {
         assert!(model.fire("AcquireWriter", &mut accepted));
         assert!(model.fire("AcceptSnapshot", &mut accepted));
 
-        // The crash: the dead publisher had promoted zero, one or both halves.
         if promote_body {
             std::fs::write(&fixture.roster, TARGET_BODY).unwrap();
         }
@@ -343,13 +319,9 @@ fn read_only_and_writer_recovery_preserve_an_unrelated_half() {
     let fixture = Fixture::new("foreign-refusal", true);
     let predecessor = fixture.predecessor(true).unwrap();
 
-    // The crash: committed through the production path, body promoted, then dead.
-    // Taking the writer lock here also establishes the persistent rendezvous inode
-    // that the read-only API deliberately refuses to create.
     let lock = fixture.commit_and_die(Some(&predecessor));
     std::fs::write(&fixture.roster, TARGET_BODY).unwrap();
     drop(lock);
-    // While this machine was down, an unrelated signature landed beside the body.
     std::fs::write(fixture.signature(), FOREIGN_SIGNATURE).unwrap();
 
     let model = roster_pair_redo_model();
@@ -410,9 +382,6 @@ fn read_only_and_writer_recovery_preserve_an_unrelated_half() {
     );
     assert!(fixture.transaction().exists());
 
-    // Negative control: the unsafe result (replace the unrelated signature, retire the
-    // marker) is rejected by healthy admission and admitted by Buggy=1, violating
-    // ForeignBytesAreNeverOverwritten.
     let buggy = interp::with_buggy(&model, 1);
     let unsafe_after = buggy.successors("BuggyOverwriteForeign", &after_readonly)[0].clone();
     let (healthy_admitted, evidence) = validate_transition_tiered(
@@ -485,8 +454,6 @@ fn stale_snapshot_and_clean_read_only_decisions_refine_the_model() {
             "AcquireWriter",
             "roster redo: acquire before snapshot CAS",
         );
-        // The same CAS decision gates the production commit path: a stale premise
-        // records nothing durable, so there is no redo marker to recover from.
         let error = guard.assert_snapshot(Some(&predecessor)).unwrap_err();
         assert!(error.contains("CHANGED ON DISK"), "{error}");
         let commit_error = commit_roster_pair(
@@ -553,9 +520,6 @@ fn stale_snapshot_and_clean_read_only_decisions_refine_the_model() {
     );
 }
 
-/// Negative control: with no redo record, a death between the two renames leaves the new
-/// body beside the old signature. The healthy model admits no transition to that disk while
-/// the `BuggyPromoteBodyWithoutRedo` mutant does, and the real lock has nothing to replay.
 #[test]
 fn the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it() {
     let fixture = Fixture::new("pre-redo-torn", true);
@@ -567,7 +531,6 @@ fn the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it() {
     assert!(model.fire("AcquireWriter", &mut accepted));
     assert!(model.fire("AcceptSnapshot", &mut accepted));
 
-    // The death: the body renamed into place, no transaction ever committed.
     std::fs::write(&fixture.roster, TARGET_BODY).unwrap();
     let torn = project(
         &model,
@@ -590,8 +553,6 @@ fn the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it() {
     );
     assert!(!buggy.check_invariant("TargetHalfHasRedoAuthority", &torn));
 
-    // With no redo record the writer lock has nothing to complete: the pair stays
-    // torn, which every client refuses as "signature did not verify".
     drop(lock_roster(fixture.roster_str()).expect("a torn pair still locks"));
     assert_eq!(std::fs::read(&fixture.roster).unwrap(), TARGET_BODY);
     assert_eq!(

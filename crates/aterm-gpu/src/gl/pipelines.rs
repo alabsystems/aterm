@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GL programs and fixed-function state built from [`crate::pipeline_table`], the rows the wgpu and
-//! Metal pipelines are built from.
+//! GL programs and fixed-function state built from [`crate::pipeline_table`].
 
 use super::device::{Current, GlDevice};
 use super::ffi::{self, GLenum, GLuint};
@@ -40,8 +39,7 @@ const fn gl_mode(t: Topology) -> GLenum {
     }
 }
 
-/// The blend state a row sets: `None` disables blending, else
-/// `(src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a)`.
+/// The blend state a row sets.
 #[inline]
 pub(crate) const fn gl_blend(blend: Option<Blend>) -> Option<[GLenum; 6]> {
     let Some(b) = blend else {
@@ -121,7 +119,7 @@ impl Drop for GlPipeline {
     }
 }
 
-/// Compile one stage; `Err` carries the driver's log.
+/// Compile one stage.
 fn compile(cur: &Current<'_>, kind: GLenum, src: &str, what: &str) -> Result<GLuint, String> {
     let gl = cur.gl();
     let len = i32::try_from(src.len()).map_err(|_| "gl: a shader over 2 GiB".to_owned())?;
@@ -211,8 +209,8 @@ impl GlDevice {
             ));
         }
         let b = spec.binds;
-        // SAFETY: the context is current; NUL-terminated names; the program is linked and bound for
-        // the uniform writes.
+        // SAFETY: the context is current; the names are NUL-terminated (`CString`); the program is
+        // linked and bound for the uniform writes.
         unsafe {
             (gl.use_program)(program);
             for n in b
@@ -256,8 +254,7 @@ impl GlDevice {
     }
 }
 
-/// Specify `layout`'s attributes over the buffer bound to `GL_ARRAY_BUFFER`, one instance per step,
-/// into the bound vertex array.
+/// Specify `layout`'s attributes over the buffer bound to `GL_ARRAY_BUFFER`.
 /// # Safety
 /// The context is current, a vertex array and the stream buffer are bound.
 pub(crate) unsafe fn specify_instance_layout(cur: &Current<'_>, layout: &VertexLayoutSpec) {
@@ -265,8 +262,8 @@ pub(crate) unsafe fn specify_instance_layout(cur: &Current<'_>, layout: &VertexL
     let stride = layout.stride as i32;
     for a in layout.attrs {
         let offset = a.offset as usize as *const std::ffi::c_void;
-        // SAFETY: the caller's contract; offsets and strides from the table (pinned to the Rust
-        // instance structs by const asserts).
+        // SAFETY: the caller's contract; offsets and strides come from the table, whose strides
+        // const asserts pin to the Rust instance structs.
         unsafe {
             (gl.enable_vertex_attrib_array)(a.location);
             match a.format {
@@ -328,9 +325,6 @@ mod tests {
     use super::*;
     use crate::pipeline_table::ALL_PIPELINES;
 
-    /// Every row's two stages compose, compile and link on the driver: each
-    /// twin selects exactly one interface per row, and the arm can draw every
-    /// row the table lists.
     #[test]
     fn every_table_row_compiles_and_links_from_its_twin() {
         let dev = super::super::test_device();
@@ -351,8 +345,6 @@ mod tests {
         assert_eq!(built.len(), crate::pipeline_table::PIPELINE_COUNT);
     }
 
-    /// A broken twin is refused with the driver's log, not drawn blank: the
-    /// negative control for the compile check above.
     #[test]
     fn a_twin_that_does_not_compile_is_refused_with_the_drivers_log() {
         let dev = super::super::test_device();
@@ -377,8 +369,6 @@ mod tests {
         );
     }
 
-    /// `compose` keeps the version line first, selects the stage and the row,
-    /// and ends the vertex stage with naga's coordinate flip.
     #[test]
     fn compose_selects_the_stage_and_the_row() {
         let src = "#version 300 es\nprecision highp float;\n";

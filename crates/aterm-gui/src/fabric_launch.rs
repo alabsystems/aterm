@@ -255,7 +255,7 @@ fn is_executable(md: &std::fs::Metadata) -> bool {
     md.permissions().mode() & 0o111 != 0
 }
 
-/// TELL EVERY WATCHER HOW THIS PROCESS LEAVES (module header): push `EVENT *
+/// TELL EVERY WATCHER HOW THIS PROCESS LEAVES: push `EVENT *
 /// bye <word>` through the instance stream — the bridge's push lane drains it,
 /// and so does every other `sessions` subscriber (`aterm ctl subscribe @*
 /// events,sessions`), bridge or none, as the subscribe help says — wake the

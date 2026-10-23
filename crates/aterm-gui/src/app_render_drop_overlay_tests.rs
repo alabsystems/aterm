@@ -51,13 +51,6 @@ fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
     );
 }
 
-/// The CPU present places the frame with its chrome rows' bands continued,
-/// then composites the tray: a full-width card over a chrome row (the stats
-/// Deck in the head, whose bottom rule runs edge to edge) must reach the
-/// remainder bands as the GPU blit's does, which samples the tray-composited
-/// copy (a maximized `--cpu` window under weston read 5 of 26790 band pixels
-/// off, first at (0,75), before this). Rows outside the chrome extent keep the
-/// band colour, and the bell invert never flips a band.
 #[test]
 fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
     const BAND: u32 = 0x0011_2233;
@@ -69,7 +62,6 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
         aterm_render::band_offset(dw, fw),
         aterm_render::band_offset_y(dh, fh),
     );
-    // The card: the frame's full width on row 3, opaque.
     let rgba: Vec<u8> = (0..fw).flat_map(|_| [0xC0, 0xFF, 0xEE, 0xFF]).collect();
     let tray = || aterm_gpu::TrayQuad {
         rgba: &rgba,
@@ -120,8 +112,6 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
                 "{edge_rows:?}: a terminal row's bands stay the band colour: {row:08x?}"
             );
         }
-        // The row under it is a chrome row the card did not touch: its bands
-        // continue the frame's own edge, as placed.
         if edge_rows.contains(&4) {
             let y = (4 + oy) as usize;
             assert_eq!(dst[y * dw] & 0x00ff_ffff, src[4 * fw]);
@@ -130,19 +120,13 @@ fn a_tray_over_a_chrome_row_continues_through_the_remainder_bands() {
     }
 }
 
-/// At a band offset the band-aware overlay twins paint the same
-/// frame-relative pixels as at offset 0, shifted and never touching the
-/// bands; a negative (crop) offset clips instead of panicking.
 #[test]
 fn band_aware_overlay_twins_shift_without_touching_bands() {
     let accent = 0x0050_FA7B;
     let (fw, fh) = (40usize, 24usize);
-    // The offset-0 overlay the shifted frame is compared against.
     let mut a = vec![0x0010_2030u32; fw * fh];
     apply_drop_overlay_at(&mut a, fw, fh, 0, 0, fw, fh, accent);
 
-    // Frame at (3, 3) inside a +7px surface: the overlaid content equals the
-    // offset-0 overlay shifted by the band, and every band pixel is untouched.
     let band = 0x0001_0203u32;
     let (sw, sh) = (fw + 7, fh + 7);
     let mut s = vec![band; sw * sh];
@@ -165,7 +149,6 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
         }
     }
 
-    // composite_tray_at: a band offset shifts the card.
     let card = crate::SettingsCard {
         scrim: None,
         rgba: vec![0xAA, 0xBB, 0xCC, 0xFF],
@@ -185,16 +168,11 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
         "card shifted by the band offset"
     );
     assert_eq!(t2.iter().filter(|&&p| p != 0).count(), 1);
-    // A negative (crop) offset clips off-surface instead of panicking.
     let mut t3 = vec![0u32; 1];
     composite_tray_at(&mut t3, 1, 1, -2, -2, &card);
     assert_eq!(t3[0], 0);
 }
 
-/// A card's scrim composites as the window-sized card of that colour it
-/// replaces: byte-identical to baking the colour into every pixel around the
-/// card from the scrim's `top` row down, the banner rows above left clear.
-/// Negative control: without it the frame around the card is untouched.
 #[test]
 fn a_tray_scrim_composites_as_the_window_sized_card_it_replaces() {
     let (w, h) = (12usize, 9usize);
@@ -254,7 +232,6 @@ fn a_tray_scrim_composites_as_the_window_sized_card_it_replaces() {
     let mut bare = base.clone();
     composite_tray_quad_at(&mut bare, w, h, 0, 0, quad(None));
     assert_ne!(bare, layered, "negative control: the scrim dims the window");
-    // A crop offset past the surface clips instead of panicking.
     let mut tiny = vec![0x00FF_FFFFu32; 1];
     composite_tray_quad_at(&mut tiny, 1, 1, -5, -50, quad(Some(scrim)));
     assert_ne!(
@@ -263,8 +240,6 @@ fn a_tray_scrim_composites_as_the_window_sized_card_it_replaces() {
     );
 }
 
-/// src-over math: `a==255` ⇒ src, `a==0` ⇒ dst untouched, `a==128` ⇒ rounded blend;
-/// and an offset past the surface never panics / writes OOB.
 #[test]
 fn composite_tray_src_over_and_clamps() {
     let card = |rgba: Vec<u8>, dx: u32, dy: u32| crate::SettingsCard {
@@ -278,22 +253,16 @@ fn composite_tray_src_over_and_clamps() {
         geom: 0,
         raster_fingerprint_once: std::sync::OnceLock::new(),
     };
-    // 1×1 card, full alpha → exactly the source color.
     let mut fb = vec![0x0010_2030u32; 4];
     composite_tray(&mut fb, 2, 2, &card(vec![0xAA, 0xBB, 0xCC, 0xFF], 0, 0));
     assert_eq!(fb[0], 0x00AA_BBCC);
-    // Fully transparent → dst preserved (the live terminal shows through).
     let mut fb2 = vec![0x0012_3456u32; 1];
     composite_tray(&mut fb2, 1, 1, &card(vec![0xFF, 0xFF, 0xFF, 0x00], 0, 0));
     assert_eq!(fb2[0], 0x0012_3456);
-    // Half alpha over black: src-over reduces to `(s*a + 127) / 255` per channel.
     let mut fb3 = vec![0u32; 1];
     composite_tray(&mut fb3, 1, 1, &card(vec![0xFF, 0x00, 0x80, 0x80], 0, 0));
     let exp = |s: u32, a: u32| (s * a + 127) / 255;
     assert_eq!(fb3[0], (exp(0xFF, 0x80) << 16) | exp(0x80, 0x80));
-    // The same half-alpha source over a half-transparent renderer
-    // destination composes alpha instead of forcing opaque:
-    // T' = round(128 * 127 / 255) = 64.
     let mut translucent = vec![0x8010_2030u32];
     composite_tray(
         &mut translucent,
@@ -302,24 +271,18 @@ fn composite_tray_src_over_and_clamps() {
         &card(vec![0xFF, 0x00, 0x80, 0x80], 0, 0),
     );
     assert_eq!(translucent[0] >> 24, 64);
-    // Offset entirely off-surface: no panic, no change.
     let mut fb4 = vec![0x00FF_FFFFu32; 1];
     composite_tray(&mut fb4, 1, 1, &card(vec![0, 0, 0, 0xFF], 5, 5));
     assert_eq!(fb4[0], 0x00FF_FFFF);
 }
 
-/// A topmost cell banner crops the selected tray as a borrowed row view:
-/// the cached bytes stay untouched, a partial card resumes at the exact
-/// first uncovered row, and a fully covered card disappears.
 #[test]
 fn tray_floor_crop_preserves_banner_and_exact_rgba_suffix() {
     let card = crate::SettingsCard {
         scrim: None,
         rgba: vec![
-            0x10, 0, 0, 0xFF, 0x11, 0, 0, 0xFF, // row 0
-            0x20, 0, 0, 0xFF, 0x21, 0, 0, 0xFF, // row 1
-            0x30, 0, 0, 0xFF, 0x31, 0, 0, 0xFF, // row 2
-            0x40, 0, 0, 0xFF, 0x41, 0, 0, 0xFF, // row 3
+            0x10, 0, 0, 0xFF, 0x11, 0, 0, 0xFF, 0x20, 0, 0, 0xFF, 0x21, 0, 0, 0xFF, 0x30, 0, 0,
+            0xFF, 0x31, 0, 0, 0xFF, 0x40, 0, 0, 0xFF, 0x41, 0, 0, 0xFF,
         ],
         pw: 2,
         ph: 4,
@@ -354,17 +317,15 @@ fn channel_dist(a: u32, b: u32) -> u32 {
     d(16) + d(8) + d(0)
 }
 
-/// The border pixels land much closer to the accent than the interior wash,
-/// and the interior is exactly the faint accent blend over the background.
 #[test]
 fn border_is_accent_heavy_interior_is_faint() {
     let (w, h) = (400usize, 300usize);
     let accent = 0x0050_FA7B;
-    let mut px = vec![0x0000_0000u32; w * h]; // black background
+    let mut px = vec![0x0000_0000u32; w * h];
     apply_drop_overlay(&mut px, w, h, accent);
 
-    let corner = px[0]; // on the border
-    let interior = px[(h / 2) * w + w / 2]; // far from any edge
+    let corner = px[0];
+    let interior = px[(h / 2) * w + w / 2];
     assert_ne!(corner, 0, "border pixel must be tinted");
     assert_ne!(interior, 0, "interior pixel must be washed");
     assert!(
@@ -375,7 +336,6 @@ fn border_is_accent_heavy_interior_is_faint() {
     assert!(drop_border_px(w, h) >= 2);
 }
 
-/// Zero dimensions are a no-op, never a panic.
 #[test]
 fn zero_dims_is_noop() {
     let mut px = vec![0x0011_2233u32; 4];
@@ -383,8 +343,6 @@ fn zero_dims_is_noop() {
     assert_eq!(px, vec![0x0011_2233u32; 4]);
 }
 
-/// The packed format is preserved: the renderer's top transmittance byte
-/// survives the presentation-only tint exactly, matching the GPU blit.
 #[test]
 fn overlay_preserves_transmittance() {
     let mut px = vec![0x7fab_cdefu32; 10 * 10];

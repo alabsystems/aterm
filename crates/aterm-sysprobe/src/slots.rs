@@ -16,6 +16,9 @@ pub const MIN_GAP_MS: u64 = 1_000;
 pub const PERIOD: Duration = Duration::from_secs(5);
 /// Polling period when no wait names build slots.
 pub const IDLE_PERIOD: Duration = Duration::from_secs(60);
+/// Period of a reading that must be new (a fact's figures re-read before it is typed): the
+/// shortest gap a paired observation keeps ([`MIN_GAP_MS`]).
+pub const REREAD: Duration = Duration::from_millis(MIN_GAP_MS);
 /// Log line emitted when a slot wait arms [`PERIOD`].
 pub const ARMED_LINE: &str = "occupancy: build slots read every 5 s (a wait names them)";
 /// Log line emitted when the last slot wait finishes and resets to [`IDLE_PERIOD`].
@@ -423,6 +426,18 @@ impl SlotReader {
     /// Returns the current or cached [`SlotsRead`] at `(now, now_us)`.
     pub fn read(&mut self, now: Instant, now_us: u64, m: &Machine, armed: bool) -> SlotsRead {
         let period = if armed { PERIOD } else { IDLE_PERIOD };
+        self.read_within(now, now_us, m, period)
+    }
+
+    /// Returns the cached [`SlotsRead`] where it was taken within `period` before `now`, else a
+    /// new one: [`Self::read`]'s two cadences, or [`REREAD`] for a reading that must be new.
+    pub fn read_within(
+        &mut self,
+        now: Instant,
+        now_us: u64,
+        m: &Machine,
+        period: Duration,
+    ) -> SlotsRead {
         if let Some((at, read)) = &self.last
             && now.saturating_duration_since(*at) < period
         {

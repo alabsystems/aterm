@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SESSION'S SETUP ([`SessionSetup`]): everything a [`Session`] is given before its loop runs — the target, the holder its claim is taken under, a self-claim it watches beside, whether it types under its own hand, the approval ledger, the approval policy's process inputs, and every timing a setter (or a test) shortens — kept apart from everything the loop learns as it runs.
+//! Initial configuration ([`SessionSetup`]) passed to a [`Session`] before its loop runs.
 
 use super::*;
+use crate::supervise::occupancy::rules;
 use crate::supervise::tape::header::{Reader, Roots, VERBATIM, Writer};
 
 /// The hosted loop's hand-over flag ([`Session::set_handover`]), as a setup holds it.
@@ -25,13 +26,8 @@ impl PartialEq for Handover {
 
 impl Eq for Handover {}
 
-/// Why a stand-in worker environment comes back from a header as `Err`
-/// ([`SessionSetup::read`]): the worker's environment is never written.
 const WORKER_NOT_TAPED: &str = "the worker's environment is never written to a tape";
 
-/// A header's `[env] worker` read back ([`SessionSetup::write`]): the
-/// session's own, or a stand-in by its digest and pid (`fixed <hex> <pid|->`)
-/// or its error (`fixed-err <words>`).
 fn worker_source(text: &str) -> Result<WorkerSource, String> {
     let bad = || format!("atape header: [env] worker: no source {text:?}");
     match text.split_once(' ') {
@@ -55,7 +51,7 @@ fn worker_source(text: &str) -> Result<WorkerSource, String> {
     }
 }
 
-/// [module docs](self).
+/// Initial configuration and timing parameters for a [`Session`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSetup {
     /// The target selector (`@sid`); `None` drives the caller's own session.
@@ -112,10 +108,12 @@ pub struct SessionSetup {
     pub(super) person_hold_wait: Option<Duration>,
     /// The memory remedy's observation window beside a proven self-claim: [`WAIT_STEP`], but in tests.
     pub(super) beside_idle_min: Duration,
+    /// How old a hold the occupancy door's `wait-nudge` holds from ([`rules::wait_nudge_after_ms`]: the shipped 30 min, or the lab's seam's seconds in a build that reads seams): read once, here, so a tape replays under the wait it was recorded under.
+    pub(super) occupancy_nudge_after: Duration,
 }
 
 impl SessionSetup {
-    /// The setup [`Session::new`] runs under for `sid`: every timing at its shipped value (but the turn-end ladder a development build is told to scale, [`TurnEndTiming::for_build`]), no ledger, typing under no hand, the holder `aterm-supervise:<pid>`, and the approval policy's inputs read from this process ([`ApprovalEnv::of_process`]).
+    /// Creates the default setup for `sid` using process environment and build timings.
     #[must_use]
     pub fn new(sid: Option<String>) -> Self {
         Self {
@@ -147,6 +145,9 @@ impl SessionSetup {
             stuck_after: wall_memory::STUCK_AFTER,
             person_hold_wait: None,
             beside_idle_min: WAIT_STEP,
+            occupancy_nudge_after: Duration::from_millis(
+                rules::wait_nudge_after_ms().unsigned_abs(),
+            ),
         }
     }
 
@@ -214,6 +215,7 @@ impl SessionSetup {
             stuck_after,
             person_hold_wait,
             beside_idle_min,
+            occupancy_nudge_after,
         } = self;
         w.section("setup");
         w.opt_text("sid", sid.as_deref());
@@ -306,6 +308,7 @@ impl SessionSetup {
         w.duration("turn_end.credits_bound", *credits_bound);
         w.opt_duration("person_hold_wait", *person_hold_wait);
         w.duration("beside_idle_min", *beside_idle_min);
+        w.duration("occupancy.nudge_after", *occupancy_nudge_after);
         let ApprovalEnv {
             home,
             uid,
@@ -422,6 +425,11 @@ impl SessionSetup {
         };
         let person_hold_wait = r.or_shipped("person_hold_wait", None, Reader::opt_duration)?;
         let beside_idle_min = r.or_shipped("beside_idle_min", WAIT_STEP, Reader::duration)?;
+        let occupancy_nudge_after = r.or_shipped(
+            "occupancy.nudge_after",
+            Duration::from_millis(rules::WAIT_NUDGE_AFTER_MS.unsigned_abs()),
+            Reader::duration,
+        )?;
         r.section("env");
         let approval_env = ApprovalEnv {
             home: r.opt_path("home", &VERBATIM)?,
@@ -458,6 +466,7 @@ impl SessionSetup {
             stuck_after,
             person_hold_wait,
             beside_idle_min,
+            occupancy_nudge_after,
         })
     }
 }

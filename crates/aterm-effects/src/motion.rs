@@ -75,7 +75,8 @@ impl MotionEffect {
         Self::HarnessCard,
     ];
 
-    /// Whether this effect is functional motion the load-shed latch must never demote (see the module doc): the terminal answering the user's hand.
+    /// Whether this effect is functional motion the host's load-shed latch (`perf_reduced`) must
+    /// never demote: the terminal answering the user's hand.
     #[must_use]
     #[inline]
     pub const fn load_shed_exempt(self) -> bool {
@@ -181,6 +182,12 @@ impl SeriousModePolicy {
 
 impl MotionPolicy {
     /// Resolve the policy, a pure total function of:
+    ///
+    /// * `mode`: config `motion` (`Auto` follows `system_reduce`; `Full` /
+    ///   `Reduced` override it),
+    /// * `system_reduce`: the platform's Reduce Motion sample (live on macOS),
+    /// * `focused`: an unfocused window always demotes to static effects,
+    ///   whatever the config.
     #[inline]
     #[must_use]
     pub const fn resolve(mode: MotionMode, system_reduce: bool, focused: bool) -> Self {

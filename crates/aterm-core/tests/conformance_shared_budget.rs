@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for process-wide scrollback budget sharing against
-//! `aterm_models_misc::shared_budget_model` (Tier-0 in `derived_ring_ty.rs`): once every
-//! live pane applied its share `min(configured, global / live_panes)`, the applied budgets
-//! sum within the global cap, and a departed pane holds no share. Every bounded action
-//! sequence over {Join, Leave, Apply1, Apply2} runs against real [`ScrollbackBudgetShare`]
-//! registrations and tiered [`Terminal`]s, with the real applied budget substituted into
-//! each transition. Negative controls: a forged over-cap observation is rejected, and the
-//! real store evicts to its applied share. The registry is process-global; this binary
-//! creates every share it sees, so the arithmetic is exact.
+//! Conformance tests for process-wide scrollback budget sharing (`shared_budget_model`).
 
 use std::collections::BTreeMap;
 
@@ -22,22 +14,13 @@ use aterm_models_misc::shared_budget_model;
 use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
-/// Bytes per model unit: model consts are tiny scaled integers; the real
-/// system runs byte values. Even, so `global/2` divides exactly.
 const UNIT: usize = 4_096;
-/// Must mirror the spec consts (pinned again in the cfg overrides).
 const GLOBAL: i64 = 6;
 const CFG: i64 = 6;
-/// Exhaustive-enumeration depth (every action sequence this long is driven);
-/// longer adversarial join/leave churn is covered by curated sequences below.
 const EXHAUSTIVE_STEPS: usize = 3;
 
-/// The registry statics are process-global: tests in this binary must not
-/// interleave their memberships.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// One real pane: its registry membership + a real tiered terminal the
-/// applied budget lands on.
 struct RealPane {
     share: ScrollbackBudgetShare,
     term: Terminal,
@@ -51,8 +34,6 @@ fn real_pane() -> RealPane {
     }
 }
 
-/// The real applied budget in model units: what the pane's store enforces after its
-/// touch-time apply.
 fn applied_units(pane: &RealPane) -> i64 {
     let bytes = pane
         .term
@@ -61,8 +42,6 @@ fn applied_units(pane: &RealPane) -> i64 {
     (bytes / UNIT) as i64
 }
 
-/// Touch one real pane: poll the registry, forward a changed share to the
-/// real terminal (which evicts to fit).
 fn touch(pane: &mut RealPane) {
     if let Some(bytes) = pane.share.pending_effective() {
         pane.term
@@ -94,12 +73,8 @@ fn validate(
 
 const ACTIONS: [&str; 4] = ["Join", "Leave", "Apply1", "Apply2"];
 
-/// One validated transition: `(prev, next)`.
 type Step = (BTreeMap<&'static str, i64>, BTreeMap<&'static str, i64>);
 
-/// Drive one action sequence on the real registry and terminals in lockstep with the
-/// model, validating every transition with the real applied budgets. Returns the last
-/// transition taken, a negative-control base (`None` when no step was feasible).
 fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
     set_global_scrollback_budget(UNIT * GLOBAL as usize);
     let mut pane1 = real_pane();
@@ -110,8 +85,6 @@ fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
     for &action in seq {
         let prev = st.clone();
         if !m.fire(action, &mut st) {
-            // Infeasible under the model, so the real op is skipped too (register/drop
-            // share its enable conditions).
             set_global_scrollback_budget(0);
             return last;
         }
@@ -122,7 +95,6 @@ fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
             "Apply2" => touch(pane2.as_mut().expect("guard: pane 2 live")),
             _ => unreachable!("bounded action alphabet"),
         }
-        // The spec judges the real measured applied budgets, carried forward.
         let mut next = st.clone();
         next.insert("a1", applied_units(&pane1));
         next.insert("a2", pane2.as_ref().map_or(0, applied_units));
@@ -139,8 +111,6 @@ fn run_lockstep(m: &Model, seq: &[&str]) -> Option<Step> {
     last
 }
 
-/// Every guard-pruned action sequence up to [`EXHAUSTIVE_STEPS`] conforms,
-/// plus curated longer join/leave churn sequences.
 #[test]
 fn real_share_registry_conforms_to_spec() {
     let _guard = SERIAL.lock().expect("serial");
@@ -160,7 +130,6 @@ fn real_share_registry_conforms_to_spec() {
         }
         sequences = next_round;
     }
-    // Churn: apply-then-membership-change staleness both ways, and a join/leave/rejoin.
     for seq in [
         ["Apply1", "Join", "Apply2", "Leave", "Apply1"],
         ["Join", "Apply1", "Leave", "Join", "Apply2"],
@@ -171,8 +140,6 @@ fn real_share_registry_conforms_to_spec() {
     }
 }
 
-/// Negative control: pane 1 claiming its full configured budget while pane 2
-/// holds a fresh share is rejected.
 #[test]
 fn forged_over_cap_share_is_rejected() {
     let _guard = SERIAL.lock().expect("serial");
@@ -188,8 +155,6 @@ fn forged_over_cap_share_is_rejected() {
     );
 }
 
-/// Two heavily fed panes under one global budget end with store budgets
-/// summing within the global, and the stores really evicted.
 #[test]
 fn real_stores_evict_to_the_shared_global() {
     let _guard = SERIAL.lock().expect("serial");
@@ -202,7 +167,6 @@ fn real_stores_evict_to_the_shared_global() {
             buf.extend_from_slice(format!("budget-load line {i} padding padding\r\n").as_bytes());
         }
         pane.term.process(&buf);
-        // Promote staged lines so byte accounting sees the full history.
         pane.term.sync_scrollback_buffers();
     }
     touch(&mut a);

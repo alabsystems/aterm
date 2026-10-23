@@ -126,7 +126,8 @@ pub fn read_toy_pack_file(path: &std::path::Path) -> std::io::Result<String> {
 #[derive(Clone, Debug, Default)]
 pub struct SpecTable {
     specs: Vec<WordEffectSpec>,
-    /// `form_hash` (scan-time semantics, see the module doc) → spec index.
+    /// `form_hash` as the scanner computes it (of the folded token, or of the raw text of a
+    /// no-space surface) → spec index.
     overrides: FxHashMap<u64, SpecId>,
 }
 

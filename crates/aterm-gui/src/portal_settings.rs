@@ -8,12 +8,10 @@ use std::time::{Duration, Instant};
 use aterm_dbus::message::flags::NO_AUTO_START;
 use aterm_dbus::{Connection, Error, Message, Value};
 
-/// The portal's bus name, object and interface.
 const DESKTOP: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
 const SETTINGS: &str = "org.freedesktop.portal.Settings";
 
-/// The bus's answer to a member an object does not have.
 const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 
 /// GNOME's interface schema and its animations key, which GTK desktops share.
@@ -42,7 +40,6 @@ pub(crate) fn read_at(
     read_on(&mut conn, namespace, key, deadline).ok()
 }
 
-/// One read on `conn` by `deadline`.
 fn read_on(
     conn: &mut Connection,
     namespace: &str,
@@ -83,7 +80,6 @@ mod tests {
 
     use super::*;
 
-    /// A wait for something that must happen: a hang detector, not a budget.
     const HANG: Duration = Duration::from_secs(60);
 
     #[test]
@@ -102,7 +98,6 @@ mod tests {
         }
     }
 
-    /// A private `dbus-daemon` (never the session's bus).
     struct Daemon(aterm_uds::spawnfd::Child);
 
     impl Drop for Daemon {
@@ -112,8 +107,6 @@ mod tests {
         }
     }
 
-    /// The daemon and its address; the services it can start are the
-    /// `.service` files in `<scratch>/services`, read at its start.
     fn private_bus(scratch: &std::path::Path) -> (Daemon, Vec<aterm_dbus::address::Address>) {
         let Some(daemon) = std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)
@@ -170,8 +163,6 @@ mod tests {
         NotFound,
     }
 
-    /// Owns the portal's name on `addresses` and answers one read as `how`
-    /// says; the calls it was sent, by member.
     fn portal(
         addresses: &[aterm_dbus::address::Address],
         how: Portal,
@@ -248,8 +239,6 @@ mod tests {
         })
     }
 
-    /// Each portal's answer, read as the motion read reads it, through a
-    /// private `dbus-daemon`; and a bus with no portal at all.
     #[test]
     fn the_portal_s_answer_is_the_motion_preference() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -282,9 +271,6 @@ mod tests {
         );
     }
 
-    /// A PORTAL THE BUS COULD START BUT NOBODY RUNS IS NEVER STARTED BY THE
-    /// READ: xdg-desktop-portal installed with no backend for the desktop, or
-    /// not started yet.
     #[test]
     fn a_portal_that_is_not_running_is_never_started_by_the_read() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -310,10 +296,6 @@ mod tests {
         );
     }
 
-    /// A session bus that never answers the handshake (a listener that never
-    /// accepts: the kernel completes the connection into its backlog) holds
-    /// the read for the bound it was given, not aterm-dbus's 25 s handshake
-    /// default: the motion read runs on a window's main thread.
     #[test]
     fn a_bus_that_never_answers_holds_the_read_no_longer_than_its_bound() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -337,9 +319,6 @@ mod tests {
         );
     }
 
-    /// The desktop's own portal: GNOME's `enable-animations` set with
-    /// `gsettings` and read back through `org.freedesktop.portal.Desktop` on
-    /// the session bus, both ways, then put back.
     #[test]
     #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
     fn the_desktop_s_portal_follows_enable_animations() {
@@ -381,10 +360,6 @@ mod tests {
         gsettings(&["set", GNOME_INTERFACE, ENABLE_ANIMATIONS, &was]);
     }
 
-    /// The desktop's own portal answers the header's button layout
-    /// (`client_frame::ButtonLayout::desktop`'s read): GNOME's
-    /// `button-layout` set with `gsettings` reads back as the portal's string,
-    /// which lays the buttons out where it says, then put back.
     #[test]
     #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
     fn the_desktop_s_portal_answers_the_button_layout() {
@@ -426,11 +401,6 @@ mod tests {
         gsettings(&["set", GNOME_WM_PREFERENCES, BUTTON_LAYOUT, &was]);
     }
 
-    /// The desktop's own portal answers the appearance launch read
-    /// (`os_appearance`'s Linux `read_running_portal`, this module's `read` of
-    /// `org.freedesktop.appearance color-scheme`): GNOME's `color-scheme` set
-    /// with `gsettings` reads back as the portal's `uint32`, `1` for
-    /// `prefer-dark` and `0` for `default`, then put back.
     #[test]
     #[ignore = "needs a session bus with xdg-desktop-portal and dconf: the Linux lane runs it"]
     fn the_desktop_s_portal_answers_the_color_scheme() {

@@ -116,7 +116,11 @@ pub fn session_bus() -> Result<Vec<Address>> {
     )))
 }
 
-/// Connects a unix-socket address, or returns [`Error::Unsupported`] or [`Error::Io`].
+/// Connects a unix-socket address.
+///
+/// # Errors
+/// [`Error::Unsupported`] for another transport or a unix address without `path=`
+/// (or, on Linux, `abstract=`); [`Error::Io`] when the connect fails.
 #[cfg(unix)]
 pub fn connect(address: &Address) -> Result<aterm_uds::CtlStream> {
     if address.transport != "unix" {

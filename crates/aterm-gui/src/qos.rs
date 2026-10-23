@@ -32,7 +32,9 @@ pub(crate) fn set_self(role: Role) {
     #[cfg(target_os = "macos")]
     {
         fork_at_default::install();
-        // SAFETY: sets this thread's own QoS class.
+        // SAFETY: sets this thread's own QoS class. Takes no pointers and
+        // mutates no shared state, so there is nothing for another thread to
+        // observe.
         unsafe {
             libc::pthread_set_qos_class_self_np(qos_class(role), 0);
         }
@@ -632,7 +634,9 @@ mod tests {
 
         let (mut probe, probe_end) = std::io::pipe().unwrap();
         let mut command = std::process::Command::new("/usr/bin/true");
-        // SAFETY: the probe loads this thread's QoS word (a thread-specific slot) and makes one 4-byte `write`; it allocates nothing and takes no lock.
+        // SAFETY: the probe loads this thread's QoS word (a thread-specific
+        // slot) and makes one 4-byte `write`; it allocates nothing and takes
+        // no lock. The closure owns the write end.
         unsafe {
             command.pre_exec(move || {
                 let class = qos_class_self();

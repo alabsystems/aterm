@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stages, as data: which ones a selection of checks runs, in which order,
-//! contending for what. Concurrency changes when a stage runs, never where its
-//! ladder prints in the log.
+//! Verification stage definitions, lane assignments, and execution order.
 
 use std::path::PathBuf;
 
@@ -12,131 +10,90 @@ use aterm_toolchain::build_cache::noindex;
 use crate::Ctx;
 use crate::scope::Scope;
 
-/// The libc oracle's lane under `<root>/libc-oracle` ([`Lane::LibcOracleTarget`]),
-/// which `aterm-libc-oracle` defaults to as well.
+/// Target directory name under `<root>/libc-oracle` ([`Lane::LibcOracleTarget`]).
 pub const LIBC_ORACLE_TARGET: &str = "target.noindex";
 
-/// A contended resource. Two stages in one lane run in declared order; lanes
-/// overlap freely. A lane is a cargo target directory, which two cargo
-/// invocations would queue on anyway.
+/// Contended target-directory lane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lane {
     /// Touches no target directory.
     Pure,
-    /// The caller's target dir, shared with plain `targo` (and its build cache,
-    /// [`crate::Ctx::main_build_dir`]): the test compile and the test run, the
-    /// measuring rows, and what `appkit` and `codex-alab` build and drive.
+    /// Caller's target directory ([`crate::Ctx::main_build_dir`]).
     MainTarget,
-    /// The same directory, for the cargo runs that start once the test compile
-    /// is done (the doctests, `spec-check`): they await it
-    /// ([`StageSpec::after_stages`]) and then run beside the test run, which
-    /// compiles nothing more. Beside it, not after it: a whole `verify --all`
-    /// measured shorter that way (the commit that set it carries the figures).
+    /// Target directory for stages awaiting [`StageId::TestCompile`] alongside [`StageId::Test`].
     AfterCompile,
-    /// `<target>/verify/tippy.noindex`: the lint. Its check-mode units share no
-    /// artifact with the test build, so a dir of its own lets the two compile
-    /// at once instead of queueing on cargo's lock.
+    /// `<target>/verify/tippy.noindex` for lint builds.
     TippyTarget,
-    /// `<target>/verify/checkers.noindex`: the workspace's tests under
-    /// `--features aterm-spec/checkers`, a feature build the main cache never holds.
+    /// `<target>/verify/checkers.noindex` for `--features aterm-spec/checkers` test builds.
     CheckersTarget,
-    /// `<target>/verify/gpu-oracle.noindex`: aterm-gpu's tests under `--features
-    /// wgpu-oracle`, a feature build the main cache never holds.
+    /// `<target>/verify/gpu-oracle.noindex` for `--features wgpu-oracle` test builds.
     GpuOracleTarget,
-    /// `<target>/verify/trust.noindex`: the release tools (aterm-release) that
-    /// `ship check --export` runs.
+    /// `<target>/verify/trust.noindex` for `ship check --export` release tools.
     TrustTarget,
-    /// `<target>/verify/cells.noindex`: the `cells` check, one directory per cell,
-    /// and the `wasm-smoke`, `wasm-glue` and `browser` modules, each built by
-    /// a rustup toolchain no other lane uses.
+    /// `<target>/verify/cells.noindex` for cross-target cells, wasm modules, and browser runs.
     CellsTarget,
-    /// `<root>/libc-oracle/target.noindex`: the libc oracle's own workspace and its
-    /// gate. One per checkout, never under a shared target dir: the oracle's
-    /// shim build is keyed by paths relative to its workspace, so a dir shared
-    /// across checkouts can serve another checkout's conformance build.
+    /// `<root>/libc-oracle/target.noindex` for the per-checkout libc oracle workspace.
     LibcOracleTarget,
 }
 
-/// Every stage.
+/// Verification stage identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageId {
-    /// The test stage's compile, at t0, so the doctests can start when it ends
-    /// and run beside the test run.
+    /// Compiles test binaries at `t0` so doctests can run beside [`Self::Test`].
     TestCompile,
     Test,
     Doctests,
     Tippy,
     Formatting,
-    /// The publication engine's export guards (`ship check --export`).
+    /// Publication engine export guards (`ship check --export`).
     Export,
     LibcOracle,
-    /// The source guards and the five L0 censuses, in process
-    /// ([`crate::stages::CENSUS_WALKS`]).
+    /// Source guards and L0 censuses ([`crate::stages::CENSUS_WALKS`]).
     Census,
-    /// The Trust checkers over every registered formal model (`spec-check`).
+    /// Trust checkers over registered formal models (`spec-check`).
     SpecCheck,
-    /// The `wgpu-oracle` feature build's compile (`--no-run`), in its own lane
-    /// beside the test run.
+    /// Compiles `wgpu-oracle` tests (`--no-run`) in [`Lane::GpuOracleTarget`].
     GpuOracleCompile,
-    /// aterm-gpu's tests with `wgpu-oracle` on: the renderer against wgpu. After
-    /// the test run, which drives the same GPU.
+    /// Runs `aterm-gpu` tests with `wgpu-oracle` after [`Self::Test`].
     GpuOracle,
-    /// The `checkers` feature build's compile (`--no-run`), in its own lane
-    /// beside the test run.
+    /// Compiles `aterm-spec/checkers` tests (`--no-run`) in [`Lane::CheckersTarget`].
     CheckersCompile,
-    /// The workspace's tests with `aterm-spec/checkers` on: the tiered tests'
-    /// per-step `ty` agreement. After the test run and the gpu oracle's, never
-    /// beside either: test suites run at once judge each other's load, and
-    /// both hold aterm-gpu's GPU suites.
+    /// Runs `aterm-spec/checkers` tests after [`Self::Test`] and [`Self::GpuOracle`].
     SpecCheckers,
-    /// The measuring rows' compile (`--no-run`), before the barrier, so the
-    /// exclusive stage that runs them compiles nothing.
+    /// Prebuilds measuring test binaries (`--no-run`) before the first exclusive barrier.
     MeasurePrebuild,
-    /// The paint and spin matrices over the handed release bundle, run alone.
+    /// Paint and spin matrices over the release bundle, run exclusively.
     MeasuringTests,
     GuiSmoke,
     RedrawConformance,
-    /// The objc drivers (`stages::OBJC_DRIVES`), one row each, on macOS.
+    /// macOS Objective-C live-window drivers (`stages::OBJC_DRIVES`).
     ObjcDrives,
-    /// The forge cells no fleet machine hosts (or each `--cell`), each linted
-    /// for its own triple ([`crate::cells`]).
+    /// Cross-target cells linted for their own triples ([`crate::cells`]).
     ForeignCells,
-    /// The two web modules' host boundary in a headless Chromium
-    /// ([`crate::wasm_smoke`]).
+    /// Web modules' host boundary in headless Chromium ([`crate::wasm_smoke`]).
     WasmSmoke,
-    /// The JS glue generator on aterm-wasm-abi's toy module
-    /// ([`crate::wasm_glue`]).
+    /// JS glue generator on `aterm-wasm-abi`'s toy module ([`crate::wasm_glue`]).
     WasmGlue,
-    /// Both web modules in headless Chromium, Firefox and WebKit: a WebGL2 boot,
-    /// GPU vs CPU pixels, on the page and in a worker (`crate::browser`).
+    /// Web modules in headless Chromium, Firefox, and WebKit (`crate::browser`).
     BrowserLane,
     Forge,
-    /// The codex-alab native harness end to end (`lab codex-alab-proof`): the
-    /// real package in a private headless aterm, run alone.
+    /// End-to-end `codex-alab` native harness (`lab codex-alab-proof`), run exclusively.
     CodexAlabProof,
-    /// The Linux runtime lane (`lab linux proof`): a lima VM on this Mac,
-    /// run alone.
+    /// Linux runtime lane (`lab linux proof`) in a Lima VM, run exclusively.
     LinuxLane,
 }
 
-/// The stages that put a window on the desktop, each with the name its
-/// `--no-windows` skip carries. A [`WINDOWED_ROWS`] stage opens one in some
-/// of its rows; every other stage drives a headless instance, a stand-in, or
-/// no binary at all.
+/// Stages that open a desktop window, paired with their `--no-windows` skip names.
 pub const WINDOWED: [(StageId, &str); 3] = [
     (StageId::GuiSmoke, "gui smoke"),
     (StageId::RedrawConformance, "redraw conformance"),
     (StageId::ObjcDrives, "objc drives"),
 ];
 
-/// The stages that run under `--no-windows` but answer a named skip, of their
-/// own, for the rows that would open a window: the browser lane's WebKit
-/// session keeps its headless pages in windows (`crate::browser`).
+/// Stages that run under `--no-windows` and emit named skips for their windowed rows.
 pub const WINDOWED_ROWS: [StageId; 1] = [StageId::BrowserLane];
 
-/// The stages whose verdicts read the machine's timing: two runs of them on
-/// one machine at once would judge each other. They take a machine-wide
-/// advisory lock while they run ([`crate::default_timing_lock`]).
+/// Stages whose verdicts depend on host timing and acquire [`crate::default_timing_lock`].
 pub const TIMED: [StageId; 4] = [
     StageId::MeasuringTests,
     StageId::GuiSmoke,
@@ -145,8 +102,7 @@ pub const TIMED: [StageId; 4] = [
 ];
 
 impl StageId {
-    /// The named skip `--no-windows` answers for this stage, with its fix:
-    /// `Some` exactly for a [`WINDOWED`] stage.
+    /// Named skip reason under `--no-windows` for a [`WINDOWED`] stage.
     #[must_use]
     pub fn no_windows_skip(self) -> Option<String> {
         WINDOWED
@@ -160,40 +116,33 @@ impl StageId {
             })
     }
 
-    /// Does `--no-windows` change what this stage does ([`WINDOWED`] or
-    /// [`WINDOWED_ROWS`])? A rerun of its check keeps the flag.
+    /// Whether `--no-windows` alters this stage ([`WINDOWED`] or [`WINDOWED_ROWS`]).
     #[must_use]
     pub fn opens_windows(self) -> bool {
         self.no_windows_skip().is_some() || WINDOWED_ROWS.contains(&self)
     }
 
-    /// Does this stage judge timings ([`TIMED`])?
+    /// Whether this stage measures host timing ([`TIMED`]).
     #[must_use]
     pub fn timed(self) -> bool {
         TIMED.contains(&self)
     }
 }
 
-/// A stage's identity, its log header, and its scheduling constraints.
+/// Stage identity, log header, and scheduling constraints.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageSpec {
     pub id: StageId,
-    /// The `=== … ===` header, resolved against the selection where it varies.
+    /// Stage log header.
     pub title: String,
     pub lane: Lane,
-    /// Runs with nothing else in flight: the stages whose verdict depends on
-    /// how busy the machine is, and the lab lanes, which load it.
+    /// Runs with no other stage in flight.
     pub exclusive: bool,
-    /// Stages declared EARLIER that must have FINISHED before this one starts
-    /// ([`crate::sched::check_waits`] refuses any other).
+    /// Earlier stages that must finish before this stage starts ([`crate::sched::check_waits`]).
     pub after_stages: Vec<StageId>,
 }
 
-/// The target directory a lane's cargo children use; `None` for [`Lane::Pure`].
-/// The side lanes live under the run's target dir, never beside it, each in a
-/// folder named `*.noindex`, which Spotlight skips with all it holds
-/// (`aterm_toolchain::build_cache::NOINDEX`): a side lane's builds are
-/// intermediates nobody opens.
+/// Target directory for `lane`'s cargo invocations, or `None` for [`Lane::Pure`].
 #[must_use]
 pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
     let side = |name: &str| Some(ctx.state_dir().join(noindex(name)));
@@ -209,20 +158,16 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
     }
 }
 
-/// The cells lane's directory ([`Lane::CellsTarget`]): every cell's target dir,
-/// the wasm modules' builds and the browser sessions' frames live under it.
+/// Directory for [`Lane::CellsTarget`] builds and browser frames.
 #[must_use]
 pub fn cells_dir(ctx: &Ctx) -> PathBuf {
     ctx.state_dir().join(noindex("cells"))
 }
 
-/// The run's stages: every declared stage the selected checks need
-/// ([`crate::checks::stages_of`]), in declared order, waiting only on stages
-/// that are planned.
+/// Planned stages for `ctx.checks` ([`crate::checks::stages_of`]) in declared order.
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
-    // An empty cone compiles nothing: the test stage says so once.
     if ctx.scope.selects_nothing() {
         wanted.retain(|id| *id != StageId::TestCompile);
     }
@@ -237,13 +182,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v
 }
 
-/// Every stage, in the order the log prints them.
-///
-/// The exclusive stages are barriers: everything declared before one finishes
-/// first, and everything behind it starts after it. The measuring rows' compile
-/// is the main lane's last row before the first barrier, so the stage that runs
-/// them alone compiles nothing; the Linux lane is the last barrier, so it has
-/// the machine to itself whatever else the run planned.
+/// Every declared stage in log order.
 #[must_use]
 pub fn declared(scope: &Scope) -> Vec<StageSpec> {
     let label = scope.label();
@@ -425,10 +364,6 @@ mod tests {
         CHECKS.iter().map(|s| s.check).collect()
     }
 
-    /// EVERY SIDE LANE IS A `*.noindex` FOLDER Spotlight skips: under the run's
-    /// `<target>/verify` (the caller's `CARGO_TARGET_DIR` moves it), the libc
-    /// oracle's under the checkout whatever the target is; the main lanes share
-    /// the target dir itself.
     #[test]
     fn every_side_lane_is_a_folder_spotlight_skips() {
         for (env, target) in [
@@ -466,8 +401,6 @@ mod tests {
         }
     }
 
-    /// Each check plans its own stages, nothing else; every combination the
-    /// CLI offers waits only on earlier stages.
     #[test]
     fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
         assert_eq!(
@@ -501,9 +434,6 @@ mod tests {
         }
     }
 
-    /// The test compile starts at t0 and the test run as soon as it ends: no
-    /// other lane holds either. The doctests await exactly the test compile,
-    /// then run beside the test run.
     #[test]
     fn the_test_run_follows_its_compile_and_waits_for_nothing_else() {
         use crate::sched::{awaited, ready};
@@ -540,9 +470,6 @@ mod tests {
         assert!(ready(&p, &started, &done, 1, doc));
     }
 
-    /// The measuring rows compile in the main lane before the first barrier,
-    /// so the exclusive stage that runs them compiles nothing; appkit's rows
-    /// build and drive from the main lane behind it.
     #[test]
     fn the_measuring_compile_precedes_the_barrier_and_appkit_drives_the_main_target() {
         let p = plan(&ctx(&RELEASE, Scope::workspace()));
@@ -567,9 +494,6 @@ mod tests {
         );
     }
 
-    /// The release's feature builds compile beside the test run and run their
-    /// tests after it, one suite at a time: the gpu oracle's, then the
-    /// checkers'. Alone, each runs straight after its compile.
     #[test]
     fn the_feature_builds_compile_beside_the_test_run_and_test_after_it() {
         use crate::sched::{awaited, ready};

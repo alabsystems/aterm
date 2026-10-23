@@ -78,7 +78,7 @@ fn current_level() -> Option<usize> {
     let mut len: libc::size_t = std::mem::size_of::<libc::c_int>();
     // SAFETY: the name is a NUL-terminated literal; `level` and `len` are live locals written only
     // during the call, `len` holds the buffer's real size, and the new-value pair is null/0 (read
-    // only).
+    // only). No pointer escapes.
     let rc = unsafe {
         libc::sysctlbyname(
             c"kern.memorystatus_vm_pressure_level".as_ptr(),
@@ -132,7 +132,8 @@ pub(crate) fn install<F>(on_level: F)
 where
     F: Fn(PressureLevel) + Send + 'static,
 {
-    // SAFETY: standard libdispatch source setup.
+    // SAFETY: standard libdispatch source setup. The source and context are
+    // deliberately process-lifetime allocations so no handler can race a free.
     unsafe {
         let queue = dispatch_get_global_queue(QUEUE_PRIORITY_DEFAULT, 0);
         let source = dispatch_source_create(

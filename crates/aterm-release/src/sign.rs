@@ -32,7 +32,7 @@ const STAPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// # notary_apple_id = "<Apple ID>"
 /// # notary_password = "<app-specific password>"
 /// # Machine-roster tier only (ignored while pins::PAPER_MASTER_PUBKEYS is empty):
-/// machine_roster = "<path to the master-signed aterm-machines.toml>"
+/// machine_roster = "<path to the master-signed aterm-machines.toml; a leading ~/ is HOME>"
 /// machine_id     = "<this machine's id, e.g. the one `join --id` was given>"
 /// ```
 #[derive(Clone)]
@@ -78,7 +78,7 @@ impl ReleaseCredentials {
         home: Option<&str>,
     ) -> Result<Option<Self>, String> {
         if let Some(path) = explicit {
-            return Self::load(path).map(Some);
+            return Self::load(path, home.map(Path::new)).map(Some);
         }
         let Some(home) = home else {
             return Ok(None);
@@ -119,8 +119,9 @@ impl ReleaseCredentials {
         }))
     }
 
-    /// Load and validate the profile at `path`.
-    pub fn load(path: &Path) -> Result<Self, String> {
+    /// Load and validate the profile at `path`, reading a `~/` `machine_roster` under `home`
+    /// ([`roster_path`]).
+    pub fn load(path: &Path, home: Option<&Path>) -> Result<Self, String> {
         let meta =
             std::fs::metadata(path).map_err(|error| format!("read {}: {error}", path.display()))?;
         #[cfg(unix)]
@@ -160,7 +161,9 @@ impl ReleaseCredentials {
             .map(str::to_string);
         let machine_roster = credentials_value(&text, "machine_roster")
             .map_err(|e| format!("{}: {e}", path.display()))?
-            .map(PathBuf::from);
+            .map(|named| roster_path(named, home))
+            .transpose()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(Self {
             pkcs8,
             pubkey_b64,
@@ -213,6 +216,23 @@ impl ReleaseCredentials {
         let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&self.pkcs8)
             .map_err(|_| "signing key became unusable after load".to_string())?;
         Ok(keypair.sign(msg).as_ref().to_vec())
+    }
+}
+
+/// A profile's `machine_roster`, a leading `~/` read under `home`: the secrets vault hands
+/// every Mac one profile, which names the roster where the vault puts it
+/// (`~/.aterm/roster/aterm-machines.toml`) whoever's home that is. A home that is missing or
+/// not absolute refuses, so the roster is never looked for under the working directory. Any
+/// other value is the path as written.
+fn roster_path(named: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    match named.strip_prefix("~/") {
+        Some(rest) => home
+            .filter(|home| home.is_absolute())
+            .map(|home| home.join(rest.trim_start_matches('/')))
+            .ok_or_else(|| {
+                format!("machine_roster {named:?} is under ~/, but HOME is unset or not absolute")
+            }),
+        None => Ok(PathBuf::from(named)),
     }
 }
 

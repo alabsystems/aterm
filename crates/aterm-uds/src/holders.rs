@@ -616,7 +616,8 @@ mod win_pids {
             return Err(io::Error::last_os_error());
         }
         let mut buf = vec![0u8; len as usize];
-        // SAFETY: `buf` has `len` writable bytes for `TOKEN_USER`.
+        // SAFETY: `buf` has `len` writable bytes; `TOKEN_USER` fills it with a `SID_AND_ATTRIBUTES`
+        // whose `Sid` points inside `buf`.
         let ok = unsafe {
             ffi::GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len)
         };
@@ -640,7 +641,8 @@ mod win_pids {
         let mut level = WTS_PROCESS_INFO_LEVEL1;
         let mut info: *mut ffi::WtsProcessInfoExW = std::ptr::null_mut();
         let mut count: u32 = 0;
-        // SAFETY: level and out-params are live locals.
+        // SAFETY: level and out-params are live locals; on success the manager
+        // allocates `info`, freed below. We never open any listed process.
         let ok = unsafe {
             ffi::WTSEnumerateProcessesExW(
                 WTS_CURRENT_SERVER,
@@ -1263,10 +1265,12 @@ mod tests {
         assert_eq!(ffi::PSHM_FDINFO_SIZE, 1192);
         assert_eq!(ffi::PSHM_VST_SIZE, 112);
         for len in [crate::shm::PAGE, 5 * crate::shm::PAGE] {
-            // SAFETY: private custody descriptor is inspected only for metadata.
+            // SAFETY: this private custody is queried only for metadata, never reopened, written or
+            // resized; both owners drop this iteration.
             let (_region, custody) = unsafe { crate::shm::Region::create(len) }.expect("a region");
             assert_eq!(super::fd_is_pshm(custody.as_fd()), Some(len as u64));
-            // SAFETY: private writable descriptor is inspected only for metadata.
+            // SAFETY: this private writable descriptor is queried only for metadata, never used to
+            // write, resize or map; both owners drop this iteration.
             let (_twin, writable) =
                 unsafe { crate::shm::testing::create_with_writable_custody(len) }.expect("a twin");
             assert_eq!(super::fd_is_pshm(writable.as_fd()), Some(len as u64));
@@ -1293,7 +1297,8 @@ mod tests {
                 .count()
         };
         assert_eq!(mine(), 0);
-        // SAFETY: fixture only inspects the descriptor table and drops local handles.
+        // SAFETY: the fixture only inspects the descriptor table and drops these owners; nothing
+        // writes, maps or resizes the private object.
         let (region, custody) = unsafe { crate::shm::Region::create(len) }.expect("a region");
         assert_eq!(mine(), 1, "the custody descriptor");
         drop(region);

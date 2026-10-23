@@ -175,7 +175,8 @@ mod imp {
 
     /// A `locale_t` from `newlocale`, never freed or changed.
     struct Ctype(*mut c_void);
-    // SAFETY: The locale object is immutable once made and only read by libc.
+    // SAFETY: The locale object is immutable once made and libc reads it
+    // from whichever thread installs it.
     unsafe impl Send for Ctype {}
     // SAFETY: As for `Send`: shared reads of an immutable object.
     unsafe impl Sync for Ctype {}
@@ -188,7 +189,8 @@ mod imp {
             Locale::Utf8 => (&UTF8, c"UTF-8"),
         };
         let made = cell.get_or_init(|| {
-            // SAFETY: A NUL-terminated name and no base locale.
+            // SAFETY: a NUL-terminated name and no base locale; a null
+            // answer (no such locale) is kept and read as none.
             Ctype(unsafe { newlocale(LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut()) })
         });
         (!made.0.is_null()).then_some(made.0)
@@ -210,9 +212,11 @@ mod imp {
         let src = CString::new(text).ok()?;
         let loc = ctype(locale)?;
         let mut dst = vec![0u8; text.len() * 8 + 1];
-        // SAFETY: `loc` is a live locale object.
+        // SAFETY: `loc` is a live locale object; the previous one is put back
+        // below, on this thread, before anything else runs on it.
         let previous = unsafe { uselocale(loc) };
-        // SAFETY: `dst` is writable for `dst.len()` bytes, the length passed.
+        // SAFETY: `dst` is writable for `dst.len()` bytes, the length passed,
+        // and `src` is NUL-terminated.
         let n = unsafe {
             strnvis(
                 dst.as_mut_ptr().cast::<c_char>(),
@@ -282,7 +286,8 @@ mod imp {
     fn sysctl_into(mib: &mut [c_int], buf: &mut [u8]) -> std::io::Result<usize> {
         let mut len: libc::size_t = buf.len();
         let n = libc::c_uint::try_from(mib.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
-        // SAFETY: `mib` holds `n` ints.
+        // SAFETY: `mib` holds `n` ints; `buf` is writable for `len` bytes and
+        // the kernel writes at most `len`, reporting how many in `len`.
         let rc = unsafe {
             libc::sysctl(
                 mib.as_mut_ptr(),
@@ -349,7 +354,8 @@ mod imp {
         let mut at = 0u64;
         for _ in 0..REGIONS {
             let mut buf = [0u8; REGION_SIZE];
-            // SAFETY: `buf` is writable for `REGION_SIZE` bytes, the size passed.
+            // SAFETY: `buf` is writable for `REGION_SIZE` bytes, the size
+            // passed; libproc returns how many it wrote.
             let n = unsafe {
                 libc::proc_pidinfo(
                     pid,

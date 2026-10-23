@@ -5,6 +5,12 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! LOCAL PATCH (aterm): the loop waits in `common::poll` and reads the display through libwayland's
+//! `prepare_read`/`read_events`/`dispatch_pending` on its own queue, where upstream ran calloop
+//! with calloop-wayland-source. A failed display call ends the loop, with
+//! `EventLoopError::DisplayLost` when the connection died. The `pump_events` wake-up thread and the
+//! `AsFd`/`AsRawFd` impls are gone.
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
@@ -282,6 +288,8 @@ impl<T: 'static> EventLoop<T> {
                 let Some((physical_size, scale_factor)) = self.with_state(|state| {
                     let windows = state.windows.get_mut();
                     let window = windows.get(&window_id)?.lock().unwrap();
+                    // LOCAL PATCH (aterm): no client-side frame to draw first; the application's
+                    // header is part of the surface it presents.
                     let scale_factor = window.scale_factor();
                     let size = logical_to_physical_rounded(window.inner_size(), scale_factor);
                     Some((size, scale_factor))
@@ -413,6 +421,7 @@ impl<T: 'static> EventLoop<T> {
 
         callback(Event::AboutToWait, &self.window_target);
 
+        // LOCAL PATCH (aterm): upstream redrew each window's client-side frame here; there is none.
         window_ids.clear();
 
         std::mem::swap(&mut self.compositor_updates, &mut compositor_updates);

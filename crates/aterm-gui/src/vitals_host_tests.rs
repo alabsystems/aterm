@@ -1679,7 +1679,7 @@ fn a_prompt_fed_before_the_latch_clears_is_read_in_that_pass() {
     assert_eq!(asked(&rx), 1, "the prompt fed as the pass began: read");
 }
 
-/// THE KERNEL EDGE (module docs, [`ProcEdge`]): with no window, the loop
+/// THE KERNEL EDGE ([`ProcEdge`]): with no window, the loop
 /// arms the latch; a session's process event (a fork, an `exec`, an exit)
 /// posts the loop one wake, and the loop takes it as an edge even with the
 /// held view parked: one whole reading the engine must look at (`jobs_now`),
@@ -1767,7 +1767,8 @@ impl JobAtRest {
     fn starting(raw: bool, before_ready: impl FnOnce(&mut Self)) -> Self {
         use std::os::fd::{FromRawFd as _, OwnedFd};
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: Both fresh descriptors are transferred to their only owners before any assertion.
+        // SAFETY: both fresh descriptors are transferred to their only
+        // owners before any assertion or other fallible setup.
         let master = unsafe { OwnedFd::from_raw_fd(master) };
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         if raw {
@@ -1947,7 +1948,8 @@ fn job_at_rest_leader() {
     {
         return;
     }
-    // SAFETY: This helper is a new session.
+    // SAFETY: this helper is a new session; fd 0 is its explicitly handed
+    // slave. It alone changes its signal policy and controlling terminal.
     unsafe {
         assert_eq!(
             libc::ioctl(0, libc::TIOCSCTTY as _, 0),
@@ -2002,7 +2004,8 @@ fn job_at_rest_leader() {
     loop {
         let left = i32::try_from(until.saturating_duration_since(Instant::now()).as_millis())
             .expect("small");
-        // SAFETY: Fd 2 is the parent's explicitly handed stop pipe. EOF ends the fixture.
+        // SAFETY: fd 2 is the parent's explicitly handed stop pipe. EOF
+        // ends the fixture; the timeout is only its fallback parked life.
         if unsafe { libc::poll(&mut p, 1, left) } >= 0
             || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {

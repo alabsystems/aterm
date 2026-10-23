@@ -372,7 +372,9 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     }
 }
 
-/// Steps 5 and 6 (the module docs) against the running `inst`.
+/// The lane's checks against the running `inst`: `status disk=` reads `short`, `await sys
+/// free>=5GiB` answers, the journal's removals run in tier order and keep what they must; then,
+/// filled past the emergency, the reserve is released before anything else of that pass.
 fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<(), String> {
     let ls = inst.ctl(&["ls"]);
     let sid = ls

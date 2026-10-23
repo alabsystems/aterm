@@ -14,21 +14,17 @@ const STOCK_VV: &str = "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\n\
     commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\n\
     host: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6\n";
 
-/// Verbatim `cargo -vV` of a shipped Trust seal: Trust's tree by `trust-repo-commit-hash:`,
-/// and no `trust:` line (its `rustc` prints one).
 const E9CA4908_CARGO_VV: &str = "cargo 1.99.0-dev (e9ca49080 2026-08-18)\n\
     release: 1.99.0-dev\ncommit-hash: e9ca49080f0f71d4ec8d6bb5a6394ff122031eaa\n\
     commit-date: 2026-08-18\n\
     trust-repo-commit-hash: e9ca49080f0f71d4ec8d6bb5a6394ff122031eaa\n\
     host: aarch64-apple-darwin\nlibgit2: 1.9.4 (sys:0.21.0 vendored)\n\
     os: Mac OS 26.6.2 [64-bit]\n";
-/// Verbatim `cargo -vV` of rustup's stock 1.97.1.
 const STOCK_CARGO_VV: &str = "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\n\
     commit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\n\
     host: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\n\
     ssl: OpenSSL 3.6.2 7 Apr 2026\nos: Mac OS 26.6.2 [64-bit]\n";
 
-/// A scratch directory, removed when the test ends however it ends.
 fn scratch(label: &str) -> crate::testdir::Dir {
     crate::testdir::dir(&format!("atpkg-upstream-identity-{label}-"))
 }
@@ -93,13 +89,11 @@ fn vv_says_trust_by_its_trust_line_and_stock_by_its_absence() {
         ("1.97.1", None)
     );
     assert!(!Identity::Known(stock).is_trust());
-    // cargo's own `-vV` (Trust's multicall cargo prints the same `trust:` line).
     let cargo = parse_vv("cargo 1.99.0-dev (7d5533b2b 2026-09-23)\nrelease: 1.99.0-dev\ntrust: 0.1.0\ncommit-hash: 7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15\n").unwrap();
     assert_eq!(
         (cargo.tool.as_str(), cargo.trust.as_deref()),
         ("cargo", Some("0.1.0"))
     );
-    // Not a Rust tool's answer: nothing is claimed.
     assert_eq!(parse_vv(""), None);
     assert_eq!(parse_vv("homebrew-style cargo: -vV\n"), None);
     assert_eq!(parse_vv("rustc 1.0\nrelease: \n"), None, "an empty release");
@@ -112,9 +106,6 @@ fn vv_says_trust_by_its_trust_line_and_stock_by_its_absence() {
     assert!(!Identity::Unknown { why: "x".into() }.is_trust());
 }
 
-/// Stock is said only where nothing marks Trust: a `-vV` with a mark of Trust but no
-/// `trust:` version (a shipped Trust cargo) is named by what it printed, neither Trust nor
-/// stock.
 #[test]
 fn stock_is_said_only_where_nothing_marks_trust() {
     let named = |vv: &str| Resolved {
@@ -130,7 +121,6 @@ fn stock_is_said_only_where_nothing_marks_trust() {
         seal.verdict("cargo")
     );
     assert!(named(STOCK_CARGO_VV).verdict("cargo").contains("STOCK"));
-    // The branded entries' own stamps mark Trust too; a `trust:` with no version does.
     for (vv, mark) in [
         (
             "rustc 1.99.0-dev (7d5533b2b 2026-09-23) (trustc 0.1.0)\nrelease: 1.99.0-dev\n",
@@ -154,14 +144,12 @@ fn stock_is_said_only_where_nothing_marks_trust() {
             got.verdict("rustc")
         );
     }
-    // Trust's own cargo with its `trust:` line is Trust, its mark notwithstanding.
     let marked_trust = "cargo 1.99.0-dev (7d5533b2b 2026-09-23)\nrelease: 1.99.0-dev\n\
         trust: 0.1.0\ncommit-hash: 7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15\n\
         trust-repo-commit-hash: 7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15\n";
     assert!(named(marked_trust).is_trust());
 }
 
-/// Why rustup picked a toolchain is said only where it is measured, in rustup's order.
 #[test]
 fn picked_follows_rustups_order_and_names_only_a_match() {
     let dir = scratch("picked");
@@ -286,8 +274,6 @@ fn a_rustup_proxy_is_resolved_through_rustup_which() {
     let dir = scratch("proxy");
     let cargo_bin = dir.join("cargo-bin");
     let rustup = assessed("rustup", FAKE_RUSTUP);
-    // The proxy layout of a copy/hard link: `rustc` is rustup's own file, not a link
-    // named rustup — known by the inode, and asked through the `rustup` beside it.
     link(&rustup, &cargo_bin.join("rustup"));
     link(&rustup, &cargo_bin.join("rustc"));
     let answers = cargo_bin.join("rustup.d");
@@ -339,7 +325,6 @@ fn a_rustup_proxy_is_resolved_through_rustup_which() {
     );
     assert_eq!(got.real, stock);
 
-    // A directory pinning 1.97.1 (the legacy one-line file, which the fake reads too).
     let pinned = dir.join("pinned");
     std::fs::create_dir_all(&pinned).unwrap();
     std::fs::write(pinned.join("rust-toolchain"), "1.97.1\n").unwrap();
@@ -415,7 +400,6 @@ fn a_rustup_answer_is_cached_by_what_rustup_reads() {
     assert_eq!(asked(), 1);
     assert!(resolve(&base).is_trust(), "the cached answer");
     assert_eq!(asked(), 1, "answered from the cache");
-    // A toolchain file nearer than anything before: a new key, rustup asked again.
     std::fs::write(work.join("rust-toolchain"), "1.97.1\n").unwrap();
     let got = resolve(&base);
     assert_eq!(asked(), 2);
@@ -425,7 +409,6 @@ fn a_rustup_answer_is_cached_by_what_rustup_reads() {
     std::fs::remove_file(work.join("rust-toolchain")).unwrap();
     assert!(resolve(&base).is_trust());
     assert_eq!(asked(), 2, "the first key's answer still stands");
-    // rustup's settings rewritten (`rustup default`, `rustup override`): asked again.
     std::fs::write(
         home.join("settings.toml"),
         "default_toolchain = \"trust\"\nprofile = \"minimal\"\n",
@@ -433,7 +416,6 @@ fn a_rustup_answer_is_cached_by_what_rustup_reads() {
     .unwrap();
     assert!(resolve(&base).is_trust());
     assert_eq!(asked(), 3);
-    // The answer gone (a toolchain uninstalled): never trusted from the cache.
     std::fs::remove_file(&trust).unwrap();
     let got = resolve(&base);
     assert_eq!(asked(), 4);
@@ -471,8 +453,6 @@ fn a_proxy_is_known_by_its_file() {
     std::fs::write(&lone, "#!/bin/sh\nexit 0\n").unwrap();
     assert_eq!(rustup_proxy(&lone, &lone), None, "no rustup beside it");
 
-    // rustup's hard-link layout reached through a symlink: the link on PATH sits beside
-    // no rustup; the file it reaches sits beside rustup's own inode.
     let cargo_bin = dir.join("cargo-home").join("bin");
     std::fs::create_dir_all(&cargo_bin).unwrap();
     std::fs::copy(&rustup, cargo_bin.join("rustup")).unwrap();
@@ -485,7 +465,6 @@ fn a_proxy_is_known_by_its_file() {
         Some(theirs.clone()),
         "the inode of the rustup beside the file"
     );
-    // …and a copy of rustup's bytes reached the same way.
     std::fs::copy(&rustup, cargo_bin.join("rustc")).unwrap();
     let via = dir.join("userbin").join("rustc");
     link(&cargo_bin.join("rustc"), &via);
@@ -503,8 +482,6 @@ fn a_proxy_is_known_by_its_file() {
 #[test]
 fn a_plain_copy_is_asked_with_the_toolchain_it_is_handed() {
     let dir = scratch("plus");
-    // A wrapper that, like one over rustup's proxy, runs the `+<toolchain>` it is
-    // handed and the default otherwise.
     let mut body = String::from(
         "#!/bin/sh\ntc=trust\ncase \"$1\" in +*) tc=${1#+}; shift;; esac\n\
          if [ \"$1\" = -vV ]; then\nif [ \"$tc\" = trust ]; then\n",
@@ -542,8 +519,6 @@ fn a_plain_copy_is_asked_with_the_toolchain_it_is_handed() {
         })
         .is_trust()
     );
-    // A copy that does not take a `+<toolchain>` (a toolchain's own cargo): the question
-    // fails as the command will, and nothing is claimed.
     let own = dir.join("own").join("cargo");
     link(&assessed("cargo", &fake_vv(STOCK_VV)), &own);
     let got = resolve(&Ask {
@@ -569,7 +544,6 @@ fn a_compiled_dispatcher_is_never_answered_from_the_cache() {
     let real = std::fs::canonicalize(&dispatcher).unwrap();
     let cargo = dir.join("shims").join("cargo");
     link(&dispatcher, &cargo);
-    // A cached Trust answer for the dispatcher's path, as a `rustc` through it would give.
     let cache = dir.join(CACHE_FILE);
     let stamp = stamp_of(&std::fs::metadata(&real).unwrap()).unwrap();
     let vv = parse_vv(TRUST_VV).unwrap();
@@ -694,13 +668,10 @@ fn the_cache_keys_only_a_toolchains_own_file_by_its_file_and_driver() {
     assert_eq!(key.lookup(&cache), None, "empty");
     key.store(&cache, &vv);
     assert_eq!(key.lookup(&cache), Some(vv.clone()));
-    // The driver rebuilt under an unchanged launcher: a different key, a miss.
     std::fs::write(&driver, "rebuilt").unwrap();
     let rebuilt = CacheKey::of(&rustc, "rustc").unwrap();
     assert_ne!(rebuilt, key);
     assert_eq!(rebuilt.lookup(&cache), None);
-    // A new entry for the same path replaces the old one; each kind stays bounded, and
-    // one kind never evicts the other.
     let stock = parse_vv(STOCK_VV).unwrap();
     rebuilt.store(&cache, &stock);
     assert_eq!(key.lookup(&cache), None, "replaced");
@@ -719,18 +690,13 @@ fn the_cache_keys_only_a_toolchains_own_file_by_its_file_and_driver() {
         cache_get(&cache, KIND_WHICH, "a which key"),
         Some(vec![String::from("/a/answer")])
     );
-    // A mark is kept: read back, a Trust-marked build is still not called stock.
     let seal = parse_vv(E9CA4908_CARGO_VV).unwrap();
     rebuilt.store(&cache, &seal);
     assert_eq!(rebuilt.lookup(&cache), Some(seal));
-    // A value that would break a line is not cached at all.
     cache_put(&cache, KIND_WHICH, "tab", &["/a\tb"], MAX_WHICH);
     assert_eq!(cache_get(&cache, KIND_WHICH, "tab"), None);
 }
 
-/// The nearest checkout decides: Trust's by its `src/stage0`, an upstream Rust checkout
-/// is not Trust's, an `x.py` with no `src/stage0` is no checkout, and outside every
-/// checkout there is none.
 #[test]
 fn a_trust_checkout_is_known_by_its_stage0() {
     let dir = scratch("checkout");
@@ -746,12 +712,10 @@ fn a_trust_checkout_is_known_by_its_stage0() {
     .unwrap();
     assert_eq!(trust_checkout(&deep), Some(root.clone()));
     assert_eq!(trust_checkout(&root), Some(root.clone()));
-    // An x.py with no src/stage0 (a tool's own script) is walked past.
     let tool = root.join("src").join("tools").join("x");
     std::fs::create_dir_all(&tool).unwrap();
     std::fs::write(tool.join("x.py"), "").unwrap();
     assert_eq!(trust_checkout(&tool), Some(root.clone()));
-    // An upstream Rust checkout nested inside is the nearest, and not Trust's.
     let upstream = root.join("vendor").join("rust");
     std::fs::create_dir_all(upstream.join("src")).unwrap();
     std::fs::write(upstream.join("x.py"), "").unwrap();

@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The global deadline and the authority guard hold for every socket call a TLS
-//! stream makes, after the handshake as well as during it.
-//!
-//! rustls's `Read` for a stream loops `complete_io` until a whole record has
-//! arrived, so one `Stream::read` is many socket reads. A timeout and a guard
-//! applied once before that loop bound one of those reads; a peer that sends
-//! the record a byte at a time restarts the clock with every byte and is never
-//! asked about authority again. Most of these tests drive a REAL TLS session
-//! (the handshake completes, against a pinned certificate) and then dribble
-//! one record, so what they exercise is the established stream; one dribbles
-//! the handshake itself, the deadline the harness network probe relies on.
+//! Global deadline and authority guard tests for TLS streams during and after handshake.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -24,11 +14,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
-/// A wait for something that must happen is a hang detector, never a latency budget.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-/// Loopback credentials: a self-signed certificate and its key, public test
-/// data (`testdata/README.md`).
 const CERT: &[u8] = include_bytes!("testdata/loopback-cert.der");
 const KEY: &[u8] = include_bytes!("testdata/loopback-key.pkcs8.der");
 
@@ -106,10 +93,6 @@ fn client_config() -> Arc<rustls::ClientConfig> {
     )
 }
 
-/// A TLS server that completes the handshake, then announces a 16 KiB
-/// application record and sends it one byte per `step` for up to five minutes,
-/// stopping at the first byte the closed client refuses. `dribbling` gets a
-/// message once the first bytes are out.
 fn dribbling_tls_server(step: Duration) -> (u16, mpsc::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -138,14 +121,11 @@ fn dribbling_tls_server(step: Duration) -> (u16, mpsc::Receiver<()>) {
                 return;
             }
         }
-        // Flush anything the handshake left queued (session tickets).
         while conn.wants_write() {
             if conn.complete_io(&mut tcp).is_err() {
                 return;
             }
         }
-        // An application-data record header claiming 16 KiB of body: the
-        // client's rustls keeps reading until the whole record is in.
         if tcp.write_all(&[0x17, 0x03, 0x03, 0x40, 0x00]).is_err() {
             return;
         }
@@ -177,8 +157,6 @@ impl Guard for Revocable {
     }
 }
 
-/// Handshake with the dribbling server, then read on a thread of its own; the
-/// receiver yields the read's outcome.
 fn read_from_dribbler(
     guard: Arc<dyn Guard>,
     deadline: Duration,
@@ -201,10 +179,6 @@ fn read_from_dribbler(
     (dribbling, outcome)
 }
 
-/// A peer that completes the TCP connect, claims a 16 KiB handshake record,
-/// and then emits one byte at a time, `step` apart, for up to five minutes. It
-/// never speaks TLS; the point is only that bytes keep ARRIVING. It stops at
-/// the first byte the closed client refuses.
 fn dribbling_handshake_peer(step: Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -212,8 +186,6 @@ fn dribbling_handshake_peer(step: Duration) -> u16 {
         let Ok((mut tcp, _)) = listener.accept() else {
             return;
         };
-        // A handshake record header claiming 16384 bytes of body, so rustls
-        // stays in `read_tls` waiting for a flight that never completes.
         if tcp.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
             return;
         }
@@ -230,11 +202,6 @@ fn dribbling_handshake_peer(step: Duration) -> u16 {
 
 #[test]
 fn a_dribbled_handshake_cannot_outlive_the_global_deadline() {
-    // The deadline has to be enforced INSIDE the handshake, not just before
-    // it: `complete_io` loops on `read_tls`, so a per-syscall timeout applied
-    // once at the top bounds one read while every dribbled byte restarts the
-    // clock. This peer dribbles for ~5 minutes against a 1 s budget; the
-    // minute below is the hang detector.
     let port = dribbling_handshake_peer(Duration::from_millis(100));
     let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let (outcome_tx, outcome) = mpsc::channel();
@@ -257,10 +224,6 @@ fn a_dribbled_handshake_cannot_outlive_the_global_deadline() {
 
 #[test]
 fn a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline() {
-    // At 50 ms a byte the record would take ~14 minutes; the 1.5 s deadline is
-    // the bound and the minute below the hang detector. The deadline also covers
-    // the handshake, which must finish inside it (`read_from_dribbler` expects it
-    // to): a debug rustls handshake on loopback takes milliseconds.
     let (_dribbling, outcome) = read_from_dribbler(
         Arc::new(aterm_http::AlwaysAuthorized),
         Duration::from_millis(1500),
@@ -277,8 +240,6 @@ fn a_record_dribbled_after_the_handshake_cannot_outlive_the_global_deadline() {
 
 #[test]
 fn authority_revoked_during_a_tls_read_stops_it() {
-    // Only the guard can end this read: it must be consulted from inside
-    // rustls's read loop, and once revoked the read stops.
     let guard = Arc::new(Revocable {
         allowed: AtomicBool::new(true),
         asked: AtomicUsize::new(0),
@@ -335,9 +296,6 @@ fn answering_tls_server(answer: &'static [u8]) -> u16 {
             return;
         };
         let _ = tcp.set_read_timeout(Some(HANG_DETECTOR));
-        // The answer leaves at once: under Nagle it would wait behind the
-        // session tickets' unacknowledged segment, and the close's reset
-        // would discard it unsent.
         let _ = tcp.set_nodelay(true);
         let Ok(mut conn) = rustls::ServerConnection::new(config) else {
             return;
@@ -383,8 +341,6 @@ fn an_answer_sent_before_the_peer_closed_over_a_failed_write_is_read() {
         Deadline::after(HANG_DETECTOR),
     )
     .expect("the handshake with the pinned loopback server completes");
-    // Far more than the socket buffers hold: the server's close lands while
-    // these writes are still going out.
     let chunk = vec![0u8; 64 * 1024];
     let failed = (0..1024)
         .find_map(|_| stream.write_all(&chunk).err())

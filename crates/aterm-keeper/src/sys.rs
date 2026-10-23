@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The syscalls `aterm-uds` has no wrapper for: `poll(2)`, a non-blocking `waitpid(2)` for the
-//! keeper's one kind of child (the relaunch's `/usr/bin/open`), and raising `RLIMIT_NOFILE` to
-//! its hard limit (the keeper holds one descriptor per terminal).
+//! Syscalls for `aterm-keeper`: `poll(2)`, non-blocking `waitpid(2)`, and `RLIMIT_NOFILE`.
 
 /// `struct pollfd`.
 #[repr(C)]
@@ -30,8 +28,7 @@ unsafe extern "C" {
     fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
 }
 
-/// `poll(2)` over `fds` for up to `timeout_ms`; `Interrupted` is retried by
-/// the caller's loop, never here.
+/// `poll(2)` over `fds` for up to `timeout_ms`.
 ///
 /// # Errors
 /// What `poll` reports.
@@ -63,8 +60,8 @@ pub fn reap_if_done(pid: u32) -> bool {
     rc != 0
 }
 
-/// Raise `RLIMIT_NOFILE`'s soft limit to its hard limit (Darwin caps the
-/// value at `OPEN_MAX` for an unlimited hard limit). Best-effort.
+/// Raise `RLIMIT_NOFILE`'s soft limit to its hard limit, capped at `OPEN_MAX` on Darwin
+/// (best-effort).
 // Skip: bottoms out at the `getrlimit`/`setrlimit` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn raise_nofile() {

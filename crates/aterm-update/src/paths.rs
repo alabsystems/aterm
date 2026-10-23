@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `.app` staging layout under `~/Library/Application Support/aterm/Updates/`. Private-dir
-//! creation is [`aterm_update_core::ensure_private_dir`].
+//! The `.app` staging layout under `~/Library/Application Support/aterm/Updates/`.
 
 use std::path::PathBuf;
 
@@ -15,9 +14,7 @@ pub struct Staging {
     pub root: PathBuf,
     /// flock target guarding the apply critical section.
     pub apply_lock: PathBuf,
-    /// flock target serializing the staging critical section (download + extract +
-    /// publish) across processes. Distinct from `apply_lock` so a long download
-    /// never blocks a starting instance's apply path.
+    /// flock target serializing the staging critical section across processes.
     pub stage_lock: PathBuf,
     /// Scratch dir for in-progress downloads.
     pub download: PathBuf,
@@ -25,17 +22,13 @@ pub struct Staging {
     pub staged_app: PathBuf,
     /// The "ready" marker — written last; its presence is the sole ready signal.
     pub ready: PathBuf,
-    /// Human-readable status record (last check, outcome, staged build): `cat` it to see
-    /// what the silent updater did.
+    /// Human-readable status record (last check, outcome, staged build).
     pub status: PathBuf,
 }
 
 impl Staging {
-    /// Resolve (and create, `0700`, ownership-verified) the staging layout.
-    /// Returns `None` if `HOME` is unset or the directory cannot be made private.
+    /// Resolve and create (`0700`, ownership-verified) the staging layout.
     pub fn resolve() -> Option<Self> {
-        // Resolve `ATERM_UPDATE_ROOT` (test/dev override) or
-        // `~/Library/Application Support/aterm/Updates`.
         let root = aterm_update_core::seal_guard::updates_root()?;
         let download = root.join("download");
         ensure_private_dir(&download).ok()?;
@@ -55,52 +48,43 @@ impl Staging {
         self.root.join("staged")
     }
 
-    /// The persisted monotonic recency floor (`floor.toml`); see `manifest::Floor`.
+    /// The persisted monotonic recency floor (`floor.toml`).
     pub fn floor(&self) -> PathBuf {
         self.root.join("floor.toml")
     }
 
-    /// The self-healing ledger (`health.toml`): consecutive-failure streak + class,
-    /// rescue-path history. See [`crate::health::Health`].
+    /// The self-healing ledger (`health.toml`).
     pub fn health(&self) -> PathBuf {
         self.root.join("health.toml")
     }
 
-    /// The last-failed-candidate memo (`failed.toml`); see `manifest::FailedMark`.
+    /// The last-failed-candidate memo (`failed.toml`).
     pub fn failed(&self) -> PathBuf {
         self.root.join("failed.toml")
     }
 
-    /// The crash-loop quarantine ledger (`quarantine.toml`): every artifact that was
-    /// swapped in, failed boot health and was reverted, kept apart from the timed
-    /// backoff memo in [`Self::failed`]; see `manifest::Quarantine`.
+    /// The crash-loop quarantine ledger (`quarantine.toml`).
     pub fn quarantine(&self) -> PathBuf {
         self.root.join("quarantine.toml")
     }
 
-    /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written
-    /// beside the boot sentinel at apply time so a subsequent crash-loop
-    /// revert can quarantine the exact build that failed (`manifest::FailedMark`).
+    /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`).
     pub fn trial(&self) -> PathBuf {
         self.root.join("trial.toml")
     }
 
     /// Durable receipt for the artifact currently installed by the self-updater.
-    /// Unlike [`Self::trial`], this survives healthy-boot confirmation so an
-    /// overlapping old process can still prove the exact completed swap.
     pub fn installed_receipt(&self) -> PathBuf {
         self.root.join("installed.toml")
     }
 
-    /// Single-use re-exec nonce (`reexec.stamp`) inside the `0700` `Updates`
-    /// root, written before apply re-exec and consumed by the post-swap guard.
+    /// Single-use re-exec nonce (`reexec.stamp`) inside the `0700` `Updates` root.
     pub fn reexec_stamp(&self) -> PathBuf {
         self.root.join("reexec.stamp")
     }
 
-    /// Retire the currently published stage (`ready`, `staged_app`, and the
-    /// authorized tag in `status.toml`) while holding [`Self::apply_lock`],
-    /// leaving `download/` and any in-flight `stage_lock` producer untouched.
+    /// Retire the currently published stage (`ready`, `staged_app`, and the latest tag in
+    /// `status.toml`).
     pub fn retire_published(&self) {
         let _ = std::fs::remove_file(&self.ready);
         let _ = std::fs::remove_dir_all(&self.staged_app);

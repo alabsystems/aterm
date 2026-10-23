@@ -175,7 +175,8 @@ pub(crate) enum UnsetOutcome {
 /// Registers aterm as the default terminal.
 ///
 /// # Errors
-/// Returns `Unsupported` while [`handoff_server_available`] is false, or a registry error.
+/// Returns `Unsupported` while [`handoff_server_available`] is false (checked before
+/// any key is created, so a refusal leaves the registry untouched), or a registry error.
 pub(crate) fn set_default_terminal() -> io::Result<()> {
     if !handoff_server_available() {
         return Err(io::Error::new(
@@ -207,7 +208,8 @@ pub(crate) fn set_default_terminal() -> io::Result<()> {
     let name = wide(VALUE_TERMINAL);
     let data = wide(CLSID_ATERM_TERMINAL);
     let cb = (data.len() * std::mem::size_of::<u16>()) as u32;
-    // SAFETY: open key; `data`/`name` outlive the call; `cb` is the byte length.
+    // SAFETY: open key; `data`/`name` outlive the call; `cb` is the byte length
+    // of `data`, its NUL terminator included, as REG_SZ requires.
     let rc =
         unsafe { RegSetValueExW(hk, name.as_ptr(), 0, REG_SZ, data.as_ptr().cast::<u8>(), cb) };
     // SAFETY: `hk` was opened above.

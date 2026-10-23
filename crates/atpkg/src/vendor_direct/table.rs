@@ -185,7 +185,6 @@ const fn revision_floor(
 /// agy's per-platform manifests on its Cloud Run updater service, as agy's own updater spells them.
 macro_rules! agy_manifests {
     () => {
-        //antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/"
         "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/"
     };
 }

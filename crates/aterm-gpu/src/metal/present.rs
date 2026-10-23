@@ -269,7 +269,8 @@ pub(crate) fn parent_layer_of<W: aterm_objc::HasNsView>(target: &W) -> Option<Ob
     if view.is_null() {
         return None;
     }
-    // SAFETY: `view` is a live `NSView` borrowed via `HasNsView` on the main thread.
+    // SAFETY: `view` is a live `NSView` borrowed via `HasNsView` on the main thread;
+    // `layer` is a +0 property read retained to +1 by `Obj::retain`.
     unsafe {
         let f: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
         Obj::retain(f(view, ffi::sel(c"layer")))
@@ -283,7 +284,9 @@ pub(crate) fn screen_edr_potential_of<W: aterm_objc::HasNsView>(target: &W) -> O
     if view.is_null() {
         return None;
     }
-    // SAFETY: `view` is a live `NSView` borrowed via `HasNsView` on the main thread.
+    // SAFETY: `view` is a live `NSView` borrowed via `HasNsView` on the main thread; `-window` and
+    // `-screen` are +0 reads, nil-checked; the getter exists on macOS 10.15+ (the app requires
+    // 11.0) and returns a `CGFloat`. Nothing is retained.
     unsafe {
         let obj: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel) -> ffi::Id = ffi::checked_msg();
         let window = obj(view, ffi::sel(c"window"));
@@ -649,7 +652,7 @@ mod tests {
     fn parent_at_scale(scale: f64) -> Obj {
         let layer = plain_calayer();
         let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: sets `contentsScale` on a live `CALayer`.
+        // SAFETY: sets `contentsScale`, a scalar `CGFloat`, on a live `CALayer`.
         unsafe {
             let set: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, f64) = ffi::checked_msg();
             set(layer.id(), ffi::sel(c"setContentsScale:"), scale);
@@ -684,7 +687,7 @@ mod tests {
         );
 
         let _pool = ffi::AutoreleasePool::new();
-        // SAFETY: sets `contentsScale` on the live parent `CALayer`.
+        // SAFETY: sets `contentsScale`, a scalar `CGFloat`, on the live parent `CALayer`.
         unsafe {
             let set: unsafe extern "C-unwind" fn(ffi::Id, ffi::Sel, f64) = ffi::checked_msg();
             set(parent.id(), ffi::sel(c"setContentsScale:"), 1.0);

@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The rows `verify provision` provides (docs/DESIGN-init-system-2026-10-20.md §4.4, §6.2–§6.4):
-//! what each is, where upstream serves it for which host, what it must hash to, the anchor its tree
-//! is held to, and how it is installed.
+//! Provisioned tool rows for `verify provision`.
 
 use aterm_uds::host::{Tool, When};
 
-/// How a row's tree is held to its origin before anything is placed.
+/// Origin verification anchor for an unpacked archive tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Anchor {
-    /// The archive's sha256 is the only anchor: upstream signs nothing.
+    /// Archive SHA-256 only (upstream signs nothing).
     Sha256,
-    /// The sha256, then every Mach-O in the unpacked tree verified by codesign as a Developer ID of
-    /// `team` (`aterm_update_core::codesign::verify_developer_id_until`).
+    /// Archive SHA-256 plus Developer ID codesign verification of every Mach-O for `team`.
     DeveloperId {
-        /// The Apple team id every Mach-O must carry.
+        /// Apple team ID every Mach-O must carry.
         team: &'static str,
     },
 }
@@ -23,13 +20,13 @@ pub enum Anchor {
 /// One upstream archive a row fetches for one host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Archive {
-    /// `<os>-<arch>` as Rust names them (`macos-aarch64`), or `source` for any host.
+    /// `<os>-<arch>` (`macos-aarch64`), or `source` for any host.
     pub platform: &'static str,
-    /// Where upstream serves it, `{v}` standing for the row's version.
+    /// Upstream URL template (`{v}` is replaced by the row's version).
     pub url: &'static str,
-    /// Its sha256, lowercase hex.
+    /// Lowercase-hex SHA-256.
     pub sha256: &'static str,
-    /// Its size in bytes.
+    /// Size in bytes.
     pub bytes: u64,
 }
 
@@ -41,8 +38,7 @@ impl Archive {
     }
 }
 
-/// The browser lane's three engines, whose pins live beside the code that drives them
-/// (`crate::browser`): each is placed in the browser cache the lane reads.
+/// Browser engine pinned by `crate::browser` and installed into the browser cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
     /// chrome-headless-shell.
@@ -56,39 +52,33 @@ pub enum Engine {
 /// How a row is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Install {
-    /// An upstream release archive, checked against `anchor` and unpacked through atpkg's vetted
-    /// extractor, `strip` leading components dropped; every name in `keep` (a licence, its notices)
-    /// must be in the tree.
+    /// Upstream release archive verified against `anchor` and unpacked with `strip` leading components dropped.
     Unpack {
-        /// One per host upstream builds for.
+        /// Archives per host.
         archives: &'static [Archive],
-        /// Leading path components each member loses.
+        /// Leading path components dropped on extraction.
         strip: u32,
-        /// What the tree is held to.
+        /// Origin verification anchor.
         anchor: Anchor,
-        /// Files the tree must keep.
+        /// Required files in the unpacked tree (e.g. license notices).
         keep: &'static [&'static str],
     },
-    /// Upstream's source tarball, built here with Trust (fish, §6.2): `targo --unverified build
-    /// --release --locked --no-default-features --features <features>`, on the hosts its tool row's
-    /// pin names ([`aterm_uds::host::Pin::hosts`]).
+    /// Upstream source tarball built with Trust (`targo --unverified build --release --locked --no-default-features`).
     Build {
-        /// The tarball.
+        /// Source tarball.
         source: Archive,
-        /// The features the build names (empty: none past `--no-default-features`).
+        /// Cargo features enabled past `--no-default-features`.
         features: &'static [&'static str],
     },
-    /// A crate's CLI built by `targo --unverified install --locked` at the pin (wasm-bindgen):
-    /// crates.io's checksums and the crate's lockfile are its anchor.
+    /// Crate CLI built by `targo --unverified install --locked` at its lockfile pin.
     Cargo,
-    /// A browser the browser lane pins.
+    /// Browser engine pinned by the browser lane.
     Browser(Engine),
-    /// rustup's stable toolchain with the slices the cells, the web modules and the shipped
-    /// binary's x86_64 slice need, and the wasm32 pin (STOCK EXCEPTION).
+    /// Pinned `rustup` stable toolchain with cross/wasm32 targets (`STOCK EXCEPTION`).
     Rustup {
-        /// The rustup release its installer is pinned at.
+        /// Pinned `rustup` release version.
         version: &'static str,
-        /// rustup-init, one per host.
+        /// `rustup-init` binaries per host.
         init: &'static [Archive],
     },
 }
@@ -96,11 +86,11 @@ pub enum Install {
 /// One row of `verify provision`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// The row's name on the command line.
+    /// CLI row name.
     pub name: &'static str,
-    /// The [`aterm_uds::host::TOOLS`] row it provides, where it provides one.
+    /// Corresponding [`aterm_uds::host::TOOLS`] row name, if any.
     pub tool: Option<&'static str>,
-    /// How it is installed.
+    /// Installation strategy.
     pub install: Install,
 }
 
@@ -120,15 +110,13 @@ impl Row {
         }
     }
 
-    /// The version its tool row pins (`None` for a row whose version lives elsewhere: the
-    /// browsers', in `crate::browser`, and rustup's toolchains).
+    /// Version pinned by its tool row (`None` for browsers and `rustup`).
     #[must_use]
     pub fn version(&self) -> Option<&'static str> {
         self.tool_row().and_then(|t| t.pin).map(|p| p.version)
     }
 
-    /// The archive it fetches for `platform` (`<os>-<arch>`): an unpacked row's, a built row's
-    /// source where its pin names the host, rustup's installer.
+    /// Archive fetched for `platform` (`<os>-<arch>`).
     #[must_use]
     pub fn archive_for(&self, platform: &str) -> Option<Archive> {
         match self.install {
@@ -145,8 +133,7 @@ impl Row {
     }
 }
 
-/// Microsoft's Apple team, which signs every Mach-O of the PowerShell archives (all 17 of 7.6.7's
-/// in each, measured with `codesign -dv`).
+/// Microsoft's Apple Developer ID team signing the PowerShell archives.
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.

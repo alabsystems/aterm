@@ -58,7 +58,9 @@ impl TransparentCommand {
 
     /// Start the child.
     /// # Errors
-    /// As `std`'s.
+    /// As `std`'s: `InvalidInput` for a NUL, `NotFound` for a program that
+    /// does not exist, `PermissionDenied` for one that may not be run, and
+    /// whatever else the spawn answers.
     pub fn spawn(&mut self) -> io::Result<TransparentChild> {
         let env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
         let image = Image::build(&self.program, &self.args, &env)?;

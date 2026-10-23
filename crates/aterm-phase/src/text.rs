@@ -1,20 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `str::trim*`, `find` and `contains` on bytes: the reader walks every row
-//! many times, and the char-wise versions, unoptimized in a debug build, are
-//! its heaviest loop. These return the same slices (whitespace is
-//! `char::is_whitespace` matched on its UTF-8 bytes), which
-//! `the_byte_trims_are_the_char_trims` checks for every char.
+//! Byte-level UTF-8 whitespace trimming and substring search matching standard `str` methods.
 
-/// The length in bytes of the char that starts at byte `i` of `b` when it is
-/// whitespace, else `0` (`i` on a char boundary, `i < b.len()`). White_Space
-/// is U+0009..=U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000..=U+200A,
-/// U+2028, U+2029, U+202F, U+205F and U+3000.
 fn space_at(b: &[u8], i: usize) -> usize {
     match b[i] {
         b' ' | b'\t'..=b'\r' => 1,
-        // ASCII, or a lead byte no whitespace char opens with.
         c if !matches!(c, 0xC2 | 0xE1 | 0xE2 | 0xE3) => 0,
         c => {
             let next = (b.get(i + 1).copied(), b.get(i + 2).copied());
@@ -30,9 +21,6 @@ fn space_at(b: &[u8], i: usize) -> usize {
     }
 }
 
-/// The length in bytes of the char that ends at byte `j` of `b` (exclusive)
-/// when it is whitespace, else `0` (`j` on a char boundary, `j > 0`). Each
-/// multi-byte match starts with a lead byte, so it is that char whole.
 fn space_before(b: &[u8], j: usize) -> usize {
     let last = b[j - 1];
     if last.is_ascii() {
@@ -100,9 +88,7 @@ pub(crate) fn blank(s: &str) -> bool {
     trim(s).is_empty()
 }
 
-/// `s.find(needle)`: each byte that opens the needle compared, the rest
-/// skipped one at a time. A match starts on the needle's first byte, which
-/// opens a char, so it is the char boundary `str::find` names.
+/// Byte index of the first occurrence of `needle` in `s`, matching `s.find(needle)`.
 pub(crate) fn find(s: &str, needle: &str) -> Option<usize> {
     let (b, n) = (s.as_bytes(), needle.as_bytes());
     let Some(&first) = n.first() else {
@@ -123,8 +109,7 @@ pub(crate) fn contains(s: &str, needle: &str) -> bool {
     find(s, needle).is_some()
 }
 
-/// How many chars `s.trim_start()` cuts: `s.chars().take_while(|c|
-/// c.is_whitespace()).count()`.
+/// Count of leading whitespace characters in `s`.
 pub(crate) fn leading_space_chars(s: &str) -> usize {
     let b = s.as_bytes();
     let (mut i, mut chars) = (0, 0);
@@ -137,9 +122,7 @@ pub(crate) fn leading_space_chars(s: &str) -> usize {
     chars
 }
 
-/// Every fixture file under `src/fixtures/` as `(its file name, its text)`,
-/// in name order: the tests that hold one program's reader to every other
-/// program's screens read the program off the name (`agy-…`, `codex-…`).
+/// Every fixture file under `src/fixtures/` as `(name, text)` in name order.
 #[cfg(test)]
 pub(crate) fn fixture_files() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fixtures");
@@ -159,9 +142,7 @@ pub(crate) fn fixture_files() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The screens the byte readings are checked on against the char readings
-/// they replace: every fixture file under `src/fixtures/`, as its rows, and
-/// the rows the reader's anchors make alone.
+/// Fixture screens and anchor test rows for byte-vs-char equivalence checks.
 #[cfg(test)]
 pub(crate) fn fixture_screens() -> Vec<Vec<String>> {
     let mut screens: Vec<Vec<String>> = fixture_files()
@@ -199,9 +180,6 @@ pub(crate) fn fixture_screens() -> Vec<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// Every char, alone and between others, trims, counts and is matched
-    /// exactly as the char-wise functions do — whitespace or not, at the
-    /// start, the end, and next to every whitespace char.
     #[test]
     fn the_byte_trims_are_the_char_trims() {
         let spaces: Vec<char> = (0..=0x10_FFFF_u32)
@@ -234,9 +212,6 @@ mod tests {
             );
             check(one);
         }
-        // Runs of whitespace around every char whose bytes a whitespace
-        // char's could be mistaken for: those sharing all but its last byte
-        // (`C2 xx`, `E1 9A xx`, `E2 80 xx`, `E2 81 xx`, `E3 80 xx`).
         let near: Vec<char> = (0x80..=0x3100_u32)
             .filter_map(char::from_u32)
             .filter(|&c| {
@@ -269,8 +244,6 @@ mod tests {
         }
     }
 
-    /// `find` and `contains` name the match `str::find` names, first of
-    /// several, at either end, overlapping itself, or none.
     #[test]
     fn the_byte_search_is_the_str_search() {
         let hays = [

@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PHASE 6: EACH RECORD KEEPS ITS PROCESS-CLOCK READING.
-//! Every append's `Stamp.mono_ms` rides the record's ring entry
-//! ([`Log::window_mono`], [`Log::mono_of`]), so a view that ages or orders
-//! records on this process's monotonic clock (the timeline's `t_ms`) reads it
-//! off the log. It is RAM only: no tier encodes it, the carry and the journal
-//! write none of it, and a record this process did not append reads its wall
-//! time on this clock (a carried one) or 0 (one read back from a journal or a
-//! closed summary).
-//!
-//! NEGATIVE CONTROL (scratch, 6F-1's commit): a `mono` copied into the
-//! record's `Fields` at the append fails the tier table, the golden lines and
-//! the shifted clock's agreement both.
+//! Tests that each record retains its monotonic process-clock reading in RAM without encoding it.
 
 use aterm_slog::{
     Actor, Amend, CarryAdopt, CarryBudget, Close, Conf, Fields, GapWhy, JournalImage, Key, Kind,
@@ -21,19 +10,12 @@ use aterm_slog::{
 
 use crate::support::WALL0;
 
-/// The process clock's reading at the script's first stamp: no digit run of
-/// it is in any wall time, id or count the script writes.
 const MONO0: u64 = 7_777_000;
 
-/// The script's `i`th stamp on a process clock started `shift` ms later: the
-/// wall time moves a second a step, the monotonic clock by its own uneven
-/// steps, so no record's `mono` is a function of its `t=`.
 fn stamp(i: u64, shift: u64) -> Stamp {
     Stamp::new(WALL0 + 1_000 * i, MONO0 + shift + 37 * i * i + 3 * i)
 }
 
-/// The script's first half, each op at its own stamp: the session open, a
-/// run, a turn and a step opened, a mark and an amend. Returns the turn.
 fn opened(log: &mut Log, shift: u64) -> Node {
     let s = |i| stamp(i, shift);
     log.open_session(
@@ -84,10 +66,6 @@ fn opened(log: &mut Log, shift: u64) -> Node {
     turn
 }
 
-/// Every op of the log, each at its own stamp: [`opened`], then the turn
-/// closed (its step cascades `out=gone` at the same stamp), a gap, the run
-/// and the session closed. Returns the stamp each record was appended at, in
-/// seq order.
 fn script(log: &mut Log, shift: u64) -> Vec<Stamp> {
     let s = |i| stamp(i, shift);
     let turn = opened(log, shift);
@@ -110,12 +88,9 @@ fn script(log: &mut Log, shift: u64) -> Vec<Stamp> {
         s(10),
     )
     .expect("the session closes");
-    // The step's cascaded close and the turn's own share the turn's stamp.
     [1, 2, 3, 4, 5, 6, 7, 7, 8, 9, 10].map(s).to_vec()
 }
 
-/// The script's records at the host tier (what the journal writes, and what
-/// `log` prints by default), as committed before 6F-1: a `mono` changes none.
 const HOST_LINES: [&str; 11] = [
     "1 open - spawn by=aterm src=aterm conf=exact t=1760000001000",
     "2 open r1 cmd par=- blk=4 src=shell conf=strong t=1760000002000",
@@ -130,10 +105,6 @@ const HOST_LINES: [&str; 11] = [
     "11 close - spawn out=app-quit dur_ms=3690 steps=1 by=aterm src=aterm conf=exact t=1760000010000",
 ];
 
-/// THE TIER TABLE: every op's record keeps its stamp's `mono_ms`, and its
-/// encoding at every tier is what it was before the record kept one: the
-/// committed host lines, no digit of a process clock in any tier's line, and
-/// the same bytes from a process clock started half an hour later.
 #[test]
 fn each_op_keeps_its_stamps_mono_and_no_tier_encodes_it() {
     let mut log = Log::new(3);
@@ -155,8 +126,6 @@ fn each_op_keeps_its_stamps_mono_and_no_tier_encodes_it() {
         .collect();
     assert_eq!(host, HOST_LINES, "the host tier as committed");
 
-    // The same ops on a process clock started 1 800 000 ms later: every
-    // reading moves, and no byte of any tier does.
     let mut later = Log::new(3);
     let _ = script(&mut later, 1_800_000);
     assert!(
@@ -178,12 +147,8 @@ fn each_op_keeps_its_stamps_mono_and_no_tier_encodes_it() {
     }
 }
 
-/// THE CARRY WRITES NONE OF IT, and a carried record reads its wall time on
-/// the successor's clock (as a carried open node does); a journal's records
-/// and a closed summary's read 0.
 #[test]
 fn a_record_from_another_process_reads_its_wall_on_this_clock_or_nothing() {
-    // A live session crosses an update with its run, turn and step open.
     let mut log = Log::new(3);
     let _ = opened(&mut log, 0);
     let stamps: Vec<Stamp> = (1..=6).map(|i| stamp(i, 0)).collect();
@@ -193,8 +158,6 @@ fn a_record_from_another_process_reads_its_wall_on_this_clock_or_nothing() {
     for line in &out.lines {
         assert!(!line.contains("777"), "the carry names a clock: {line}");
     }
-    // The successor's clock reads 50 000 000 at a wall time 24 s past the
-    // carried log's newest record.
     let now = Stamp::new(WALL0 + 30_000, 50_000_000);
     let (back, _, _) = Log::from_carry(
         &out.lines,
@@ -209,8 +172,6 @@ fn a_record_from_another_process_reads_its_wall_on_this_clock_or_nothing() {
     .expect("the carry reads");
     let mut crossed = 0;
     for (r, mono) in back.window_mono() {
-        // A carried record's wall time on this clock; the successor's own
-        // (its handoff gap) at `now`, which reads the same.
         assert_eq!(mono, 50_000_000 - (now.wall_ms - r.t), "seq {}", r.seq);
         if let Some(s) = usize::try_from(r.seq - 1).ok().and_then(|i| stamps.get(i)) {
             assert_ne!(mono, s.mono_ms, "seq {}: the old clock's reading", r.seq);
@@ -219,7 +180,6 @@ fn a_record_from_another_process_reads_its_wall_on_this_clock_or_nothing() {
     }
     assert!(crossed >= 4, "the open path crossed: {crossed}");
 
-    // The whole script, closed, read back from its journal and its summary.
     let mut log = Log::new(3);
     let _ = script(&mut log, 0);
     let recs: Vec<Rec> = log.window().cloned().collect();

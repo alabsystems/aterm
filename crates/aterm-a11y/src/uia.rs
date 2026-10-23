@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows UI Automation delivery for the shared accessibility model.
-//!
-//! Providers read a synchronized publication; actions are posted through the
-//! host handler after releasing its lock. They never borrow the live GUI.
-//! A window installs the single `WM_GETOBJECT` route and owns its adapter.
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
@@ -139,8 +135,6 @@ impl Shared {
                 .collect::<Vec<_>>();
             (changes, nodes, announcements)
         };
-        // UIA may synchronously call a provider while receiving an event.
-        // No publication/host-handler lock is held across an external call.
         let Ok(root) = self.root() else {
             return;
         };
@@ -246,13 +240,13 @@ impl Shared {
     }
 }
 
-/// A real window's UIA publisher. An absent HWND never creates native state.
+/// A real window's UIA publisher.
 pub struct Adapter {
     shared: Arc<Shared>,
 }
 
 impl Adapter {
-    /// Attach to a live HWND owned by the caller. Call on its event-loop thread.
+    /// Attach to a live HWND owned by the caller.
     ///
     /// # Safety
     /// `hwnd` must remain the window's handle until this adapter is dropped.
@@ -327,8 +321,7 @@ impl Drop for Adapter {
     }
 }
 
-/// Retire the publication as soon as the native HWND is destroyed, even when
-/// the host's adapter field is dropped later in its window-state teardown.
+/// Retire the publication as soon as the native HWND is destroyed.
 pub fn window_destroyed(hwnd: isize) {
     let shared = windows()
         .lock_or_recover()
@@ -339,8 +332,7 @@ pub fn window_destroyed(hwnd: isize) {
     }
 }
 
-/// Handle only UIA's root-object request, from the host's existing window proc.
-/// Other object ids/messages remain the host's responsibility.
+/// Handle UIA's root-object request from the host's window proc.
 pub fn handle_wm_getobject(hwnd: isize, wparam: usize, lparam: isize) -> Option<isize> {
     if lparam as i32 != UiaRootObjectId {
         return None;
@@ -407,8 +399,6 @@ impl Key {
     }
 
     fn provider(&self) -> Result<IRawElementProviderSimple> {
-        // Retain the exact lifetime observed under the publication lock. A
-        // replacement after this read can retire this provider, never retarget it.
         self.read(|_, _| Ok(()))?;
         Ok(ComObject::new(Provider {
             shared: self.shared.clone(),
@@ -461,8 +451,6 @@ fn control_type(role: Role) -> UIA_CONTROLTYPE_ID {
         Role::ListBoxOption => UIA_ListItemControlTypeId,
         Role::Menu => UIA_MenuControlTypeId,
         Role::MenuItem | Role::MenuItemRadio => UIA_MenuItemControlTypeId,
-        // UIA has no meter type: a read-only progress bar with a range value
-        // is the platform's gauge.
         Role::ProgressIndicator | Role::Meter => UIA_ProgressBarControlTypeId,
         Role::Grid => UIA_DataGridControlTypeId,
         Role::Status | Role::Alert => UIA_StatusBarControlTypeId,
@@ -593,8 +581,6 @@ impl IRawElementProviderFragment_Impl for Provider_Impl {
         let id = self
             .key()
             .read(|node, _| Ok((!node.is_root()).then(|| runtime_id(node))))?;
-        // The top-level HWND gets its runtime identity from the UIA host provider.
-        // Fragment children append their model insertion identity to that HWND.
         id.map_or(Ok(std::ptr::null_mut()), |id| array_i32(&id))
     }
     fn BoundingRectangle(&self) -> Result<UiaRect> {

@@ -107,7 +107,8 @@ impl Git {
 
     /// Store `token` for `account` at `host` (`git credential approve`), then read it back ([`Self::fill`]): git reports no helper's failure to store, so the read is the proof.
     /// # Errors
-    /// The account or host cannot be a credential field, git could not run whole, or the helper does not hand back exactly this token.
+    /// The account or host cannot be a credential field, git could not run whole, or the
+    /// helper does not hand back exactly this token. No error carries credential bytes.
     pub(crate) fn store(
         &self,
         sys: &dyn System,
@@ -142,7 +143,8 @@ impl Git {
 
     /// The token the helper holds for `account` at `host` (`git credential fill`), or `None` when it holds none: git then ends at its disabled prompt (exit 128) without asking.
     /// # Errors
-    /// The account or host cannot be a credential field, git could not run whole, or its answer is not one password.
+    /// The account or host cannot be a credential field, git could not run whole, or its
+    /// answer is not one password. No error carries credential bytes.
     pub(crate) fn fill(
         &self,
         sys: &dyn System,

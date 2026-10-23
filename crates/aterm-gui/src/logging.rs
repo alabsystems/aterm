@@ -21,7 +21,7 @@ pub(crate) use stderr_line;
 
 use aterm_log::{LevelFilter, Log, Metadata, Record};
 
-/// Install the panic hook and file logger (at `info`; see the module docs).
+/// Install the panic hook and file logger (at `info`).
 pub(crate) fn init(arming: crate::crash_signal::Arming) {
     let Some(dir) = log_dir() else {
         crate::logging::stderr_line!(

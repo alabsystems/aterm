@@ -3,13 +3,6 @@
 
 //! Pure helpers for the ConPTY spawn: command-line quoting and the `CreateProcessW`
 //! environment block.
-//!
-//! Quoting is an injection surface: Windows flattens argv to one string that the
-//! child's CRT re-parses. The canonical MSVCRT algorithm here (quote an arg that is
-//! empty or holds a space, tab or quote; double a backslash run before a quote; escape
-//! embedded quotes as `\"`) round-trips through a conforming CRT. `cmd.exe` also
-//! interprets `&`, `|`, `^`, `%` in `/C`/`/K` arguments, so a `-e` command run through
-//! it is shell-interpreted, unlike Unix `execve`.
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
@@ -25,7 +18,7 @@ pub(crate) fn wide_nul(s: &OsStr) -> Vec<u16> {
 }
 
 /// Flatten `argv` into one NUL-terminated UTF-16 command line with the MSVCRT quoting
-/// rules (see the module docs); `CreateProcessW` takes a mutable NUL-terminated buffer.
+/// rules; `CreateProcessW` takes a mutable NUL-terminated buffer.
 pub(crate) fn build_command_line(argv: &[OsString]) -> Vec<u16> {
     let mut out: Vec<u16> = Vec::new();
     for (i, arg) in argv.iter().enumerate() {
@@ -38,10 +31,6 @@ pub(crate) fn build_command_line(argv: &[OsString]) -> Vec<u16> {
     out
 }
 
-/// Append one argument, quoted iff needed (empty, or contains space/tab/quote).
-/// Inside quotes: a run of N backslashes before an embedded `"` becomes 2N+1
-/// backslashes + the quote; a run of N trailing backslashes (before the closing
-/// quote we add) becomes 2N backslashes; backslashes elsewhere pass verbatim.
 fn append_quoted(arg: &OsStr, out: &mut Vec<u16>) {
     let units: Vec<u16> = arg.encode_wide().collect();
     let needs_quotes =
@@ -59,15 +48,12 @@ fn append_quoted(arg: &OsStr, out: &mut Vec<u16>) {
             i += 1;
         }
         if i == units.len() {
-            // Trailing run: double it so the closing quote stays a real quote.
             out.extend(std::iter::repeat_n(BACKSLASH, n_backslashes * 2));
         } else if units[i] == QUOTE {
-            // Escape the run and the quote itself.
             out.extend(std::iter::repeat_n(BACKSLASH, n_backslashes * 2 + 1));
             out.push(QUOTE);
             i += 1;
         } else {
-            // Backslashes not before a quote are literal.
             out.extend(std::iter::repeat_n(BACKSLASH, n_backslashes));
             out.push(units[i]);
             i += 1;
@@ -81,7 +67,6 @@ fn append_quoted(arg: &OsStr, out: &mut Vec<u16>) {
 /// inherited `Path` and an injected `PATH` must yield one entry, the injected one) and
 /// sorted case-insensitively by key, as `CreateProcessW` requires.
 pub(crate) fn build_env_block(pairs: &[(OsString, OsString)]) -> Vec<u16> {
-    // (folded key, index into `pairs` of the last occurrence)
     let mut kept: Vec<(Vec<u16>, usize)> = Vec::new();
     for (idx, (k, _)) in pairs.iter().enumerate() {
         let folded: Vec<u16> = k.encode_wide().map(fold_upper).collect();
@@ -106,8 +91,6 @@ pub(crate) fn build_env_block(pairs: &[(OsString, OsString)]) -> Vec<u16> {
     block
 }
 
-/// ASCII-uppercase fold of one UTF-16 unit: the ordinal, locale-free fold for env-name
-/// dedupe and sort.
 fn fold_upper(u: u16) -> u16 {
     if (u16::from(b'a')..=u16::from(b'z')).contains(&u) {
         u - 32
@@ -120,7 +103,6 @@ fn fold_upper(u: u16) -> u16 {
 mod tests {
     use super::*;
 
-    /// Decode a NUL-terminated UTF-16 command line back to a String for asserts.
     fn decode(cmdline: &[u16]) -> String {
         let no_nul = cmdline.strip_suffix(&[0]).expect("trailing NUL");
         String::from_utf16(no_nul).expect("valid UTF-16")
@@ -151,8 +133,6 @@ mod tests {
 
     #[test]
     fn backslashes_before_a_quote_double_but_elsewhere_stay_literal() {
-        // A trailing backslash run doubles before the closing quote; an interior one is
-        // literal. A `\"` becomes `\\\"`.
         let c = build_command_line(&args(&["p.exe", "C:\\a dir\\"]));
         assert_eq!(decode(&c), "p.exe \"C:\\a dir\\\\\"");
         let c2 = build_command_line(&args(&["p.exe", "x\\\"y z"]));
@@ -165,7 +145,6 @@ mod tests {
         assert_eq!(decode(&c), "C:\\Windows\\System32\\cmd.exe");
     }
 
-    /// Decode an env block into its `KEY=VAL` entries for asserts.
     fn decode_block(block: &[u16]) -> Vec<String> {
         let mut entries = Vec::new();
         let mut cur: Vec<u16> = Vec::new();
@@ -199,7 +178,6 @@ mod tests {
 
     #[test]
     fn env_block_dedupes_case_insensitively_last_wins() {
-        // An inherited `Path` plus an injected `PATH`: one entry, the last.
         let block = build_env_block(&pairs(&[
             ("Path", "C:\\old"),
             ("TERM", "dumb"),

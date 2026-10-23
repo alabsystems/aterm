@@ -55,7 +55,8 @@ pub(crate) mod queue_ffi_census {
     }
 }
 
-/// The owner of the render queue (see the module header).
+/// The owner of the one render queue: it mints every [`CommandBuffer`], so command buffers
+/// schedule in commit order.
 #[derive(Debug)]
 pub(crate) struct EncodeSession {
     /// The one `MTLCommandQueue` of the encode and present path. Lent only to
@@ -194,7 +195,10 @@ impl<'s> CommandBuffer<'s> {
         }
         let StoreAction::Store = desc.store;
         let _pool = AutoreleasePool::new();
-        // SAFETY: the pass descriptor, `colorAttachments`, its subscript and the encoder are autoreleased into the pool; the encoder is retained to +1 before the pop.
+        // SAFETY: the pass descriptor, `colorAttachments`, its subscript and the
+        // encoder are autoreleased into the pool; the encoder is retained to +1
+        // before the pop. Every setter is a message on a live object with its
+        // prototype written out.
         let enc = unsafe {
             let rp_cls = class(c"MTLRenderPassDescriptor");
             let mk: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
@@ -315,7 +319,8 @@ impl<'s> CommandBuffer<'s> {
             ));
         }
         let _pool = AutoreleasePool::new();
-        // SAFETY: `blitCommandEncoder` returns an autoreleased encoder owned by the pool through `endEncoding`.
+        // SAFETY: `blitCommandEncoder` returns an autoreleased encoder owned by
+        // the pool through `endEncoding`. The rects were validated above.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let blit = get(self.cb.id(), sel(c"blitCommandEncoder"));
@@ -489,7 +494,10 @@ fn report_gpu_span(cb: Id, token: crate::gpu_time::FrameToken<'static>) {
         };
         token.complete(span);
     };
-    // SAFETY: `MTLCommandBufferHandler` is `void (^)(id<MTLCommandBuffer>)` — exactly `(Id) -> ()`, the prototype this block is invoked with.
+    // SAFETY: `MTLCommandBufferHandler` is `void (^)(id<MTLCommandBuffer>)` —
+    // exactly `(Id) -> ()`, the prototype this block is invoked with. The
+    // closure captures one `Copy` token, does not allocate or panic, and the
+    // sink contract forbids blocking or unwinding.
     let Some(block) = (unsafe { aterm_objc::RcBlock::new1(handler) }) else {
         token.complete(None);
         return;
@@ -766,7 +774,9 @@ impl CbProbe {
     }
 }
 
-// SAFETY: the probe only reads command-buffer status (thread-safe reads) and waits; drop is `objc_release`, which is thread-safe.
+// SAFETY: the probe only reads command-buffer status (thread-safe reads) and
+// waits; drop is `objc_release`, which is thread-safe. The tap ring's
+// `WindowGpu` crosses a thread once at startup.
 unsafe impl Send for CbProbe {}
 
 /// A committed command buffer: the non-blocking completion handle used in place of `addCompletedHandler:`.

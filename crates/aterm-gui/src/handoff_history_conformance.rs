@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `NativeUpdateHistoryCarry`
-//! (`aterm_models_update::native_update_history_carry_model`): a self-update
-//! carries every history line of a tab, or counts it.
-//!
-//! Every path of the machine (the export, up to two lines of output and a
-//! rewrap in any order, the park, an optionally corrupted sidecar, an
-//! optional scrollback clear before the import, and the import) is driven
-//! through the real code on real engines: `HistoryExporter` writes the sidecar
-//! from a live `Terminal`; the park is `Terminal::checkpoint_carry` (at the
-//! machine's `Cap`) plus [`capture_head`]; the join is [`stamp_manifest`]
-//! (which calls [`join`]); the take-before-proof is [`incoming`]; the adopt is
-//! `spawn::hydrate_adopted_engine`; the import is [`run_imports`]. Output is
-//! `Terminal::process`, the rewrap a resize one column narrower, the
-//! corruption one flipped byte in the sidecar, the clear an `ESC [3J`. The
-//! export runs without following (the fork lane's shape); the launched lane's
-//! following is pinned by
-//! `a_following_export_takes_what_lands_after_its_first_pass`.
-//!
-//! Projection after every step: `exp` — the export's fenced line count;
-//! `total` — the parent's history at the park; `carried` —
-//! [`carried_history`] of the checkpoint; `take` — what the join named;
-//! `dropped` — the record's `history_dropped`; `held` — the successor's
-//! history after the import; `failed` — the report's `failed_lines`. Where
-//! nothing was lost, the successor's history is also compared line for line.
-//!
-//! Negative control: the `Buggy = 1` machine's four defect paths are replayed
-//! on the real code, and on each the real code lands where the buggy machine
-//! does not.
+//! Conformance tests binding `NativeUpdateHistoryCarry` (`aterm_models_update::native_update_history_carry_model`) to the real history export, park, adopt, and import pipeline.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -55,13 +28,12 @@ struct Real {
     results: Option<ExportResults>,
     exp: i64,
     park: Option<(TerminalCheckpoint, SessionHandoff, i64)>,
-    /// The successor's adopted engine and what it brought, from its first
-    /// step after the park that needs it (the clear, or the settle).
+    /// Adopted successor engine and history state.
     successor: Option<(Arc<Mutex<Terminal>>, AdoptedHistory)>,
     settled: Option<(Vec<String>, ImportReport)>,
 }
 
-/// One of the machine's constants, by name.
+/// Looks up a constant on `model` by name.
 fn constant(model: &Model, name: &str) -> i64 {
     model
         .consts
@@ -117,7 +89,7 @@ fn record() -> SessionRecord {
 }
 
 impl Real {
-    /// A live session whose history holds exactly the machine's `Deep` lines.
+    /// Creates a live session with `Deep` lines of scrollback.
     fn new(model: &Model) -> Self {
         let deep = usize::try_from(constant(model, "Deep")).expect("a count");
         let mut t = Terminal::new(ROWS, COLS);
@@ -138,8 +110,7 @@ impl Real {
         }
     }
 
-    /// The successor's take-before-proof and adopt, once: the sidecar opened
-    /// (and unlinked) by [`incoming`], the engine hydrated by the real seam.
+    /// Opens the exported sidecar via [`incoming`] and hydrates the successor engine on first use.
     fn successor(&mut self) -> &mut (Arc<Mutex<Terminal>>, AdoptedHistory) {
         if self.successor.is_none() {
             let (checkpoint, manifest, _) = self.park.as_ref().expect("parked");
@@ -262,8 +233,7 @@ impl Real {
     }
 }
 
-/// The projection: the real system's facts, under the machine's names, for
-/// every variable the steps so far have defined.
+/// Projects `real` into the model's state variables.
 fn project(real: &Real) -> State {
     let mut s = State::new();
     s.insert("exp", real.exp);
@@ -297,7 +267,7 @@ fn project(real: &Real) -> State {
     s
 }
 
-/// Every path from the initial state to a settled one (the stutter left out).
+/// Enumerates every non-stuttering path from the initial state to `phase == 3`.
 fn paths(model: &Model) -> Vec<Vec<&'static str>> {
     let mut out = Vec::new();
     let mut stack = vec![(model.init_state(), Vec::new())];
@@ -321,8 +291,7 @@ fn paths(model: &Model) -> Vec<Vec<&'static str>> {
     out
 }
 
-/// Run `path` on the real system and on `model`, and return where they
-/// disagree (empty: the real code matches the machine along this path).
+/// Steps `path` on both the real system and `model`, returning any variable or line-content mismatches.
 fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
     let mut real = Real::new(model);
     let mut state = model.init_state();
@@ -339,8 +308,6 @@ fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
             }
         }
     }
-    // Where nothing was lost (and nothing cleared), the successor holds the
-    // parent's history itself, not merely as many lines.
     if let Some((held, report)) = &real.settled
         && report.lost() == 0
         && report.failed.is_none()
@@ -354,13 +321,10 @@ fn divergence(model: &Model, path: &[&'static str]) -> Vec<String> {
     out
 }
 
-/// Tier-1: every path of the committed machine, on the real code.
+/// Verifies that all 22 paths of `native_update_history_carry_model` match the real implementation.
 #[test]
 fn the_real_history_carry_is_the_derived_machine() {
     let model = aterm_models_update::native_update_history_carry_model();
-    // Nine interleavings of up to two lines and a rewrap; the two that name a
-    // sidecar branch four ways (corruption, clear, both, neither), the seven
-    // others two ways (clear or not): twenty-two paths.
     let all = paths(&model);
     assert_eq!(all.len(), 22, "the machine's paths: {all:?}");
     let mut failures = Vec::new();
@@ -378,10 +342,7 @@ fn the_real_history_carry_is_the_derived_machine() {
     );
 }
 
-/// Negative control: each of the `Buggy = 1` machine's four defect paths ends
-/// where the real code does not (the real carry counts the fallback, refuses
-/// the moved history, counts the failed sidecar, keeps a cleared scrollback
-/// cleared).
+/// Negative control: each of the `Buggy = 1` model's four defect paths diverges from the real implementation.
 #[test]
 fn the_buggy_machine_is_not_the_real_history_carry() {
     let buggy = aterm_spec::interp::with_buggy(

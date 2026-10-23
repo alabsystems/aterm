@@ -20,7 +20,7 @@ pub fn running_posture() -> Option<InstallPosture> {
     Some(posture_from(&exe))
 }
 
-/// What the running copy is — decides whether the other-copy clause.
+/// What the running copy is — decides whether the other-copy clause is made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Running {
     /// An installed `.app` the updater may replace (`bundle::resolve` semantics).
@@ -43,7 +43,7 @@ pub struct OtherCopy {
 /// The answer: the running copy, what kind of thing it is, and the other copies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhichCopy {
-    /// macOS `.app` root containing the executable.
+    /// macOS `.app` root containing the executable; otherwise the executable path.
     pub running: PathBuf,
     /// See [`Running`].
     pub kind: Running,

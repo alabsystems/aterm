@@ -49,8 +49,6 @@ fn release_value(release: ReleaseObject, slug: &Slug, latest_id: Option<Option<u
     value
 }
 
-/// Reads GitHub's latest release id when the output projection includes `latest`, reusing
-/// the caller's `how` so private repos remain visible.
 fn latest_if_wanted(
     gh: &Github,
     slug: &Slug,
@@ -68,9 +66,7 @@ fn latest_if_wanted(
 }
 
 /// `agh release list REPO [--drafts] [--tag-regex RE] [--prerelease|--no-prerelease]`.
-///
 /// # Errors
-///
 /// Usage for contradicting flags or a bad regex; the listing's error.
 pub(crate) fn release_list(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let prerelease = prerelease_filter(inv)?;
@@ -130,7 +126,6 @@ fn named_release(gh: &Github, inv: &Invocation) -> Result<(Slug, How, ReleaseObj
             crate::path::digits::<u64>(id)
                 .ok_or_else(|| inv.usage("--id wants a release id (digits)"))?,
         ),
-        // Validate tag syntax before any request; the drafts branch lists releases first.
         (Some(tag), None) => {
             crate::path::refuse_bad_tag(tag)?;
             Which::Tag(tag)
@@ -174,9 +169,7 @@ fn named_release(gh: &Github, inv: &Invocation) -> Result<(Slug, How, ReleaseObj
 }
 
 /// `agh release view REPO TAG | --id ID [--include-drafts]`.
-///
 /// # Errors
-///
 /// Usage for naming no release or two; the read's error (NotFound, Conflict
 /// `AmbiguousTag`, Forbidden `no_push`).
 pub(crate) fn release_view(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
@@ -193,9 +186,7 @@ pub(crate) fn release_view(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 }
 
 /// `agh release latest REPO`: GitHub's own latest pointer.
-///
 /// # Errors
-///
 /// NotFound when the repository has no latest release.
 pub(crate) fn release_latest(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -214,11 +205,8 @@ pub(crate) fn release_latest(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome>
     })
 }
 
-/// `agh release newest REPO [--tag-regex RE] [--prerelease|--no-prerelease]`: the newest
-/// published release by `created_at` that passes the filters.
-///
+/// `agh release newest REPO [--tag-regex RE] [--prerelease|--no-prerelease]`.
 /// # Errors
-///
 /// Usage for contradicting flags or a bad regex; NotFound when none matches.
 pub(crate) fn release_newest(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let prerelease = prerelease_filter(inv)?;
@@ -247,11 +235,8 @@ pub(crate) fn release_newest(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome>
     })
 }
 
-/// `agh release assets REPO TAG | --id ID [--include-drafts]`: the release's assets, sorted
-/// by name, `--limit` after the sort.
-///
+/// `agh release assets REPO TAG | --id ID [--include-drafts]`.
 /// # Errors
-///
 /// As `release view`.
 pub(crate) fn release_assets(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let gh = ctx.github()?;
@@ -322,7 +307,6 @@ fn download_target(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
         }
     }
     let out = output(ctx, inv, names)?;
-    // Validate destination paths before making any network request.
     let dests: Vec<PathBuf> = match &out {
         Out::Stdout => Vec::new(),
         Out::File(file) => vec![file.clone()],
@@ -387,13 +371,11 @@ fn output(ctx: &Ctx, inv: &Invocation, names: &[&str]) -> Result<Out> {
     }
 }
 
-/// `agh release download REPO TAG | --id ID --asset NAME… [--dir D | --output F |
-/// --output -] [--clobber] [--include-drafts]`.
-///
+/// `agh release download REPO TAG | --id ID --asset NAME…`: each asset checked, in the order
+/// given. The first error stops the verb; files already finished stay, each whole and verified.
 /// # Errors
-///
-/// Usage for the argument checks; NotFound for an asset name the release lacks;
-/// `download::fetch`'s errors.
+/// Usage for the argument checks; NotFound for an asset name the release lacks (every name is
+/// checked before the first byte moves); the read's and `download::fetch`'s errors.
 pub(crate) fn release_download(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let names = inv.flag_all("--asset");
     let target = download_target(ctx, inv, &names)?;
@@ -437,7 +419,6 @@ pub(crate) fn release_download(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcom
             .download(asset, sink, expect)
         {
             Ok(done) => done,
-            // If stdout's reader closed early, end the stream cleanly with exit 0.
             Err(_) if stdout.gone => break,
             Err(error) => return Err(error),
         };

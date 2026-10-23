@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Program output must change the row the prism wake decorates. A TUI can
-//! keep its caret on an unchanged composer while repainting a timer elsewhere.
+//! Output streak row attribution and model conformance tests.
 
 use std::time::{Duration, Instant};
 
@@ -110,8 +109,6 @@ fn another_rows_timer_cannot_paint_the_stationary_composer() {
     assert!(!h.streak.is_active());
 }
 
-/// A write that leaves no new ink is not output and lights nothing; the next
-/// genuinely new glyph still earns light.
 #[test]
 fn a_write_that_adds_no_new_ink_is_not_output() {
     for (name, initial, repaint, fresh) in [
@@ -141,7 +138,6 @@ fn a_write_that_adds_no_new_ink_is_not_output() {
     }
 }
 
-/// Genuinely new ink is output, and only the row it was written on lights.
 #[test]
 fn new_ink_is_output_on_the_row_it_was_written_on() {
     let full_row = "x".repeat(COLS);
@@ -186,8 +182,6 @@ fn a_rewritten_wide_glyph_owns_both_columns() {
 
 #[test]
 fn sparse_particle_rewrites_never_light_the_unchanged_composer_or_gaps() {
-    // Braille particles and ASCII obey the same rule: attribution is by changed
-    // cells, not a Unicode-block exception.
     for particles in [["⠁", "⠂"], ["x", "y"]] {
         let mut h = Host::new(&format!(
             "\x1b[6;3HAsk Codex\x1b[6;25H{}\x1b[6;41H{}\x1b[6;3H",
@@ -195,8 +189,6 @@ fn sparse_particle_rewrites_never_light_the_unchanged_composer_or_gaps() {
         ));
         let placeholder = h.input.cells[5][2..11].to_vec();
         let mut painted = 0;
-        // Enough sustained arrivals to exercise both comets and the flood
-        // ribbon: neither may bridge from column 24 to 40 over blank cells.
         for n in 0..60 {
             let ch = particles[(n + 1) % 2];
             assert!(h.output(&format!("\x1b[6;25H{ch}\x1b[6;41H{ch}\x1b[6;3H")));
@@ -238,9 +230,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
     let model = output_streak_attribution_model();
     let mut state = model.init_state();
     let mut visited = std::collections::BTreeSet::new();
-    // Only the public licence decision comes from OutputStreak. Token changes
-    // and glyph identity are read from the real terminal; event facts below
-    // describe the VT stimuli and are pinned against its actual visible cells.
     let mut step =
         |action, licensed: bool, token: i64, snapshot: i64, fresh, echo, moved, based| {
             let mut next = state.clone();
@@ -306,8 +295,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
     assert_eq!(h.input.cells[0][0].ch, 'a');
     step("Echo", licensed, token, glyph(&h), 1, 1, 0, 1);
 
-    // Consuming the echo snapshot is observable at the next non-echo token:
-    // leaving the old 'b' behind would mis-license unchanged 'a' here.
     h.now += Duration::from_secs(1);
     let before = h.term.content_seq();
     let licensed = h.output("\x1b[3;1Htimer 2\x1b[1;2H");
@@ -322,8 +309,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
     assert_eq!(h.input.cells[1][0].ch, 'a');
     step("Relocated", licensed, token, glyph(&h), 1, 0, 1, 1);
 
-    // A geometry discontinuity establishes history before accepting another
-    // character. Exercise the real helper with one fewer supplied visible row.
     let before = h.term.content_seq();
     h.term.process(b"\rb");
     h.term.cell_frame_into(&mut h.input, ROWS, COLS);
@@ -338,8 +323,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
     token ^= i64::from(h.term.content_seq() != before);
     step("GeometryBaseline", licensed, token, glyph(&h), 0, 0, 0, 1);
 
-    // The host's width changes again while the snapshot/token remains the
-    // same. This must pass through the geometry baseline before the idle gate.
     let before = h.term.content_seq();
     let licensed = h.streak.note_output_cells(
         &h.input.cells,
@@ -369,9 +352,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
 
     assert_eq!(visited, model.actions.iter().map(|a| a.name).collect());
 
-    // A wrong licence input through the low-level API: pass existing ink as if
-    // a globally changed token meant row damage. The projection must reject
-    // its (wrong) licence decision.
     let mut wrong = OutputStreak::new(17);
     assert!(!wrong.note_output(1, &[(0, 0, 0)], h.now, false));
     let wrong_licence = wrong.note_output(2, &[(0, 0, 0)], h.now, false);
@@ -382,8 +362,6 @@ fn real_cell_observations_refine_the_attribution_snapshot_model() {
     bad.insert("licensed", i64::from(wrong_licence));
     assert!(!model.check_invariant("LicensedRequiresFreshUndiscountedInk", &bad));
 
-    // Reflowed old text does differ at the newly selected coordinates; that
-    // alone passes the fresh-ink law. The geometry law must reject it.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut reflow = model.init_state();
     assert!(model.fire("Baseline", &mut reflow));
@@ -398,9 +376,6 @@ fn width_only_reflow_does_not_licence_existing_text_as_new_output() {
     let original_token = h.term.content_seq();
     assert_eq!((h.input.cursor_row, h.input.cursor_col), (0, 36));
 
-    // Real geometry change, no PTY write. Height stays fixed, while existing
-    // text wraps onto a formerly blank row. Sparse row lengths cannot tell
-    // this apart from output; the host's actual column count can.
     h.now += Duration::from_secs(1);
     h.term.resize(ROWS as u16, 24);
     h.term.cell_frame_into(&mut h.input, ROWS, 24);
@@ -457,9 +432,6 @@ fn viewport_change_retires_pending_and_live_output_even_before_a_new_token() {
             if terminal_resized {
                 h.term.resize(ROWS as u16, 24);
             }
-            // A host can receive its new viewport before a resized terminal
-            // frame. The independently supplied geometry must retire the old
-            // effect even when the content token still names the same cells.
             h.term.cell_frame_into(&mut h.input, ROWS, 24);
             assert_eq!(h.term.content_seq() != before, terminal_resized);
             assert!(!h.streak.note_output_cells(
@@ -493,7 +465,5 @@ fn compact_row_growth_at_fixed_dimensions_preserves_live_output() {
         "prefix growth is not a geometry reset"
     );
     assert_ne!(h.paint(), 0);
-    // The already-admitted comet continues on its original text. A reset on
-    // sparse prefix growth would instead erase it or jump to the later word.
     assert!(h.out.iter().all(|q| q.x + q.w <= 5 * 8));
 }

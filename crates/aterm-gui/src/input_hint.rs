@@ -11,7 +11,11 @@ static TYPING_HOT_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
 /// How long after a keystroke the reader keeps its term-lock holds fine.
 pub(crate) const TYPING_HOT_TAIL_NS: u64 = 250_000_000;
 
-/// Arm the window.
+/// Arm the window: a human is waiting on the UI thread — a key press, a
+/// wheel/trackpad gesture, a mouse button press, input a control client or
+/// controller host writes — so the PTY reader must keep its term-lock holds
+/// FINE (and the gather its short batch budget) until [`TYPING_HOT_TAIL_NS`]
+/// after the LAST such input.
 pub(crate) fn arm() {
     TYPING_HOT_UNTIL_NS.store(
         crate::metrics::now_ns().saturating_add(TYPING_HOT_TAIL_NS),

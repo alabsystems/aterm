@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The mark and the ring of marks set before it: `set-mark-command`, the
-//! commands that move by the ring (`pop-to-mark-command`,
-//! `exchange-point-and-mark`, `mark-whole-buffer`), and the buffer-end
-//! motions that leave a mark behind. The ring is the workspace's global
-//! one; a document's marks are its entries for that document, most recent
-//! first, and they move with the text the workspace edits.
+//! Mark and global mark-ring commands for editor buffers.
 
 use super::view::{EditorBufferView, Selection, clamp_to_grapheme_boundary};
 use super::workspace::{EditorEffect, EditorError, EditorWorkspace, GlobalMark, snapshot_for_view};
 use crate::store::{DocumentId, DocumentStore, EditDelta, rebase_position};
 
-/// How many marks the ring keeps, across every document.
 const MARK_RING_LIMIT: usize = 64;
 
 const NO_MARK: &str = "No mark set in this buffer";
 
 impl EditorWorkspace {
-    /// Push `offset` in `document` onto the front of the mark ring.
     fn push_mark(&mut self, document: DocumentId, offset: usize) {
         self.global_mark_ring
             .push_front(GlobalMark { document, offset });
@@ -35,9 +28,6 @@ impl EditorWorkspace {
         }
     }
 
-    /// The most recent mark set in `document`, where `text` can hold one: a
-    /// commit this workspace did not make (another face, the disk) may have
-    /// moved the text under it.
     fn last_mark(&self, document: DocumentId, text: &str) -> Option<usize> {
         self.global_mark_ring
             .iter()

@@ -20,15 +20,12 @@ fn pane_snapshot(
     (snap, terminal_blank_cell(&term))
 }
 
-/// `fill_divider_grid` produces a full `rows`x`cols` grid of identical seam
-/// cells, no cursor, single-width rows.
+/// `fill_divider_grid` produces a full `rows`x`cols` grid of identical seam cells with no cursor and single-width rows.
 #[test]
 fn divider_grid_is_uniform_seam() {
     let theme = Theme::default();
     let seam = divider_cell(theme);
     let mut dst = RenderInput::empty();
-    // Host visuals and present transforms belong to the frame that made them: a single-pane ->
-    // split/native transition must not carry any of them in the reused scratch.
     dst.ink.push(aterm_render::InkCell {
         row: 0,
         col: 0,
@@ -147,8 +144,7 @@ fn divider_grid_is_uniform_seam() {
     );
 }
 
-/// An implicit blank is resolved from the pane's live terminal defaults, not
-/// the host theme. OSC 10/11 update these defaults, and DECSCNM swaps them.
+/// An implicit blank is resolved from the pane's live terminal defaults (updated by OSC 10/11 and swapped by DECSCNM).
 #[test]
 fn terminal_blank_tracks_live_defaults_and_decscnm() {
     let mut term = Terminal::new(1, 2);
@@ -173,13 +169,11 @@ fn terminal_blank_tracks_live_defaults_and_decscnm() {
     assert_eq!(reversed.bg, normal.fg, "DECSCNM swaps default bg");
 }
 
-/// `blit_pane_into` places a pane's cells at the given offset and leaves the divider column a
-/// seam.
+/// `blit_pane_into` places a pane's cells at the given offset and leaves the divider column a seam.
 #[test]
 fn blit_places_pane_and_keeps_seam() {
     let theme = Theme::default();
     let seam = divider_cell(theme);
-    // 1x5 window: [pane A (cols 0..2)] [divider col 2] [pane B (cols 3..5)].
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 5, theme, None);
     let (left, left_blank) = pane_snapshot("AB", 1, 2);
@@ -194,18 +188,15 @@ fn blit_places_pane_and_keeps_seam() {
     assert_eq!(row[4].ch, 'D');
 }
 
-/// A split pane's BiDi row keeps its visual→logical map at the pane's columns, so its
-/// relocated selection lights the cells it copies; the left pane and divider stay unpermuted.
+/// A split pane's BiDi row keeps its visual-to-logical map at the pane's columns without permuting sibling panes or the divider.
 #[test]
 fn a_composed_bidi_pane_lights_the_cells_its_selection_copies() {
     use crate::app_render::push_pane_selection;
     use aterm_core::selection::{SelectionSide, SelectionType};
     let theme = Theme::default();
-    // 1x20 window: [left pane 0..6] [divider 6] [right pane 7..20].
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 20, theme, None);
     let (left, left_blank) = pane_snapshot("LEFT", 1, 6);
-    // `ab אבג cd`, painted `ab גבא cd`: logical 3 (א) sits at pane column 5.
     let mut term = Terminal::new(1, 13);
     term.process("ab \u{05D0}\u{05D1}\u{05D2} cd".as_bytes());
     let sel = term.text_selection_mut();
@@ -229,18 +220,15 @@ fn a_composed_bidi_pane_lights_the_cells_its_selection_copies() {
     assert_eq!(dst.logical_col(0, 6), 6, "so is the divider");
 }
 
-/// DEC line size is per pane, and a composite row can hold several panes: each pane's
-/// line size must stay confined to its own columns, not win the whole row.
+/// Each pane's DEC line size stays confined to its own columns in a composite row.
 #[test]
 fn blit_confines_each_pane_line_size_to_its_own_columns() {
     use aterm_core::grid::LineSize;
     let theme = Theme::default();
-    // 1x11 window: [left pane 0..5] [divider 5] [right pane 6..11].
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 11, theme, None);
 
     let (left, left_blank) = pane_snapshot("AB", 1, 5);
-    // ESC # 6 = DECDWL: this pane's line really is double-width.
     let (right, right_blank) = pane_snapshot("\x1b#6CD", 1, 5);
     assert_eq!(
         left.line_sizes[0],
@@ -253,7 +241,6 @@ fn blit_confines_each_pane_line_size_to_its_own_columns() {
         "control: the right pane really did take DECDWL"
     );
 
-    // Blit the double-width pane last, the order that would otherwise win the row.
     blit_pane_into(&mut dst, &left, 0, 0, left_blank);
     blit_pane_into(&mut dst, &right, 0, 6, right_blank);
 
@@ -275,8 +262,7 @@ fn blit_confines_each_pane_line_size_to_its_own_columns() {
     }
 }
 
-/// An all-single-width split records no spans, so the renderers keep their uniform
-/// `col * cell_w` path.
+/// An all-single-width split records no spans, keeping the uniform `col * cell_w` path.
 #[test]
 fn blit_leaves_ordinary_splits_uniform() {
     let theme = Theme::default();
@@ -296,8 +282,7 @@ fn blit_leaves_ordinary_splits_uniform() {
     );
 }
 
-/// Panes need not blit left to right: the DEC pane records exactly one run over its own
-/// columns in either order.
+/// A DEC double-width pane records a single span over its own columns regardless of blit order.
 #[test]
 fn blit_records_pane_local_line_size_spans() {
     use aterm_core::grid::LineSize;
@@ -306,16 +291,12 @@ fn blit_records_pane_local_line_size_spans() {
     let theme = Theme::default();
     let (left, left_blank) = pane_snapshot("AB", 1, 2);
     let mut right_term = Terminal::new(1, 2);
-    // Set only the row mode: a 2-column DECDWL row has one visible position, so text would
-    // wrap and scroll this one-row terminal onto a fresh SingleWidth line.
     right_term.process(b"\x1b#6");
     let mut right = RenderInput::empty();
     right_term.cell_frame_into(&mut right, 1, 2);
     let right_blank = terminal_blank_cell(&right_term);
     assert_eq!(right.line_sizes, vec![LineSize::DoubleWidth]);
 
-    // Only the DEC pane records a run; an unclaimed column renders SingleWidth, which keeps
-    // ordinary splits on the uniform path.
     let expected = vec![LineSizeSpan::new(3, 5, LineSize::DoubleWidth)];
     for reverse in [false, true] {
         let mut dst = RenderInput::empty();
@@ -345,8 +326,7 @@ fn blit_records_pane_local_line_size_spans() {
     }
 }
 
-/// One scalar cannot hold each pane's OSC 11/DECSCNM default: each pane row records its own
-/// implicit background span, the divider gap keeps the scalar, and blit order cannot change it.
+/// Each pane row records its own implicit default-background span regardless of blit order.
 #[test]
 fn blit_records_pane_local_default_background_spans() {
     use aterm_core::render::{COLOR_UNSET, DefaultBgSpan};
@@ -384,8 +364,7 @@ fn blit_records_pane_local_default_background_spans() {
     }
 }
 
-/// A native tray's underlay (it may antialias transparently) is a themed blank pane, never the
-/// divider sentinel, with the same SingleWidth pane clip as a terminal leaf.
+/// `fill_blank_pane_into` paints a themed blank pane rectangle with `SingleWidth` and default-background spans.
 #[test]
 fn native_blank_underlay_replaces_only_its_pane_rectangle() {
     use aterm_core::grid::LineSize;
@@ -418,8 +397,7 @@ fn native_blank_underlay_replaces_only_its_pane_rectangle() {
     }
 }
 
-/// A snapshot keeps unwritten row tails sparse; the blit still paints the pane's full rectangle
-/// with the terminal's implicit blank, or the divider sentinel shows through as gray bands.
+/// `blit_pane_into` pads ragged or sparse snapshot rows to the full pane rectangle with the terminal's implicit blank cell.
 #[test]
 fn blit_ragged_rows_paints_full_pane_rectangles() {
     let theme = Theme::default();
@@ -431,8 +409,6 @@ fn blit_ragged_rows_paints_full_pane_rectangles() {
         b: 213,
     });
     term.set_default_background(aterm_core::terminal::Rgb { r: 7, g: 11, b: 13 });
-    // The final materialized cell has a non-default background. Padding must
-    // use the implicit terminal blank, never clone this cell's SGR style.
     term.process(b"AB\x1b[1;41mC");
     let mut pane = RenderInput::empty();
     term.cell_frame_into(&mut pane, 3, 5);
@@ -445,7 +421,6 @@ fn blit_ragged_rows_paints_full_pane_rectangles() {
     assert!(pane.cells[1].is_empty(), "row 1 is intentionally sparse");
     assert!(pane.cells[2].is_empty(), "row 2 is intentionally sparse");
 
-    // 3x11 window: [left pane 0..5] [divider 5] [right pane 6..11].
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 3, 11, theme, None);
     blit_pane_into(&mut dst, &pane, 0, 0, blank);
@@ -461,14 +436,12 @@ fn blit_ragged_rows_paints_full_pane_rectangles() {
     }
 }
 
-/// A blit that would overflow the composite (a degenerate too-small window) is
-/// bounds-checked: it writes only the cells that fit, never past the row.
+/// `blit_pane_into` clips writes that would overflow the composite grid bounds.
 #[test]
 fn blit_is_bounds_checked() {
     let theme = Theme::default();
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 3, theme, None);
-    // A 1x5 pane blitted at col_off 1 into a 3-wide composite: only cols 1,2 fit.
     let (wide, blank) = pane_snapshot("VWXYZ", 1, 5);
     blit_pane_into(&mut dst, &wide, 0, 1, blank);
     assert_eq!(dst.cells[0].len(), 3, "the composite row is not grown");
@@ -501,13 +474,11 @@ fn test_image_ref() -> aterm_core::grid::extra::ImageRef {
     }
 }
 
-/// `fill_divider_grid` rebuilds `images` to exactly `rows` empty rows, keeping it aligned with
-/// `cells` for the per-row damage gate.
+/// `fill_divider_grid` rebuilds `images` to `rows` empty rows aligned with `cells`.
 #[test]
 fn divider_grid_resets_stale_images_to_window_rows() {
     let theme = Theme::default();
     let mut dst = RenderInput::empty();
-    // A stale, oversized images vec from an earlier compose.
     dst.images = vec![Vec::new(); 7];
     dst.images[2].push((1, test_image_ref()));
     fill_divider_grid(&mut dst, 3, 5, theme, None);
@@ -527,14 +498,12 @@ fn divider_grid_resets_stale_images_to_window_rows() {
     );
 }
 
-/// `blit_pane_into` copies a pane's inline-image placements into the composite,
-/// shifted by `col_off` like clusters and combining marks.
+/// `blit_pane_into` shifts a pane's inline-image placements by `col_off`.
 #[test]
 fn blit_copies_pane_images_col_shifted() {
     let theme = Theme::default();
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 5, theme, None);
-    // A 1x2 right pane (blitted at col_off 3) carrying an image at its local col 0.
     let (mut right, blank) = pane_snapshot("CD", 1, 2);
     let im = test_image_ref();
     right.images[0].push((0, im.clone()));
@@ -551,8 +520,7 @@ fn blit_copies_pane_images_col_shifted() {
     );
 }
 
-/// During resize convergence a snapshot can carry metadata from a wider grid: every sparse
-/// channel clips at `src.cols` like the cells, or it lands on the divider or neighbour.
+/// `blit_pane_into` clips sparse cluster, combining, and image metadata to `src.cols`.
 #[test]
 fn blit_clips_sparse_metadata_to_pane_rectangle() {
     let theme = Theme::default();
@@ -593,8 +561,7 @@ fn blit_clips_sparse_metadata_to_pane_rectangle() {
     );
 }
 
-/// A wider snapshot can cut a wide glyph at the pane boundary: the orphaned lead goes too, or
-/// both renderers paint its two-cell glyph over the divider.
+/// `blit_pane_into` replaces a wide glyph lead cut by the pane boundary with `blank` and drops its cluster metadata.
 #[test]
 fn blit_drops_wide_glyph_cut_by_pane_boundary() {
     let theme = Theme::default();
@@ -610,7 +577,6 @@ fn blit_drops_wide_glyph_cut_by_pane_boundary() {
         "fixture has a clipped wide-glyph continuation at local col 2"
     );
 
-    // [two-column pane] [divider] [two-column sibling].
     let mut dst = RenderInput::empty();
     fill_divider_grid(&mut dst, 1, 5, theme, None);
     blit_pane_into(&mut dst, &pane, 0, 0, blank);

@@ -272,6 +272,7 @@ pub(crate) fn oklab_to_rgb([l, a, b]: [f32; 3]) -> u32 {
 }
 
 /// The Euclidean OKLab distance between two `0x00RRGGBB` colours.
+#[cfg(test)]
 #[inline]
 pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
     let (x, y) = (oklab(a), oklab(b));

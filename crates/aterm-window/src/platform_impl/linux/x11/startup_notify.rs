@@ -4,7 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/activation.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
+//! Modified by the aterm project in 2026; see the repository NOTICE. (Only the launchee's
+//! half survives: naming the launch on the window and ending its sequence. Requesting a token
+//! for a launch of our own is cut. The messages are aterm-x11's `ClientMessage`s, where
+//! upstream used x11rb's.)
 
 use aterm_x11::proto::event::ClientMessage;
 use aterm_x11::proto::xproto;

@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The daily-driver CLI runs a real shell through the protected spawn seam
-//! (`aterm_pty::spawn_shell_with_pid`, not raw `forkpty`/`execvp`) and stays functional:
-//! given a command it prints the command's output and exits with the shell's status. A
-//! behavioural complement to clippy.toml's `libc::forkpty` ban. It also pins that a session
-//! builds no VT model.
-//!
-//! The unix tests drive a POSIX `/bin/sh` through the binary; the `#[cfg(windows)]`
-//! twin drives the platform's default shell through the ConPTY seam. No fleet host
-//! runs Windows (`FLEET_HOST_TRIPLES`), so `verify cells` type-checks the twin
-//! and it RUNS only on a Windows host.
+//! Verifies that `aterm --session` runs a shell through the protected spawn seam and exits cleanly.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -22,21 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::launch_isolation;
 
-/// How long the CLI gets to run the scripted shell session and exit. GENEROUS —
-/// a healthy run finishes in well under a second even on a loaded machine — because
-/// the only thing this bound must catch is the exact regression these tests guard:
-/// the CLI *not exiting*. `Child::wait_with_output` has no deadline and a test run
-/// (`targo --unverified test`) has no per-test timeout, so without this bound a
-/// doesn't-exit regression manifests as the test run hanging forever instead of a
-/// red test — the failure would hide inside the harness meant to detect it.
 const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// The one way this file spawns `aterm --session`. The session lane reads the atpkg prefix
-/// under `$HOME` and may spawn a detached `aterm pkg update` against it, so every launch
-/// gets private HOME/config/data roots whose `aterm.toml` switches the package and
-/// native-update lanes off (`launch_isolation::CONFIG_OFF`), and `--no-reroute`. `/bin/sh`
-/// is the shell on unix; piped stdio still routes to the session. The roots go when the
-/// returned guard drops, so the caller holds it until the session has exited.
 fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
     let root = launch_isolation::scratch_root(&format!("aterm-protected-spawn-{test}"));
     let mut cmd = Command::new(launch_isolation::aterm_executable());
@@ -45,12 +23,7 @@ fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
     (cmd, root)
 }
 
-/// Bounded `Child::wait_with_output`: threads drain stdout and stderr (so the child never
-/// stalls on a full pipe) while `try_wait` is polled against [`CLI_EXIT_DEADLINE`]; on
-/// expiry the child is killed and the test panics with what was captured.
 fn wait_with_output_bounded(mut child: Child) -> Output {
-    // One drain thread per pipe; a stream routed to `Stdio::null()` drains empty, and a read
-    // error (the kill tearing a pipe down) ends the drain with what it has.
     fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -67,8 +40,8 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
     loop {
         match child.try_wait().expect("poll the aterm CLI child") {
             Some(status) => {
-                // The child is gone, so its pipe write-ends are closed and the drains reach
-                // EOF (the grandchild shell lives on the PTY slave, not these pipes).
+                // The child is gone, so its pipe write-ends are closed and the drains reach EOF
+                // (the grandchild shell lives on the PTY slave, not these pipes).
                 return Output {
                     status,
                     stdout: stdout.join().expect("join the stdout drain"),
@@ -76,9 +49,6 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
                 };
             }
             None if Instant::now() >= deadline => {
-                // Kill and reap, then join with a bound: a hung CLI that also leaked a pipe
-                // write-end into a descendant outliving the kill would block an unbounded
-                // join, and the panic path would hang too.
                 let _ = child.kill();
                 let _ = child.wait();
                 fn join_bounded(handle: std::thread::JoinHandle<Vec<u8>>) -> String {
@@ -108,7 +78,6 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
 #[cfg(unix)]
 #[test]
 fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
-    // No containment flag: the default User mode — no sandbox, fast.
     let (mut cmd, _root) = session_command("protected");
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -117,8 +86,6 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
         .spawn()
         .expect("spawn the aterm CLI binary");
 
-    // `$((6*7))` prints 42 only if a real shell evaluated it (the PTY echo of the line shows
-    // the literal). Dropping stdin after the write delivers EOF.
     child
         .stdin
         .take()
@@ -187,7 +154,6 @@ fn malformed_containment_mode_fails_closed_not_open() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the aterm CLI binary with a malformed mode");
-    // The shell may never start (off macOS), so a closed pipe is not an error.
     let _ = child
         .stdin
         .take()
@@ -196,14 +162,11 @@ fn malformed_containment_mode_fails_closed_not_open() {
     let out = wait_with_output_bounded(child);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // It announced the fail-closed fallback.
     assert!(
         stderr.contains("using containment"),
         "a malformed mode must announce the fallback to containment; stderr={stderr:?}"
     );
-    // `aterm_containment::os_sandbox_actuated()` is exactly this cfg.
     if cfg!(target_os = "macos") {
-        // macOS: the confined shell runs a basic command and exits success.
         assert!(
             stdout.contains("ATERM_FAILCLOSED_10"),
             "the confined shell must still run a basic command; stdout={stdout:?}"
@@ -214,7 +177,6 @@ fn malformed_containment_mode_fails_closed_not_open() {
             out.status
         );
     } else {
-        // No OS sandbox: no shell at all, exit 1, the gap named.
         assert!(
             !stdout.contains("ATERM_FAILCLOSED_10"),
             "no shell may run without the OS sandbox; stdout={stdout:?}"

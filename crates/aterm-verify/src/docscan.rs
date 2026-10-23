@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH LIBRARIES HOLD A DOCTEST, read off their sources, so the doctests stage's stand-in doc
-//! driver skips the rustdoc pass of every library that holds none
-//! ([`crate::stages::doctest_split`], [`crate::docdriver`]; most crates have none).
+//! Source scanner that detects whether a crate contains any doctests.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-/// rustdoc's own tags: a block carrying one compiles as Rust whatever else its info
-/// string says ([`info_runs`]). Error codes (`E0308`), `edition*` and
-/// `ignore-<target>` are matched by shape.
 const RUSTDOC_TAGS: [&str; 7] = [
     "rust",
     "no_run",
@@ -21,8 +16,7 @@ const RUSTDOC_TAGS: [&str; 7] = [
     "allow_fail",
 ];
 
-/// Info-string words that name a block rustdoc does not compile: the languages the tree's docs
-/// show, and `notest`, which vendored code writes for "not a test".
+/// Code-fence info-string tokens that rustdoc does not compile as Rust.
 pub const NOT_RUST: [&str; 34] = [
     "text",
     "txt",
@@ -104,8 +98,6 @@ pub fn src_holds_a_doctest(src: &Path) -> bool {
     false
 }
 
-/// `path` with its `.` and `..` components resolved lexically, so a file reached
-/// by `#[path]` and by the walk is read once.
 fn normalized(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
@@ -127,16 +119,13 @@ fn normalized(path: &Path) -> PathBuf {
 pub enum Pull {
     /// Relative to the pulling file's directory: `#[path = "…"]`, `include!("…")`.
     Beside(String),
-    /// Relative to the compiling crate's directory: `include!(concat!(env!("CARGO_MANIFEST_DIR"),
-    /// "…"))`.
+    /// Relative to the compiling crate's directory: `include!(concat!(env!("CARGO_MANIFEST_DIR"), "…"))`.
     InCrate(String),
 }
 
-/// The files `text` pulls in: each `#[path = "…"]` and each `include!(…)` that opens a line, the
-/// call read across the lines it spans.
+/// Returns the files referenced by `#[path = "…"]` and `include!(…)` in `text`.
 #[must_use]
 pub fn pulled_in(text: &str) -> Option<Vec<Pull>> {
-    /// How many lines an `include!` call is read across.
     const CALL_LINES: usize = 8;
     let lines: Vec<&str> = text.lines().collect();
     let literal = |rest: &str| Some(rest.strip_prefix('"')?.split('"').next()?.to_string());
@@ -246,8 +235,6 @@ struct DocText {
 }
 
 impl DocText {
-    /// Read one line of doc text (`raw`, after its comment marker): is a doctest
-    /// open here?
     fn line(&mut self, raw: &str) -> bool {
         let text = raw.strip_prefix(' ').unwrap_or(raw);
         let body = text.trim_start();
@@ -287,8 +274,6 @@ impl DocText {
     }
 }
 
-/// A fence opening `body`: its character, its length and its info string. A
-/// backtick run whose info string holds a backtick is inline code, not a fence.
 fn fence(body: &str) -> Option<(char, usize, &str)> {
     let c = body.chars().next().filter(|c| *c == '`' || *c == '~')?;
     let n = body.chars().take_while(|x| *x == c).count();
@@ -299,8 +284,6 @@ fn fence(body: &str) -> Option<(char, usize, &str)> {
     (c == '~' || !info.contains('`')).then_some((c, n, info))
 }
 
-/// The content indent a list marker opening `body` gives its item (`- `, `* `,
-/// `+ `, `1. `, `1) `), or `None`.
 fn list_marker(body: &str) -> Option<usize> {
     let digits = body.chars().take_while(char::is_ascii_digit).count();
     let marker = match body.as_bytes().get(digits)? {
@@ -339,9 +322,6 @@ pub fn info_runs(info: &str) -> bool {
     words.iter().any(rustdoc) || !words.iter().any(|w| NOT_RUST.contains(&w.as_str()))
 }
 
-/// Does this attribute line give doc text the scan cannot read: `doc = …` with
-/// anything but a one-line string literal free of fences (`include_str!`,
-/// `concat!`, a macro's `$doc`, a constant, a string spanning lines)?
 fn doc_attribute_hides_text(attr: &str) -> bool {
     let mut from = 0;
     while let Some(at) = attr[from..].find("doc") {
@@ -376,7 +356,6 @@ fn doc_attribute_hides_text(attr: &str) -> bool {
     false
 }
 
-/// The byte index of the `"` that closes a string literal's text, past `\"`.
 fn closing_quote(text: &str) -> Option<usize> {
     let mut escaped = false;
     for (i, c) in text.char_indices() {
@@ -393,11 +372,6 @@ fn closing_quote(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// A doctest is a block rustdoc compiles, in any doc-comment form: Rust's
-    /// info string, rustdoc's tags (error codes and `ignore-<target>` too), an
-    /// unknown word (fail wide), an indented code block, a doc attribute the scan
-    /// cannot read. Never `text`, a language, `ignore`, a plain comment, a string,
-    /// or a list item's own indented text.
     #[test]
     fn a_doctest_is_a_block_rustdoc_compiles_in_a_doc_comment() {
         for yes in [
@@ -445,7 +419,6 @@ mod tests {
         }
     }
 
-    /// What a file pulls in, as written; a computed `include!` is unreadable.
     #[test]
     fn a_file_pulls_in_its_path_and_include_targets() {
         let text = "#[path = \"../../w/src/a.rs\"]\nmod a;\n  include!(\"b.rs\");\n\
@@ -469,7 +442,6 @@ mod tests {
         );
     }
 
-    /// The walk follows a pull out of `src/`, and an unreadable pull counts.
     #[test]
     fn a_doctest_in_a_file_pulled_in_from_another_crate_counts() {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");

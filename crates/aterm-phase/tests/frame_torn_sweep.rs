@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WHOLE-FRAME SWEEP.
+//! THE WHOLE-FRAME SWEEP: over every measured screen, a reader judges a frame torn
+//! ([`ScreenReader::frame_torn`]) only where one was caught mid-redraw, and every measured
+//! half-drawn frame is one a turn-end reader takes again rather than judges
+//! (`docs/measured/half-drawn-frame-2026-10-22.md`).
 
 use aterm_phase::{Phase, Program};
 

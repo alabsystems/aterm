@@ -3,20 +3,9 @@
 // Author: Andrew Yates
 
 //! Response capability: a structural gate on the `send_response` sink.
-//!
-//! Every response-producing handler (DA, DSR/CPR, DECRQSS, XTGETTCAP, color queries,
-//! title and XTWINOPS reports, …) takes a `&ResponseCapability` and passes it to
-//! [`super::handler::TerminalHandler::send_response`]. Its only constructor
-//! ([`ResponseCapability::mint_for_dispatch`]) is called from the `ActionSink` dispatch
-//! entry points in `handler_actions.rs`, and the parser crate cannot name the type.
-//!
-//! The capability authorizes an attempt; rate limiting
-//! ([`super::response_rate_limiter::ResponseRateLimiter`]) and the
-//! [`super::MAX_RESPONSE_BUFFER_SIZE`] cap still run inside `send_response`.
 
 /// Dispatch kind that selects the [`aterm_policy::selector::DispatchedSequence`]
 /// probe shape. Lives here because the terminal module is its only producer.
-/// Production probes only the response sink ([`Self::response_sink`]).
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ProbeKind {
     /// DCS dispatch (ESC P ... `<final_byte>` ST).
@@ -56,11 +45,6 @@ impl ResponseCapability {
     /// Engine-consulting variant of [`Self::mint_for_dispatch`]: probes the
     /// [`aterm_policy::engine::PolicyEngine`] with `kind` at `origin` and returns `None`
     /// when it denies; with no engine or no matching rule it mints.
-    ///
-    /// Not on the dispatch path: the `send_response` sink's probe and origin are constants,
-    /// so [`super::policy_gates`] compiles its verdict once per installed policy. This is
-    /// the reference that table is checked against
-    /// (`compiled_gate_matches_the_per_dispatch_mint`).
     #[inline]
     #[must_use]
     #[cfg(test)]
@@ -69,7 +53,6 @@ impl ResponseCapability {
         origin: aterm_policy::OriginTag,
         kind: ProbeKind,
     ) -> Option<Self> {
-        // No engine resolves to allow: skip building the probe and its heap strings.
         if engine.is_none() {
             return Some(Self::mint_for_dispatch());
         }
@@ -90,8 +73,6 @@ impl ResponseCapability {
 #[inline]
 pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSequence {
     let ProbeKind::Dcs { final_byte } = kind;
-    // DCS has no major code; the "response any" catch-all covers it via the
-    // wildcard bucket in the standard profile.
     let suffix = std::str::from_utf8(&[final_byte])
         .map(str::to_owned)
         .unwrap_or_default();

@@ -74,7 +74,8 @@ impl WakeSource {
         const extern "C" fn perform(_: *mut c_void) {}
         let identity = Box::new(0u8);
         let info = (&*identity as *const u8).cast_mut().cast::<c_void>();
-        // SAFETY: version-0 context whose `info` is only compared/hashed; released in `Drop`.
+        // SAFETY: version-0 context whose `info` is only compared/hashed; released in `Drop`, after
+        // the source is invalidated.
         unsafe {
             let mut context = CFRunLoopSourceContext {
                 version: 0,
@@ -97,7 +98,8 @@ impl WakeSource {
 
 impl Drop for WakeSource {
     fn drop(&mut self) {
-        // SAFETY: invalidates and releases the +1 source created in `new`.
+        // SAFETY: invalidates and releases the +1 source created in `new`; invalidating removes it
+        // from every mode, so a proxy outliving the loop signals a source nothing runs.
         unsafe {
             CFRunLoopSourceInvalidate(self.source);
             CFRelease(self.source as _);
@@ -208,7 +210,8 @@ impl<T: 'static> EventLoop<T> {
         };
 
         let seconds = wait.map_or(WAIT_FOREVER_SECS, |d| d.as_secs_f64());
-        // SAFETY: runs the main run loop's default mode on the main thread.
+        // SAFETY: runs the main run loop's default mode on the main thread (`new` asserted it;
+        // `EventLoop` is `!Send`).
         unsafe {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 1);
         }

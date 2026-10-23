@@ -18,9 +18,11 @@ use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
 use super::*;
 use crate::harness::accounts::Sample;
+use crate::harness::upgrade_drive::HAND_RENEW;
 use crate::harness::usage::{
     PanelRead, PanelWindow, USAGE_COMMAND, panel_sample, usage_panel_read,
 };
+use aterm_types::control_verbs::ScreenGen;
 
 /// Usage-tap state and timing at a single wall ([`Session::tap_reset`]).
 #[derive(Debug, Clone)]
@@ -79,8 +81,18 @@ pub(super) const RULES_CAP: usize = 400;
 /// Maximum duration the loop waits for the worker to react to a supervisor write.
 pub(super) const REACTION_WAIT: Duration = Duration::from_secs(10);
 
-/// Idle settle duration (ms) before pressing Enter on programs with a paste guard ([`ScreenReader::paste_guard`]).
-const PASTE_GUARD_SETTLE_MS: &str = "600";
+/// How long the echo of a fenced write must hold still before its Enter, for
+/// a program whose paste guard takes an Enter in the same burst as the text
+/// as a newline ([`aterm_phase::ScreenReader::paste_guard`]). The program
+/// must have read the text's last key at least this long before it reads the
+/// Enter ([`Session::await_echo`]).
+pub(super) const PASTE_GUARD_HOLD: Duration = Duration::from_millis(600);
+
+/// How long the echo of a fenced write may take to show whole in the
+/// composer before the text is escalated as typed and not submitted: a hang
+/// detector, never a latency budget. A starved worker draws what it read
+/// seconds late, and in pieces ([`Session::await_echo`]).
+pub(super) const ECHO_HANG: Duration = Duration::from_secs(60);
 
 /// Collapse multi-line text into a single line for a turn write.
 pub(crate) fn one_turn(text: &str) -> String {
@@ -123,7 +135,8 @@ pub(crate) fn composer_guard_at(caret: char, column: usize, text: &str) -> Strin
 
 /// Post-wake settle window before typing into an agent session.
 pub(super) const WAKE_SETTLE: Duration = Duration::from_secs(30);
-/// See [`WAKE_SETTLE`].
+/// Each session's own share of the wake's settle, added past [`WAKE_SETTLE`], is below this,
+/// so one account's sessions do not all type in the same second.
 pub(super) const WAKE_SPREAD: Duration = Duration::from_secs(60);
 
 /// How long the session repository's last answer stands for the same done words, no turn run since ([`Session::repo_read`]).
@@ -146,6 +159,85 @@ const fn restart_note_due(tries: u32) -> bool {
 /// The composer's caret row as `reader` reads it (`None`: no composer).
 fn caret_row(reader: &dyn ScreenReader, rows: &[String]) -> Option<usize> {
     reader.composer(rows).map(|(caret, _)| caret)
+}
+
+/// What a read after a fenced write shows of its text ([`echo_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Echo {
+    /// The composer holds the text whole, however it wrapped.
+    Whole,
+    /// The echo is on its way: the composer is empty, shows its placeholder or
+    /// a start of the text, or the frame was caught mid-redraw.
+    Arriving,
+    /// Anything else: another text, no composer, a prompt.
+    Other,
+}
+
+/// What [`Session::await_echo`] came to: the read the Enter is fenced on, or
+/// the read the text was left on and why (`left_typed`'s words).
+#[derive(Debug)]
+pub(super) enum Echoed {
+    Whole(Screen),
+    Not(Screen, &'static str),
+}
+
+/// What a fenced write came to ([`Session::type_fenced`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Written {
+    /// Written and submitted.
+    Submitted,
+    /// Nothing written: refused, skipped at its fence, or a read with no person count.
+    Not,
+    /// Written, not submitted: the text stands in the composer, escalated
+    /// ([`Session::left_typed`]).
+    Left,
+}
+
+/// A person keyed since the write.
+const ECHO_PERSON: &str = "the original person count changed or is unavailable";
+/// The composer shows something the text never begins as.
+const ECHO_OTHER: &str = "the composer does not show it as written";
+/// The echo did not finish within [`ECHO_HANG`].
+const ECHO_HUNG: &str = "the composer had not shown it whole a minute after it was written";
+
+/// What `screen` shows of `text` written into the composer `reader` reads.
+pub(super) fn echo_of(reader: &dyn ScreenReader, screen: &Screen, text: &str) -> Echo {
+    if reader.prompt(&screen.rows).is_some() {
+        return Echo::Other;
+    }
+    let Some((_, lines)) = reader.composer(&screen.rows) else {
+        return if reader.frame_torn(&screen.rows) {
+            Echo::Arriving
+        } else {
+            Echo::Other
+        };
+    };
+    if !typed_draft(reader, screen) {
+        return Echo::Arriving;
+    }
+    let shown = squashed(&lines.concat());
+    let want = squashed(text);
+    if shown == want {
+        Echo::Whole
+    } else if want.starts_with(&shown) {
+        Echo::Arriving
+    } else {
+        Echo::Other
+    }
+}
+
+/// Whether `screen` has not moved since a write at content seq `at` on the
+/// grid of epoch `epoch` (the generation the write was fenced on): the same
+/// grid, its content seq no later than the write's, so it shows what the
+/// write found. A grid entered since (an alternate screen, a reset) has
+/// moved, however low its own seq restarted; a read with no generation, or
+/// a write whose epoch is unknown, is never taken as unmoved.
+pub(super) fn unmoved_since(screen: &Screen, at: u64, epoch: Option<u64>) -> bool {
+    screen
+        .generation
+        .as_deref()
+        .and_then(ScreenGen::parse)
+        .is_some_and(|now| Some(now.epoch) == epoch && now.seq <= at)
 }
 
 /// The text on the composer's caret row as `reader` reads it, the caret
@@ -457,7 +549,6 @@ impl<C: Ctl> Session<'_, C> {
         check: Check,
         seq: u64,
     ) -> Option<Option<i64>> {
-        // A recording build without this observer took neither its clock
         if self.fx.replay_lacks_host_door("host.tap_window") {
             self.wall_tap = None;
             return None;
@@ -682,7 +773,7 @@ impl<C: Ctl> Session<'_, C> {
             }
     }
 
-    /// Whether the agent process launched after the newest ledger/journal row this loop found.
+    /// Whether the agent process launched after the newest ledger row this loop found.
     fn launched_since_books(&self, host: Option<&Arc<dyn IdleHost>>) -> bool {
         !self.first_books
             && self.books_last_ms.is_some_and(|last| {
@@ -806,7 +897,6 @@ impl<C: Ctl> Session<'_, C> {
                 }
             }
             (None, None) => {
-                // rule, [`TurnEndState::observe`]): the next is a new reset.
                 if worked.is_some() {
                     self.wall_reset = None;
                     self.reprint_jumps = 0;
@@ -2146,7 +2236,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Carry out what the policy decided at `point` (module docs).
+    /// Carry out what the policy decided at `point`.
     pub(super) fn turn_end_execute(
         &mut self,
         point: &Turn,
@@ -2532,7 +2622,6 @@ impl<C: Ctl> Session<'_, C> {
                 self.turn_end_execute(point, otherwise, opts, allow, review)
             }
             (Some("wait"), Some(step)) => {
-                // ([`approvals::relaunch_waits_reason`]).
                 if self.restart_waits == 0 && matches!(why, Restart::Model { .. }) {
                     self.ledger_row(
                         rule,
@@ -2803,8 +2892,28 @@ impl<C: Ctl> Session<'_, C> {
         self.set_due(self.fx.mono() + self.setup.redecide_after_skip, why);
     }
 
-    /// Hold any write while the worker has unread or undrawn input queued ([`UNDRAWN_INPUT_HANG`]).
-    fn input_unread(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
+    /// INPUT THE WORKER HAS NOT READ STANDS BEFORE ANY ACT: the `status` that
+    /// named the program for this decision ([`Self::foreground_program`])
+    /// says `input=pending|typeahead`, bytes queued to the program that its
+    /// screen does not show yet. Nothing is written behind them: journaled
+    /// `SKIPPED`, and the point decided again shortly
+    /// ([`Self::redecide_soon`]) on the screen the worker draws once it has
+    /// read them (the launch's own rule, [`LaunchCall::Again`]). A host that
+    /// does not measure the queue (`input=-`, no field) says nothing here.
+    ///
+    /// READ IS NOT DRAWN: the queue reads `clear` the moment the worker's
+    /// `read(2)` drains it, and the worker paints what it read later (seconds
+    /// later, starved). The screen at the content seq the queue was last seen
+    /// unread at is still the one the input has not reached, its composer
+    /// empty, and the send's fences pass on it (`if-gen=` is that seq, `if=`
+    /// matches the empty composer). So the hold lasts until the screen moves
+    /// past that seq, and the point is decided on what the worker drew; or,
+    /// a worker that read its input and drew nothing, until
+    /// [`UNDRAWN_INPUT_HANG`] after the queue was last seen unread, a hang
+    /// detector, after which the screen as it stands is decided on.
+    ///
+    /// [`LaunchCall::Again`]: super::approval_loop::LaunchCall::Again
+    pub(super) fn input_unread(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
         let now = self.fx.mono();
         let unread = self
             .launch_status
@@ -2875,7 +2984,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Type and submit `text` via [`Self::type_fenced`] when supported, falling back to [`Self::type_guarded`].
-    fn type_text(
+    pub(super) fn type_text(
         &mut self,
         point: &Turn,
         text: &str,
@@ -2883,7 +2992,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
         self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
-            Some(typed) => Ok(typed),
+            Some(written) => Ok(written == Written::Submitted),
             None => s.type_guarded(point, text, rule, review),
         })
     }
@@ -2904,12 +3013,18 @@ impl<C: Ctl> Session<'_, C> {
         text: &str,
         rule: &str,
         review: &mut dyn Review,
-    ) -> Result<Option<bool>, Fail> {
+    ) -> Result<Option<Written>, Fail> {
         use crate::supervise::occupancy::fault::{Fault, armed};
         self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
-            Some(typed) => Ok(Some(typed)),
+            Some(written) => Ok(Some(written)),
             None if armed(Fault::DoorGuardedFallback) => {
-                s.type_guarded(point, text, rule, review).map(Some)
+                s.type_guarded(point, text, rule, review).map(|typed| {
+                    Some(if typed {
+                        Written::Submitted
+                    } else {
+                        Written::Not
+                    })
+                })
             }
             None => Ok(None),
         })
@@ -2918,7 +3033,9 @@ impl<C: Ctl> Session<'_, C> {
     /// Run `act` while holding the session's hand lease when `types_under_hand` is enabled.
     fn under_hand<T>(&mut self, act: impl FnOnce(&mut Self) -> Result<T, Fail>) -> Result<T, Fail> {
         let held = self.take_hand()?;
+        self.hand_taken = held.then(|| self.fx.mono());
         let out = act(self);
+        self.hand_taken = None;
         if held {
             let back =
                 crate::harness::upgrade_drive::hand_give_back_here_request_as(self.setup.holder());
@@ -2940,6 +3057,38 @@ impl<C: Ctl> Session<'_, C> {
         Ok(r.ok() && r.stdout.starts_with("OK lease acquired"))
     }
 
+    /// THE HAND OUTLASTS THE ACT: the hand [`Self::under_hand`] took,
+    /// renewed once [`HAND_RENEW`] has passed since it was taken or last
+    /// renewed. An act that waits out a starved echo ([`ECHO_HANG`]) can take
+    /// longer than the hand's TTL, and the hand must not lapse before the
+    /// act's Enter. A renewal the host refuses leaves the act to its fences
+    /// (`if-gen=`, `if=`, `if-human=`), as an act typed with no hand is.
+    fn keep_hand(&mut self) -> Result<(), Fail> {
+        let Some(taken) = self.hand_taken else {
+            return Ok(());
+        };
+        let now = self.fx.mono();
+        if now.saturating_duration_since(taken) < HAND_RENEW {
+            return Ok(());
+        }
+        let take = crate::harness::upgrade_drive::hand_take_here_request_as(self.setup.holder());
+        let words: Vec<&str> = take.split(' ').collect();
+        let r = self.call(&words)?;
+        self.hand_taken = (r.ok() && r.stdout.starts_with("OK lease acquired")).then_some(now);
+        Ok(())
+    }
+
+    /// How long one wait inside a typed act may last, of the `left` it has:
+    /// no longer than [`HAND_RENEW`] while the act holds the hand, so
+    /// [`Self::keep_hand`] renews it in time.
+    fn hand_step(&self, left: Duration) -> Duration {
+        if self.hand_taken.is_some() {
+            left.min(HAND_RENEW)
+        } else {
+            left
+        }
+    }
+
     /// Whether the host's `send` takes the `if-gen=` fence.
     pub(super) fn send_fence_known(&mut self) -> Result<bool, Fail> {
         if let Some(known) = self.caps.send_gen {
@@ -2954,14 +3103,108 @@ impl<C: Ctl> Session<'_, C> {
         Ok(known)
     }
 
-    /// Type and submit `text` using `if-gen=` and `if-human=` fenced `send` and `key` calls.
+    /// THE ECHO OF A FENCED WRITE, WAITED FOR AS A HANG DETECTOR: the read the
+    /// write's Enter is fenced on, once the composer shows `text` whole, or
+    /// why it never will. `at` is the write's content seq and `epoch` the
+    /// grid epoch it was fenced on (`if-gen=`), `human` the person count the
+    /// write was fenced on, `guarded` whether the program's paste guard takes
+    /// an Enter close behind typed text as a newline.
+    ///
+    /// Each read follows a settle (`await idle`, [`SETTLE_CAP`] at most), and
+    /// a settle that ran out says nothing of the echo. A read is judged by
+    /// what it shows ([`echo_of`]):
+    ///
+    /// * the text whole: the echo is done. Behind a paste guard, Enter waits
+    ///   until the read shows the screen the settle latched on, after it held
+    ///   still [`PASTE_GUARD_HOLD`] (the host's `OK idle <seq>` is the read's
+    ///   own seq, on the write's grid), or until that long has passed since a
+    ///   read first showed the text whole. Either way the program drew the
+    ///   last key at least that long before the Enter, however starved it is.
+    ///   A settle that latched before the last of the echo was drawn is no
+    ///   hold: the read after it shows a later seq;
+    /// * a start of the text, an empty composer or its placeholder, a frame
+    ///   caught mid-redraw, or a screen that has not moved since the write
+    ///   ([`unmoved_since`]: the same grid, its content seq no later than the
+    ///   write's, so it shows what the write found): the echo is still on its
+    ///   way. The loop waits for the screen to move past that read and reads
+    ///   again, until [`ECHO_HANG`] after the write. Only then is it
+    ///   escalated, as a hang. A read that is not whole sets the guard's
+    ///   clock back: the next whole read starts it again;
+    /// * anything else (another text, no composer, a prompt, a person's key,
+    ///   another grid): escalated at once, as before.
+    ///
+    /// Nothing is written while it waits. The text is written once and its
+    /// Enter at most once. A hand the act holds is renewed while it waits
+    /// ([`Self::keep_hand`]). Measured under load in
+    /// `docs/measured/typing-under-load-2026-10-22.md`.
+    fn await_echo(
+        &mut self,
+        at: u64,
+        epoch: Option<u64>,
+        text: &str,
+        human: u64,
+        guarded: bool,
+    ) -> Result<Echoed, Fail> {
+        let began = self.fx.mono();
+        let hold = PASTE_GUARD_HOLD.as_millis().to_string();
+        let settle = if guarded { hold.as_str() } else { SETTLE_MS };
+        let mut whole_since: Option<Instant> = None;
+        self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
+        loop {
+            self.keep_hand()?;
+            let (settled, latched) = self.wait_at(&["idle", settle], SETTLE_CAP)?;
+            let now = self.screen()?;
+            if now.human_seq != Some(human) {
+                return Ok(Echoed::Not(now, ECHO_PERSON));
+            }
+            let read_at = self.fx.mono();
+            // The screen held still through the settle, and this read shows
+            // what the settle latched on, on the write's grid.
+            let grid = now.generation.as_deref().and_then(ScreenGen::parse);
+            let still = matches!(settled, Wait::Latched)
+                && grid.is_some_and(|g| Some(g.epoch) == epoch && latched == Some(g.seq));
+            let echo = match echo_of(self.reader(&now.rows), &now, text) {
+                // The screen has not moved since the write: it shows what the
+                // write found, and says nothing of the echo.
+                Echo::Other if unmoved_since(&now, at, epoch) => Echo::Arriving,
+                echo => echo,
+            };
+            match echo {
+                Echo::Whole => {
+                    let first = *whole_since.get_or_insert(read_at);
+                    if !guarded
+                        || still
+                        || read_at.saturating_duration_since(first) >= PASTE_GUARD_HOLD
+                    {
+                        return Ok(Echoed::Whole(now));
+                    }
+                }
+                Echo::Arriving => {
+                    whole_since = None;
+                    let spent = read_at.saturating_duration_since(began);
+                    if spent >= ECHO_HANG {
+                        return Ok(Echoed::Not(now, ECHO_HUNG));
+                    }
+                    let step = self.hand_step(ECHO_HANG - spent);
+                    let moved = self.wait(&["seq", &now.seq.to_string()], step)?;
+                    if matches!(moved, Wait::Unsupported) {
+                        return Ok(Echoed::Not(now, ECHO_OTHER));
+                    }
+                }
+                Echo::Other => return Ok(Echoed::Not(now, ECHO_OTHER)),
+            }
+        }
+    }
+
+    /// Type and submit `text` using `if-gen=` and `if-human=` fenced `send` and `key` calls: what
+    /// the write came to, `None` for a read it cannot fence.
     fn type_fenced(
         &mut self,
         point: &Turn,
         text: &str,
         rule: &str,
         review: &mut dyn Review,
-    ) -> Result<Option<bool>, Fail> {
+    ) -> Result<Option<Written>, Fail> {
         let seq = point.screen.seq;
         let rows = &point.screen.rows;
         let (Some(generation), Some(caret)) = (
@@ -2978,7 +3221,7 @@ impl<C: Ctl> Session<'_, C> {
                 "SKIPPED seq={seq} rule={rule} the judged read carries no person count; \
                  nothing written"
             ));
-            return Ok(Some(false));
+            return Ok(Some(Written::Not));
         };
         let person = format!("if-human={human}");
         let fence = format!("if-gen={generation}");
@@ -2989,24 +3232,24 @@ impl<C: Ctl> Session<'_, C> {
             Some(Pressing::Lost { why, .. }) => return Err(Fail::Lost(why)),
             Some(Pressing::Halted { why }) => {
                 self.write_refused(true, &why, seq, review)?;
-                return Ok(Some(false));
+                return Ok(Some(Written::Not));
             }
             Some(Pressing::Refused { why }) => {
                 self.write_refused(false, &why, seq, review)?;
-                return Ok(Some(false));
+                return Ok(Some(Written::Not));
             }
             Some(Pressing::Unconfirmed { why, .. }) => {
                 review.note(&format!("SKIPPED seq={seq} rule={rule} {why}"));
-                return Ok(Some(false));
+                return Ok(Some(Written::Not));
             }
-            Some(_) => return Ok(Some(false)),
+            Some(_) => return Ok(Some(Written::Not)),
         }
         if r.skipped_person() {
             review.note(&format!(
                 "SKIPPED seq={seq} rule={rule} a person keyed before the write; nothing written"
             ));
             self.redecide_soon("a person keyed before the write");
-            return Ok(Some(false));
+            return Ok(Some(Written::Not));
         }
         if r.skipped_changed() {
             review.note(&format!(
@@ -3014,39 +3257,37 @@ impl<C: Ctl> Session<'_, C> {
                  written"
             ));
             self.redecide_soon("the screen moved before the write");
-            return Ok(Some(false));
+            return Ok(Some(Written::Not));
         }
         if r.skipped() {
             self.not_written(point, text, rule, &format!("{fence} {guard}"), review)?;
-            return Ok(Some(false));
+            return Ok(Some(Written::Not));
         }
         let at = r.seq().unwrap_or(seq);
-        self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
-        let settle = if self.reader(rows).paste_guard() {
-            PASTE_GUARD_SETTLE_MS
-        } else {
-            SETTLE_MS
+        let epoch = ScreenGen::parse(&generation).map(|g| g.epoch);
+        let guarded = self.reader(rows).paste_guard();
+        let now = match self.await_echo(at, epoch, text, human, guarded)? {
+            Echoed::Whole(now) => now,
+            Echoed::Not(now, why) => {
+                if unmoved_since(&now, at, epoch) {
+                    // The screen has not moved since the write: the text is
+                    // input the worker has not drawn, and no act goes behind
+                    // it on this screen ([`Self::input_unread`]). Measured
+                    // (`t4-attr-r1`, `t4-diag-r3`, the loop before
+                    // [`Self::await_echo`]): escalated on the unmoved screen,
+                    // the point decided again 0.5 s later on the same seq
+                    // typed the continuation a second time, and the worker
+                    // submitted both as one prompt.
+                    self.input_unread_at = Some((now.seq, self.fx.mono()));
+                }
+                let turn = self.turn_of(now);
+                self.left_typed(&turn, text, why, review)?;
+                return Ok(Some(Written::Left));
+            }
         };
-        self.wait(&["idle", settle], SETTLE_CAP)?;
-        let now = self.screen()?;
-        if now.human_seq != Some(human) {
-            let turn = self.turn_of(now);
-            self.left_typed(
-                &turn,
-                text,
-                "the original person count changed or is unavailable",
-                review,
-            )?;
-            return Ok(Some(false));
-        }
         let reader = self.reader(&now.rows);
-        let held = reader
-            .composer(&now.rows)
-            .is_some_and(|(_, lines)| squashed(&lines.concat()) == squashed(text))
-            && typed_draft(reader, &now)
-            && reader.prompt(&now.rows).is_none();
-        let (true, Some(generation), Some(caret)) =
-            (held, now.generation.clone(), caret_row(reader, &now.rows))
+        let (Some(generation), Some(caret)) =
+            (now.generation.clone(), caret_row(reader, &now.rows))
         else {
             let turn = self.turn_of(now);
             self.left_typed(
@@ -3055,32 +3296,32 @@ impl<C: Ctl> Session<'_, C> {
                 "the composer does not show it as written",
                 review,
             )?;
-            return Ok(Some(false));
+            return Ok(Some(Written::Left));
         };
         let guard = super::super::policy::row_guard(&now.rows[caret]);
         let (r, args) = self.fenced_key(&guard, "enter", &generation, Some(&person))?;
         let turn = self.turn_of(now);
         match self.refused_press(&r, &args)? {
-            None if !r.skipped() => Ok(Some(true)),
+            None if !r.skipped() => Ok(Some(Written::Submitted)),
             None if r.skipped_person() => {
                 self.left_typed(&turn, text, "a person keyed before Enter", review)?;
-                Ok(Some(false))
+                Ok(Some(Written::Left))
             }
             None => {
                 self.left_typed(&turn, text, "the screen moved before Enter", review)?;
-                Ok(Some(false))
+                Ok(Some(Written::Left))
             }
             Some(Pressing::Lost { why, .. }) => Err(Fail::Lost(why)),
             Some(Pressing::Halted { why }) => {
                 self.park_on_hold(&why, seq, review)?;
                 self.left_typed(&turn, text, "the session is halted", review)?;
-                Ok(Some(false))
+                Ok(Some(Written::Left))
             }
             Some(Pressing::Refused { why }) | Some(Pressing::Unconfirmed { why, .. }) => {
                 self.left_typed(&turn, text, &why, review)?;
-                Ok(Some(false))
+                Ok(Some(Written::Left))
             }
-            Some(_) => Ok(Some(false)),
+            Some(_) => Ok(Some(Written::Left)),
         }
     }
 
@@ -3167,6 +3408,39 @@ impl<C: Ctl> Session<'_, C> {
         Ok(None)
     }
 
+    /// THE ACCEPT KEY IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY A
+    /// BUDGET: the read after `right` that shows what the key did, waited past
+    /// every read whose composer still shows the suggestion as a placeholder
+    /// (the worker has not taken the key yet), up to [`ECHO_HANG`] after the
+    /// press. Only a composer that still shows the placeholder then (a build
+    /// without the accept key) has its words typed. Each read is settled as
+    /// before, and a read with no composer is settled and read once more.
+    fn await_accept(&mut self, at: u64, text: &str) -> Result<Screen, Fail> {
+        let began = self.fx.mono();
+        self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
+        loop {
+            self.keep_hand()?;
+            self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
+            let mut now = self.screen()?;
+            if caret_row(self.reader(&now.rows), &now.rows).is_none() {
+                self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
+                now = self.screen()?;
+            }
+            let reader = self.reader(&now.rows);
+            let untaken = caret_text(reader, &now.rows).as_deref() == Some(text)
+                && !typed_draft(reader, &now);
+            let spent = self.fx.mono().saturating_duration_since(began);
+            if !untaken || spent >= ECHO_HANG {
+                return Ok(now);
+            }
+            let step = self.hand_step(ECHO_HANG - spent);
+            let moved = self.wait(&["seq", &now.seq.to_string()], step)?;
+            if matches!(moved, Wait::Unsupported) {
+                return Ok(now);
+            }
+        }
+    }
+
     /// Accept and submit the worker's inline suggestion via fenced `right` and `enter` keys.
     fn accept_suggestion(
         &mut self,
@@ -3206,13 +3480,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(false);
         }
         let at = r.seq().unwrap_or(seq);
-        self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
-        self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
-        let mut now = self.screen()?;
-        if caret_row(self.reader(&now.rows), &now.rows).is_none() {
-            self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
-            now = self.screen()?;
-        }
+        let now = self.await_accept(at, text)?;
         let reader = self.reader(&now.rows);
         let shows = caret_text(reader, &now.rows).as_deref() == Some(text);
         let filled = shows && typed_draft(reader, &now) && reader.prompt(&now.rows).is_none();
@@ -3234,7 +3502,6 @@ impl<C: Ctl> Session<'_, C> {
             }
         };
         if !filled {
-            // suggestion gone): its words, typed — once, guarded.
             if !(shows && !typed_draft(reader, &now)) {
                 review.note(&format!(
                     "SKIPPED seq={seq} rule={rule} the composer no longer shows the suggestion"
@@ -3392,7 +3659,6 @@ impl<C: Ctl> Session<'_, C> {
         host: &dyn IdleHost,
         opts: &SuperviseOpts,
     ) -> Result<Option<ProbeGate>, Fail> {
-        //    probes.
         if self.claim.watching_behind().is_some() {
             return Ok(Some(ProbeGate::Watching));
         }
@@ -3629,7 +3895,6 @@ impl<C: Ctl> Session<'_, C> {
                 PanelRead::Fold => {
                     prior = None;
                     if folds >= PROBE_READS {
-                        // read of this probe was the fold.
                         if !tail_seen {
                             self.probe_fold = Some((point.screen.cols, point.screen.pane_rows));
                         }
@@ -3707,7 +3972,6 @@ impl<C: Ctl> Session<'_, C> {
         match self.refused_press(&r, &format!("{person} {fence} {guard} (send)"))? {
             None => {}
             Some(Pressing::Lost { why, .. }) => {
-                // Cut mid-exchange, the text may be in the composer.
                 if !r.untouched() {
                     self.probe_owes(seq);
                 }

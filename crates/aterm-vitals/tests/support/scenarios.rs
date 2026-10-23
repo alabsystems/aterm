@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The design's stuck scenarios (`docs/DESIGN-system-awareness-2026-10-16.md`
-//! §18 item 8) as scripted fixtures: each row of the expectation table, in
-//! each shape it names (`pty`: the person's foreground job in a tab;
-//! `setsid`: an agent's detached call), with the readings gap-1 measured
-//! (curl's 5 syscalls and 1 wakeup a second; the 1 ms poller's 635 a second
-//! at 2.6 ms/s of CPU; the spinner's CR-only output; the clang loop's
-//! 900 ms/s of child CPU; the silent writer's 84 KB/s; M7's logical-write
-//! noise). Thresholds sit at minutes, so a run repeats its steady tick with
-//! the clock advanced, as the design's replay does (gap-1's quiet rows are
-//! exactly constant). Expected results are the table's, at the 60 s prior and
-//! stretch 1 unless the row says otherwise: "the table is the conformance
-//! test's expectation list: a row that changes is a design change".
-//!
-//! The `D2` rows are `docs/DESIGN-hung-background-call-2026-10-20.md`'s
-//! no-progress word: an agent's call asleep with no CPU (I4's deadlocked
-//! test, held 26 h) reads quiet and `no_progress=1` from φ 8, and the calls
-//! that print, burn CPU, use a little CPU or had a reading refused, and the
-//! person's own `sleep`, never do.
+//! Scripted stuck-job scenarios across `pty` and `setsid` shapes.
 
 #![allow(dead_code, reason = "each test binary mounting this uses part of it")]
 
@@ -31,7 +14,7 @@ use aterm_vitals::jobs::{
 
 use super::world::{OutFile, Proc, World, hint};
 
-/// The tick cadence while a job can accrue suspicion (§11.3).
+/// Tick cadence while a job can accrue suspicion.
 pub const TICK_MS: u64 = 2_000;
 /// The agent in front of tab 1 for every `setsid` shape.
 pub const AGENT: u32 = 300;
@@ -69,8 +52,7 @@ pub enum Expect {
     Zombies(u64, u32, u32),
     /// Never two rows with the watched id at one tick.
     OneRow,
-    /// The watched job reads `no_progress` at every tick from this time on,
-    /// and at none before.
+    /// The watched job reads `no_progress` at every tick from this time on and at none before.
     NoProgressFrom(u64),
     /// The watched job never reads `no_progress`.
     NoProgressNever,
@@ -93,8 +75,7 @@ pub struct Scenario {
     /// How long it runs, ms.
     pub until_ms: u64,
     pub expect: &'static [Expect],
-    /// Whether the StuckVerdict model covers it (the unread-input gate is
-    /// its own machine, `InputUnreadGate`, so gate-decided runs are not).
+    /// Whether the `StuckVerdict` model covers this scenario.
     pub model: bool,
 }
 
@@ -262,9 +243,6 @@ pub fn check(s: &Scenario, t: &Trace) -> Vec<String> {
             bad.push(format!("{} ({}): {e:?} failed; saw {seen}", s.name, s.row));
         }
     }
-    // Every row of every tick: `no_progress` is a word derived from a quiet
-    // agent's call at φ ≥ 8, never a verdict of its own, and the row prints
-    // it beside the verdict exactly when it holds.
     let derived = |r: &JobRow| {
         let wire = r.wire();
         if !r.no_progress {
@@ -294,8 +272,6 @@ pub fn check(s: &Scenario, t: &Trace) -> Vec<String> {
     }
     bad
 }
-
-// Builders
 
 pub fn tcp_fd(fd: i32) -> Fd {
     Fd {
@@ -347,12 +323,10 @@ pub fn pipe_end(fd: i32, handle: u64, peer: u64, write: bool, status: u32, queue
     }
 }
 
-/// The `pty` shape: `p` in front of tab 1 under block 51.
 fn pty(w: &mut World, p: Proc, command: &str) {
     w.run_fg(1, 51, command, p);
 }
 
-/// The `setsid` shape: `child` as an agent's call (consumer unknown: agent).
 fn setsid(w: &mut World, child: Proc) {
     w.call(1, AGENT, CALL, child, None);
 }
@@ -385,7 +359,6 @@ fn poller(pid: u32) -> Proc {
 
 fn nothing(_: &mut World, _: u64) {}
 
-/// Name the watched job's wait with Tier B `word` at 20 min + 2 s.
 fn name_at_20m(w: &mut World, rel: u64, leader: u32, word: TierB, holder: Option<u32>) {
     if rel == 1_202_000 {
         w.name(
@@ -399,7 +372,6 @@ fn name_at_20m(w: &mut World, rel: u64, leader: u32, word: TierB, holder: Option
     }
 }
 
-/// The setsid shape's exit at once: no terminal, stdin `/dev/null`.
 fn exit_at_once(w: &mut World, rel: u64) {
     if rel == TICK_MS {
         w.exit(CHILD, false);
@@ -407,14 +379,9 @@ fn exit_at_once(w: &mut World, rel: u64) {
     }
 }
 
-// The table
-
 const M1: u64 = 60_000;
 const M20: u64 = 1_200_000;
-/// 26 h: about I4's age when it was found (`etime 01-02:28:34`).
 const H26: u64 = 93_600_000;
-/// The first tick at φ ≥ 8 at the 60 s prior (18 min 25 s, read on the
-/// 2 s grid).
 const PHI8: u64 = 1_106_000;
 
 /// Every scenario of the table, each shape a row of its own.
@@ -452,8 +419,6 @@ pub fn all() -> Vec<Scenario> {
                 At(M20, Quiet),
                 Never(Stuck),
                 At(M20 + 10_000, Fine),
-                // Quiet at φ 8.67 with no CPU, but the person's own job: the
-                // no-progress word is an agent's call's.
                 NoProgressNever,
             ],
             model: true,
@@ -482,7 +447,6 @@ pub fn all() -> Vec<Scenario> {
             stretch_milli: 1000,
             setup: |w| setsid(w, sleeper(CHILD, "sleep")),
             each: |w, rel| {
-                // An EPERM reading at 3 min and at 10 min: unknown, never zero.
                 let refused = rel == 180_000 || rel == 600_000;
                 w.p(CHILD).refused = refused;
             },
@@ -589,7 +553,6 @@ pub fn all() -> Vec<Scenario> {
             row: "6 read -r x",
             stretch_milli: 1000,
             setup: |w| {
-                // The shell's own builtin: the foreground stays the shell.
                 let at = w.at;
                 w.tab(1).tab.block = Some(Block {
                     id: 51,
@@ -657,7 +620,6 @@ pub fn all() -> Vec<Scenario> {
             stretch_milli: 1000,
             setup: |w| {
                 pty(w, sleeper(FG, "flock"), "flock /tmp/l sleep 1");
-                // The holder sleeps outside the tree.
                 let mut h = sleeper(9100, "sleep");
                 h.ppid = 1;
                 h.sid = 9100;
@@ -1564,8 +1526,6 @@ pub fn all() -> Vec<Scenario> {
             stretch_milli: 1000,
             setup: |w| {
                 let mut p = sleeper(CHILD, "python3");
-                // A run from 0 sums rel_s × 17,000 ns: 1.02 ms a minute at
-                // every tick, so the bound's units are pinned within 2 %.
                 p.cpu_per_s = 17_000;
                 setsid(w, p);
             },
@@ -1679,8 +1639,6 @@ pub fn all() -> Vec<Scenario> {
             expect: &[
                 WaitAt(M1, WaitName::Follow),
                 At(600_000, Fine),
-                // The shown wait turns unnamed after 2 agreeing ticks, at
-                // 602 s: the suspect run (and its CPU sum) starts there.
                 NoProgressFrom(602_000 + PHI8),
                 Never(Stuck),
             ],
@@ -1689,15 +1647,11 @@ pub fn all() -> Vec<Scenario> {
     ]
 }
 
-/// I4's shape: an agent's call (its consumer unknown: no transcript joins
-/// it) whose test binary waits for ever on a mutex its own thread holds; no
-/// descriptor names the wait, and it uses no CPU.
 fn deadlocked(w: &mut World) {
     setsid(w, sleeper(CHILD, "aterm_gui-e0964a"));
 }
 
-/// A dev server: a listening socket, one idle keep-alive connection from a
-/// browser, asleep in its kqueue with a read entry on each.
+/// Dev server with a listening socket and one idle connection in kqueue.
 pub fn dev_server(pid: u32) -> Proc {
     let mut p = Proc::new(pid, 0, "node");
     p.fds = vec![
@@ -1739,10 +1693,6 @@ pub fn dev_server(pid: u32) -> Proc {
     p
 }
 
-/// `while :; do sleep 0.5; done` typed at an interactive shell: the loop
-/// runs in the shell (pid 200), and each `sleep` is a group of its own the
-/// terminal puts in front. Every fifth tick lands between two commands, the
-/// shell holding the terminal.
 fn typed_sleep_loop(w: &mut World, rel: u64) {
     let n = u32::try_from(rel / TICK_MS).unwrap_or(0);
     let born = 3_000 + n;
@@ -1759,9 +1709,6 @@ fn typed_sleep_loop(w: &mut World, rel: u64) {
     w.tab(1).tpgid = born;
 }
 
-/// `make && make test`: `make` prints a line every tick and churns
-/// compilers until 18 s; the shell holds the terminal at 20 s; `make test`
-/// (its own group) prints until 60 s, then the block closes with status 2.
 fn make_chain(w: &mut World, rel: u64) {
     match rel {
         r if r < 20_000 => w.line(1),
@@ -1797,9 +1744,6 @@ pub fn named(name: &str) -> Scenario {
         .unwrap_or_else(|| panic!("no scenario {name}"))
 }
 
-/// A second tab (key 2, `tab2`, shell 210) whose `cargo build` (pid 2100,
-/// block 61) holds the build-directory lock while its build script sleeps
-/// (`hrtimer_nanosleep`: a timer, Linux's public wait channel).
 fn holder_tab(w: &mut World) {
     w.shell_tab(2, 2, 210);
     let cargo = sleeper(2100, "cargo");
@@ -1813,8 +1757,7 @@ fn holder_tab(w: &mut World) {
     w.add(script);
 }
 
-/// A compile loop: each tick a new compiler child with its own CPU is born
-/// under `parent` and the last one reaped.
+/// Spawn a new compiler child and reap the previous one on each tick.
 pub fn churn(w: &mut World, parent: u32, pgid: u32, rel: u64, name: &str) {
     let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
     w.exit(born - 1, false);
@@ -1828,8 +1771,6 @@ pub fn churn(w: &mut World, parent: u32, pgid: u32, rel: u64, name: &str) {
     w.add(cc);
 }
 
-/// A shell poll loop: each tick a `sleep` child is born and the last reaped,
-/// with no work (1.9 ms/s of child CPU).
 fn idle_churn(w: &mut World, parent: u32, pgid: u32, rel: u64) {
     let born = 3_000 + u32::try_from(rel / TICK_MS).unwrap_or(0);
     w.exit(born - 1, false);

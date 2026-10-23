@@ -28,7 +28,8 @@ fn note_request(size: usize) {
     }
 }
 
-// SAFETY: requests are forwarded unchanged to System.
+// SAFETY: requests are forwarded unchanged to System. Only their sizes are counted; neither
+// initialized contents nor allocation padding is read.
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller supplies the valid allocation layout.

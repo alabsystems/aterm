@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `[OB-18]`: `deny.toml`'s `[bans] deny` list and its `[sources]` policy,
-//! held over each cell's RESOLVED graph.
-//!
-//! A ban is cargo-deny's: a package `name`, an optional version requirement
-//! (`"<0.17.14"`), and optional `wrappers`, the only packages allowed to
-//! depend on it directly. A resolved package the ban matches fails unless
-//! every parent it has in the graph is a wrapper. A source is judged from the
-//! annotation cargo prints beside a package: none for crates.io, a directory
-//! for a path package (the workspace and its `[patch]` forks), anything else
-//! (a git URL, another registry) is a source `deny.toml` does not allow.
-//!
-//! Resolution sees every crate whatever its name, so a ban here cannot be
-//! dodged by a rename, a dotted key or a `package =` alias in a manifest.
+//! Evaluates `deny.toml`'s `[bans] deny` list and `[sources]` policy over each cell's resolved graph.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,15 +33,13 @@ pub struct Policy {
 /// One violation in one cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finding {
-    /// `pkg` matches a ban; `via` holds its parents that are not wrappers
-    /// (empty for the root itself).
+    /// `pkg` matches a ban; `via` holds its non-wrapper parents (empty for the root).
     Banned {
         pkg: PkgId,
         via: Vec<PkgId>,
         ban: Ban,
     },
-    /// `pkg` comes from `source`, which is neither crates.io, a path, nor an
-    /// allowed git prefix.
+    /// `pkg` comes from `source`, which is neither crates.io, a path, nor an allowed git prefix.
     Source { pkg: PkgId, source: String },
     /// A ban's version requirement is not a form this check understands.
     BadRequirement { ban: Ban },
@@ -123,8 +109,7 @@ pub fn parse_policy(text: &str) -> Result<Policy, String> {
     Ok(Policy { bans, allow_git })
 }
 
-/// Every violation of `policy` in one cell's `graph`, whose path packages
-/// cargo printed in `annotations`.
+/// Every violation of `policy` in one cell's `graph` with cargo path `annotations`.
 #[must_use]
 pub fn findings(
     policy: &Policy,
@@ -186,9 +171,7 @@ pub fn findings(
     out
 }
 
-/// Whether `version` satisfies a cargo-deny requirement made of
-/// comma-separated comparators (`<`, `<=`, `>`, `>=`, `=`); `None` when the
-/// requirement is not one this check reads.
+/// Whether `version` satisfies comma-separated comparators (`<`, `<=`, `>`, `>=`, `=`), or `None` if unsupported.
 #[must_use]
 pub fn satisfies(req: &str, version: &str) -> Option<bool> {
     let have = parse_version(version)?;
@@ -220,7 +203,6 @@ mod tests {
         PkgId::new(name, version)
     }
 
-    /// root -> {app, ring}; app -> getrandom 0.2; ring -> getrandom 0.2.
     fn graph() -> Graph {
         let root = id("aterm", "1.0.0");
         let (app, ring, rng) = (

@@ -7,14 +7,7 @@
 // CacheItem construction in src/atspi/interfaces/cache.rs, and rewritten by
 // the aterm project in 2026 to build aterm-dbus values instead of serde ones.
 
-//! The AT-SPI values on the wire, built as aterm-dbus [`Value`]s: object
-//! paths and references, interface and state sets, rectangles, attribute
-//! maps, cache items and event bodies.
-//!
-//! Every shape here is the one accesskit_unix sent through zvariant: the
-//! signatures are the AT-SPI introspection's (`a(so)`, `au`, `(iiii)`, ...),
-//! and the paths are its object ids, so a screen reader reading the old
-//! publisher reads this one the same way.
+//! AT-SPI wire values built as `aterm-dbus` [`Value`]s.
 
 use std::collections::HashMap;
 
@@ -29,13 +22,10 @@ use super::semantics::{
 pub(crate) const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 /// The `org.a11y.atspi.Cache` object's path.
 pub(crate) const CACHE_PATH: &str = "/org/a11y/atspi/cache";
-/// Where a node's path starts: `<prefix><adapter>/<node id as u128>`.
 const ACCESSIBLE_PREFIX: &str = "/org/a11y/atspi/accessible/";
-/// AT-SPI's null object (libatspi's `ATSPI_DBUS_PATH_NULL`).
 const NULL_PATH: &str = "/org/a11y/atspi/null";
 
-/// One object this process publishes: the application root, or a node of
-/// one window's tree (one adapter per window).
+/// Published AT-SPI object identifier: the application root or a window tree node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ObjectId {
     Root,
@@ -67,13 +57,10 @@ impl ObjectId {
     }
 }
 
-/// An object path value. Every path this module builds is a constant or the
-/// prefix plus two decimal numbers, which the specification always accepts.
 fn path_value(path: &str) -> Value {
     Value::path(path).expect("the publisher builds only valid object paths")
 }
 
-/// An array whose items the caller built all of type `elem`.
 fn array(elem: Type, items: Vec<Value>) -> Value {
     Value::array(elem, items).expect("every item is of the element type")
 }
@@ -211,9 +198,7 @@ pub(crate) fn cache_item_type() -> Type {
     ])
 }
 
-/// A cache item's ten fields for `node`: itself, the application, its
-/// parent, its index and child count, its interfaces, its name (AT-SPI's
-/// "short name"), role, description (AT-SPI's "name") and states.
+/// Builds the ten cache item fields for `node`.
 pub(crate) fn cache_item(bus: &str, node: CacheNode) -> Vec<Value> {
     let parent = ObjectId::in_adapter(node.adapter_id, node.parent);
     cache_fields(
@@ -269,8 +254,7 @@ fn cache_fields(bus: &str, object: Value, parent: Value, item: CacheText) -> Vec
     ]
 }
 
-/// An AT-SPI event's body, `siiva{sv}`: the detail, two numbers, any data
-/// and an empty property map (unused by AT-SPI 2.x).
+/// Builds an AT-SPI event body (`siiva{sv}`).
 pub(crate) fn event_body(kind: &str, detail1: i32, detail2: i32, any: Value) -> Vec<Value> {
     vec![
         kind.into(),
@@ -336,7 +320,6 @@ mod tests {
 
     #[test]
     fn states_split_the_bits_low_word_first() {
-        // Focused is bit 12 and Visible bit 30; ReadOnly (bit 43) is in the high word.
         let set = State::Focused | State::Visible | State::ReadOnly;
         assert_eq!(
             states(set),

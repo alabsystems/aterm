@@ -735,6 +735,17 @@ fn release_handoff_handles(handles: [isize; 4]) {
 }
 
 /// ADOPT an inbound Windows 11 default-terminal (DefTerm) handoff.
+///
+/// Handles are named from our side of the pipes: we write keystrokes into `in_pipe` and read VT
+/// output from `out_pipe`; `signal_pipe` takes ConPTY signal packets (resize; 0 when the handoff
+/// carried none, which leaves the session unresizable); `client_process` is the console
+/// program's process, never conhost's, because the waiter keys EOF on it.
+///
+/// # Ownership
+/// On success the session owns all four handles and closes them on drop; the caller must not
+/// close them. On failure the rule is by error kind: `InvalidInput` takes nothing, so the caller
+/// still owns every handle and can let conhost fall back; `Other` has consumed and closed them,
+/// so the caller must not close them again.
 pub fn adopt_handoff(
     in_pipe: isize,
     out_pipe: isize,

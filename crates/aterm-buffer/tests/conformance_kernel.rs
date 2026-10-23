@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Tier-1 conformance: binds the real event-log spine to the derived `Kernel`
-//! model (`aterm_models_session::kernel_model()`): every `Emit` bumps `count` by
-//! one and assigns the next contiguous `seq`, so `SeqIsCount` holds. `Buggy = 1`
-//! opens a gap (an append that advances `seq` by two).
-//!
-//! The two projected variables come from different sides of the code, so the
-//! law is checked rather than restated: `count` is how many edits the test handed
-//! `Surface::apply` / `Surface::transact` / `EventLog::append_at`, and `seq` is
-//! the seq stored on each event read back off the ring (never the log's own
-//! counter). The seq a call returns and the log's head must be the newest stored.
-//!
-//! Covered: every edit kind, a committed multi-edit transaction, a refused one
-//! (no step), the temporal `append_at` seam, and eviction past
-//! `MAX_LOG_EVENTS`, where the live window stays contiguous and `append_at`
-//! spills exactly the event that fell off. Negative control: the modelled gap,
-//! projected from a real state, is rejected by the model and admitted by `Buggy`.
+
+//! Tier-1 conformance tests binding the real event-log spine to `aterm_models_session::kernel_model()`.
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, EventLog, LineId, MAX_LOG_EVENTS, Op, Seq, Surface, Ticks, TxnOutcome};
@@ -27,7 +12,6 @@ use std::collections::BTreeMap;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// `MaxSeq` lifted past every real run so the model's bound never refuses one.
 const OVERRIDES: &[(&str, i64)] = &[("MaxSeq", 1_000_000_000)];
 
 fn state(seq: u64, count: u64) -> State {
@@ -39,8 +23,6 @@ fn state(seq: u64, count: u64) -> State {
     .collect()
 }
 
-/// Is `prev -> next` the model's `Emit`? The interpreter answers every step;
-/// `tiered` also asks `ty` (spawned per call, so used on a spread).
 fn emits(m: &Model, prev: &State, next: &State, tiered: bool) -> (bool, String) {
     if tiered {
         return verify::validate_transition_tiered(
@@ -59,7 +41,6 @@ fn emits(m: &Model, prev: &State, next: &State, tiered: bool) -> (bool, String) 
     )
 }
 
-/// The seqs of the `n` newest stored events, oldest first, read off the ring.
 fn newest_stored(log: &EventLog, n: usize) -> Vec<u64> {
     if n == 1 {
         return vec![log.newest_live().expect("an event was stored").seq.0];
@@ -69,8 +50,6 @@ fn newest_stored(log: &EventLog, n: usize) -> Vec<u64> {
     live[live.len() - n..].to_vec()
 }
 
-/// The live window is contiguous: from the oldest live seq to the newest, one
-/// event per seq. O(ring), so only asserted at the eviction edge.
 fn assert_live_contiguous(log: &EventLog) {
     let oldest = log.oldest_live().expect("non-empty").seq.0;
     let newest = log.newest_live().expect("non-empty").seq.0;
@@ -81,7 +60,6 @@ fn assert_live_contiguous(log: &EventLog) {
     );
 }
 
-/// Drive writer-side emits and validate the spine's answer.
 struct Spine {
     model: Model,
     count: u64,
@@ -101,8 +79,6 @@ impl Spine {
         }
     }
 
-    /// Record that one real call stored `n` events, each one `Emit` projected
-    /// from its stored seq; the returned seq and the log's head must be the newest.
     fn emitted(&mut self, log: &EventLog, n: usize, returned: Seq, tiered: bool) {
         let stored = newest_stored(log, n);
         let newest = *stored.last().expect("n > 0");
@@ -137,14 +113,11 @@ fn real_surface_spine_conforms_to_kernel_model() {
         "an empty surface is the model's Init"
     );
 
-    // Every edit kind, each one event on the spine. `apply` returns the seq it
-    // assigned: it must be the head the spine then reports.
     let edits = [
         Edit::AppendLine("a".into()),
         Edit::AppendLine("b".into()),
         Edit::SetLine(LineId(0), "a2".into()),
         Edit::ClearLine(LineId(1)),
-        // An absent line still rides the spine (the edit is recorded, not lost).
         Edit::SetLine(LineId(99), "nowhere".into()),
         Edit::ClearLine(LineId(99)),
     ];
@@ -153,7 +126,6 @@ fn real_surface_spine_conforms_to_kernel_model() {
         spine.emitted(s.log(), 1, assigned, true);
     }
 
-    // A committed transaction stores one event per edit in one call.
     let base = s.seq();
     let body = vec![
         Edit::AppendLine("t1".into()),
@@ -166,7 +138,6 @@ fn real_surface_spine_conforms_to_kernel_model() {
     };
     spine.emitted(s.log(), n, committed, true);
 
-    // A refused transaction appends nothing, so the head must not move.
     let stale = Seq(base.0);
     let head = s.seq();
     assert_eq!(
@@ -180,12 +151,10 @@ fn real_surface_spine_conforms_to_kernel_model() {
     );
     assert_eq!(state(s.seq().0, spine.count), spine.state);
 
-    // A reader never moves the spine either.
     let _ = s.snapshot(&read_cap());
     let _ = s.poll(s.subscribe(&read_cap()));
     assert_eq!(s.seq(), head, "reads are not events");
 
-    // Eviction: the ring forgets its oldest entries but `seq = count` holds.
     let cap = MAX_LOG_EVENTS as u64;
     let target = cap + 16;
     while spine.count < target {
@@ -210,7 +179,6 @@ fn real_surface_spine_conforms_to_kernel_model() {
     assert!(spine.steps as u64 >= target, "every real event was a step");
 }
 
-/// `EventLog::append_at` rides the same spine, including across its spill point.
 #[test]
 fn real_append_at_spine_conforms_to_kernel_model() {
     let mut log = EventLog::default();
@@ -223,7 +191,6 @@ fn real_append_at_spine_conforms_to_kernel_model() {
         spine.emitted(&log, 1, seq, near_edge || spine.count == 0);
         if let Some(evicted) = evicted {
             spilled += 1;
-            // The spill is exactly the event that fell off the live window.
             assert_eq!(
                 evicted.seq.0 + 1,
                 log.oldest_live().expect("non-empty").seq.0,
@@ -241,7 +208,6 @@ fn real_append_at_spine_conforms_to_kernel_model() {
     assert_eq!(log.total(), spine.count);
 }
 
-/// The modelled defect from a real state: an append that jumps the head by two.
 #[test]
 fn a_gapped_append_is_the_buggy_step_the_bind_rejects() {
     let m = kernel_model();

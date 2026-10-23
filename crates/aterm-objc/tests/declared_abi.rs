@@ -30,7 +30,8 @@ unsafe extern "C" {
 }
 
 fn encoding_of(cls: ClassPtr, name: &'static CStr) -> String {
-    // SAFETY: side-effect-free runtime queries on a registered class.
+    // SAFETY: side-effect-free runtime queries on a registered class; the runtime owns the
+    // returned string and it outlives the read.
     unsafe {
         let m = class_getInstanceMethod(cls, sel_uncached(name));
         assert!(!m.is_null(), "{name:?} is not a method of this class");
@@ -126,7 +127,8 @@ fn arity() -> aterm_objc::Retained<Arity> {
 #[test]
 fn arity_four_five_and_six_reach_their_bodies_with_arguments_in_order() {
     let obj = arity();
-    // SAFETY: each prototype matches the declared C signature on a live instance.
+    // SAFETY: each prototype is the exact C signature declared above, on a live instance of the
+    // declaring class.
     unsafe {
         let f4: unsafe extern "C-unwind" fn(Id, Sel, i64, i64, i64, i64) -> i64 = msg();
         assert_eq!(f4(obj.as_id(), sel!(a:b:c:d:), 1, 2, 3, 4), 1234);
@@ -228,7 +230,8 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
 fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
     let obj = arity();
     let cls = Arity::class();
-    // SAFETY: every prototype below matches the documented Foundation method signature.
+    // SAFETY: every prototype below matches the documented Foundation method signature, on live
+    // objects.
     unsafe {
         let sig_for: unsafe extern "C-unwind" fn(ClassPtr, Sel, Sel) -> Id = msg();
         let sig = sig_for(
@@ -342,7 +345,8 @@ declare_class! {
 #[test]
 fn a_fourteen_argument_method_is_sendable_from_rust_not_just_declarable() {
     let obj = Widest::alloc_init(mtm(), ()).expect("+alloc/-init");
-    // SAFETY: exact declared 16-parameter prototype on a live instance.
+    // SAFETY: the exact declared 16-parameter prototype on a live instance of the class that
+    // declares it.
     unsafe {
         #[rustfmt::skip]
         let f: unsafe extern "C-unwind" fn(
@@ -443,7 +447,8 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     assert_eq!(encoding_of(cls, c"takeBlock:"), "v@:@?");
 
     let obj = Shapes::alloc_init(mtm(), ()).expect("+alloc/-init");
-    // SAFETY: each prototype below matches the declared method signature on a live instance.
+    // SAFETY: each prototype below is exactly the declared method's signature, on a live instance
+    // of the class that declares it.
     unsafe {
         let f_cls: unsafe extern "C-unwind" fn(Id, Sel, ClassPtr) -> Bool = msg();
         assert!(!f_cls(obj.as_id(), sel!(setDelegateClass:), Shapes::class()).as_bool());
@@ -463,6 +468,8 @@ fn bool_ptr_encodes_what_foundation_compiled_for_its_bool_out_parameter() {
     assert!(!cls.is_null(), "Foundation's NSFileManager is registered");
     let name = c"fileExistsAtPath:isDirectory:";
     // SAFETY: side-effect-free runtime queries on a registered class.
+    // `method_copyArgumentType` answers a `malloc`ed copy (null past the last argument), which
+    // is read and then freed exactly once.
     let arg3 = unsafe {
         let m = class_getInstanceMethod(cls, sel_uncached(name));
         assert!(!m.is_null(), "{name:?} is a method of NSFileManager");

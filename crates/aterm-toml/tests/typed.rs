@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typed serde: `from_str::<T>` and `to_string` over `#[derive]` models shaped like
-//! aterm's.
+//! Typed serde `from_str::<T>` and `to_string` tests.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -10,9 +9,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::fuzz::Lcg;
 
-/// Shaped like the real consumers: a scalar-heavy root, nested tables reached
-/// by dotted keys, list-valued keys, optional keys that are absent from most
-/// files, an enum spelled as a bare string, and a repeated `[[section]]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -109,8 +105,6 @@ fn a_typed_value_survives_serialize_then_deserialize() {
     );
 }
 
-/// The `Option` contract: an absent key is `None`, and `None` writes no key at
-/// all rather than some spelling of null, which TOML does not have.
 #[test]
 fn absent_keys_and_none_values() {
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -127,8 +121,6 @@ fn absent_keys_and_none_values() {
     assert_eq!(aterm_toml::from_str::<S>(&ours).expect("reparse"), value);
 }
 
-/// Unknown keys are an error where the model asks for it (`deny_unknown_fields` on
-/// `Config`), so a typo does not silently do nothing.
 #[test]
 fn unknown_fields_are_refused_where_the_model_asks() {
     let text = "font_px = 1.0\nscrollback_lines = 10\nfont_pxx = 2.0\n";
@@ -138,7 +130,6 @@ fn unknown_fields_are_refused_where_the_model_asks() {
     );
 }
 
-/// Schema errors carry a span, because the config editor underlines them.
 #[test]
 fn schema_errors_carry_a_source_span() {
     let text = "font_px = 13.5\nscrollback_lines = \"not a number\"\n";
@@ -157,8 +148,6 @@ fn schema_errors_carry_a_source_span() {
     );
 }
 
-/// Every scalar shape a model can ask for, and the numeric coercions (integer
-/// into a float field, width-narrowing).
 #[test]
 fn scalar_coercions() {
     #[derive(Debug, PartialEq, Deserialize)]
@@ -187,8 +176,6 @@ fn scalar_coercions() {
         }
     );
 
-    // An integer where a float is expected is accepted; an out-of-range
-    // narrowing is refused.
     for (probe, accepted) in [
         ("f = 2\n", true),
         ("u = 70000\n", false),
@@ -215,8 +202,6 @@ fn scalar_coercions() {
     }
 }
 
-/// A fixed-length target takes the whole array or refuses it: `[1, 2, 3]` into `[u32; 2]`
-/// is an error, not `[1, 2]`. A `Vec` drains every element and is untouched.
 #[test]
 fn a_fixed_length_target_refuses_a_longer_array() {
     #[derive(Debug, Deserialize)]
@@ -253,8 +238,6 @@ fn a_fixed_length_target_refuses_a_longer_array() {
     );
 }
 
-/// A unit variant spelled as a one-key table carries nothing: `cursor_style = { bar = {} }`
-/// is `Bar`, and `cursor_style = { bar = 99 }` is an error, not `Bar` with the `99` dropped.
 #[test]
 fn a_unit_variant_in_table_form_carries_nothing() {
     #[derive(Debug, Deserialize)]
@@ -277,8 +260,6 @@ fn a_unit_variant_in_table_form_carries_nothing() {
     }
 }
 
-/// Date-times cross serde through a reserved struct name; that they survive a
-/// typed round-trip is the check that the protocol is wired on both sides.
 #[test]
 fn datetimes_round_trip_through_serde() {
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -302,8 +283,6 @@ fn datetimes_round_trip_through_serde() {
     );
 }
 
-/// `Table: FromStr` and `Value` indexing: the untyped path the art-asset suites read a
-/// document through (`doc["layer"][0]["role"]`), with no derived model.
 #[test]
 fn the_untyped_table_and_index_surface() {
     const SOURCE: &str = "\
@@ -328,15 +307,12 @@ paths = [\"M0 0\"]
     assert_eq!(ours["layer"][0]["role"].as_str(), Some("body"));
     assert_eq!(ours["layer"][0]["paths"][0].as_str(), Some("M0 0"));
 
-    // A malformed document is refused, with a span.
     let bad = "a = ";
     assert!(bad.parse::<aterm_toml::Table>().is_err());
     let err = bad.parse::<aterm_toml::Table>().unwrap_err();
     assert!(err.span().is_some(), "a refusal carries a span: {err}");
 }
 
-/// A schema error in a node with no span of its own (a table made by a dotted key or
-/// implied by a deeper header, an array of tables) is located on the key that names it.
 #[test]
 fn a_schema_error_in_a_spanless_node_is_located_on_its_key() {
     #[derive(Debug, Deserialize)]
@@ -371,21 +347,14 @@ fn a_schema_error_in_a_spanless_node_is_located_on_its_key() {
     struct Row {
         x: u8,
     }
-    // (source, the token the error must underline, and the byte it starts at
-    // where that token appears more than once)
     for (text, token, at) in [
-        // A dotted table where a string belongs.
         ("font.family.name = \"x\"\n", "family", None),
-        // A missing field in a dotted table, and in an implied one.
         ("net.listen = \"x\"\n", "net", None),
         ("[a]\n[net.x]\n", "net", None),
-        // An unknown variant names the variant key, in all three spellings.
         ("background_material.glass = {}\n", "glass", None),
         ("[background_material.glass]\n", "glass", None),
         ("background_material = { glass = {} }\n", "glass", None),
-        // A missing field in a dotted variant body.
         ("background_material.blur.x = 1\n", "blur", None),
-        // An array of tables longer than its target.
         ("[[rows]]\nx = 1\n[[rows]]\nx = 2\n", "rows", Some(2)),
     ] {
         let error = aterm_toml::from_str::<Doc>(text).expect_err(text);
@@ -403,10 +372,6 @@ fn a_schema_error_in_a_spanless_node_is_located_on_its_key() {
     }
 }
 
-// ---- round-trip properties --------------------------------------------------
-
-/// Write `value` as TOML and read it back: `Ok` when what comes back equals
-/// it, else what went wrong.
 fn reads_back<T>(value: &T) -> Result<(), String>
 where
     T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
@@ -421,8 +386,6 @@ where
     }
 }
 
-/// A key drawn where a spelling could go wrong: the type's extremes, zero,
-/// small values of both signs, and wide random ones.
 trait DrawKey: Sized {
     fn draw(rng: &mut Lcg) -> Self;
 }
@@ -451,8 +414,6 @@ draw_integer_key!(
     u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, usize, isize
 );
 
-/// Characters a key spelling can trip on: digits and signs, a dot (a path
-/// separator when bare), the escaped ones, and multi-byte ones.
 const KEY_CHARS: &[char] = &[
     'a', '7', '0', '-', '+', '.', ' ', '"', '\'', '\\', '\n', '\u{0}', '\u{7f}', 'é', '世', '😀',
 ];
@@ -470,8 +431,6 @@ impl DrawKey for char {
 }
 
 impl DrawKey for String {
-    /// Includes text that LOOKS like another key type's spelling: a string
-    /// key stays the string it is.
     fn draw(rng: &mut Lcg) -> Self {
         const LOOKALIKES: &[&str] = &["7", "007", "-0", "+7", "true", "True", "1e3", ""];
         if rng.below(3) == 0 {
@@ -482,13 +441,11 @@ impl DrawKey for String {
 }
 
 impl<K: DrawKey> DrawKey for Option<K> {
-    /// Only `Some`: a `None` key has no spelling and is refused when written.
     fn draw(rng: &mut Lcg) -> Self {
         Some(K::draw(rng))
     }
 }
 
-/// Newtype keys, as a model wraps an id, a name, or another newtype.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct KeyId(u32);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -500,7 +457,6 @@ struct KeyName(String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct KeyOuter(KeyId);
 
-/// A unit-variant key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum KeyLane {
     Fast,
@@ -543,17 +499,12 @@ impl DrawKey for KeyLane {
     }
 }
 
-/// A document whose tables are keyed by `K`: one flat, one nested under a key
-/// of the same type, and the same map at the document root.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Keyed<K: Ord> {
     flat: BTreeMap<K, i64>,
     nested: BTreeMap<K, BTreeMap<K, i64>>,
 }
 
-/// The same table read back through serde's buffer rather than straight from
-/// the document: flattened into a struct, as an untagged enum's payload, and
-/// inside an internally tagged one. No drawn key spells `name` or `kind`.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct FlatKeyed<K: Ord> {
     name: String,
@@ -573,7 +524,6 @@ enum TaggedKeyed<K: Ord> {
     Rec { map: BTreeMap<K, i64> },
 }
 
-/// `rounds` documents keyed by `K`, each written and read back.
 fn every_table_reads_back<K>(rng: &mut Lcg, rounds: u32)
 where
     K: DrawKey + Ord + Clone + Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -608,21 +558,8 @@ where
     }
 }
 
-/// A TOML key is a string, so a table keyed by anything else — an integer,
-/// a `bool`, a `char`, a unit variant, a newtype or `Some` over one of them —
-/// is written with its key spelled as text. Every such table the writer
-/// accepts reads back as itself, whether the reader takes it straight from the
-/// document or from serde's buffer (a flattened map, an untagged or internally
-/// tagged enum). It did not: the reader handed every key to `visit_str`, so
-/// `7 = "x"` refused to read back into the `HashMap<u32, _>` that wrote it
-/// (`invalid type: string "7", expected u32`), and the buffer did the same
-/// after the reader was fixed.
 #[test]
 fn every_table_the_writer_accepts_reads_back() {
-    // The negative control first: a key that does NOT read back as itself is
-    // caught.
-
-    /// Written with leading zeros, which no integer key is written with.
     #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
     struct Padded(u32);
     impl Serialize for Padded {
@@ -658,10 +595,6 @@ fn every_table_the_writer_accepts_reads_back() {
     every_table_reads_back::<KeyLane>(&mut rng, 150);
 }
 
-/// A non-string key reads back from exactly the text the writer spells it
-/// with, and from nothing else: a spelling it never writes reaches the key
-/// type as the string it is, which refuses it, and the error points at the
-/// key. `String` and `Value` keys stay text, however numeric they look.
 #[test]
 fn a_key_reads_back_only_in_the_spelling_the_writer_uses() {
     let map: HashMap<u32, String> = HashMap::from([(7, "x".to_owned())]);
@@ -745,7 +678,6 @@ fn a_key_reads_back_only_in_the_spelling_the_writer_uses() {
     assert_eq!(names.get("-0"), Some(&2));
 }
 
-/// A `None` the writer puts somewhere a value must be written.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 enum Carried {
     Unit,
@@ -759,12 +691,9 @@ struct Holder {
     x: Option<i64>,
 }
 
-/// A newtype over a `None`: nothing reads it back from an absent key.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Wrap(Option<i64>);
 
-/// A struct with a flattened field is written as a map, field by field; its
-/// flattened enum's newtype payload is a map VALUE, not a field.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct FlatHolder {
     inner: Option<i64>,
@@ -779,8 +708,6 @@ enum Flattened {
     C { deep: Deep },
 }
 
-/// Buffered whole when it is a flattened struct variant's field, so its
-/// fields cross serde's buffer before they reach the writer.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Deep {
     x: Option<i64>,
@@ -788,12 +715,6 @@ struct Deep {
     more: BTreeMap<String, i64>,
 }
 
-/// Every place a `None` can sit. Where it must be written: array elements
-/// (flat and nested), a tuple field, a fixed array, a variant's payload,
-/// `Some(None)`, a newtype over `None` (a field's and inside `Some`), a map
-/// value, a flattened newtype variant's payload. Where it is a field a table leaves out: the root's, an
-/// array-of-tables row's, a struct variant's, a field of a struct written as a
-/// map, and one that crossed serde's buffer.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Carrier {
     keep: i64,
@@ -815,13 +736,9 @@ struct Carrier {
     flat: Option<FlatHolder>,
 }
 
-/// How many sites [`Carrier::draw`] can put an unwritable `None` at.
 const NONE_SITES: u32 = 11;
 
 impl Carrier {
-    /// Half the values put a `None` at one site that cannot leave it out,
-    /// drawn at random; every value holds `None`s where a table leaves them
-    /// out.
     fn draw(rng: &mut Lcg) -> (Self, Option<u32>) {
         fn some(rng: &mut Lcg) -> Option<i64> {
             Some(i64::from(rng.next()) - (1 << 30))
@@ -913,9 +830,6 @@ impl Carrier {
         (carrier, site)
     }
 
-    /// Whether a `None` sits where a value must be written: leaving it out
-    /// would shift the elements after it, leave a variant with no payload,
-    /// read back as a different value, or not read back at all.
     fn holds_an_unwritable_none(&self) -> bool {
         self.list.contains(&None)
             || self.nested.iter().any(|row| row.contains(&None))
@@ -939,16 +853,6 @@ impl Carrier {
     }
 }
 
-/// TOML has no null. A `None` FIELD is left out and reads back as the `None`
-/// it was; a `None` that leaving out would lose is REFUSED, with an error: an
-/// array cannot skip an element without shifting every later one, a map
-/// without its entry is another map, a variant cannot drop its payload,
-/// `Some(None)` would read back as `None`, and a newtype over `None` would not
-/// read back at all. Before, the array's refusal was the same sentinel a
-/// `None` field raises, so the enclosing struct swallowed it and dropped the
-/// whole field: `{ keep: 1, list: [Some(1), None] }` wrote `keep = 1` and said
-/// nothing. The property: every value either reads back as itself or is
-/// refused, never written as something else.
 #[test]
 fn a_none_is_left_out_of_a_table_and_refused_anywhere_else() {
     #[derive(Debug, Serialize)]
@@ -967,8 +871,6 @@ fn a_none_is_left_out_of_a_table_and_refused_anywhere_else() {
          variant payload, `Some` or newtype cannot be written"
     );
 
-    // The negative control: the round-trip check catches a silent loss, here a
-    // value written without its low bit.
     #[derive(Debug, PartialEq, Deserialize)]
     struct Even(i64);
     impl Serialize for Even {
@@ -1008,8 +910,6 @@ fn a_none_is_left_out_of_a_table_and_refused_anywhere_else() {
             at_site[site as usize] += 1;
         }
     }
-    // Both halves of the property ran on plenty of cases, and every site held
-    // its `None` in many of them.
     assert!(
         refused > 1_000 && written > 1_000,
         "{refused} refused, {written} written"
@@ -1017,13 +917,6 @@ fn a_none_is_left_out_of_a_table_and_refused_anywhere_else() {
     assert!(at_site.iter().all(|&n| n > 50), "{at_site:?}");
 }
 
-/// A `None` field is left out wherever serde sends it: a struct written as a
-/// map (it has a flattened field) and a flattened struct reach the writer
-/// through `SerializeMap::serialize_field_entry`, and the field reads back as
-/// the `None` it was. A `None` map value and a flattened enum's `None` payload
-/// reach it through `serialize_entry`, and are refused: the map without the
-/// entry, and the struct without the variant, would read back as something
-/// else (`{a: None, b: Some(1)}` as `{b: Some(1)}`) or not at all.
 #[test]
 fn a_none_field_is_left_out_and_a_none_map_value_refused() {
     #[derive(Debug, PartialEq, Serialize, Deserialize)]

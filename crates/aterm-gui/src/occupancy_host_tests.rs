@@ -60,6 +60,7 @@ fn the_board_copies_the_snapshots_facts_and_says_when_it_is_stale() {
             pressure: Some(Pressure::Warn),
             disk: Some(Level::Low),
             slots: Some(THREE_ONE_FREE),
+            slots_as_of_unix_ms: None,
             stale: false,
         }
     );
@@ -79,6 +80,7 @@ fn the_board_copies_the_snapshots_facts_and_says_when_it_is_stale() {
             pressure: None,
             disk: None,
             slots: None,
+            slots_as_of_unix_ms: None,
             stale: true,
         }
     );
@@ -752,6 +754,301 @@ fn a_stale_board_reserves_no_slot() {
     }
 }
 
+// SAMPLING AND THE WRITE'S RE-READ (design §3.1): under `prompt`, while a session's loop asks
+// for `hold-room`'s reading, the board samples every five seconds; a slot rule's write is
+// answered on the board re-read for it, no older than `FACT_FRESH_MS`.
+
+/// Every build slot of three taken.
+const NONE_OF_THREE: SlotsView = SlotsView::Read {
+    n: 3,
+    held: 3,
+    free: 0,
+    pending: 0,
+    unknown: 0,
+    discounted: 0,
+};
+
+/// Two build slots of three free.
+const TWO_OF_THREE: SlotsView = SlotsView::Read {
+    n: 3,
+    held: 1,
+    free: 2,
+    pending: 0,
+    unknown: 0,
+    discounted: 0,
+};
+
+/// A board from a snapshot of `slots` that landed at `unix_ms`, its slots read then, taken then.
+fn sampled_at(unix_ms: i64, slots: SlotsView) -> Option<(FactsBoard, Arc<Snapshot>)> {
+    let snap = at(unix_ms, slots, Pressure::Normal, Some(0), None);
+    Some((
+        board_of(&snap, Some(unix_ms), Some(Level::Ok), unix_ms),
+        Arc::new(snap),
+    ))
+}
+
+/// Half an hour at one-second ticks under `mode`: the window's look each minute, session `a`'s
+/// loop asking the board's reading at each look through `asks_to_s` (seconds), and a sampler
+/// pass each tick. The reads the sampler made, and the tick its pass first said stop.
+fn sampled_half_hour(mode: Occupancy, asks_to_s: i64) -> (usize, Option<i64>) {
+    let sessions = [(7, "a".to_string())];
+    let kept = Mutex::new(Some(Judged::default()));
+    let mut reads = 0;
+    let mut stopped = None;
+    let mut read = |now: i64| {
+        reads += 1;
+        sampled_at(now, THREE_ONE_FREE)
+    };
+    for s in 0..30 * 60 {
+        let now = NOW + s * 1000;
+        if s % 60 == 0 {
+            let mut k = kept.lock().expect("the board");
+            let j = k.as_mut().expect("judged");
+            step(
+                j,
+                &at(now, THREE_ONE_FREE, Pressure::Normal, Some(0), None),
+                now,
+                &sessions,
+            );
+            if s <= asks_to_s {
+                j.asked("a", now, mode);
+            }
+        }
+        if !sample_pass(&kept, mode, now, &mut read) && stopped.is_none() {
+            stopped = Some(s);
+        }
+    }
+    (reads, stopped)
+}
+
+/// OBSERVE SAMPLES NO FASTER THAN ITS LOOKS: under `observe` and `off` a loop's asks start no
+/// sampler and its passes read nothing (the minute looks alone); under `prompt`, asked at every
+/// look, the board is read every [`SAMPLE_EVERY`] between them. The sampler keeps to the asks:
+/// asked only through nine minutes, it reads until [`ASK_KEEP_MS`] past the last ask and stops;
+/// never asked, it reads nothing. NEGATIVE CONTROL: `prompt` asked throughout.
+#[test]
+fn observe_samples_no_faster_than_its_looks() {
+    let half_hour_s = 30 * 60;
+    let every_s = SAMPLE_EVERY_MS / 1000;
+    let all = usize::try_from(half_hour_s / every_s).unwrap();
+    assert_eq!(
+        sampled_half_hour(Occupancy::Prompt, half_hour_s),
+        (all, None),
+        "prompt, asked throughout"
+    );
+    for mode in [Occupancy::Observe, Occupancy::Off] {
+        assert_eq!(
+            sampled_half_hour(mode, half_hour_s),
+            (0, Some(0)),
+            "{mode:?}"
+        );
+        let mut j = Judged::default();
+        j.asked("a", NOW, mode);
+        assert!(!j.sampling(NOW, mode), "{mode:?}");
+        assert!(!j.sample_due(NOW, mode), "{mode:?}");
+    }
+    let last_ask_s = 9 * 60;
+    let last_s = last_ask_s + ASK_KEEP_MS / 1000;
+    let kept = usize::try_from(last_s / every_s + 1).unwrap();
+    assert_eq!(
+        sampled_half_hour(Occupancy::Prompt, last_ask_s),
+        (kept, Some(last_s + 1)),
+        "the sampler keeps to the asks"
+    );
+    assert_eq!(sampled_half_hour(Occupancy::Prompt, -1), (0, Some(0)));
+}
+
+/// UNDER PROMPT THE SLOT TERM IS JUDGED ON THE SAMPLES: a slot taken for five seconds between
+/// two minute looks, which only a sample sees, starts `slots>=1 for=20m` over, so twenty
+/// minutes of looks do not span it. NEGATIVE CONTROL: under `observe` the looks alone judge
+/// it, and it spans.
+#[test]
+fn under_prompt_the_slot_term_is_judged_on_the_samples() {
+    let blip = NOW + 10 * MIN_MS + 5_000..NOW + 10 * MIN_MS + 10_000;
+    let run = |mode: Occupancy| {
+        let sessions = [(7, "a".to_string())];
+        let kept = Mutex::new(Some(Judged::default()));
+        let mut read = |now: i64| {
+            let slots = if blip.contains(&now) {
+                NONE_OF_THREE
+            } else {
+                THREE_ONE_FREE
+            };
+            sampled_at(now, slots)
+        };
+        for s in 0..=20 * 60 {
+            let now = NOW + s * 1000;
+            if s % 60 == 0 {
+                let mut k = kept.lock().expect("the board");
+                let j = k.as_mut().expect("judged");
+                step(
+                    j,
+                    &at(now, THREE_ONE_FREE, Pressure::Normal, Some(0), None),
+                    now,
+                    &sessions,
+                );
+                j.asked("a", now, mode);
+            }
+            sample_pass(&kept, mode, now, &mut read);
+        }
+        let k = kept.lock().expect("the board");
+        read_at_look(k.as_ref().expect("judged"), "a").slots_free_ms
+    };
+    assert_eq!(run(Occupancy::Observe), Some(20 * 60_000));
+    assert_eq!(run(Occupancy::Prompt), None);
+}
+
+/// A hold begun three hours before [`NOW`].
+const ROOM_SINCE: i64 = NOW - 3 * HOUR_MS;
+
+/// A board over twenty-five minutes of looks to [`NOW`], one slot of three free throughout,
+/// sessions `a` (tab 7) and `b` (tab 9) each seen holding one at the first: `hold-room`'s terms
+/// hold at `NOW` for a hold begun [`ROOM_SINCE`].
+fn room_board() -> Judged {
+    let sessions = [(7, "a".to_string()), (9, "b".to_string())];
+    let mut j = Judged::default();
+    for m in (0..=25).rev() {
+        let t = NOW - m * MIN_MS;
+        let tabs = (m == 25).then(|| vec![7, 9]);
+        step(
+            &mut j,
+            &at(t, THREE_ONE_FREE, Pressure::Normal, Some(0), tabs),
+            t,
+            &sessions,
+        );
+    }
+    j
+}
+
+/// The board re-read for a write at `now_ms`: a snapshot of `slots` that landed at `landed_ms`,
+/// its slots read `age_ms` before, `avail_gib` available.
+fn reread(
+    j: &mut Judged,
+    now_ms: i64,
+    landed_ms: i64,
+    slots: SlotsView,
+    avail_gib: u64,
+    age_ms: Option<u64>,
+) {
+    let snap = Snapshot {
+        avail: Some(avail_gib << 30),
+        ..at(landed_ms, slots, Pressure::Normal, age_ms, None)
+    };
+    j.sample(
+        board_of(&snap, Some(landed_ms), Some(Level::Ok), now_ms),
+        Some(&snap),
+    );
+}
+
+/// The answer to session `sid`'s `hold-room` line at `now_ms`.
+fn room_answer(j: &mut Judged, sid: &str, now_ms: i64) -> PaceGrant {
+    j.answer(sid, RuleId::HoldRoom, ROOM_SINCE, now_ms)
+}
+
+/// A SLOT TAKEN SINCE THE LOOK HOLDS THE LINE: the minute look saw one free; the board re-read
+/// for the write half a minute later sees none, and the answer is `unmet`, no slot reserved.
+/// The look's board itself, half a minute old, types nothing (`stale`). NEGATIVE CONTROL: the
+/// slot still free at the re-read is answered with the room; the look's board within
+/// `FACT_FRESH_MS` of its landing is too.
+#[test]
+fn a_slot_taken_since_the_look_holds_the_line() {
+    let now = NOW + 30_000;
+    let mut j = room_board();
+    reread(&mut j, now, now, NONE_OF_THREE, 96, Some(0));
+    assert_eq!(room_answer(&mut j, "a", now), PaceGrant::Unmet);
+    assert!(j.pace.reserved.is_empty(), "no slot reserved for it");
+    let mut j = room_board();
+    reread(&mut j, now, now, THREE_ONE_FREE, 96, Some(0));
+    assert!(
+        matches!(room_answer(&mut j, "a", now), PaceGrant::Room(_)),
+        "the control"
+    );
+    let mut j = room_board();
+    assert_eq!(room_answer(&mut j, "a", now), PaceGrant::Stale);
+    let mut j = room_board();
+    assert!(matches!(
+        room_answer(&mut j, "a", NOW + FACT_FRESH_MS),
+        PaceGrant::Room(_)
+    ));
+}
+
+/// A STALE RE-READ REFUSES: a re-read whose snapshot landed, or whose slots were read, more than
+/// `FACT_FRESH_MS` before the answer, or whose slots say no age, is answered `stale`. NEGATIVE
+/// CONTROL: each at the edge is answered with the room.
+#[test]
+fn a_stale_reread_refuses() {
+    let now = NOW + 30_000;
+    let edge = u64::try_from(FACT_FRESH_MS).unwrap();
+    for (landed, age, stale) in [
+        (now - FACT_FRESH_MS - 1, Some(0), true),
+        (now - FACT_FRESH_MS, Some(0), false),
+        (now, Some(edge + 1), true),
+        (now, Some(edge), false),
+        (now - 2_000, Some(edge - 2_000 + 1), true),
+        (now - 2_000, Some(edge - 2_000), false),
+        (now, None, true),
+    ] {
+        let mut j = room_board();
+        reread(&mut j, now, landed, THREE_ONE_FREE, 96, age);
+        let grant = room_answer(&mut j, "a", now);
+        assert_eq!(
+            grant == PaceGrant::Stale,
+            stale,
+            "landed {} ms before, slots {age:?}: {grant:?}",
+            now - landed
+        );
+        assert!(stale || matches!(grant, PaceGrant::Room(_)), "{grant:?}");
+    }
+}
+
+/// THE ROOM ANSWER CARRIES THE RE-READ FIGURES: the look's board says one slot of three and
+/// 96 GiB; the board re-read for the write says two and 64 GiB, and the answer's reading is the
+/// re-read's, stamped when its oldest figure was read, its slot term spanned to the re-read.
+/// NEGATIVE CONTROL: the look's reading says the other figures.
+#[test]
+fn the_room_answer_carries_the_reread_figures() {
+    let now = NOW + 30_000;
+    let mut j = room_board();
+    let looked = read_at_look(&j, "a");
+    assert_eq!(looked.slots, Some(SlotsSeen { usable: 1, n: 3 }));
+    assert_eq!(looked.avail_mib, Some(96 << 10));
+    reread(&mut j, now, now - 2_000, TWO_OF_THREE, 64, Some(1_000));
+    let PaceGrant::Room(r) = room_answer(&mut j, "a", now) else {
+        panic!("the room");
+    };
+    assert_eq!(r.slots, Some(SlotsSeen { usable: 2, n: 3 }));
+    assert_eq!(r.avail_mib, Some(64 << 10));
+    assert_eq!(r.taken_ms, now - 3_000);
+    assert_eq!(r.slots_free_ms, Some(25 * 60_000 + 28_000));
+    assert_ne!((r.slots, r.avail_mib), (looked.slots, looked.avail_mib));
+    assert!(r.typeable_at(Some(now)));
+}
+
+/// A SLOT RULE IS NEVER ANSWERED A BARE GRANT (a bare `granted` to `hold-room` is an older
+/// build's, which types the line as decided): it is the room, or the line held, the pace's
+/// holds passed through (`b`'s line waits on the slot reserved for `a`'s). NEGATIVE CONTROL: a
+/// nudge's pace is the bare grant.
+#[test]
+fn a_slot_rule_is_never_answered_a_bare_grant() {
+    let now = NOW + 30_000;
+    let mut j = room_board();
+    reread(&mut j, now, now, THREE_ONE_FREE, 96, Some(0));
+    assert!(matches!(room_answer(&mut j, "a", now), PaceGrant::Room(_)));
+    assert_eq!(room_answer(&mut j, "b", now + 1_000), PaceGrant::Reserved);
+    assert_eq!(
+        j.answer("b", RuleId::WaitNudge, ROOM_SINCE, now + 1_000),
+        PaceGrant::Granted
+    );
+    for slots in [THREE_ONE_FREE, TWO_OF_THREE, NONE_OF_THREE] {
+        for landed in [now, now - FACT_FRESH_MS - 1] {
+            let mut j = room_board();
+            reread(&mut j, now, landed, slots, 96, Some(0));
+            let grant = room_answer(&mut j, "a", now);
+            assert_ne!(grant, PaceGrant::Granted, "{slots:?} {landed}");
+        }
+    }
+}
+
 // SURFACING (slice 1e): the told word, the ready proxy, the slot-minutes idle while ready, the
 // status fields and the `occupancy` verb's replies.
 
@@ -1154,4 +1451,265 @@ fn a_poke_between_ticks_takes_no_row() {
         "a minute apart"
     );
     assert_eq!(j.ready_now(), 1);
+}
+
+// THE SAMPLER'S LEAD AND ITS MODE (§3.1): a told hold's `hold-room` line is sampled from its slot
+// term's `for=` before the line can go, under the owner's `prompt` alone; a slot rule's write
+// re-reads the board under `prompt` alone.
+
+/// When session `a`'s hold, begun at [`ROOM_SINCE`], can first type `hold-room`'s line.
+const ROOM_DUE: i64 = ROOM_SINCE + rules::HOLD_ROOM_AFTER_MS;
+
+/// The lead the sampler takes before a line can go: the slot term's `for=` and one look.
+fn lead_ms() -> i64 {
+    let wait = machine_wait(HOLD_ROOM_SLOTS).expect("the slot term parses");
+    i64::try_from(wait.for_ms).unwrap() + LOOK_EVERY_MS
+}
+
+/// A RUN TO `hold-room`'S CADENCE under the owner's `mode`: session `a`'s hold begun at
+/// [`ROOM_SINCE`], told by its loop running under `told` (nothing told for `None`); the
+/// window's look each minute from 25 minutes before [`ROOM_DUE`] to it, the loop asking the
+/// board at each look from then (its line can go from then, [`rules::wants_reading`]), a
+/// sampler pass each second, and a build slot taken for five seconds ten minutes before it. The
+/// reads the sampler made before [`ROOM_DUE`], and the slot term's span at the look then.
+fn lead_run(mode: Occupancy, told: Option<Occupancy>) -> (usize, Option<u64>) {
+    let blip = ROOM_DUE - 10 * MIN_MS + 5_000..ROOM_DUE - 10 * MIN_MS + 10_000;
+    let sessions = [(7, "a".to_string())];
+    let mut j = Judged::default();
+    if let Some(told) = told {
+        j.tell("a", Some(said(told, Some(ROOM_SINCE), QUIET, None)));
+    }
+    let kept = Mutex::new(Some(j));
+    let mut reads = 0;
+    let mut read = |now: i64| {
+        reads += usize::from(now < ROOM_DUE);
+        let slots = if blip.contains(&now) {
+            NONE_OF_THREE
+        } else {
+            THREE_ONE_FREE
+        };
+        sampled_at(now, slots)
+    };
+    for s in 0..=25 * 60 {
+        let now = ROOM_DUE - 25 * MIN_MS + s * 1000;
+        if s % 60 == 0 {
+            let mut k = kept.lock().expect("the board");
+            let j = k.as_mut().expect("judged");
+            step(
+                j,
+                &at(now, THREE_ONE_FREE, Pressure::Normal, Some(0), None),
+                now,
+                &sessions,
+            );
+            if now >= ROOM_DUE {
+                j.asked("a", now, mode);
+            }
+        }
+        sample_pass(&kept, mode, now, &mut read);
+    }
+    let k = kept.lock().expect("the board");
+    (
+        reads,
+        read_at_look(k.as_ref().expect("judged"), "a").slots_free_ms,
+    )
+}
+
+/// A TOLD HOLD IS SAMPLED FROM ITS SLOT TERM'S `for=` BEFORE ITS LINE CAN GO: a loop asks the
+/// board only once `hold-room`'s line can go, but `slots>=1 for=20m` spans the twenty minutes
+/// before, so under `prompt` the board samples from the told hold, and a slot taken for five
+/// seconds ten minutes before the line can go starts the term over: at the look it can go, the
+/// term does not span. NEGATIVE CONTROLS: nothing told, the owner's `observe` or `off`, or a loop
+/// running under `observe`, and nothing is read before the line can go; the looks alone judge the
+/// term, which spans their 25 minutes across the slot taken between two of them.
+#[test]
+fn a_told_hold_is_sampled_from_its_slot_terms_for_before_its_line_can_go() {
+    let lead = usize::try_from(lead_ms() / SAMPLE_EVERY_MS).unwrap();
+    assert_eq!(
+        lead_run(Occupancy::Prompt, Some(Occupancy::Prompt)),
+        (lead, None)
+    );
+    let looks = Some(25 * 60_000);
+    assert_eq!(
+        lead_run(Occupancy::Prompt, None),
+        (0, looks),
+        "nothing told"
+    );
+    for (mode, told) in [
+        (Occupancy::Observe, Occupancy::Prompt),
+        (Occupancy::Off, Occupancy::Prompt),
+        (Occupancy::Prompt, Occupancy::Observe),
+    ] {
+        assert_eq!(
+            lead_run(mode, Some(told)),
+            (0, looks),
+            "{mode:?} told {told:?}"
+        );
+    }
+}
+
+/// THE LEAD'S EDGES: from the slot term's `for=` and one look before the told hold's line can go
+/// to [`ASK_KEEP_MS`] after (by when its loop asks the board itself), and the look starts one
+/// sampler there; each line told typed moves the next lead to two hours after it; the rule told
+/// spent (with no line told typed here: a predecessor's), or its cap's four lines told typed,
+/// leaves none; a hold told closed keeps its lines, as a successor carries it, and a hold begun
+/// after them counts afresh; a session forgotten leaves none. NEGATIVE CONTROL: the owner's
+/// `observe` and `off` sample at no edge.
+#[test]
+fn the_lead_runs_from_the_slot_terms_for_before_each_line_to_its_loops_asks() {
+    let lead = lead_ms();
+    let room = |verdict: SaidVerdict, at_ms: i64| {
+        let mut word = said(
+            Occupancy::Prompt,
+            Some(ROOM_SINCE),
+            [SaidVerdict::Quiet, verdict],
+            None,
+        );
+        word.rules[1].at_ms = at_ms;
+        word
+    };
+    let edges = |j: &Judged, due: i64| {
+        [
+            due - lead - 1,
+            due - lead,
+            due,
+            due + ASK_KEEP_MS,
+            due + ASK_KEEP_MS + 1,
+        ]
+        .map(|t| j.sampling(t, Occupancy::Prompt))
+    };
+    let window = [false, true, true, true, false];
+    let mut j = Judged::default();
+    j.tell("a", Some(room(SaidVerdict::Quiet, 0)));
+    assert_eq!(edges(&j, ROOM_DUE), window, "the first line");
+    let mut spent = Judged::default();
+    spent.tell("a", Some(room(SaidVerdict::Spent, ROOM_DUE)));
+    assert_eq!(
+        edges(&spent, ROOM_DUE),
+        [false; 5],
+        "said spent, none told typed"
+    );
+    for mode in [Occupancy::Observe, Occupancy::Off] {
+        for t in [ROOM_DUE - lead, ROOM_DUE, ROOM_DUE + ASK_KEEP_MS] {
+            assert!(!j.sampling(t, mode), "{mode:?} at {t}");
+            assert!(!j.sampler_due(t, mode), "{mode:?} at {t}");
+        }
+    }
+    assert!(!j.sampler_due(ROOM_DUE - lead - 1, Occupancy::Prompt));
+    assert!(
+        j.sampler_due(ROOM_DUE - lead, Occupancy::Prompt),
+        "one starts"
+    );
+    assert!(!j.sampler_due(ROOM_DUE, Occupancy::Prompt), "one runs");
+
+    let mut typed_at = ROOM_DUE + 5 * MIN_MS;
+    for n in 1..rules::HOLD_ROOM_PER_HOLD {
+        j.tell("a", Some(room(SaidVerdict::Typed, typed_at)));
+        j.tell("a", Some(room(SaidVerdict::Typed, typed_at)));
+        let next = typed_at + rules::HOLD_ROOM_APART_MS;
+        assert_eq!(edges(&j, next), window, "after line {n}");
+        assert!(!j.sampling(typed_at + HOUR_MS, Occupancy::Prompt), "spaced");
+        j.tell("a", Some(room(SaidVerdict::Quiet, typed_at + MIN_MS)));
+        assert_eq!(edges(&j, next), window, "the line stays booked");
+        typed_at = next + 5 * MIN_MS;
+    }
+    let mut closed = said(Occupancy::Prompt, None, QUIET, None);
+    closed.rules[1].at_ms = typed_at;
+    j.tell("a", Some(closed));
+    j.tell("a", Some(room(SaidVerdict::Quiet, 0)));
+    let after_last = typed_at - 5 * MIN_MS;
+    assert_eq!(
+        edges(&j, after_last),
+        window,
+        "a hold told closed keeps its lines"
+    );
+    j.tell("a", Some(room(SaidVerdict::Typed, typed_at)));
+    let next = typed_at + rules::HOLD_ROOM_APART_MS;
+    assert_eq!(edges(&j, next), [false; 5], "the cap's lines typed");
+    j.tell("a", Some(room(SaidVerdict::Spent, next)));
+    assert_eq!(edges(&j, next), [false; 5], "said spent");
+
+    let since = typed_at + MIN_MS;
+    let mut fresh = said(Occupancy::Prompt, Some(since), QUIET, None);
+    fresh.rules[1].at_ms = 0;
+    j.tell("a", Some(fresh));
+    let due = since + rules::HOLD_ROOM_AFTER_MS;
+    assert_eq!(edges(&j, due), window, "another hold counts afresh");
+    j.tell("a", None);
+    assert_eq!(edges(&j, due), [false; 5], "forgotten");
+}
+
+/// THE SAMPLER KEEPS TO THE OWNER'S MODE, EACH CHECK ALONE: a board whose loop asked under
+/// `prompt` samples under `prompt`, but not once the owner's mode reads `observe` or `off`, and a
+/// pass then reads nothing and stops; an ask under `observe` or `off` wants nothing, and clears
+/// what `prompt`'s asks wanted, so `prompt` then samples nothing either. NEGATIVE CONTROL: the
+/// ask under `prompt`, sampled under `prompt`.
+#[test]
+fn the_sampler_keeps_to_the_owners_mode_each_check_alone() {
+    for mode in [Occupancy::Observe, Occupancy::Off] {
+        let mut j = Judged::default();
+        j.asked("a", NOW, Occupancy::Prompt);
+        assert!(j.sampling(NOW, Occupancy::Prompt), "the control");
+        assert!(!j.sampling(NOW, mode), "{mode:?}");
+        assert!(!j.sample_due(NOW, mode), "{mode:?}");
+        let kept = Mutex::new(Some(j));
+        let mut reads = 0;
+        let mut read = |now: i64| {
+            reads += 1;
+            sampled_at(now, THREE_ONE_FREE)
+        };
+        assert!(!sample_pass(&kept, mode, NOW, &mut read), "{mode:?}");
+        assert_eq!(reads, 0, "{mode:?}");
+
+        let mut j = Judged::default();
+        j.asked("a", NOW, mode);
+        assert!(j.wanting.is_empty(), "{mode:?}");
+        assert!(!j.sampling(NOW, Occupancy::Prompt), "{mode:?}");
+        j.asked("a", NOW, Occupancy::Prompt);
+        j.asked("b", NOW + 1, mode);
+        assert!(j.wanting.is_empty(), "{mode:?}");
+        assert!(!j.sampling(NOW + 2, Occupancy::Prompt), "{mode:?}");
+    }
+}
+
+/// A SLOT RULE'S WRITE RE-READS THE BOARD UNDER `prompt` ALONE: a loop whose policy still says
+/// `prompt` after the owner's mode moved to `observe` or `off` asks the pace of a `hold-room`
+/// line; nothing is read and the line waits (`stale`). A nudge's pace reads nothing under any
+/// mode. NEGATIVE CONTROL: under `prompt` the board is re-read once and the line answered with
+/// the room.
+#[test]
+fn a_slot_rules_write_rereads_the_board_under_prompt_alone() {
+    let now = NOW + 30_000;
+    let run = |mode: Occupancy, rule: RuleId| {
+        let kept = Mutex::new(Some(room_board()));
+        let mut reads = 0;
+        let mut reread = || {
+            reads += 1;
+            Some(Reread {
+                snap: Arc::new(at(now, THREE_ONE_FREE, Pressure::Normal, Some(0), None)),
+                landed_ms: now,
+                disk: Some(Level::Ok),
+            })
+        };
+        let grant = pace_on(
+            &kept,
+            mode,
+            ("a", rule, ROOM_SINCE),
+            &mut reread,
+            &mut || Some(now),
+        );
+        (grant, reads)
+    };
+    for mode in [Occupancy::Observe, Occupancy::Off] {
+        assert_eq!(
+            run(mode, RuleId::HoldRoom),
+            (PaceGrant::Stale, 0),
+            "{mode:?}"
+        );
+    }
+    for mode in [Occupancy::Observe, Occupancy::Off, Occupancy::Prompt] {
+        assert_eq!(run(mode, RuleId::WaitNudge).1, 0, "{mode:?}");
+    }
+    let (grant, reads) = run(Occupancy::Prompt, RuleId::HoldRoom);
+    assert!(matches!(grant, PaceGrant::Room(_)), "{grant:?}");
+    assert_eq!(reads, 1);
 }

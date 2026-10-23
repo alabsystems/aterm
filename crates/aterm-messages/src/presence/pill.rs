@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEEDS PILL'S MODEL (§5): what a window's titlebar pill says and offers
-//! ([`Pill`]), and the one geometry its painters lay it out by and resolve a
-//! click through ([`pill_layout`], [`PillLayout::hit`]): the macOS
-//! `NeedsPill` view measures its pieces in points, the in-grid strip in grid
-//! cells, and both hand the same pure function their measure. So a click
-//! lands on the act the painter drew there, whatever the unit.
+//! Window titlebar needs-pill model and layout ([`Pill`], [`pill_layout`], [`PillLayout::hit`]).
 
 use super::NeedSeverity;
 use super::words::PillWords;
@@ -14,7 +9,7 @@ use super::words::PillWords;
 /// What lit the pill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PillKind {
-    /// A need of this severity: the border's.
+    /// A need of this severity.
     Need(NeedSeverity),
     /// The person's own hold on the front session, nothing needing them.
     Yours,
@@ -23,11 +18,9 @@ pub enum PillKind {
 /// The one act a pill offers beside going to the tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PillAct {
-    /// Restart the front tab's frozen program: offered only where the host's
-    /// restart act would be carried (`aterm-gui`'s `restart_act::offered`).
+    /// Restart the front tab's frozen program.
     Restart,
-    /// Continue the front tab's stopped job (`signal cont`): the remedy the
-    /// stall's own words name for a job stopped with input queued.
+    /// Continue the front tab's stopped job (`signal cont`).
     Resume,
     /// Lift the person's hold (Take Over's other half).
     HandBack,
@@ -48,36 +41,33 @@ impl PillAct {
 /// What a click on the pill does: the region it landed in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PillHit {
-    /// The body (the glyph, the label, the words): go to the tab.
+    /// The body (the glyph, the label, the words).
     Go,
     /// The act.
     Act(PillAct),
-    /// The `+N`: the host opens its Overview at the window's next need
-    /// (`drive::next_need`).
+    /// The `+N`: the host opens its Overview at the window's next need (`drive::next_need`).
     More,
 }
 
-/// One window's pill: the session it names and what it says of it.
+/// One window's pill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pill {
     /// What lit it.
     pub kind: PillKind,
-    /// The session it names (the host's local id): where the body goes.
+    /// The session it names (the host's local id).
     pub session: u64,
     /// The session's label (role, else user title, else the title the strip
     /// shows), sanitized; empty for the session in front, which the window
     /// names already — a background tab's, or another pane's of the front
     /// tab, is shown.
     pub label: String,
-    /// The tab's 1-based number when it is not the window's front tab;
-    /// `None` for the front tab.
+    /// The tab's 1-based number when it is not the window's front tab.
     pub tab: Option<usize>,
-    /// The need's words (the published verdict's, sanitized); empty for the
-    /// person's hold.
+    /// The need's words (the published verdict's, sanitized).
     pub what: String,
     /// When the need began ([`super::Slot::need_since`]), on a background
     /// tab's pill alone, which prints its age (and whose age alone arms the
-    /// host's tick). `None` for the front tab's pill and the person's hold.
+    /// host's tick).
     pub since: Option<crate::Instant>,
     /// The act it offers.
     pub act: Option<PillAct>,
@@ -85,7 +75,7 @@ pub struct Pill {
     pub more: usize,
 }
 
-/// One laid-out piece: from `x`, `w` wide, in the painter's unit.
+/// One laid-out piece.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
     /// Its leading edge.
@@ -100,10 +90,7 @@ impl Span {
     }
 }
 
-/// The pill laid out at a width ([`pill_layout`]): each piece's span. The
-/// glyph is never clipped; the words clip first, then the label; the act and
-/// the count are whole or gone (the count first, then the act, only where
-/// the glyph alone would not fit beside them).
+/// The pill laid out at a width ([`pill_layout`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PillLayout {
     /// The glyph.
@@ -121,8 +108,7 @@ pub struct PillLayout {
 }
 
 impl PillLayout {
-    /// What a click at `x` (the pill's own coordinate) does: the region the
-    /// painter drew there, or `None` for the pill's margins.
+    /// What a click at `x` (in the pill's own coordinates, `0..width`) does.
     #[must_use]
     pub fn hit(&self, x: f64) -> Option<PillHit> {
         if let Some((act, span)) = self.act
@@ -141,12 +127,7 @@ impl PillLayout {
     }
 }
 
-/// Lay `words` out in at most `max` (the painter's unit: points or cells),
-/// each piece measured by `measure` and kept `gap` apart. The glyph keeps
-/// its width whatever `max` is; the act and the `+N` are kept whole while
-/// the glyph fits beside them (the `+N` given up first); what is left goes
-/// to the label first and the words after, so the words clip first and the
-/// label after them.
+/// Lay `words` out in at most `max`.
 #[must_use]
 pub fn pill_layout(
     words: &PillWords,
@@ -180,9 +161,6 @@ pub fn pill_layout(
     } else {
         0.0
     };
-    // The words' span is measured at their room ([`PillWords::room`]): as
-    // wide as they get before the age's unit moves, so the pill's width holds
-    // still while its age ticks.
     let words_full = measure(&words.room);
     let words_w = if words_full > 0.0 && room > gap {
         words_full.min(room - gap)

@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Bounded off-thread config analysis for Settings ▸ Manual.
-//!
-//! TOML/schema analysis and filesystem/font-backed semantics share one worker,
-//! a one-entry request channel, and one latest-wins pending slot. Rendering only
-//! consumes a completed immutable projection. Completions carry both document
-//! and environment generations and are accepted only by the matching editor.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -38,11 +33,6 @@ pub(crate) struct Completion {
 }
 
 /// UI-thread half of the Manual host-diagnostics lane.
-///
-/// `request` and `worker_drained` are strictly nonblocking. If the worker's
-/// bounded channel is occupied, `pending` is replaced with the newest document
-/// revision, so an arbitrarily fast edit stream retains constant memory and the
-/// final revision is never lost.
 pub(crate) struct HostDiagnosticsLane {
     request_tx: SyncSender<Request>,
     pending: Option<Request>,
@@ -55,8 +45,6 @@ impl HostDiagnosticsLane {
             "aterm-config-diagnostics",
             crate::qos::Role::Background,
             move || {
-                // Background QoS: the results feed a settings screen through
-                // the proxy and hold no lock.
                 worker_loop(request_rx, proxy);
             },
         )
@@ -107,9 +95,6 @@ impl HostDiagnosticsLane {
             Ok(()) => {}
             Err(TrySendError::Full(request)) => self.pending = Some(request),
             Err(TrySendError::Disconnected(_)) => {
-                // The event loop is closing or the worker is gone. The editor
-                // keeps Save closed rather than treating unvalidated bytes as
-                // safe.
                 self.pending = None;
             }
         }
@@ -130,8 +115,6 @@ impl HostDiagnosticsLane {
 
 fn worker_loop(request_rx: Receiver<Request>, proxy: EventLoopProxy<Wake>) {
     while let Ok(mut request) = request_rx.recv() {
-        // If the UI filled the one-entry channel before this turn began, skip
-        // intermediate text and resolve only its most recent queued revision.
         while let Ok(newer) = request_rx.try_recv() {
             request = newer;
         }
@@ -169,7 +152,6 @@ fn worker_loop(request_rx: Receiver<Request>, proxy: EventLoopProxy<Wake>) {
 
 impl App {
     /// Admit the current Manual source revision to the host lane exactly once.
-    /// Production windows, visible or headless, never parse or probe on the event loop.
     pub(crate) fn request_config_host_diagnostics(&mut self, document: DocumentId) {
         let Some(snapshot) = self.document_store.snapshot(document) else {
             return;
@@ -185,9 +167,6 @@ impl App {
         {
             return;
         }
-        // `begin_config_host_analysis` fail-closes every Save face, including
-        // for an environment refresh at the same revision; publish that now
-        // rather than leave a cached valid modeline/button until the worker ends.
         for (window, instance, view) in self.document_native_views(document) {
             self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
             self.refresh_native_presentation(window, instance, view);
@@ -204,9 +183,6 @@ impl App {
             return;
         }
 
-        // An unredeemed headless GPU intent counts as GPU: the capability
-        // warnings answer "can this run do it", and `ensure_pixel_backend` may
-        // still install the device on the first pixel demand.
         let backend_gpu = self.backend.is_gpu() || self.backend_kind_undecided();
         if let Some(lane) = self.native_config_host.as_mut() {
             lane.request(
@@ -220,9 +196,6 @@ impl App {
             return;
         }
 
-        // Unit-test Apps have no event-loop proxy/worker and run the analysis
-        // inline. A production worker that failed to start blocks Save rather
-        // than moving parse/I/O work onto the UI thread.
         let mut analysis = if self.proxy.is_none() {
             let mut analysis = crate::native_config_language::analyze(&snapshot.text);
             analysis.adopt_theme_names(&config_assets.themes);
@@ -316,7 +289,6 @@ mod tests {
         let model = aterm_models_misc::manual_config_diagnostics_lane_model();
         let mut state = model.init_state();
 
-        // Abstract generation 1: document 1 under host environment 1.
         lane.request(
             document,
             1,
@@ -326,8 +298,6 @@ mod tests {
             assets(),
         );
         assert!(model.fire("RequestFirst", &mut state));
-        // Generation 2 changes only the environment: the byte-equal
-        // asset/font-refresh case a revision-only latch would drop.
         lane.request(
             document,
             1,
@@ -337,7 +307,6 @@ mod tests {
             assets(),
         );
         assert!(model.fire("RequestSecond", &mut state));
-        // Generation 3 is a later document edit under that environment.
         lane.request(
             document,
             2,
@@ -373,8 +342,6 @@ mod tests {
         assert_eq!(state.get("published_revision"), Some(&3));
         assert!(receiver.try_recv().is_err());
 
-        // Negative control: the model's non-replacing slot loses revision 3
-        // under this same burst and must violate both latest-retention guards.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut lost = buggy.init_state();
         for action in ["RequestFirst", "RequestSecond", "RequestThird"] {

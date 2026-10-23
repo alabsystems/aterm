@@ -2,38 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! Behavioural coverage for the handshake signature methods.
-//!
-//! Replacing `verify_tls12_signature` and `verify_tls13_signature` with
-//! `Ok(HandshakeSignatureValid::assertion())` is a TOTAL TLS
-//! server-authentication bypass: the peer stops having to prove it holds the
-//! private key for the certificate it presented, and chain validation is
-//! irrelevant against it. These tests are what catches that stub.
-//!
-//! Nothing here needs a VALID signature, and that is the point — minting one
-//! would need a committed private key, which the fixtures' minting
-//! (`src/testdata/tls/PROVENANCE.md`) deliberately does not keep and which the
-//! repository's B6 guard forbids outright. Proving the
-//! REJECT direction is enough to kill the stub: a method that always returns
-//! `Ok` cannot reject anything.
-//!
-//! Verified armed: with both bodies replaced by `Ok(assertion())`, every test
-//! in this file fails.
 
 use aterm_http::tls::{Trust, client_config};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::CertificateDer;
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
-/// A well-formed certificate from the local corpus, so a rejection can only
-/// come from the signature check.
 fn good_cert() -> CertificateDer<'static> {
     CertificateDer::from(include_bytes!("../src/testdata/tls/good.der").to_vec())
 }
 
-/// The shipped verifier, reached exactly as `client_config` reaches it.
 fn verifier() -> std::sync::Arc<dyn ServerCertVerifier> {
-    // Through `client_config`, so this file also fails if `PlatformVerifier`
-    // stops being what gets installed.
     let _ = client_config(&Trust::PlatformVerifier).expect("platform verifier builds");
     std::sync::Arc::new(
         aterm_http::verifier::PlatformVerifier::new(
@@ -45,13 +24,8 @@ fn verifier() -> std::sync::Arc<dyn ServerCertVerifier> {
     )
 }
 
-/// `DigitallySignedStruct::new` is `pub(crate)` in rustls, so this decodes one
-/// from its wire encoding via the public `Codec` trait: a two-byte scheme, a
-/// u16 length, then the signature.
 fn garbage_dss(scheme: SignatureScheme) -> DigitallySignedStruct {
     use rustls::internal::msgs::codec::{Codec, Reader};
-    // 72 zero bytes: a plausible length for an ECDSA P-256 signature, and not a
-    // valid signature over anything.
     let sig = [0u8; 72];
     let mut wire = Vec::new();
     scheme.encode(&mut wire);

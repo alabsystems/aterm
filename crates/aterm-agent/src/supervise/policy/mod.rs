@@ -1,51 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The supervisor's policies: pure decisions over what a screen shows, kept
-//! apart from the loop that reads screens and presses keys.
-//!
-//! * [`approval`]: which option, if any, to choose on an agent's approval box,
-//!   under which rule and guard (`approve = "all"` by default, the proven
-//!   rules alone under `"safe"`, nothing under `"none"`), or a refusal with a
-//!   reason the worker acts on ([`Decision::Decline`], [`decline`]).
-//! * [`question`]: a question's answer, the recommended option(s) or option 1
-//!   ([`RULE_ANSWER_RECOMMENDED`]), or under `long-term`/`short-term`
-//!   ([`QuestionPriority`]) the worker's pick by a fixed policy text
-//!   ([`LONG_TERM_TEXT`], [`SHORT_TERM_TEXT`]); what a person began, or what
-//!   aterm-phase did not read whole, is escalated.
-//! * [`claude_settings`]: where a Claude Code agent's settings live, and the
-//!   ask rules and PreToolUse hooks in them that may send a box to a person.
-//! * [`box_facts`]: what the loop learned of a box before deciding it, and the
-//!   context built from those facts alone ([`ApprovalCtx::from`]).
-//! * [`box_call`]: transcript candidates matching a box's possible tool and
-//!   file, which lift a settings hold only where the screen draws the box
-//!   under the Edit tool's own call row too.
-//! * [`box_command`]: what the screen cannot show of a Bash box's command
-//!   (a blank a tab or a row's end hides), which no reading may turn on.
-//! * [`git_config`]: what a git read would load that can run a program.
-//! * [`probe`]: the one door the approval policy looks at the machine by
-//!   ([`PolicyProbe`]), at the level of what it concluded — so a harness tape
-//!   holds what a decision turned on, and never the worker's environment.
-//! * [`rm_breaker`]: where every `rm` operand on a line points, for the rm
-//!   circuit breaker's approval rule.
-//! * [`shell_startup`]: what the worker's shell carries in from the person's
-//!   startup files, which the rm rule and the classifier must model.
-//! * [`guard`]: the press guard binding a keystroke to the judged row, and the
-//!   generation fence.
-//! * [`reset`]: a limit reset's vocabulary between the loop and its host, and
-//!   the verdict on the confirmation its row opens ([`confirm_verdict`]).
-//! * [`trace`]: a decision's rule trace — the checks a policy consulted and what
-//!   came of each, which `aterm drive replay --why` collects from a tape
-//!   (`tape::explain`). The loop keeps no steps.
-//! * [`turn_end`]: the turn-end decider (continue, wait out a wall, switch a
-//!   model, compact, log in, or escalate).
-//! * [`needs`]: the report lines the turn-end decider reads by their head —
-//!   `NEEDS YOU:` (what only a person can give: loud, never blocking) and the
-//!   `Nothing left:` defense (Cruise's done claim, Land's landing when clean).
-//! * [`sleeps`]: the machine's sleeps a loop knows of, which a turn's done
-//!   row counts and its work does not.
-//! * [`exception`], [`outlook`]: the points only a person can answer, and what
-//!   becomes of each wall.
+//! Supervisor policies: pure decisions over parsed screens for approvals,
+//! questions, turn ends, limit resets, and safety circuit breakers.
 
 pub mod approval;
 pub mod box_call;
@@ -95,9 +52,7 @@ pub use reset::{
 };
 pub use shell_startup::ShellStartup;
 
-/// `word` after its indefinite article (`a write`, `an edit`): `an` before
-/// `a`, `e`, `i` and `o`, `a` before anything else, `u` included, which the
-/// CLI words all sound as "you" (`a usage-limit`).
+/// Prefix `word` with its indefinite article (`a` or `an`).
 #[must_use]
 pub fn a_or_an(word: &str) -> String {
     let article = if word.starts_with(['a', 'e', 'i', 'o']) {

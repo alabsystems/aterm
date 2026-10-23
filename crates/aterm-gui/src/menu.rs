@@ -2527,7 +2527,8 @@ mod macos {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
+                // action sender; `-tag` is `-(NSInteger)` with no side effects.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = MenuAction::from_tag(tag) {
                     // Fire-and-forget: a closed loop (app shutting down) just
@@ -2542,13 +2543,15 @@ mod macos {
                 if sender.is_null() {
                     return aterm_objc::Bool::NO;
                 }
-                // SAFETY: AppKit supplied a live NSMenuItem.
+                // SAFETY: AppKit supplied a live NSMenuItem; reading its integer tag has no side
+                // effects.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let Some(action) = MenuAction::from_tag(tag) else {
                     return aterm_objc::Bool::NO;
                 };
                 if let Some(on) = super::native_menu_checked(action) {
-                    // SAFETY: A plain setter on the live NSMenuItem AppKit passed, main thread.
+                    // SAFETY: a plain setter on the live NSMenuItem AppKit
+                    // passed, main thread, no preconditions.
                     unsafe { appkit::send_v_isize(sender, sel!(setState:), isize::from(on)) };
                 }
                 if matches!(action, MenuAction::ToggleFullScreen) {
@@ -2561,7 +2564,8 @@ mod macos {
                     let tip = super::native_item_tip(action)
                         .unwrap_or_else(|| action.help().to_string());
                     if let Some(tip) = appkit::nsstring(&tip) {
-                        // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the live NSMenuItem.
+                        // SAFETY: `-setToolTip:` is `-(void)(NSString *)` on the
+                        // live NSMenuItem AppKit passed; it COPIES its argument.
                         unsafe { appkit::send_v_id(sender, sel!(setToolTip:), tip.id()) };
                     }
                 }
@@ -2623,7 +2627,10 @@ mod macos {
             build_version_menu(&target, None, None, false, false)?,
         )?;
 
-        // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit singleton accessor.
+        // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit
+        // singleton accessor (`_main_thread` is the witness); `-setMainMenu:` is
+        // `-(void)(NSMenu *)` and RETAINS the menu, which is why `main` may drop
+        // at the end of this frame.
         unsafe {
             let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
             if app.is_null() {
@@ -2680,7 +2687,10 @@ mod macos {
         let Some(ns_title) = appkit::nsstring(title) else {
             return;
         };
-        // SAFETY: `-setTitle:` is `-(void)(NSString *)` and `-setSubmenu:` is `-(void)(NSMenu *)`.
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)` and `-setSubmenu:` is
+        // `-(void)(NSMenu *)`, both plain main-thread setters on live objects
+        // that COPY/RETAIN their argument, so the +1 title and the submenu may
+        // drop at the end of this frame.
         unsafe {
             appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(handle.version_item.id(), sel!(setTitle:), ns_title.id());
@@ -2782,14 +2792,18 @@ mod macos {
     }
 
     fn new_menu() -> Option<Obj> {
-        // SAFETY: `+alloc` gives a +1 uninitialised NSMenu and `-init` consumes it.
+        // SAFETY: `+alloc` gives a +1 uninitialised NSMenu and `-init` consumes
+        // it, so `Obj::from_owned` adopts exactly one +1.
         unsafe { Obj::from_owned(appkit::send_id(appkit::alloc(class(c"NSMenu")), sel!(init))) }
     }
 
     fn new_item(title: &str, action: Sel, key: &str) -> Option<Obj> {
         let title = appkit::nsstring(title)?;
         let key = appkit::nsstring(key)?;
-        // SAFETY: NSMenuItem's designated initializer, `-(id)(NSString *, SEL, NSString *)`.
+        // SAFETY: NSMenuItem's designated initializer,
+        // `-(id)(NSString *, SEL, NSString *)`; a nil SEL is its documented
+        // "no action" value. `+alloc` is +1 and the initializer consumes it.
+        // Both strings are live +1 NSStrings the initializer copies.
         unsafe {
             Obj::from_owned(appkit::send_id_id_sel_id(
                 appkit::alloc(class(c"NSMenuItem")),
@@ -2825,7 +2839,12 @@ mod macos {
             return;
         };
         let tip = appkit::nsstring(action.help());
-        // SAFETY: Plain setters on a fresh NSMenuItem, then `-addItem:` on the live menu.
+        // SAFETY: plain setters on a fresh NSMenuItem, then `-addItem:` on the
+        // live menu. `-setTarget:` is `-(void)(id)` and holds the target WEAKLY
+        // (which is why `MenuHandle` retains it), `-setTag:` is
+        // `-(void)(NSInteger)`, `-setToolTip:` is `-(void)(NSString *)` and
+        // COPIES its argument, and `-setKeyEquivalentModifierMask:` is
+        // `-(void)(NSEventModifierFlags)`, an `NSUInteger` bitmask.
         unsafe {
             appkit::send_v_id(item.id(), sel!(setTarget:), target.as_id());
             appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
@@ -2840,7 +2859,10 @@ mod macos {
     }
 
     fn add_separator(menu: &Obj) {
-        // SAFETY: `+separatorItem` is `-(id)` and returns a shared, autoreleased item.
+        // SAFETY: `+separatorItem` is `-(id)` and returns a shared, AUTORELEASED
+        // item — borrowed for the length of `-addItem:`, which retains it into
+        // the menu. The pool it lives in is the caller's; every path into this
+        // module opens one.
         unsafe {
             let sep = appkit::send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
             if !sep.is_null() {
@@ -2872,7 +2894,12 @@ mod macos {
             .map(|kind| appkit::nsstring(kind))
             .collect::<Option<Vec<Obj>>>()?;
         let type_ids = types.iter().map(Obj::id).collect::<Vec<Id>>();
-        // SAFETY: NSOpenPanel is created and run on AppKit's main thread.
+        // SAFETY: NSOpenPanel is created and run on AppKit's main thread (`_main_thread` is the
+        // witness). `+openPanel` is `-(id)` and returns an AUTORELEASED panel — borrowed for the
+        // length of this pool, which is why the whole body is inside one. The setters are
+        // `-(void)(BOOL)` and `-(void)(NSString *)`; `-runModal` is `-(NSModalResponse)`, i.e.
+        // `NSInteger`, and owns its nested modal loop; `-URL` and `-path` are `-(id)` accessors
+        // valid until the pool pops.
         autoreleasepool(|_| unsafe {
             let panel = appkit::send_id(class(c"NSOpenPanel").as_id(), sel!(openPanel));
             if panel.is_null() {
@@ -2914,7 +2941,9 @@ mod macos {
     fn attach_submenu(bar: &Obj, title: &str, submenu: Obj) -> Option<Obj> {
         let ns_title = appkit::nsstring(title)?;
         let item = new_item(title, Sel::NULL, "")?;
-        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is `-(void)(NSMenu *)`.
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is `-(void)(NSMenu *)`
+        // and retains, `-addItem:` is `-(void)(NSMenuItem *)` and retains, so both the +1 title
+        // and the moved `submenu` may drop at the end of this frame.
         unsafe {
             appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
             appkit::send_v_id(item.id(), sel!(setSubmenu:), submenu.id());
@@ -2957,10 +2986,16 @@ mod macos {
             // Foundation refused a string, so no alert can be built.
             return None;
         };
-        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init).
+        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init), which is what
+        // `Obj::from_owned` adopts.
         let alert =
             unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }?;
-        // SAFETY: Standard `NSAlert` setters and `runModal`, on the main thread.
+        // SAFETY: standard `NSAlert` setters and `runModal`, on the main thread
+        // (`MainThread::new()` above proves it). `-setMessageText:` and `-setInformativeText:` are
+        // `-(void)(NSString *)` and copy their argument, so the +1 strings may drop at the end of
+        // this frame. `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and `-window` is
+        // `-(NSWindow *)`, both +0, so both are retained into `Obj`, not adopted. `-runModal` is
+        // `-(NSModalResponse)`, an `NSInteger`.
         unsafe {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
@@ -3008,7 +3043,8 @@ mod macos {
             let Some(alert) = ok_alert(title, body) else {
                 return;
             };
-            // SAFETY: Main thread (checked above).
+            // SAFETY: main thread (checked above); `-runModal` is
+            // `-(NSModalResponse)` on the live alert.
             let _ = unsafe { appkit::send_isize(alert.id(), sel!(runModal)) };
         });
     }
@@ -3022,7 +3058,11 @@ mod macos {
         ) else {
             return None;
         };
-        // SAFETY: Standard `NSAlert` construction + setters on the main thread.
+        // SAFETY: standard `NSAlert` construction + setters on the main thread.
+        // `+new` is +1 (alloc+init) and lands in `Obj`;
+        // `-setMessageText:`/`-setInformativeText:` are `-(void)(NSString *)`;
+        // `-addButtonWithTitle:` is `-(id)` returning a BORROWED button this
+        // caller does not keep.
         unsafe {
             let alert = Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))?;
             appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
@@ -3033,7 +3073,13 @@ mod macos {
     }
 
     fn terminate_is_the_systems() -> bool {
-        // SAFETY: Foundation sends on the main thread inside `applicationShouldTerminate:`.
+        // SAFETY: Foundation sends on the main thread inside
+        // `applicationShouldTerminate:`. `+sharedAppleEventManager` and
+        // `-currentAppleEvent` return BORROWED objects (nil outside an event);
+        // `-attributeDescriptorForKeyword:` takes an `AEKeyword` (a 32-bit
+        // `FourCharCode`, passed in a full register) and returns a borrowed
+        // descriptor or nil; `-enumCodeValue` returns an `OSType`, the low
+        // 32 bits of the return register.
         autoreleasepool(|_| unsafe {
             let manager = appkit::send_id(
                 class(c"NSAppleEventManager").as_id(),
@@ -3108,7 +3154,7 @@ mod macos {
         // convenience constructors returning an AUTORELEASED NSURL (nil for a
         // string that is not a URL, which is checked); `+sharedWorkspace` is the
         // `-(id)` singleton; `-openURL:` is `-(BOOL)(NSURL *)` and its answer is
-        // handed straight back.
+        // handed straight back. Both borrows live inside this pool.
         autoreleasepool(|_| unsafe {
             let url = appkit::send_id_id(
                 class(c"NSURL").as_id(),
@@ -3146,7 +3192,10 @@ mod macos {
         let (Some(file), Some(root)) = (appkit::nsstring(s), appkit::nsstring("")) else {
             return false;
         };
-        // SAFETY: `+sharedWorkspace` is the `-(id)` singleton.
+        // SAFETY: `+sharedWorkspace` is the `-(id)` singleton;
+        // `-selectFile:inFileViewerRootedAtPath:` is `-(BOOL)(NSString *,
+        // NSString *)`, and its answer is handed straight back. The two
+        // strings live inside this pool.
         autoreleasepool(|_| unsafe {
             let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
             if ws.is_null() {
@@ -3188,7 +3237,8 @@ mod macos {
         if super::os_ui_refused(what) || MainThread::new().is_none() || window.is_null() {
             return false;
         }
-        // SAFETY: `-orderFrontRegardless` is `-(void)` on the live `NSWindow` the caller owns.
+        // SAFETY: `-orderFrontRegardless` is `-(void)` on the live `NSWindow` the
+        // caller owns, on the main thread (checked above).
         unsafe { appkit::send_v(window, sel!(orderFrontRegardless)) };
         true
     }
@@ -3200,7 +3250,11 @@ mod macos {
         let Some(ns) = appkit::nsstring(s) else {
             return;
         };
-        // SAFETY: Standard AppKit.
+        // SAFETY: Standard AppKit. Every `s` reaching here is one of this module's own `&'static
+        // str` URL constants, so `URLWithString:` is non-nil. `NSWorkspace` retains the receiver
+        // and the argument until the perform fires, so nothing here outlives this frame. The
+        // delayed perform invokes `openURL:` (really `BOOL`-returning) as `id`-returning; the value
+        // lands in the same return register on every target aterm builds for and is discarded.
         autoreleasepool(|_| unsafe {
             let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
             let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));

@@ -12,6 +12,8 @@ mod aos_repair;
 #[cfg(target_os = "macos")]
 mod band;
 #[cfg(target_os = "macos")]
+mod bus;
+#[cfg(target_os = "macos")]
 mod clock;
 #[cfg(target_os = "macos")]
 mod codex;
@@ -94,6 +96,8 @@ mod muse_proof;
 #[cfg(target_os = "macos")]
 mod nudge;
 #[cfg(target_os = "macos")]
+mod occupancy_break;
+#[cfg(target_os = "macos")]
 mod paths;
 #[cfg(target_os = "macos")]
 mod predict_live;
@@ -140,6 +144,8 @@ mod sampler;
 mod scn;
 #[cfg(target_os = "macos")]
 mod screen;
+#[cfg(target_os = "macos")]
+mod seamless;
 #[cfg(target_os = "macos")]
 mod selftest;
 #[cfg(target_os = "macos")]
@@ -349,7 +355,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
 
 Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N]
-           [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--home DIR] [--harness]
+           [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world and print its `--sock` path
                                  (--window: open a real window; --band app|agent; --image PNG: capture one settled frame;
@@ -378,9 +384,16 @@ Outside any lab (no jail, no stub):
                [--rounds N] [--no-split] [--out DIR]
                                  verify predictive editing over a simulated RTT `link` in single and split panes
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep]
-                   [--policy-only|--upgrade-only]
+                   [--policy-only|--upgrade-only|--raw-upgrade-only]
                                  end-to-end native harness proof on the real codex-alab package against a loopback fake model
-                                 (~11 min; --policy-only runs cybersecurity refusal; --upgrade-only checks one live handoff)
+                                 (~11 min; --policy-only runs cybersecurity refusal; --upgrade-only checks one live handoff;
+                                  --raw-upgrade-only checks automatic crash repair then live handoff after starting
+                                  through the produced primary with its managed entry absent)
+  seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
+                                 OPENS A WINDOW, one at a time: one dev-seams instance across a real seamless update (QA seam), legs gap,
+                                 topics, gaptopic, redial, redial75, latch and hwkey; then present: N (default 4) fresh instances each of
+                                 the tested aterm and the baseline (built from 6B-6's tree), alternating, judged same-day (~1-2 min, plus
+                                 about 1 min a present run)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  key-only transcript/rollout reducer for harness step fixtures (verifies reader equivalence before writing)
   ptyrec <log> -- <cmd> [args...]
@@ -550,6 +563,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "meta-keys" => meta_keys::cmd_meta_keys(args),
         "predict-live" => predict_live::cmd_predict_live(args),
         "codex-alab-proof" => codex_alab_proof::cmd_codex_alab_proof(args),
+        "seamless" => seamless::cmd_seamless(args),
         "linux" => linux::cmd_linux(args),
         "windows" => windows::cmd_windows(args),
         "mac" => mac::cmd_mac(args),

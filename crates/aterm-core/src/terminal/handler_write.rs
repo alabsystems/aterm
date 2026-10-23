@@ -10,7 +10,11 @@ use crate::grid::{Cell, CellFlags, row_u16};
 
 use super::TerminalHandler;
 
-/// Character width with tiered fast paths, agreeing with `aterm_grapheme`:
+/// Character width with tiered fast paths that agree with `aterm_grapheme`: printable ASCII,
+/// and U+00A0-U+02FF outside CJK mode (it holds ambiguous characters), are width 1; the
+/// uniformly wide CJK ideograph and Hangul blocks are width 2; the emoji blocks read a
+/// bitmap before the table; and everything else asks `aterm_grapheme::char_width`
+/// (`char_width_cjk` when `cjk`).
 #[inline]
 fn char_width(c: char, cjk: bool) -> usize {
     let cp = c as u32;

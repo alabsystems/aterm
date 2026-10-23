@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Phosphor glyph ROM: 64 glyphs on a 24×48 1-bit master grid (matrix-rain
-//! design §2): katakana-like forms, digits, symbols and kanji-like blocks. With
-//! output material enabled, [`rasterize_material_master`] replaces the first
-//! slots with literal characters sampled from the terminal, drawn from small
-//! public-domain bitmap faces. The master feeds the same fixed-size atlas on
-//! every host.
-//!
-//! Recipes are const data (line segments + dots); an integer Bresenham
-//! rasterizer (~4 px strokes) produces the 1-bit master deterministically. The
-//! mirrored film texture comes from `flip_x` at render time.
+//! Phosphor glyph ROM: 64 glyphs rasterized onto a 24×48 1-bit master grid, with optional terminal-output material overrides.
 
 use std::sync::OnceLock;
 
@@ -21,10 +12,7 @@ pub const MASTER_H: usize = 48;
 /// ROM size — must match [`super::field::GLYPH_COUNT`].
 pub const ROM_GLYPHS: usize = 64;
 
-/// Stroke thickness: each Bresenham point stamps a `THICK×THICK` square
-/// (offset −1, so a stroke reads ~4 px wide on the 24-px master).
 const THICK: i32 = 4;
-/// Dot radius² (a stamped disc, `dx² + dy² <= DOT_R2` → ~5 px across).
 const DOT_R2: i32 = 6;
 
 /// One authoring primitive on the 24×48 grid.
@@ -38,10 +26,7 @@ enum Stroke {
 
 use Stroke::{D, L};
 
-/// The 64 recipes. Order is the field's glyph index (`glyph_from_epoch() % 64`):
-/// 0..=39 katakana-like, 40..=49 digits, 50..=63 symbols/kanji-like.
 const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
-    // -- katakana-like forms (simplified straight-stroke approximations) ----
     &[L(3, 10, 21, 10), L(15, 10, 13, 24), L(13, 24, 7, 40)], // a
     &[L(18, 8, 8, 24), L(12, 20, 12, 42)],                    // i
     &[
@@ -159,14 +144,13 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
         L(18, 28, 8, 40),
     ], // ra
     &[L(8, 8, 8, 28), L(16, 8, 16, 32), L(16, 32, 10, 42)],   // ri
-    // -- digits 0-9 ----------------------------------------------------------
     &[
         L(7, 8, 17, 8),
         L(17, 8, 17, 40),
         L(17, 40, 7, 40),
         L(7, 40, 7, 8),
     ], // 0
-    &[L(8, 14, 12, 8), L(12, 8, 12, 40), L(7, 40, 17, 40)], // 1
+    &[L(8, 14, 12, 8), L(12, 8, 12, 40), L(7, 40, 17, 40)],   // 1
     &[
         L(6, 10, 17, 10),
         L(17, 10, 17, 22),
@@ -179,7 +163,7 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
         L(17, 40, 6, 40),
         L(9, 23, 17, 23),
     ], // 3
-    &[L(14, 8, 6, 26), L(6, 26, 19, 26), L(15, 16, 15, 42)], // 4
+    &[L(14, 8, 6, 26), L(6, 26, 19, 26), L(15, 16, 15, 42)],  // 4
     &[
         L(18, 8, 7, 8),
         L(7, 8, 7, 22),
@@ -195,7 +179,7 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
         L(17, 40, 17, 24),
         L(17, 24, 7, 24),
     ], // 6
-    &[L(5, 8, 19, 8), L(19, 8, 10, 42)],                    // 7
+    &[L(5, 8, 19, 8), L(19, 8, 10, 42)],                      // 7
     &[
         L(7, 8, 17, 8),
         L(17, 8, 17, 40),
@@ -210,23 +194,22 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
         L(17, 8, 17, 40),
         L(17, 40, 9, 40),
     ], // 9
-    // -- symbols + kanji-like blocks -----------------------------------------
-    &[L(5, 8, 19, 8), L(19, 8, 5, 40), L(5, 40, 19, 40)], // Z
+    &[L(5, 8, 19, 8), L(19, 8, 5, 40), L(5, 40, 19, 40)],     // Z
     &[
         L(12, 10, 12, 34),
         L(4, 22, 20, 22),
         L(6, 12, 18, 32),
         L(18, 12, 6, 32),
     ], // *
-    &[D(12, 14), D(12, 32)],                              // :
-    &[L(5, 24, 19, 24)],                                  // -
-    &[L(5, 18, 19, 18), L(5, 30, 19, 30)],                // =
-    &[L(12, 10, 12, 38), L(4, 24, 20, 24)],               // +
-    &[L(18, 10, 6, 24), L(6, 24, 18, 38)],                // <
-    &[L(6, 10, 18, 24), L(18, 24, 6, 38)],                // >
-    &[L(12, 6, 12, 42)],                                  // |
-    &[D(12, 24)],                                         // katakana middle dot
-    &[L(9, 8, 8, 16), L(15, 8, 14, 16)],                  // "
+    &[D(12, 14), D(12, 32)],                                  // :
+    &[L(5, 24, 19, 24)],                                      // -
+    &[L(5, 18, 19, 18), L(5, 30, 19, 30)],                    // =
+    &[L(12, 10, 12, 38), L(4, 24, 20, 24)],                   // +
+    &[L(18, 10, 6, 24), L(6, 24, 18, 38)],                    // <
+    &[L(6, 10, 18, 24), L(18, 24, 6, 38)],                    // >
+    &[L(12, 6, 12, 42)],                                      // |
+    &[D(12, 24)],                                             // katakana middle dot
+    &[L(9, 8, 8, 16), L(15, 8, 14, 16)],                      // "
     &[
         L(6, 8, 18, 8),
         L(18, 8, 18, 40),
@@ -243,18 +226,14 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
     &[L(6, 12, 18, 12), L(4, 24, 20, 24), L(12, 12, 12, 42)], // dry-like block
 ];
 
-/// The rasterized 1-bit master: 64 glyphs × 48 scanlines, one `u32` of
-/// 24 valid bits per scanline (bit `x` set ⇒ pixel `(x, y)` inked).
-///
-/// `Clone` is a plain ~12 KB `Vec<u32>` copy; the material path forks
-/// [`decorative_master`] this way.
+/// Rasterized 1-bit master: 64 glyphs × 48 scanlines, one `u32` of 24 valid bits per scanline.
 #[derive(Clone)]
 pub struct RomMaster {
     rows: Vec<u32>,
 }
 
 impl RomMaster {
-    /// Scanline `y` of glyph `g` (low 24 bits valid).
+    /// Scanline `y` of `glyph` (low 24 bits valid).
     #[must_use]
     #[inline]
     pub fn row(&self, glyph: usize, y: usize) -> u32 {
@@ -262,8 +241,7 @@ impl RomMaster {
     }
 }
 
-/// Rasterize the whole ROM (~12 KB) with integer math, identical on every
-/// host. Engines use [`decorative_master`], which caches it.
+/// Rasterizes the full 64-glyph ROM master using integer math.
 #[must_use]
 pub fn rasterize_master() -> RomMaster {
     let mut rows = vec![0u32; ROM_GLYPHS * MASTER_H];
@@ -279,36 +257,23 @@ pub fn rasterize_master() -> RomMaster {
     RomMaster { rows }
 }
 
-/// The decorative master, rasterized at most once per process.
-///
-/// The material path forks it (a 12 KB copy) on every charset change instead
-/// of re-rasterizing ~55k plots. Process-wide because each `EffectsPipeline`
-/// builds its own rain engine; `RomMaster` is `Send + Sync`.
+/// Returns the decorative ROM master, rasterized at most once per process.
 #[inline]
 pub(crate) fn decorative_master() -> &'static RomMaster {
     static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
     DECORATIVE.get_or_init(rasterize_master)
 }
 
-/// The embedded 8x8 bitmap (from `bitmap_font`) for one literal material
-/// character: Basic/Latin text, Greek, box/block drawing and Hiragana. The
-/// sampler skips an unsupported code point rather than substituting a
-/// different-looking character, so the rain only ever shows real output.
+/// Returns the embedded 8×8 bitmap for a supported terminal-output character.
 #[must_use]
 #[inline]
 pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
     super::bitmap_font::bitmap(c)
 }
 
-/// Author a hybrid 64-slot master: the prefix is the exact `chars` from the
-/// output-material bank, the unused tail stays the classic ROM. Each 8×8
-/// source pixel expands to 2×5 pixels, centered in the 24×48 master; the
-/// four-pixel margin keeps letterforms off adjacent cells after the integer
-/// box filter. Integer-only, identical on every backend.
+/// Authors a hybrid 64-slot master with `chars` in the leading slots and decorative ROM in the tail.
 #[must_use]
 pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
-    // The decorative tail (slots `chars.len()..64`) is the classic ROM, so
-    // fork the memoized copy instead of re-rasterizing.
     let mut master = decorative_master().clone();
     for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
         let _ = author_material_glyph(&mut master, glyph_index, ch);
@@ -316,8 +281,6 @@ pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     master
 }
 
-/// Author one material slot over the decorative glyph already in it. An
-/// unsupported code point leaves the decorative glyph untouched.
 fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool {
     let Some(bitmap) = material_bitmap(ch) else {
         return false;
@@ -341,11 +304,7 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool 
     true
 }
 
-/// Re-author one slot of an already authored master in place: restore the
-/// decorative glyph, then author `ch` over it (or leave the decorative glyph
-/// when the slot is now unused). The slot ends byte-identical to the same slot
-/// of `rasterize_material_master(new_chars)`, without rewriting unchanged
-/// slots or forking the decorative master.
+/// Re-authors `slot` of `master` in place for `ch`, or restores its decorative glyph when `None` or unsupported.
 pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<char>) {
     if slot >= ROM_GLYPHS {
         return;
@@ -378,7 +337,6 @@ fn stamp_thick(glyph: &mut [u32], x: i32, y: i32) {
     }
 }
 
-/// Integer Bresenham line, stamped at stroke thickness.
 fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
     let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
     let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
@@ -401,7 +359,6 @@ fn stamp_line(glyph: &mut [u32], x0: i32, y0: i32, x1: i32, y1: i32) {
     }
 }
 
-/// Stamp a round dot (`dx² + dy² <= DOT_R2`).
 fn stamp_dot(glyph: &mut [u32], x: i32, y: i32) {
     for dy in -2..=2 {
         for dx in -2..=2 {
@@ -416,8 +373,6 @@ fn stamp_dot(glyph: &mut [u32], x: i32, y: i32) {
 mod tests {
     use super::*;
 
-    /// Literal output material is literal: case and punctuation retain their
-    /// own bitmap instead of hashing into a decorative kana substitute.
     #[test]
     fn material_master_preserves_real_characters() {
         let chars = ['C', 'c', '0', '{', '─'];

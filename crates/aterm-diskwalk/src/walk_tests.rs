@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The walker against trees these tests create (never the owner's home). Unix only: on any
-//! other platform every walk is `Refusal::Unsupported`, and the oracle reads Unix metadata
-//! (blocks, links, modes).
+//! Unix scratch-tree tests for the disk walker.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,10 +16,6 @@ fn p(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-// Scratch trees
-
-/// A policy for walking scratch trees under the temp folder: the live mount
-/// table (read without asking any file system) and a home the tree is not in.
 fn scratch_policy(lister: ListerChoice) -> Policy {
     let mut policy = Policy::new(
         Deny::for_home(Path::new("/Users//diskwalk-test-home"), &[], &[]),
@@ -35,9 +29,6 @@ fn write(path: &Path, bytes: usize) {
     std::fs::write(path, vec![7u8; bytes]).expect("write scratch file");
 }
 
-/// The tree every walk test reads: nested folders, files of several sizes,
-/// an executable, an empty folder, a hard link inside, a hard link out, and
-/// a symlink to a folder outside that must not be followed.
 fn build(root: &Path, outside: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     for d in ["a/b/c", "a/d", "e", "empty", "x/y/z/w"] {
@@ -93,8 +84,6 @@ fn oracle(root: &Path) -> Sums {
     s
 }
 
-/// A clock that charges `step` per read: the slice's budget is spent by calls,
-/// never by how loaded the machine is.
 fn tick_clock(step: Duration) -> impl FnMut() -> Instant {
     #[expect(
         clippy::disallowed_methods,
@@ -142,7 +131,6 @@ fn a_walk_sums_what_std_sees_with_either_lister() {
         assert_eq!(got.unreadable + got.gone, 0, "{lister:?} errors");
         assert_eq!(walk.walked(), want.files + want.dirs, "{lister:?} walked");
         assert!(walk.tree().dirs().iter().all(|r| r.complete));
-        // The link to the outside folder is a file entry, never entered.
         for i in 0..walk.tree().dirs().len() {
             let name = walk.tree().name(DirId(u32::try_from(i).expect("small")));
             assert!(
@@ -228,7 +216,6 @@ fn slices_end_at_the_first_boundary_past_the_budget_and_resume_to_the_same_tree(
     let policy = scratch_policy(ListerChoice::Native);
     let whole = walk_all(&root, &policy);
     let mut walk = Walk::begin(&RootSpec::new(&root), &policy).expect("begin");
-    // One millisecond per clock read: a 4 ms slice starts at most four calls.
     let mut clock = tick_clock(Duration::from_millis(1));
     let mut slices = 0;
     let mut last_calls = 0;
@@ -278,7 +265,6 @@ fn a_superseded_ticket_walks_nothing_and_a_cancel_disarms() {
         Sliced::Step(Step::Cancelled)
     );
     assert!(!walker.armed(), "nothing re-arms a cancelled walk");
-    // A refused start changes nothing.
     assert!(walker.start(&RootSpec::new("relative"), &policy).is_err());
     assert_eq!(walker.ticket(), Some(second));
 }
@@ -350,7 +336,6 @@ fn a_full_size_answers_a_tree_and_a_file() {
         file.sums.alloc_fair > 0,
         "a file root reads its allocation, never 0"
     );
-    // A budget that runs out answers a partial figure.
     let mut slow = tick_clock(Duration::from_millis(1));
     let part = diskwalk_size_full(
         &RootSpec::new(&root),
@@ -375,8 +360,6 @@ fn entry_counts_come_without_a_listing_where_the_platform_can() {
 fn a_broad_root_lists_one_level_and_names_a_protected_child_unread() {
     let (tmp, root, _outside) = scratch();
     let base = crate::refuse::canonical(tmp.path()).expect("canonical");
-    // Protect `root/a` by override: `root` is then an ancestor of a protected
-    // folder, too broad to walk.
     let mut policy = scratch_policy(ListerChoice::Native);
     policy.deny = Deny::for_home(
         Path::new("/Users//diskwalk-test-home"),
@@ -408,20 +391,42 @@ fn a_broad_root_lists_one_level_and_names_a_protected_child_unread() {
     );
 }
 
+/// The walker's policy lands on the fresh thread that sets it: dataless
+/// files off either way, and its disk reads throttled only when asked.
+/// CONTROL: a thread that set nothing has no throttle of its own.
 #[test]
 fn the_walker_thread_policy_takes_on_a_fresh_thread() {
-    let out = std::thread::spawn(|| {
-        let out = crate::set_walker_thread_policy();
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(
-            crate::iopol::thread_materialize_policy(),
-            Some(crate::iopol::MaterializePolicy::Off)
-        );
-        out
-    })
-    .join()
-    .expect("thread");
-    assert!(out.failed.is_empty(), "{out:?}");
+    for disk in [crate::DiskIo::Throttled, crate::DiskIo::Inherited] {
+        let (out, materialize, throttled) = std::thread::spawn(move || {
+            let out = crate::set_walker_thread_policy(disk);
+            (
+                out,
+                crate::iopol::thread_materialize_policy(),
+                crate::thread_disk_throttled(),
+            )
+        })
+        .join()
+        .expect("thread");
+        assert!(out.failed.is_empty(), "{disk:?}: {out:?}");
+        if cfg!(target_vendor = "apple") {
+            assert_eq!(
+                materialize,
+                Some(crate::iopol::MaterializePolicy::Off),
+                "{disk:?}"
+            );
+            assert_eq!(
+                throttled,
+                Some(disk == crate::DiskIo::Throttled),
+                "{disk:?}"
+            );
+        }
+    }
+    let untouched = std::thread::spawn(crate::thread_disk_throttled)
+        .join()
+        .expect("thread");
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(untouched, Some(false), "a thread that set nothing");
+    }
 }
 
 /// A clone shares its blocks with its source: each one's private size is
@@ -446,14 +451,10 @@ fn private_sizes_see_clones_share_their_blocks() {
         private < s.alloc_fair,
         "the clone pair shares blocks: {s:?}"
     );
-    // Without the ask, nothing pretends to know.
     let plain = walk_all(&root, &scratch_policy(ListerChoice::Native));
     assert_eq!(plain.tree().root().subtree.private, None);
 }
 
-/// The worktree search finds the nearest `.git` (a folder for a checkout, a
-/// file for a linked worktree), reads a `target` link as text, and never
-/// looks inside a refused folder or at or above the home.
 #[test]
 fn marker_looks_find_worktrees_and_links_and_refuse_what_the_deny_set_holds() {
     use crate::look::{Marker, link_target, marker_at, worktree_above};
@@ -498,7 +499,6 @@ fn marker_looks_find_worktrees_and_links_and_refuse_what_the_deny_set_holds() {
     assert_eq!(link_target(&home.join("repo"), "src", &policy), Ok(None));
     assert_eq!(marker_at(&home.join("repo"), "absent", &policy), Ok(None));
 
-    // A protected folder is refused on its spelling: nothing in it is asked.
     assert_eq!(worktree_above(&home.join("Documents/proj"), &policy), None);
     assert_eq!(
         marker_at(&home.join("Documents/proj"), ".git", &policy),
@@ -532,24 +532,19 @@ fn the_build_folder_climb_finds_the_target_folder_then_a_profile_and_never_a_pro
     let mut policy = scratch_policy(ListerChoice::Native);
     policy.deny = Deny::for_home(&home, &[], &[]);
 
-    // A file deep in a profile anchors at the target folder, past the profile's lock.
     assert_eq!(
         build_dir_above(&home.join("repo/target/debug/incremental/x"), &policy),
         Some(home.join("repo/target"))
     );
-    // A tree with only a profile lock anchors at that profile.
     assert_eq!(
         build_dir_above(&home.join("bare/out/release/build"), &policy),
         Some(home.join("bare/out/release"))
     );
-    // No marker below the home: none, and the home itself is never asked.
     assert_eq!(build_dir_above(&home.join("plain/src"), &policy), None);
-    // A protected folder ends the climb before anything in it is asked.
     assert_eq!(
         build_dir_above(&home.join("Documents/proj/target/debug"), &policy),
         None
     );
-    // One open answers every name.
     assert_eq!(
         markers_at(
             &home.join("repo/target"),
@@ -564,8 +559,6 @@ fn the_build_folder_climb_finds_the_target_folder_then_a_profile_and_never_a_pro
     );
 }
 
-/// `path`'s device as `stat` reads it, spelled as the walker spells every
-/// device ([`crate::list::dev_of`]).
 fn stat_dev(path: &Path) -> u64 {
     use std::os::unix::ffi::OsStrExt as _;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
@@ -576,11 +569,6 @@ fn stat_dev(path: &Path) -> u64 {
     crate::list::dev_of(st.st_dev)
 }
 
-/// A child folder's device, as each lister reads it, is the device `stat`
-/// gives the folder itself, which is also the root's: a mismatch makes every
-/// subfolder a mount boundary, never entered (Linux's `statx` major and minor
-/// against glibc's `makedev`; macOS's `u32` `ATTR_CMN_DEVID` against `fstat`'s
-/// `i32`).
 #[test]
 fn a_child_folders_device_is_the_one_stat_gives_with_either_lister() {
     use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};

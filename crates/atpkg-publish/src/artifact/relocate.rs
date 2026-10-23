@@ -119,7 +119,10 @@ pub fn backend_for_host() -> Result<Box<dyn Backend>, String> {
 /// Relocate a staged payload in place.
 ///
 /// # Errors
-/// I/O, a missing relocation tool, a rewrite failure, or a library that would be vendored from a stock toolchain.
+/// I/O, a missing relocation tool, a rewrite failure, or a library that would be vendored
+/// from a stock toolchain. Unresolved builder refs, including a library outside every donor
+/// root, and a failed rpath rewrite are returned in the [`Report`] so the caller decides
+/// hard fail or advisory.
 pub fn relocate_stage(
     stage: &Path,
     sign_id: Option<&str>,

@@ -5,9 +5,6 @@ use crate::input::{InputEvent, Source};
 use crate::{App, WindowId};
 use aterm_types::keyboard::{Key as EKey, KeyEventType, Modifiers, NamedKey as ENamed};
 
-/// The source an `aterm ctl key` verb stamps. For audit only: the seam never
-/// branches on it (`seam_egress` takes no source), so these tests pin the
-/// route, not the label.
 const CTL: Source = Source::Controller;
 
 fn app_with_strip() -> (App, WindowId) {
@@ -17,7 +14,6 @@ fn app_with_strip() -> (App, WindowId) {
     (app, wid)
 }
 
-/// The exact event `control_input`'s `"menu" | "contextmenu"` arm builds.
 fn key(named: ENamed, mods: Modifiers) -> InputEvent {
     InputEvent::Key {
         key: EKey::Named(named),
@@ -28,9 +24,6 @@ fn key(named: ENamed, mods: Modifiers) -> InputEvent {
     }
 }
 
-/// `aterm ctl key menu` pops the same card the physical Menu key does, and
-/// the press is booked as consumed so its release cannot leak an orphan
-/// `REPORT_EVENT_TYPES` report.
 #[test]
 fn ctl_key_menu_pops_the_card_the_physical_key_pops() {
     let (mut app, wid) = app_with_strip();
@@ -79,7 +72,6 @@ fn shift_f10_reaches_the_program_by_default_on_both_sources() {
         );
     }
 
-    // Negative control: the opt-in claims it on this route too.
     app.config.tab_menu_chord = Some("on".to_string());
     app.input(wid, key(ENamed::F10, Modifiers::SHIFT), CTL);
     assert!(
@@ -93,7 +85,6 @@ fn shift_f10_reaches_the_program_by_default_on_both_sources() {
     close(pipe);
 }
 
-/// Once up, the card is drivable from the controller.
 #[test]
 fn the_controller_walks_and_activates_the_card() {
     let (mut app, wid) = app_with_strip();
@@ -106,8 +97,6 @@ fn the_controller_walks_and_activates_the_card() {
     assert!(app.windows[&wid].tab_menu.is_none(), "Esc dismissed it");
 }
 
-/// A wheel notch under an open card scrolls and reports nothing, on either
-/// route (`on_mouse_wheel` and `ctl mouse wheel` both converge here).
 #[test]
 fn a_wheel_notch_under_the_card_is_swallowed() {
     use aterm_window::event::MouseScrollDelta;
@@ -119,8 +108,6 @@ fn a_wheel_notch_under_the_card_is_swallowed() {
         .term
         .clone();
     {
-        // Enough history that scrolling up is a real move, or the assertion
-        // below would pass on a viewport that had nowhere to go.
         let mut t = crate::term_lock(&term);
         for line in 0..100 {
             t.process(format!("history {line}\r\n").as_bytes());
@@ -145,8 +132,6 @@ fn a_wheel_notch_under_the_card_is_swallowed() {
         "and it armed no smooth-scroll glide either"
     );
 
-    // Negative control: the same notch with the card down reaches the
-    // terminal path, so the assertions above are about the gate.
     app.input(wid, key(ENamed::Escape, Modifiers::empty()), CTL);
     assert!(app.windows[&wid].tab_menu.is_none());
     app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 3.0));
@@ -156,10 +141,6 @@ fn a_wheel_notch_under_the_card_is_swallowed() {
     );
 }
 
-/// A controller press cannot be resolved against the card (grid cell vs
-/// frame rect), so it dismisses and is consumed. While the card is up a
-/// press does nothing underneath it, witnessed by the selection the same
-/// press starts once the card is gone.
 #[test]
 fn a_controller_press_under_the_card_dismisses_and_acts_on_nothing() {
     use aterm_types::mouse::MouseButton;
@@ -191,8 +172,6 @@ fn a_controller_press_under_the_card_dismisses_and_acts_on_nothing() {
          costs a click, on this route exactly as on the glass"
     );
 
-    // Negative control: the same press with the card down reaches the
-    // grid, so the assertion above is about the gate.
     app.input(wid, press(true), CTL);
     assert!(
         app.windows[&wid].selecting,

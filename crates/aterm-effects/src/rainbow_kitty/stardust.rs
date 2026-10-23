@@ -1767,7 +1767,9 @@ impl Stardust {
         let quad_cap = frame.out.len() + STARDUST_QUAD_BUDGET;
         let halo_cap = frame.halos.len() + STARDUST_LIGHT_HALO_BUDGET;
         let mut index = std::mem::take(&mut self.sky_index);
-        index.open(ctx.geom, (frame.out.len(), frame.halos.len()));
+        if ctx.cfg.dark_theme && !self.stars.is_empty() {
+            index.open(ctx.geom, (frame.out.len(), frame.halos.len()));
+        }
         self.draw_veil(ctx, frame.halos, halo_cap);
         let mut haloed = 0usize;
         let n = self.stars.len();
@@ -2926,8 +2928,9 @@ impl Paint {
         } else {
             star_body_px(self.arm) + 1
         };
+        let watch_len = if d == 1 { 5 } else { SETTLE_PIXELS };
         let mut watch = [((0i32, 0i32), 0u32); SETTLE_PIXELS];
-        for (slot, (dx, dy)) in watch.iter_mut().zip([
+        for (slot, (dx, dy)) in watch[..watch_len].iter_mut().zip([
             (0, 0),
             (d, 0),
             (-d, 0),
@@ -3005,7 +3008,7 @@ impl Paint {
                 self.draw_halo(geom, frame.halos, r, (halo_rgb, peak), haloed);
             }
         }
-        settle_under_ceiling(frame, q0, h0, &watch);
+        settle_under_ceiling(frame, q0, h0, &watch[..watch_len]);
     }
 
     #[inline]
@@ -3880,12 +3883,7 @@ fn quad_covers(q: &GlowQuad, x: i32, y: i32) -> bool {
 /// The pixels [`settle_under_ceiling`] watches on one star: its centre, the first pixel of each arm past the body (where stub, taper and halo ring meet), and its four orthogonal neighbours.
 pub const SETTLE_PIXELS: usize = 9;
 
-fn settle_under_ceiling(
-    frame: &mut Frame<'_>,
-    q0: usize,
-    h0: usize,
-    watch: &[((i32, i32), u32); SETTLE_PIXELS],
-) {
+fn settle_under_ceiling(frame: &mut Frame<'_>, q0: usize, h0: usize, watch: &[((i32, i32), u32)]) {
     let table = relative_luminance_table();
     let own_at = |k: u8, (x, y): (i32, i32)| -> u32 {
         let mut own = 0u32;
@@ -3903,15 +3901,25 @@ fn settle_under_ceiling(
         }
         own
     };
+    let mut over = [((0i32, 0i32), 0u32); SETTLE_PIXELS];
+    let mut over_len = 0usize;
+    for &(p, ground) in watch {
+        if !under_ceil_with(table, add_sat(ground, own_at(u8::MAX, p)))
+            && let Some(slot) = over.get_mut(over_len)
+        {
+            *slot = (p, ground);
+            over_len += 1;
+        }
+    }
+    if over_len == 0 {
+        return;
+    }
+    let over = &over[..over_len];
     let fits = |k: u8| {
-        watch
-            .iter()
+        over.iter()
             .all(|&(p, ground)| under_ceil_with(table, add_sat(ground, own_at(k, p))))
     };
     let k = fit_byte(u8::MAX, fits);
-    if k == u8::MAX {
-        return;
-    }
     for q in &mut frame.out[q0..] {
         q.color = premul_rgb(q.color, k);
         q.color2 = premul_rgb(q.color2, k);

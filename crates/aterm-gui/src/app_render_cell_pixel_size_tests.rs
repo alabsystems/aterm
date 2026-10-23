@@ -3,12 +3,8 @@
 
 use crate::{App, WindowId, term_lock};
 
-/// The engine's headless placeholder cell box (`Terminal::set_cell_pixel_size`
-/// default); a live window reporting it is a defect.
 const PLACEHOLDER: (u16, u16) = (8, 16);
 
-/// Stage a headless window whose resolved cell box is not the 8x16
-/// placeholder, without resizing, and return that cell box.
 fn window_with_a_big_cell(app: &mut App, wid: WindowId) -> (u16, u16) {
     app.windows
         .get_mut(&wid)
@@ -25,15 +21,12 @@ fn window_with_a_big_cell(app: &mut App, wid: WindowId) -> (u16, u16) {
     cell
 }
 
-/// `apply_window_scale` runs at every raster seam, so a never-resized window
-/// reports the real font's cell box (DEC 1016, OSC 1337) from its first frame.
 #[test]
 fn a_never_resized_window_reports_its_real_cell_box_to_every_session() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let cell = window_with_a_big_cell(&mut app, wid);
 
-    // A second tab, also never resized: a stub engine born at the placeholder.
     let second = app.next_session_id;
     app.push_stub_tab(wid, crate::stub_session(second));
 
@@ -45,7 +38,6 @@ fn a_never_resized_window_reports_its_real_cell_box_to_every_session() {
         );
     }
 
-    // The first raster seam. No `on_resize`, no `apply_term_resize`, no drag.
     app.apply_window_scale(wid);
 
     for id in [0, second] {
@@ -57,29 +49,20 @@ fn a_never_resized_window_reports_its_real_cell_box_to_every_session() {
     }
 }
 
-/// A session is seeded with the cell box at construction (`spawn_session`),
-/// before any frame is drawn.
 #[test]
 fn a_newborn_live_engine_carries_the_owning_windows_cell_box() {
     let build = |cell_px| crate::spawn::new_live_terminal(24, 80, None, cell_px);
     assert_eq!(build(Some((11, 23))).cell_pixel_size(), (11, 23));
-    // `None` (the boot session, whose backend is still building) keeps the
-    // placeholder — `sync_cell_pixel_size` corrects it at the first raster seam.
     assert_eq!(build(None).cell_pixel_size(), PLACEHOLDER);
-    // A zero axis would be a divide-by-zero in the OSC 1337 footprint math.
     assert_eq!(build(Some((0, 0))).cell_pixel_size(), (1, 1));
 }
 
-/// The boot session is spawned before the backend build is joined, so it cannot be seeded at
-/// construction; the join corrects it with no frame or resize in between.
 #[test]
 fn the_backend_join_corrects_the_boot_sessions_placeholder() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     window_with_a_big_cell(&mut app, wid);
 
-    // Windowed cold-launch shape: the boot engine at the placeholder, nothing
-    // reported to this window yet, and the backend build still in flight.
     term_lock(&app.pool.get(0).expect("session 0").term)
         .set_cell_pixel_size(PLACEHOLDER.0, PLACEHOLDER.1);
     app.windows
@@ -95,7 +78,6 @@ fn the_backend_join_corrects_the_boot_sessions_placeholder() {
     });
     app.backend = crate::BackendSlot::Pending(Some(handle));
 
-    // A `Pending` slot has no metrics to give (asking it for any panics), so nothing is pushed.
     assert_eq!(app.spawn_cell_px(wid), None);
 
     app.finalize_backend();
@@ -120,8 +102,8 @@ fn the_backend_join_corrects_the_boot_sessions_placeholder() {
 #[test]
 fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
     fn winsize_of(master: i32) -> libc::winsize {
-        // SAFETY: `winsize` is four integers; zeroed is valid, and
-        // `TIOCGWINSZ` fills it for an open pty master.
+        // SAFETY: `winsize` is four integers; zeroed is valid, and `TIOCGWINSZ` fills it for an
+        // open pty master.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         assert_eq!(
             unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut ws) },
@@ -143,7 +125,6 @@ fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
         .session
         .master = master;
 
-    // The windowed cold-launch seed: `spawn_session(.., cell_px: None, ..)`.
     aterm_pty::resize_with_cell_px(master, 24, 80, None);
     let seeded = winsize_of(master);
     assert_eq!(
@@ -153,7 +134,6 @@ fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
          pass on a pty that was never wrong"
     );
 
-    // The correction seam the backend join reaches.
     app.windows
         .get_mut(&wid)
         .expect("window 0")
@@ -189,8 +169,8 @@ fn the_backend_join_teaches_the_boot_ptys_winsize_its_cell_box() {
 #[test]
 fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
     fn winsize_of(fd: i32) -> (u16, u16, u16, u16) {
-        // SAFETY: `winsize` is four integers; zeroed is valid, and
-        // `TIOCGWINSZ` fills it for an open pty fd.
+        // SAFETY: `winsize` is four integers; zeroed is valid, and `TIOCGWINSZ` fills it for an
+        // open pty fd.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         assert_eq!(
             unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) },
@@ -217,7 +197,6 @@ fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
         let engine = term_lock(&term);
         (engine.rows(), engine.cols())
     };
-    // The boot seed, with no cell box yet.
     aterm_pty::resize_with_cell_px(master, rows, cols, None);
 
     let mut held = None;
@@ -234,7 +213,6 @@ fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
         "the program reads the transient"
     );
 
-    // The backend join, mid-hold.
     app.windows
         .get_mut(&wid)
         .expect("window 0")
@@ -270,7 +248,6 @@ fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
         "the second half ends on the engine's grid with the join's cell box"
     );
 
-    // Negative control: with no hold standing, the join writes the PTY.
     aterm_pty::resize_with_cell_px(master, rows, cols, None);
     app.windows
         .get_mut(&wid)
@@ -290,9 +267,6 @@ fn the_backend_join_does_not_end_an_adoption_pulse_hold_early() {
     }
 }
 
-/// The per-window memo avoids locks and never gates correctness: it keys on the resolved
-/// cell size (so a face swap at an unchanged `font_px` still pushes), and an unchanged second
-/// call is a no-op.
 #[test]
 fn the_cell_box_memo_re_pushes_whenever_the_resolved_size_moves() {
     let mut app = App::headless_for_test();
@@ -304,7 +278,6 @@ fn the_cell_box_memo_re_pushes_whenever_the_resolved_size_moves() {
         Some(first)
     );
 
-    // Zoom back down: a different resolved box must be pushed again.
     app.windows.get_mut(&wid).expect("window 0").metrics.font_px = 10.0;
     let second = {
         let (cw, ch) = app.win_cell_size(wid);
@@ -318,8 +291,6 @@ fn the_cell_box_memo_re_pushes_whenever_the_resolved_size_moves() {
         "a font change with no re-grid must still reach the engine"
     );
 
-    // An unchanged box is a memo hit: poison the engine's value and check the
-    // second call leaves it alone while a real change still lands.
     term_lock(&app.pool.get(0).expect("session 0").term).set_cell_pixel_size(3, 5);
     app.apply_window_scale(wid);
     assert_eq!(
@@ -329,8 +300,6 @@ fn the_cell_box_memo_re_pushes_whenever_the_resolved_size_moves() {
     );
 }
 
-/// Session 0's engine with a full-screen program that set DEC 2048 on its
-/// alternate screen, the enable's own report already taken (the reader's).
 fn session_reporting_its_size(
     app: &App,
 ) -> std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>> {
@@ -344,14 +313,6 @@ fn session_reporting_its_size(
     term
 }
 
-/// A new cell box at the same grid (the first frame's measurement, a font zoom,
-/// a DPI move) re-reports the text area's pixels to a program that set DEC 2048,
-/// and the window sends that report itself, in the same pass, by both seams that
-/// push the box: nothing is left in the engine for the session reader's next
-/// take, which under ConPTY is the program's next output (a resize to the same
-/// size draws nothing). An idle vim had its report wait until it was killed, and
-/// pwsh got it with the console title written after the kill (measured
-/// 2026-10-18).
 #[test]
 fn a_new_cell_box_sends_its_size_report_in_the_same_pass() {
     let mut app = App::headless_for_test();
@@ -373,8 +334,6 @@ fn a_new_cell_box_sends_its_size_report_in_the_same_pass() {
         );
     }
 
-    // The pane pass (`resize_panes`) pushes the box too, before its unchanged
-    // grid returns early.
     app.resize_panes(wid);
     let grid = {
         let mut t = term_lock(&term);
@@ -397,15 +356,10 @@ fn a_new_cell_box_sends_its_size_report_in_the_same_pass() {
     );
 }
 
-/// A metrics change (`refresh_all_window_metrics`: font zoom, `font_size` /
-/// `font_family` reload) reaches a background window's engines immediately,
-/// with no redraw, resize or `apply_window_scale` after it.
 #[test]
 fn a_font_change_reaches_an_unpainted_windows_engines_at_the_change() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // Seed at the default face through one raster seam, so the memo is warm
-    // and the engine already carries the pre-change box.
     app.apply_window_scale(wid);
     let before = app
         .windows
@@ -419,8 +373,6 @@ fn a_font_change_reaches_an_unpainted_windows_engines_at_the_change() {
         "the seed must have reached the engine, or this test proves nothing"
     );
 
-    // The font change (the shape a zoom or config reload takes), through the metrics
-    // seam only.
     app.font_size = 24.0;
     app.font_px = 24.0;
     app.refresh_all_window_metrics();

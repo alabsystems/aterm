@@ -4,12 +4,7 @@
 // Derived from lz4_flex 0.11.5 and modified by the aterm project in 2026.
 // See ../LICENSE-MIT for the upstream MIT license.
 
-//! Fast `memcpy` for short slices.
-//!
-//! The compiler calls `memcpy` for slices of unknown length. Up to 32 bytes
-//! (64 on x86_64 or with `avx`) this copies inline with two overlapping
-//! fixed-size copies, e.g. 6 bytes as `[1, 2, 3, 4]` then `[3, 4, 5, 6]`.
-//! Longer slices fall back to `memcpy`.
+//! Fast `memcpy` for short slices using overlapping fixed-size copies.
 
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)] // len-contract copy family (see len_mismatch_fail); native lowering gap: typed-TrustIr does not complete on this body
@@ -54,17 +49,6 @@ pub fn slice_copy(src: &[u8], dst: &mut [u8]) {
         return;
     }
 
-    // The 33..=64-byte tier. Upstream gates it on `target_feature = "avx"`,
-    // which no x86_64 lane of this tree sets (none passes `-C target-cpu` or
-    // `target-feature`), so those copies all called `memcpy`. On x86_64 it is
-    // taken unconditionally: call-free `movq`/SSE2 `movups` without AVX.
-    //
-    // Measured on an i7-7920HQ (macOS 13.7, Trust, opt-level 3, 65536 random
-    // 33..=64-byte copies, min of 200 passes, 6 runs): memcpy 17.7..18.5
-    // ns/op, this tier 12.1..12.7 (-29..-33%); >64-byte copies unchanged
-    // within noise. A runtime-dispatched `#[target_feature(enable = "avx2")]`
-    // copy measured 13.6..14.4 ns/op and needs `unsafe`. aarch64 keeps
-    // upstream's gate. Linux and Windows x86_64 take the tier unmeasured.
     #[cfg(any(target_feature = "avx", target_arch = "x86_64"))]
     {
         if len <= 64 {
@@ -73,14 +57,12 @@ pub fn slice_copy(src: &[u8], dst: &mut [u8]) {
         }
     }
 
-    // Larger copies: `memcpy`, where the checks above cost little.
     dst.copy_from_slice(src);
 }
 
 #[inline(always)]
 #[cfg_attr(trust_verify, trust::skip)] // precondition helper (1 <= src.len() <= dst.len()), enforced by slice_copy's contract
 fn short_copy(src: &[u8], dst: &mut [u8]) {
-    // length 1-3
     dst[0] = src[0];
     if src.len() >= 2 {
         double_copy_trick::<2>(src, dst);

@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The recorder: each value the door observed is taped in the order it was
-//! observed, as astream's seam defines it, while the door returns the live
-//! value; doors do not nest; a tape that fails never reaches the loop; a
-//! decision names the record of the screen it judged; and every value a
-//! round trip returns reads back from its bytes.
+//! Recorder tests: effect ordering, non-nesting doors, failure isolation,
+//! decision screen links, and round-trip codecs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,11 +39,7 @@ fn effects(items: &[Item]) -> Vec<(EffectRecord, Option<Stamp>)> {
         .collect()
 }
 
-/// A run's reads, round trips, outputs, flags, notes and files are taped in
-/// the order the door saw them — the clocks' reads as `Mono` and `Clock`, a
-/// round trip stamped where the clocks stood when it came back, a flag only
-/// at its first true read with the false reads before it counted, a sleep as
-/// a round trip of its length — and every door returned its live value.
+/// Effects are taped in observation order with return-time stamps on round trips, sleeps, and raised flags.
 #[test]
 fn each_value_is_taped_in_the_order_the_door_saw_it() {
     let (fx, clock) = virtual_fx();
@@ -133,8 +126,6 @@ fn each_value_is_taped_in_the_order_the_door_saw_it() {
             },
         ]
     );
-    // The sleep came back with the clocks moved on; the round trip and the
-    // flag were stamped there; nothing else carries a stamp.
     let moved = Stamp {
         mono_ns: 1_500_000_000,
         wall_ms: WALL_MS + 1500,
@@ -163,10 +154,7 @@ fn each_value_is_taped_in_the_order_the_door_saw_it() {
     assert_eq!(clock.passed(), Duration::from_millis(1500));
 }
 
-/// A door reached inside another door's live call runs live, is taped
-/// nowhere, is said once on the tape, and — in this crate's tests — fails a
-/// `debug_assert!`, so the suite keeps every boundary clean. The recorder is
-/// whole again after it: the next round trip is taped as usual.
+/// Nested door calls fail a debug assertion, record a `Mark::Nested`, and leave subsequent calls working.
 #[test]
 fn doors_do_not_nest() {
     let (fx, _) = virtual_fx();
@@ -196,7 +184,6 @@ fn doors_do_not_nest() {
         !inner_ran.load(std::sync::atomic::Ordering::SeqCst),
         "the assertion fires before the inner call"
     );
-    // The recorder's count of live calls was given back by the unwind.
     fx.emit(doors::JOURNAL, || b"after".to_vec());
     let read = tape.finish("exit 0");
     let marks: Vec<&Item> = read
@@ -224,8 +211,7 @@ fn doors_do_not_nest() {
     );
 }
 
-/// A tape whose writes fail is said once and stops; every door goes on
-/// returning its live value, and nothing reaches the loop.
+/// A tape sink failure logs once and stops recording without disrupting live door calls.
 #[test]
 fn a_failing_tape_never_reaches_the_loop() {
     let (fx, _) = virtual_fx();
@@ -258,9 +244,7 @@ fn screen(seq: u64, generation: Option<&str>) -> Screen {
     }
 }
 
-/// A decision's mark names the record of the very screen it judged: the
-/// last read, or a screen read earlier and carried, by its sequence and
-/// generation — and no record for a screen the recorder never saw parsed.
+/// A decision mark links to the effect index of the parsed screen it judged.
 #[test]
 fn a_decision_names_the_record_of_the_screen_it_judged() {
     let (fx, _) = virtual_fx();
@@ -327,8 +311,7 @@ fn a_decision_names_the_record_of_the_screen_it_judged() {
     assert_eq!(marks[2].generation, None);
 }
 
-/// Every value a round trip returns reads back from its bytes; a mark reads
-/// back whatever its outcome holds (a newline, `=`, `-`).
+/// Round-trip values and `DecideMark` payloads encode and decode losslessly.
 #[test]
 fn every_value_reads_back_from_its_bytes() {
     let back =
@@ -352,7 +335,6 @@ fn every_value_reads_back_from_its_bytes() {
     );
     assert_eq!(<()>::from_tape(&().to_tape()), Ok(()));
     assert!(<()>::from_tape(b"x").is_err());
-    // The machine's count of its sleep, and its record of its last sleep.
     use crate::supervise::policy::sleeps::{Boot, SleepStamp};
     let boot = [
         0x4F, 0x1C, 0x2A, 0x9E, 0x3E, 0x4F, 0x50, 0x61, 0x72, 0x83, 0x94, 0xA5, 0xB6, 0xC7, 0xD8,
@@ -372,11 +354,6 @@ fn every_value_reads_back_from_its_bytes() {
     ] {
         assert_eq!(Option::<SleepStamp>::from_tape(&v.to_tape()), Ok(v));
     }
-    // The boot as the kernel spells it, and as it was read: a tape any build
-    // recorded on either kernel (macOS's upper-case text, Linux's lower-case)
-    // replays the same 16 bytes and is written back byte for byte, so the act
-    // rows a replay writes are the recorded ones. CONTROL: the all-zero id
-    // replays as a count on no named boot.
     for recorded in [
         &b"1800003 4F1C2A9E-3E4F-5061-7283-94A5B6C7D8E9"[..],
         b"1800003 4f1c2a9e-3e4f-5061-7283-94a5b6c7d8e9",
@@ -423,7 +400,6 @@ fn every_value_reads_back_from_its_bytes() {
         },
     ] {
         assert_eq!(DecideMark::decode(&mark.encode()), Some(mark.clone()));
-        // A key a later build writes is skipped: the mark reads as it was.
         let later = format!("{}later=1\n", mark.encode());
         assert_eq!(DecideMark::decode(&later), Some(mark));
     }
@@ -434,8 +410,7 @@ fn every_value_reads_back_from_its_bytes() {
     );
 }
 
-/// A tape read back from the recorder's bytes decodes each record the
-/// recorder taped, a stamp on a round trip included, under one decoder.
+/// Compressed frames decode back to the full recorded item sequence.
 #[test]
 fn the_recorders_bytes_read_back_whole() {
     let (fx, clock) = virtual_fx();
@@ -467,7 +442,6 @@ fn the_recorders_bytes_read_back_whole() {
     assert_eq!(effects(&read.items).len(), 900);
     assert!(read.frames > 2, "flushed into frames: {}", read.frames);
     assert_eq!(clock.passed(), Duration::from_millis(6000));
-    // Repeated screens cost little: the delta and the frame's compression.
     let raw: usize = 300 * 830;
     assert!(
         tape.sink.bytes().len() * 10 < raw,
@@ -477,13 +451,7 @@ fn the_recorders_bytes_read_back_whole() {
     assert_eq!(recover(&tape.sink.bytes()).items, read.items);
 }
 
-/// A STAMP IS A PEEK: a scripted clock's staged jump (a Mac's sleep, landing
-/// at the read after the one that follows `set_jump`) is not consumed by the
-/// recorder's look at the clocks — the origin it takes, the stamp on a round
-/// trip — so the loop's own next read still sees the old time and the one
-/// after it the jump, as with no recorder. NEGATIVE CONTROL: the same reads
-/// with a real read in place of the stamp's peek land the jump one read
-/// early.
+/// Recorder clock peeks for origin and stamps do not consume a staged `ScriptedClock` jump.
 #[test]
 fn a_stamp_never_makes_the_read_a_staged_jump_lands_at() {
     use crate::supervise::fx::ScriptedClock;
@@ -499,8 +467,6 @@ fn a_stamp_never_makes_the_read_a_staged_jump_lands_at() {
             || codec::ctl_request(&["status"]),
             || {
                 if consume {
-                    // What a recorder that READ the clock for its stamp
-                    // would do to the run.
                     let _ = fx.wall_ms();
                 }
                 Err("closed".to_string())
@@ -520,13 +486,7 @@ fn a_stamp_never_makes_the_read_a_staged_jump_lands_at() {
     );
 }
 
-/// A NOTE NEVER HOLDS THIS PROCESS'S RAW CLOCK: every `Instant` in its
-/// `Debug` text — one after the origin, one before it, one nested in an
-/// `Option` and a tuple — is written as its offset from the tape's origin,
-/// as a decision's outcome writes one; text that only looks like one (a
-/// string naming `Instant`) is left as it is. This build's std writes an
-/// `Instant` in a form the recorder learns; were it not, the note would be
-/// withheld rather than hold the clock.
+/// `Instant` values formatted into notes are rewritten as signed nanosecond offsets from the tape origin.
 #[test]
 fn a_notes_instants_are_written_as_offsets_from_the_origin() {
     let (fx, _clock) = virtual_fx();
@@ -559,8 +519,7 @@ fn a_notes_instants_are_written_as_offsets_from_the_origin() {
     assert_eq!(instants_as_offsets(&raw, origin), "+0ns");
 }
 
-/// A note is recorder-only text: actual valid Instants become offsets, but
-/// malformed or excessive Instant-shaped literals cannot stop its live loop.
+/// Malformed or overflowing `Instant`-shaped substrings in notes remain literal text without panicking.
 #[test]
 fn instant_shaped_note_text_cannot_overflow_the_recorder() {
     let origin = Instant::now();
@@ -598,8 +557,6 @@ fn instant_shaped_note_text_cannot_overflow_the_recorder() {
     ] {
         assert_eq!(note(&inert), inert, "malformed text stays text");
     }
-    // Every bad shape is reached before the aggregate assertion, even when
-    // an old recorder panics while trying to interpret the first one.
     let bad = [
         literal("999999999999999999999999999999", "0"),
         literal("-999999999999999999999999999999", "0"),

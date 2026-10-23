@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The query layer of a full-history search: what one query over a built index means.
+//! Full-history search query execution over a built index.
 
 use aterm_search::{DirectedFind, LineFrame};
 
@@ -15,18 +15,16 @@ use crate::search::{
 /// The soft-wrap layout one query is answered in.
 #[derive(Clone, Copy, Debug)]
 pub struct WrapFrame {
-    /// Display columns one grid row holds — the width each continued row was
-    /// padded out to before the join.
+    /// Display columns one grid row holds.
     cols: usize,
-    /// The index joins soft-wrap runs ([`super::SearchLayout::Logical`]); an
-    /// index of one line per row needs no re-expression.
+    /// The index joins soft-wrap runs ([`super::SearchLayout::Logical`]).
     joined: bool,
     /// [`WrapFrame::to_logical`] of the caller's anchor, when it has one.
     logical_anchor: Option<(usize, usize)>,
 }
 
 impl WrapFrame {
-    /// The frame a query under `key` is answered in, read in the hold that captured `key`, so the stride that un-joins a logical line's columns is the width of the grid the rows are read from.
+    /// The frame a query under `key` is answered in, read in the hold that captured `key`.
     #[must_use]
     pub fn under_key(t: &Terminal, key: &SearchKey, anchor: Option<(usize, usize)>) -> Self {
         let cols = usize::from(key.cols);
@@ -42,7 +40,7 @@ impl WrapFrame {
         }
     }
 
-    /// The frame of an index under `key` that joins no rows ([`super::SearchLayout::Physical`]): every match is already physical, and the anchor addresses the index as it is.
+    /// The frame of an index under `key` that joins no rows ([`super::SearchLayout::Physical`]).
     #[must_use]
     #[inline]
     pub(crate) const fn unjoined(key: &SearchKey) -> Self {
@@ -60,15 +58,15 @@ impl WrapFrame {
         self.cols
     }
 
-    /// The caller's anchor in the joined line's columns, `(row its logical line starts on, column along that line)`; `None` without an anchor, or when its run is too deep to walk back over (the walks then take the physical anchor).
+    /// The caller's anchor in the joined line's columns.
     #[must_use]
     #[inline]
     pub const fn logical_anchor(self) -> Option<(usize, usize)> {
         self.logical_anchor
     }
 
-    /// Carry a physical `(row, col)` point into the joined line's columns,
-    /// given the row that line starts on.
+    /// Carry a physical `(row, col)` point into the joined line's columns, given the row that line
+    /// starts on.
     #[inline]
     const fn to_logical(cols: usize, origin: usize, row: usize, col: usize) -> (usize, usize) {
         (
@@ -79,7 +77,7 @@ impl WrapFrame {
         )
     }
 
-    /// Re-express one engine match — keyed at a logical line's first row, its columns measured along the joined line — as the physical row and column the hit STARTS on, with `end_col` still measured from that row's column 0.
+    /// Re-express one engine match.
     #[must_use]
     #[inline]
     pub fn to_physical(self, m: &SearchMatch) -> SearchMatch {
@@ -105,7 +103,7 @@ impl WrapFrame {
     }
 }
 
-/// Fold each soft-wrapped run of snapshot rows into the ONE logical line the reader sees, in place: the run's head takes the whole text and the cells it was read from, and every continuation becomes empty, so a hit that straddles the boundary is found exactly once, keyed at the row it starts on.
+/// Fold each soft-wrapped run of snapshot rows into the ONE logical line the reader sees.
 pub fn join_wrapped_rows(
     lines: &mut [String],
     cells: &mut [LineCells],
@@ -155,7 +153,7 @@ pub fn join_wrapped_rows(
     }
 }
 
-/// One query over an index of joined soft-wrap runs: the batch results in physical coordinates ([`WrapFrame::to_physical`]) and, with an anchor, the match it selects: the first (`Forward`) or last (`Backward`) hit past it (`strict`) or at it, wrapping to the other end, and past the batch cap the index's own walk from the anchor carried into the joined frame.
+/// One query over an index of joined soft-wrap runs ([`WrapFrame::to_physical`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the wrap frame rides alongside the query's own surface, like the anchor"
@@ -187,9 +185,7 @@ pub fn query_search_index(
     Ok((results, point_match))
 }
 
-/// Anchored point-match selection over ALREADY-COMPUTED batch results — split
-/// out of [`query_search_index`] verbatim so the narrowing path shares the
-/// exact anchored/point/cap-edge policy instead of re-implementing it.
+/// Anchored point-match selection over ALREADY-COMPUTED batch results ([`query_search_index`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "verbatim split of query_search_index's policy tail; every flag is load-bearing"
@@ -268,13 +264,11 @@ fn select_point_match(
 #[derive(Debug)]
 struct NarrowFrame {
     query: String,
-    /// Ascending retained lines whose folded text contains the folded query —
-    /// absolute rows, held as `u32` offsets from the frame's own base, so a
-    /// frame costs four bytes a line past row `u32::MAX` too.
+    /// Ascending retained lines whose folded text contains the folded query.
     occurrence_lines: LineFrame,
 }
 
-/// A find bar's narrowing state over one index: the occurrence frames of the prefixes it typed, valid for the index generation they were read in (the holder's key) and for one case sensitivity (checked here).
+/// A find bar's narrowing state over one index.
 #[derive(Debug)]
 pub struct NarrowStack {
     case_sensitive: bool,
@@ -282,10 +276,7 @@ pub struct NarrowStack {
     frames: Vec<NarrowFrame>,
 }
 
-/// Retained-entry budget per stack (~1.6 MB of `u32` offsets at the bound). The
-/// SHALLOWEST frames (the biggest — short prefixes) are dropped first; a deep
-/// backspace past a dropped frame reseeds from the engine, which is always
-/// correct, merely batch-priced.
+/// Retained-entry budget per stack (~1.6 MB of `u32` offsets at the bound).
 const NARROW_STACK_MAX_ENTRIES: usize = 4 * MAX_SEARCH_MATCHES;
 
 #[cfg(any(test, debug_assertions))]
@@ -303,7 +294,7 @@ fn record_narrowed_query() {
 #[inline]
 const fn record_narrowed_query() {}
 
-/// Take (read and reset) how many queries on THIS thread were served off a narrowing frame — the deterministic reach signal for the wiring tests (thread-local so parallel tests on other terminals cannot perturb it).
+/// Take (read and reset) how many queries on THIS thread were served off a narrowing frame.
 #[cfg(any(test, debug_assertions))]
 pub fn take_narrowed_query_steps() -> usize {
     NARROWED_QUERY_STEPS.with(|count| {
@@ -313,7 +304,7 @@ pub fn take_narrowed_query_steps() -> usize {
     })
 }
 
-/// [`query_search_index`] with narrowing: literal queries consult and extend `stack`; regex and empty queries (and any capped backward edge) take the batch path unchanged.
+/// [`query_search_index`] with narrowing: literal queries consult and extend `stack`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the narrowing stack rides alongside query_search_index's own surface"
@@ -405,8 +396,6 @@ pub fn query_search_index_narrowing(
         }
         *stack = Some(session);
     } else if let Some(session) = session {
-        // Capped walk: no frame for THIS query, but the stacked ancestors are
-        // still valid for other extensions of their prefixes — keep them.
         *stack = Some(session);
     }
     let point_match = select_point_match(
@@ -436,8 +425,6 @@ mod tests {
         index
     }
 
-    /// `query` through the narrowing layer and the batch layer: (narrowed
-    /// results, batch results, whether it was served off a frame).
     fn step(
         index: &TerminalSearch,
         stack: &mut Option<NarrowStack>,
@@ -478,10 +465,6 @@ mod tests {
         (narrowed, batch, served_off_a_frame)
     }
 
-    /// A case-sensitive frame holds only the lines the exact prefix occurs on,
-    /// so a folded query grown from it must not be verified over it: the stack
-    /// the holder hands back for the index generation is read only at its own
-    /// case sensitivity.
     #[test]
     fn a_narrowing_stack_is_read_only_at_its_own_case_sensitivity() {
         let index = index(&["Find one", "find two", "FIND three", "nothing"]);

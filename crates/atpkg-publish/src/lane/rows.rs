@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A pack manifest's rows, as the client reads them: a published manifest is verified
-//! under the head's roster ([`crate::quad::VerifiedQuad::verify_pkg`]); one this lane
-//! staged (unsigned, on local disk) is parsed into the client's own `PkgManifest`.
+//! Pack manifest row queries and local/remote manifest loading.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -75,10 +73,7 @@ pub enum Fetched {
     Invalid(String),
 }
 
-/// Fetch `pkg-<program>-<build>.toml` and its signature from `slug`'s release
-/// `atpkg-<program>-<build>` into `dir`, and verify it under `quad`'s roster. A failed
-/// download is tried three times: the asset endpoint answers an intermittent HTTP 500
-/// after other assets of the same call landed.
+/// Downloads `pkg-<program>-<build>.toml` and its `.sig` from `slug` into `dir` and verifies it.
 #[must_use]
 pub fn fetch(
     host: &HostRef,

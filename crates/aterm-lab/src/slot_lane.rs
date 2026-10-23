@@ -262,7 +262,9 @@ fn duration_of(v: &str) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// `slot-capture [--watch <dur>] [--dir DIR]` (the module docs).
+/// `slot-capture [--watch <dur>] [--dir DIR]`: the real `build-slot` admits `true` into a
+/// scratch slot directory, whose `slot-0` must parse as its record; `--watch` instead reads the
+/// real slot directory (or `DIR`) with the reader and with `lsof` for `<dur>`.
 /// # Errors
 /// Usage, or the world could not be made.
 pub fn cmd_slot_capture(args: &[String]) -> Res {
@@ -599,7 +601,8 @@ fn start_holder(world: &World, slot: &Path, dir: &Path) -> Result<Running, Strin
     }
 }
 
-/// `slot-lane [--aterm PATH] [--keep]` (the module docs).
+/// `slot-lane [--aterm PATH] [--keep]`: a headless instance's `await sys slots>=1` times out
+/// while a stand-in holds its one slot, and answers once the stand-in is `SIGKILL`ed.
 /// # Errors
 /// Usage, or the world, the stand-in or the instance could not be made.
 pub fn cmd_slot_lane(args: &[String]) -> Res {

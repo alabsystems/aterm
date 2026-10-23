@@ -219,7 +219,7 @@ impl fmt::Display for SnapshotRefusal {
 
 impl std::error::Error for SnapshotRefusal {}
 
-/// Bytes per field, in layout order (the table in the module docs).
+/// Bytes per field, in layout order.
 const SCHEMA_BYTES: usize = 2;
 const F32_BYTES: usize = 4;
 const TAG_BYTES: usize = 1;
@@ -241,7 +241,8 @@ impl MomentumGlowSnapshot {
         + OFFSET_BYTES
         + F32_BYTES;
 
-    /// The canonical encoding (the module docs' table).
+    /// The canonical encoding: the fields little-endian in the order written below, each
+    /// option a 0/1 tag then its `i128` offset (all zero under tag 0).
     #[inline]
     #[must_use]
     pub const fn encode(&self) -> [u8; Self::LEN] {
@@ -331,7 +332,8 @@ impl MomentumGlowSnapshot {
         })
     }
 
-    /// Refuses every state that breaks an invariant the engine's transitions keep, or a bound of the hosted profile (the module docs' lists), checked in this order, naming the first one broken.
+    /// Refuses every state that breaks an invariant the engine's transitions keep, or a bound of
+    /// the hosted profile, checked in the order listed below, naming the first one broken.
     /// # Errors
     /// [`SnapshotRefusal::RateValue`], [`SnapshotRefusal::RateStamp`], [`SnapshotRefusal::Latched`], [`SnapshotRefusal::Latch`], [`SnapshotRefusal::Fingerprint`], [`SnapshotRefusal::HotWithoutRate`], [`SnapshotRefusal::Tau`], [`SnapshotRefusal::History`] or [`SnapshotRefusal::Horizon`].
     pub const fn validate(&self) -> Result<(), SnapshotRefusal> {
@@ -454,7 +456,9 @@ impl MomentumGlow {
 
     /// An engine in `s`'s state, its instants placed on this host's `epoch`.
     /// # Errors
-    /// Any of [`MomentumGlowSnapshot::validate`]'s refusals, or [`SnapshotRefusal::Instant`] when an offset lands outside the `Instant` range, or a stamp's settle schedule would (the module docs).
+    /// Any of [`MomentumGlowSnapshot::validate`]'s refusals, or [`SnapshotRefusal::Instant`] when
+    /// an offset lands outside the `Instant` range, or a stamp's settle schedule
+    /// (`stamp + τ·ln 255 + SETTLE_MARGIN`) would.
     pub fn restore(s: &MomentumGlowSnapshot, epoch: Instant) -> Result<Self, SnapshotRefusal> {
         s.validate()?;
         let at = s

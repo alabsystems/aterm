@@ -149,7 +149,7 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
 }
 
 // SAFETY: `pthread_set_qos_class_self_np` is in libpthread, part of `libSystem`, which every
-// process links.
+// process links; `qos_class_t` is `unsigned int`.
 unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }

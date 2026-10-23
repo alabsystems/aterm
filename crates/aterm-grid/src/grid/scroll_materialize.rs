@@ -899,7 +899,6 @@ fn place_cell(
             row.cells[col as usize] = cell;
             col.saturating_add(1)
         } else {
-            // wide at last column — drop
             col // wide at last column — drop
         }
     } else if is_wide {

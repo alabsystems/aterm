@@ -1,37 +1,22 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The evergreen pointer: learning which release is newest from one unmetered HEAD.
+//! Resolves the newest published release tag via one unmetered HEAD request to
+//! `/releases/latest/download/{name}`.
 //!
-//! GitHub answers `https://github.com/{owner}/{repo}/releases/latest/download/{name}` with a
-//! 302 to `…/releases/download/<tag>/{name}` for the newest published release (drafts and
-//! prereleases excluded by the server), with no `x-ratelimit-*` header; a private repo answers
-//! 404. So the channel head costs one request against no budget, and a check whose head has
-//! not moved needs no second one.
-//!
-//! The pointer is not trust: it only chooses which tag later GETs address, and every byte they
-//! return still meets the appcast signature, the roster, the version/tag/URL binds and the
-//! build and floor gates. The tag is taken only from a `Location` that is exactly the
-//! tag-specific URL for the caller's owner, repo and name, with a tag that passes the caller's
-//! predicate and [`crate::cdn::path_segment_safe`]; any other `Location` is refused, never
-//! interpreted. Nothing after the HEAD goes through `latest` again, so a pointer that moves
-//! mid-check cannot mix two releases.
-//!
-//! `latest` need not carry an app build: the shared `vX.Y.0` release can be published before
-//! the app cut attaches its assets, so the check lane treats a 404 on the head's appcast as
-//! "channel head has no app manifest yet", a healthy end to the check.
+//! Only a redirect to the exact tag-specific download URL for `(owner, repo, name)` under a
+//! [`crate::cdn::path_segment_safe`] tag accepted by the caller is trusted to name the tag;
+//! all subsequent GETs use that derived tag URL directly.
 
 use crate::cdn::path_segment_safe;
 use crate::http::{HeadAnswer, HttpError};
 
-/// The evergreen URL for asset `name` of the newest published release in `owner/repo`, or
-/// `None` when any of the three is not a safe path segment.
+/// Returns the `/releases/latest/download/{name}` URL for `owner/repo`, or `None` if any segment is unsafe.
 #[must_use]
 pub fn latest_download_url(owner: &str, repo: &str, name: &str) -> Option<String> {
     if !(path_segment_safe(owner) && path_segment_safe(repo) && path_segment_safe(name)) {
         return None;
     }
-    // Manual concat, as in `cdn::release_download_url`.
     let mut url = String::with_capacity(
         "https://github.com/".len()
             + owner.len()
@@ -49,29 +34,22 @@ pub fn latest_download_url(owner: &str, repo: &str, name: &str) -> Option<String
     Some(url)
 }
 
-/// Why the pointer did not yield a tag, in the classes a check lane treats differently.
+/// Reason why the evergreen pointer did not yield a release tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PointerError {
-    /// `owner`, `repo` or `name` is not a safe path segment: no URL was built and no
-    /// request was made.
+    /// `owner`, `repo` or `name` is not a safe path segment.
     UnsafeName,
-    /// 404: no published (non-draft, non-prerelease) release, or a private or nonexistent
-    /// repository, which the web host renders identically. A standing state, not weather.
+    /// HTTP 404: no published release (or a private or nonexistent repository).
     NoRelease { url: String },
-    /// The pointer names this repository and asset under a safe tag this client does not
-    /// install from (an `atpkg-index-<n>` cut published as a normal release captures
-    /// `/releases/latest`). The channel is intact but its head is not an app release; the
-    /// caller records that and ends the check. Nothing at the location was fetched.
+    /// Safe redirect within this repository and asset whose tag `accept_tag` rejected.
     OtherTag { tag: String },
-    /// 429 or 5xx: weather, retried on the next cycle.
+    /// HTTP 429 or 5xx transient error.
     Transient { code: u16, url: String },
-    /// curl itself failed (DNS, TLS, timeout) or the answer was unparseable.
+    /// Transport failure or unparseable response.
     Transport(String),
-    /// A status the pointer has no reading for (a 200 with no redirect, a 403 from a filtering
-    /// proxy, …): a verdict about this host.
+    /// Non-redirect HTTP status other than 404, 429, or 5xx.
     Unexpected { code: u16, url: String },
-    /// The redirect's `Location` is not exactly the tag-specific download URL of `name` in this
-    /// repository. The value is not echoed (it is server-controlled); `why` is a fixed literal.
+    /// Redirect `Location` does not match the exact tag-specific download URL of `name` in `owner/repo`.
     Refused { why: &'static str },
 }
 
@@ -111,20 +89,15 @@ impl std::fmt::Display for PointerError {
     }
 }
 
-/// The parsed pointer: the newest published release's tag, and the tag-specific URL the
-/// `Location` named (proved equal to the derived one).
+/// Verified release tag and derived download URL from the evergreen pointer redirect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pointer {
     pub tag: String,
     pub location: String,
 }
 
-/// Parse a 302's `Location` into the tag it names, strictly: it must be byte for byte
-/// `https://github.com/{owner}/{repo}/releases/download/<tag>/{name}`, with `<tag>` one
-/// [`path_segment_safe`] segment. A tag `accept_tag` refuses is [`PointerError::OtherTag`];
-/// anything else is [`PointerError::Refused`]. The URL rebuilt by
-/// [`crate::cdn::release_download_url`] must equal the `Location`, so the caller always fetches
-/// the derived URL, never a server string with a hidden difference.
+/// Strictly parses a redirect `Location` into `https://github.com/{owner}/{repo}/releases/download/<tag>/{name}`
+/// with a [`path_segment_safe`] `<tag>` accepted by `accept_tag`.
 pub fn parse_location(
     owner: &str,
     repo: &str,
@@ -152,12 +125,10 @@ pub fn parse_location(
         ));
     }
     if !accept_tag(tag) {
-        // This repository, this asset, a safe segment: the one benign refusal.
         return Err(PointerError::OtherTag {
             tag: tag.to_string(),
         });
     }
-    // Every later GET uses the derived URL, so it must be the very string the server named.
     let derived = crate::cdn::release_download_url(owner, repo, tag, name)
         .ok_or_else(|| refused("the release source is not URL-safe"))?;
     if derived != location {
@@ -171,8 +142,7 @@ pub fn parse_location(
     })
 }
 
-/// Classify a redirect-refusing HEAD's answer for `url` (from [`latest_download_url`]) into
-/// the tag it names, under `accept_tag`. Pure: the caller supplies the transport.
+/// Classifies a redirect-refusing HEAD response for `url` under `accept_tag`.
 pub fn classify(
     owner: &str,
     repo: &str,
@@ -203,7 +173,7 @@ pub fn classify(
     }
 }
 
-/// [`resolve`] over an injected HEAD transport, which tests count requests through.
+/// [`resolve`] over an injected HEAD transport.
 pub fn resolve_with(
     owner: &str,
     repo: &str,
@@ -216,8 +186,7 @@ pub fn resolve_with(
     classify(owner, repo, name, &url, answer, accept_tag)
 }
 
-/// The newest published release's tag in `owner/repo`, from one anonymous unmetered HEAD of
-/// the evergreen URL for `name`.
+/// Resolves the newest published release tag in `owner/repo` via one HEAD request for `name`.
 pub fn resolve(
     owner: &str,
     repo: &str,
@@ -233,8 +202,7 @@ pub fn resolve(
     )
 }
 
-/// The app channel's tag grammar for the pointer: a canonical `vMAJOR.MINOR.PATCH` candidate
-/// ([`crate::tag::parse_release_tag`] + [`crate::tag::canonical_version`]).
+/// Returns `true` if `tag` is a canonical `vMAJOR.MINOR.PATCH` release tag.
 #[must_use]
 pub fn canonical_app_tag(tag: &str) -> bool {
     match crate::tag::parse_release_tag(tag) {
@@ -254,7 +222,6 @@ mod tests {
     const NAME: &str = "aterm-appcast.toml";
 
     fn measured() -> String {
-        // A real `location:` from the shipped channel.
         "https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-appcast.toml".into()
     }
 
@@ -282,7 +249,6 @@ mod tests {
         }
     }
 
-    /// GitHub's answer parses to its tag, and the location handed back is the derived URL.
     #[test]
     fn the_measured_redirect_names_the_tag() {
         let p = parse_location(OWNER, REPO, NAME, &measured(), &canonical_app_tag).unwrap();
@@ -293,15 +259,12 @@ mod tests {
         );
     }
 
-    /// The pointer cannot choose a tag outside the grammar or point later GETs off this
-    /// repository.
     #[test]
     fn every_other_location_is_refused_not_interpreted() {
         let refused = |loc: &str| match parse_location(OWNER, REPO, NAME, loc, &canonical_app_tag) {
             Err(PointerError::Refused { .. }) => {}
             other => panic!("{loc}: expected a refusal, got {other:?}"),
         };
-        // Another host, another repo, another asset.
         refused(
             "https://evil.example/alabsystems/aterm/releases/download/v0.74.0/aterm-appcast.toml",
         );
@@ -312,7 +275,6 @@ mod tests {
         refused(
             "https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-machines.toml",
         );
-        // http, a query, a fragment, an escape, an extra segment, a traversal.
         refused("http://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-appcast.toml");
         refused(
             "https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-appcast.toml?x=1",
@@ -327,13 +289,9 @@ mod tests {
             "https://github.com/alabsystems/aterm/releases/download/v0.74.0/x/aterm-appcast.toml",
         );
         refused("https://github.com/alabsystems/aterm/releases/download/../aterm-appcast.toml");
-        // The `latest` alias itself, and the tag page: neither is a download URL.
         refused("https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml");
         refused("https://github.com/alabsystems/aterm/releases/tag/v0.74.0");
-        // An empty tag never reaches the grammar (it is not a safe segment).
         refused("https://github.com/alabsystems/aterm/releases/download//aterm-appcast.toml");
-        // A tag outside the grammar on this repository, for this asset, is the one benign
-        // case: `OtherTag`, named and never fetched from.
         for tag in [
             "v0.74",
             "v01.74.0",
@@ -350,7 +308,6 @@ mod tests {
                 other => panic!("{loc}: expected OtherTag, got {other:?}"),
             }
         }
-        // …but a caller with a different grammar (atpkg) accepts its own tags.
         let p = parse_location(
             "alabsystems",
             "atpkg-index",
@@ -362,8 +319,6 @@ mod tests {
         assert_eq!(p.tag, "atpkg-index-41");
     }
 
-    /// A redirect is the answer, 404 the standing state, 429/5xx weather, anything else a host
-    /// verdict, and a redirect without a Location is refused.
     #[test]
     fn head_answers_are_classified_into_exactly_the_check_lanes_classes() {
         let url = latest_download_url(OWNER, REPO, NAME).unwrap();
@@ -422,7 +377,6 @@ mod tests {
         ));
     }
 
-    /// One HEAD, to the evergreen URL; none for an unsafe source.
     #[test]
     fn resolve_makes_one_head_and_none_for_an_unsafe_source() {
         let mut asked: Vec<String> = Vec::new();

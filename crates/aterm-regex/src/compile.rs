@@ -24,11 +24,11 @@ pub(crate) enum Inst {
     Match,
 }
 
-/// Bytes one instruction is charged against `size_limit`: the instruction plus, in each of the Pike VM's two thread lists, a `Thread` slot and a generation stamp.
+/// Bytes one instruction is charged against `size_limit`.
 pub(crate) const INST_COST: usize =
     size_of::<Inst>() + 2 * (size_of::<Thread>() + size_of::<u32>());
 
-/// A compiled pattern: instructions, the class table they index, and the prefilter.
+/// A compiled pattern.
 #[derive(Debug)]
 pub(crate) struct Program {
     pub(crate) insts: Vec<Inst>,
@@ -36,9 +36,9 @@ pub(crate) struct Program {
     pub(crate) start: usize,
     /// The prefilter, when one can be armed.
     pub(crate) first: Option<Prefilter>,
-    /// Every path out of `start` passes a `\A` before it can consume or accept, so the pattern can only match at offset 0.
+    /// Every path out of `start` passes a `\A` before it can consume or accept.
     pub(crate) start_anchored: bool,
-    /// `classes[i]`'s membership over U+0000..U+007F, one bit per code point, parallel to `classes`.
+    /// `classes[i]`'s membership over U+0000..U+007F.
     pub(crate) class_ascii: Vec<u128>,
 }
 
@@ -106,8 +106,7 @@ impl Compiler {
         Ok(self.classes.len() - 1)
     }
 
-    /// Emit `ast` so that control reaches `next` when it succeeds; return the
-    /// instruction control enters it at.
+    /// Emit `ast` so that control reaches `next` when it succeeds.
     fn emit(&mut self, ast: &Ast, next: usize) -> Result<usize, Error> {
         match ast {
             Ast::Empty => Ok(next),
@@ -193,8 +192,7 @@ impl Compiler {
     }
 }
 
-/// Can `ast` match the empty string? Decides which of the two `x*` shapes
-/// [`Compiler::emit_repeat`] uses, and nothing else.
+/// Can `ast` match the empty string ([`Compiler::emit_repeat`]).
 fn matches_empty(ast: &Ast) -> bool {
     match ast {
         Ast::Empty | Ast::Assert(_) => true,
@@ -220,16 +218,14 @@ const fn split(body: usize, exit: usize, greedy: bool) -> Inst {
 pub(crate) struct Prefilter {
     pub(crate) pcs: Box<[usize]>,
     pub(crate) lead_bytes: [bool; 256],
-    /// The same marking for the second code point, when every path has one; `None` for a pattern that can stop after its first.
+    /// The same marking for the second code point, when every path has one.
     pub(crate) second_bytes: Option<[bool; 256]>,
 }
 
 /// Past this many candidate instructions a prefilter costs more than it saves.
 const MAX_FIRST: usize = 16;
 
-/// The consuming instructions reachable from `starts` without consuming
-/// anything: the epsilon closure, stopped at the first thing that eats a code
-/// point.
+/// The consuming instructions reachable from `starts` without consuming anything.
 fn consuming_closure(insts: &[Inst], starts: &[usize]) -> Option<Vec<usize>> {
     let mut seen = vec![false; insts.len()];
     let mut stack: Vec<usize> = starts.to_vec();
@@ -258,8 +254,7 @@ fn consuming_closure(insts: &[Inst], starts: &[usize]) -> Option<Vec<usize>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Mark the leading UTF-8 byte of every code point `pcs` can consume: a superset (a class
-/// marks the non-ASCII side conservatively), which is what makes skipping on it safe.
+/// Mark the leading UTF-8 byte of every code point `pcs` can consume.
 fn mark_leads(insts: &[Inst], classes: &[ClassSet], pcs: &[usize]) -> Option<[bool; 256]> {
     let mut lead_bytes = [false; 256];
     for &pc in pcs {
@@ -295,7 +290,7 @@ fn second_set(insts: &[Inst], classes: &[ClassSet], first_pcs: &[usize]) -> Opti
     mark_leads(insts, classes, &out)
 }
 
-/// Compute [`Program::first`]: what a match can begin with, if that is knowable.
+/// Compute [`Program::first`].
 fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefilter> {
     let out = consuming_closure(insts, &[start])?;
     let mut lead_bytes = [false; 256];
@@ -321,13 +316,12 @@ fn first_set(insts: &[Inst], classes: &[ClassSet], start: usize) -> Option<Prefi
     })
 }
 
-/// Compute [`Program::start_anchored`]: can this pattern match only at offset 0?
+/// Compute [`Program::start_anchored`].
 fn start_anchored(insts: &[Inst], start: usize) -> bool {
     let mut seen = vec![false; insts.len()];
     let mut stack = vec![start];
     while let Some(pc) = stack.pop() {
         let Some(slot) = seen.get_mut(pc) else {
-            // Out of range: claim nothing.
             return false;
         };
         if *slot {
@@ -360,9 +354,6 @@ mod tests {
         compile(&ast, usize::MAX).expect("compiles")
     }
 
-    /// The second-byte filter excludes positions, so it must stay disarmed for every
-    /// pattern that can match one code point: by length, an optional or starred tail, a
-    /// shorter alternative, or only an assertion after the first.
     #[test]
     fn the_second_byte_filter_arms_only_when_a_second_code_point_is_certain() {
         let second = |pattern: &str| {
@@ -400,8 +391,6 @@ mod tests {
         }
     }
 
-    /// The ASCII bitmap is consulted instead of its class, so the two must agree over all
-    /// of ASCII.
     #[test]
     fn the_ascii_bitmap_agrees_with_the_class_it_stands_in_for() {
         for pattern in [
@@ -447,8 +436,6 @@ mod tests {
         }
     }
 
-    /// `start_anchored` lets the search stop walking, so a false positive is a missed
-    /// match.
     #[test]
     fn start_anchored_is_exact_about_which_patterns_can_only_match_at_zero() {
         for pattern in [
@@ -492,8 +479,6 @@ mod tests {
         }
     }
 
-    /// The byte map never marks a continuation byte, and marks the lead byte of every
-    /// code point a match can start with.
     #[test]
     fn the_prefilter_byte_map_marks_lead_bytes_only() {
         let mut buf = [0u8; 4];

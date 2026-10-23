@@ -496,7 +496,9 @@ impl Grid {
             }
             let mut new_pages = PageStore::new();
             for row in &mut self.storage.rows {
-                // SAFETY: `new_pages` stays alive until it replaces `self.storage.pages`.
+                // SAFETY: `new_pages` stays alive until it replaces `self.storage.pages`
+                // at the end of this branch, so every resized row keeps a live
+                // backing store for at least as long as the row remains in `self`.
                 unsafe { row.resize(new_cols, &mut new_pages) };
             }
             self.storage.pages = new_pages;
@@ -766,7 +768,8 @@ impl Grid {
                         let extracted =
                             Self::extract_row_extras(&row, &self.storage.extras, u16::MAX);
                         self.storage.lazy_buffer.push_row(&row, extracted);
-                        // SAFETY: These rows came from storage.rows.
+                        // SAFETY: these rows came from storage.rows, and staging
+                        // copied their content before returning their allocations.
                         unsafe { row.recycle(&mut self.storage.pages) };
                     }
                 } else {
@@ -786,7 +789,8 @@ impl Grid {
                         let extracted =
                             Self::extract_row_extras(&row, &self.storage.extras, external_row);
                         self.storage.lazy_buffer.push_row(&row, extracted);
-                        // SAFETY: The removed row belongs to storage.pages.
+                        // SAFETY: the removed row belongs to storage.pages;
+                        // the lazy buffer owns its content before this transfer.
                         unsafe { row.recycle(&mut self.storage.pages) };
                     }
                 } else {
@@ -809,7 +813,8 @@ impl Grid {
             {
                 let rows = &mut self.storage.rows;
                 let pages = &mut self.storage.pages;
-                // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`.
+                // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`, and rows
+                // drop before the backing pages.
                 for _ in 0..rows_to_add {
                     rows.push(unsafe { Row::new(new_cols, pages) });
                 }
@@ -1021,7 +1026,8 @@ impl Grid {
                 let rows = &mut self.storage.rows;
                 let pages = &mut self.storage.pages;
                 for _ in 0..rows_to_add {
-                    // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`.
+                    // SAFETY: New rows are stored in the same `GridStorage`
+                    // that owns `pages`, and rows drop before the backing pages.
                     rows.push(unsafe { Row::new(new_cols, pages) });
                 }
                 self.storage.total_lines += rows_to_add;
@@ -1095,12 +1101,14 @@ impl Grid {
                 let pages = &mut self.storage.pages;
                 for (i, entry) in restored_bottom.into_iter().enumerate() {
                     let Some((row, extras)) = entry else {
-                        // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`.
+                        // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`,
+                        // and rows drop before the backing pages.
                         rows.push(unsafe { Row::new(new_cols, pages) });
                         blanks_restored += 1;
                         continue;
                     };
-                    // SAFETY: The row is stored in the same `GridStorage` that owns `pages`.
+                    // SAFETY: the row is stored in the same `GridStorage` that
+                    // owns `pages`, and rows drop before the backing pages.
                     rows.push(unsafe { Row::from_snapshot(&row, new_cols, pages) });
                     pushed += 1;
                     if let Some(bx) = extras {
@@ -1121,7 +1129,8 @@ impl Grid {
                 let rows = &mut self.storage.rows;
                 let pages = &mut self.storage.pages;
                 for _ in 0..rows_to_add {
-                    // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`.
+                    // SAFETY: New rows are stored in the same `GridStorage` that owns `pages`, and
+                    // rows drop before the backing pages.
                     rows.push(unsafe { Row::new(new_cols, pages) });
                 }
                 self.storage.total_lines += rows_to_add;
@@ -1298,7 +1307,8 @@ impl Grid {
                 let row_idx = u16::try_from(i).unwrap_or(u16::MAX);
                 let extracted = Self::extract_row_extras(&row, &result.extras, row_idx);
                 self.storage.lazy_buffer.push_row(&row, extracted);
-                // SAFETY: Reflow built these rows in result.pages, not the old storage.pages.
+                // SAFETY: reflow built these rows in result.pages, not the old
+                // storage.pages. The lazy buffer now owns the preserved data.
                 unsafe { row.recycle(&mut result.pages) };
             }
 
@@ -1328,7 +1338,8 @@ impl Grid {
                 let extracted =
                     Self::extract_row_extras(&row, &result.extras, row_u16(target_rows + i));
                 self.storage.lazy_buffer.push_row(&row, extracted);
-                // SAFETY: Reflow built these rows in result.pages.
+                // SAFETY: Reflow built these rows in result.pages; the lazy buffer now owns the
+                // preserved data.
                 unsafe { row.recycle(&mut result.pages) };
             }
         }
@@ -1479,7 +1490,8 @@ impl Grid {
                     &mut new_extras,
                 );
             } else if copy_len == 0 {
-                // SAFETY: `new_row` is appended to `new_rows` and returned alongside `new_pages`.
+                // SAFETY: `new_row` is appended to `new_rows` and returned alongside `new_pages` in
+                // the same reflow result.
                 let mut new_row = unsafe { Row::new(new_cols, &mut new_pages) };
                 if row.is_wrapped() {
                     new_row.set_wrapped(true);
@@ -1653,7 +1665,8 @@ impl Grid {
         }
 
         if merge_buf.is_empty() {
-            // SAFETY: `new_row` is appended to `new_rows` and returned alongside `new_pages`.
+            // SAFETY: `new_row` is appended to `new_rows` and returned alongside `new_pages` in the
+            // same reflow result.
             let mut new_row = unsafe { Row::new(new_cols, new_pages) };
             new_row.set_line_size(first_row_line_size);
             for (k, offset) in offsets.into_iter().enumerate() {

@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! An outgoing listener's file identity, carried only by an admitted handoff.
-//! Connection errors cannot establish that a fixed socket path is unowned: a
-//! live listener with a full backlog can also answer ECONNREFUSED. This witness
-//! binds the path and token to the listener this process actually published.
+//! Outgoing control-socket listener file and token identity across admitted handoffs.
 
 use crate::control_auth::SocketPlan;
 use aterm_uds::CtlListener;
@@ -74,8 +71,6 @@ impl SocketIdentity {
                 token_inode: token.inode,
                 token_sha256: token.digest,
             };
-            // Recheck both files after the bounded token read: a replacement
-            // during capture must not be published as this listener's identity.
             identity.encode()?;
             identity.matches_current(plan).then_some(identity)
         }
@@ -97,8 +92,7 @@ impl SocketIdentity {
         self.matches_plan_path(plan) && self.matches_files(plan)
     }
 
-    /// Restore a relative endpoint's binding directory, only after the socket and credential
-    /// there validate; the files are rechecked against the new cwd before this returns true.
+    /// Restore a relative endpoint's binding directory after validating its socket and credential.
     ///
     /// # Safety
     /// Called only in single-threaded startup of an admitted Ready/Commit candidate: changing
@@ -109,7 +103,6 @@ impl SocketIdentity {
             return false;
         }
         let Some(directory) = &self.directory else {
-            // An absolute endpoint, or an older witness: validate in place, failing closed.
             return self.matches_current(plan);
         };
         if !directory.is_absolute() || !std::path::Path::new(&plan.sock_path).is_relative() {
@@ -238,9 +231,6 @@ fn read_token(plan: &SocketPlan) -> Option<TokenIdentity> {
     })
 }
 
-/// The witness this process publishes: set once at bind, moved only by [`republish_rebound`]
-/// when the supervised listener replaces its own wedged socket. A leaf lock, never held across
-/// another acquisition; the only I/O under it is the rebind's file revalidation.
 static PUBLISHED: Mutex<Option<SocketIdentity>> = Mutex::new(None);
 
 /// Called only after the real listener has bound and its witness was captured. The first
@@ -304,8 +294,6 @@ fn bind_command_identity(
     command: &mut aterm_uds::spawnfd::StdCommand,
     identity: Option<&SocketIdentity>,
 ) {
-    // LaunchServices accepts only environment additions (removing a key forces the fork
-    // fallback), so an explicit empty value clears inherited authority.
     command.envs([ENV_IDENTITY.pair("")]);
     if let Some(wire) = identity.and_then(SocketIdentity::encode) {
         command.envs([ENV_IDENTITY.pair(wire)]);
@@ -336,8 +324,6 @@ pub(crate) fn consume_incoming_from(
     SocketIdentity::decode(wire).map(Some).ok_or_else(invalid)
 }
 
-// Two attributes rather than `all(test, unix)`: the lock-order census masks a
-// `#[cfg(test)]` item and reads any other gate as shipping code.
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
@@ -358,12 +344,8 @@ mod tests {
         (dir, plan, listener, token)
     }
 
-    /// The witness is taken once: absent and empty are `Ok(None)`, malformed is the refusal,
-    /// and the variable is gone after every case. `SocketIdentity` has no `Debug` on purpose
-    /// (nothing about a listener's files belongs in a log), so it is compared with `==`.
     #[test]
     fn consume_incoming_takes_the_witness_once_through_the_blessed_helper() {
-        // `HandoffEnv::capture`'s conformance takes this name out of the process too.
         let Some(_env) = crate::seamless::tests::env_alone() else {
             return;
         };
@@ -422,7 +404,6 @@ mod tests {
         let listener = CtlListener::bind(&plan.sock_path).unwrap();
         let identity = SocketIdentity::capture(&plan, &listener, &token).unwrap();
         assert_eq!(identity.directory.as_ref(), Some(&original_dir));
-        // std's Command on purpose: never spawned; the shipped `bind_command_identity` takes std's.
         let mut command = std::process::Command::new("unused-test-command");
         bind_command_identity(&mut command, Some(&identity));
         let wire = command
@@ -435,8 +416,6 @@ mod tests {
         let received = SocketIdentity::decode(wire).unwrap();
         assert!(!wire.contains(&token));
 
-        // LaunchServices can start from another cwd; the relative spelling must stay usable
-        // without lengthening the Unix bind path.
         std::env::set_current_dir(foreign.path()).unwrap();
         let foreign_dir = std::env::current_dir().unwrap();
         assert!(
@@ -453,7 +432,6 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), foreign_dir);
         assert_eq!(std::fs::read(&plan.token_path).unwrap(), token.as_bytes());
 
-        // The endpoint and credential validate in the original directory before cwd moves.
         // SAFETY: same isolated child and the fixture's admitted witness.
         assert!(unsafe { received.prepare_incoming_directory(&plan) });
         assert_eq!(std::env::current_dir().unwrap(), original_dir);
@@ -462,7 +440,6 @@ mod tests {
         let (accepted, _) = listener.accept().unwrap();
         assert!(crate::control_auth::peer_check(&accepted).is_ok());
         assert_eq!(std::fs::read(&plan.token_path).unwrap(), token.as_bytes());
-        // An absolute endpoint's witness keeps the wire shape older receivers read.
         let (_absolute_dir, absolute, absolute_listener, absolute_token) = fixture();
         let absolute_identity =
             SocketIdentity::capture(&absolute, &absolute_listener, &absolute_token).unwrap();
@@ -483,7 +460,6 @@ mod tests {
         let decoded = SocketIdentity::decode(&wire).unwrap();
         assert!(decoded == identity);
         assert!(decoded.matches_current(&plan));
-        // std's Command on purpose: never spawned; the shipped `bind_command_identity` takes std's.
         let mut command = std::process::Command::new("unused-test-command");
         command.env(ENV_IDENTITY, "inherited-authority");
         bind_command_identity(&mut command, None);
@@ -548,8 +524,6 @@ mod tests {
         assert!(!identity.matches_current(&plan));
     }
 
-    /// The parent's own rebind invalidates a carried witness; the successor's refusal exit is
-    /// filed Transient by a parent that reads it (`seamless::endpoint_refusal_exit`).
     #[test]
     fn a_witness_the_parents_rebind_moved_is_filed_a_moment() {
         use crate::app_native::PhysicalFailureShape as Shape;
@@ -599,8 +573,6 @@ mod tests {
             "the fixture must really reach the foreign listener"
         );
         assert!(!identity.matches_current(&plan));
-        // Token-only matching is the negative control: the old credential is
-        // untouched while the listening endpoint belongs to someone else.
         assert_eq!(read_token(&plan).unwrap().digest, identity.token_sha256);
         assert!(std::fs::read(&plan.token_path).unwrap() == token.as_bytes());
         drop((pending, foreign));

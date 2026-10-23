@@ -188,7 +188,9 @@ impl ClassPtr {
 impl std::fmt::Debug for ClassPtr {
     /// Prints the class's name via `class_getName`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: the type's invariant: `self` is null (reported as `"(nil)"` without a dereference) or a registered class object, which is immortal.
+        // SAFETY: the type's invariant: `self` is null (reported as `"(nil)"`
+        // without a dereference) or a registered class object, which is
+        // immortal. No safe constructor admits anything else.
         let name = unsafe { class_name(*self) };
         write!(f, "Class({})", name.to_string_lossy())
     }
@@ -495,7 +497,8 @@ where
     } else {
         objc_msgSend as *const c_void
     };
-    // SAFETY: `entry` is a function symbol's address and `F` is pointer-wide.
+    // SAFETY: `entry` is a function symbol's address and `F` is pointer-wide. `F` supplies the
+    // prototype; the entry point matches its return class.
     unsafe { std::mem::transmute_copy(&entry) }
 }
 
@@ -569,7 +572,8 @@ pub unsafe fn protocol_method_types(
         return None;
     }
     let is_instance = crate::encode::Bool::new(instance_method);
-    // SAFETY: `proto` is live; `name` is interned.
+    // SAFETY: `proto` is live; `name` is interned. An undeclared selector yields a zeroed
+    // description, so `types` is null-checked.
     let mut desc = unsafe {
         protocol_getMethodDescription(proto, name, crate::encode::Bool::YES, is_instance)
     };
@@ -732,7 +736,8 @@ pub unsafe fn class_methods(cls: ClassPtr) -> Vec<(Sel, Option<String>)> {
         return Vec::new();
     }
     let mut count: c_uint = 0;
-    // SAFETY: `cls` is live.
+    // SAFETY: `cls` is live. `class_copyMethodList` writes the count and returns a malloc'd array
+    // (freed below), or null with a zero count.
     let list = unsafe { class_copyMethodList(cls, &raw mut count) };
     if list.is_null() {
         return Vec::new();
@@ -909,7 +914,9 @@ impl AutoreleasePool {
 
 impl Drop for AutoreleasePool {
     fn drop(&mut self) {
-        // SAFETY: `self.0` is the matching push's token.
+        // SAFETY: `self.0` is the matching push's token. The safe constructor
+        // `autoreleasepool` makes this the innermost pop; the `unsafe` `new`
+        // puts that obligation on its caller.
         unsafe { objc_autoreleasePoolPop(self.0) }
     }
 }
@@ -929,7 +936,9 @@ pub fn autoreleasepool<R>(f: impl FnOnce(&AutoreleasePool) -> R) -> R {
 pub fn ns_string(s: &str) -> Option<Obj> {
     let units: Vec<u16> = s.encode_utf16().collect();
     let cls = class(c"NSString");
-    // SAFETY: `alloc` returns +1 uninitialised; `initWithCharacters:length:` (`@32@0:8r^S16Q24`) consumes it and returns +1 or nil (`from_owned` maps nil to `None`).
+    // SAFETY: `alloc` returns +1 uninitialised; `initWithCharacters:length:`
+    // (`@32@0:8r^S16Q24`) consumes it and returns +1 or nil (`from_owned` maps
+    // nil to `None`). It copies `units.len()` code units during the call only.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = crate::checked_msg();
         let raw = alloc(cls, crate::sel!(alloc));
@@ -957,7 +966,11 @@ pub unsafe fn ns_string_to_rust(s: Id) -> String {
         return String::new();
     }
     autoreleasepool(|_| {
-        // SAFETY: `s` is a live NSString.
+        // SAFETY: `s` is a live NSString. `-length` is `Q16@0:8`, the count of
+        // UTF-16 code units. `-getCharacters:range:` is `v40@0:8^S16{_NSRange=QQ}24`
+        // and writes exactly `range.length` units into the buffer; the range is
+        // the whole string, so it is in bounds, and the buffer holds that many.
+        // Its length is set only after the call has written them.
         unsafe {
             let length: unsafe extern "C-unwind" fn(Id, Sel) -> usize = crate::checked_msg();
             let n = length(s, crate::sel!(length));
@@ -991,7 +1004,8 @@ pub unsafe fn ns_error_string(err: Id) -> String {
         return "(nil NSError)".to_owned();
     }
     autoreleasepool(|_| {
-        // SAFETY: `err` is a live `NSError`.
+        // SAFETY: `err` is a live `NSError`. `localizedDescription` is
+        // autoreleased and copied before the pool pops.
         unsafe {
             let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = crate::checked_msg();
             let d = desc(err, sel(c"localizedDescription"));

@@ -106,11 +106,24 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
     let Some(pid) = proof.claim_with_limit(&leg, HANG)? else {
         return Ok(());
     };
+    let Some(before) = paced_record(proof, &leg, pid, None)? else {
+        return Ok(());
+    };
+    handoff(proof, &leg, pid, before, old, new)
+}
+
+fn paced_record(
+    proof: &mut Proof,
+    leg: &Leg,
+    pid: i32,
+    version: Option<&str>,
+) -> Result<Option<J>, Stopped> {
     let mut before = None;
     let paced = Proof::wait_for(HANG, Duration::from_millis(250), || {
-        before = Proof::record(&leg, pid);
+        before = Proof::record(leg, pid);
         before.as_ref().is_some_and(|record| {
             record.get("status").and_then(J::as_str) == Some("idle")
+                && version.is_none_or(|version| active_image_record(record, version, pid))
                 && record.get("owed").is_some_and(|owed| {
                     owed.get("rule").and_then(J::as_str) == Some("continue@v1")
                         && owed
@@ -124,10 +137,20 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
         "upgrade-only: the old image owes a paced continuation while idle",
         paced,
     );
-    let Some(before) = before.filter(|_| paced) else {
-        proof.diagnose(&[&leg]);
-        return Ok(());
-    };
+    if !paced {
+        proof.diagnose(&[leg]);
+    }
+    Ok(before.filter(|_| paced))
+}
+
+fn handoff(
+    proof: &mut Proof,
+    leg: &Leg,
+    pid: i32,
+    before: J,
+    old: &Path,
+    new: &Path,
+) -> Result<(), Fail> {
     let old_version = package_version(old)?;
     let new_version = package_version(new)?;
     proof.check(
@@ -140,10 +163,10 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
         .and_then(J::as_i64)
         .expect("observed deadline");
     println!("  saved record: {}", before.py());
-    proof.upgrade_leg_with_limits(&leg, new, HANG, HANG)?;
+    proof.upgrade_leg_with_limits(leg, new, HANG, HANG)?;
     let mut after = None;
     let active = Proof::wait_for(HANG, Duration::from_millis(250), || {
-        after = Proof::record(&leg, pid);
+        after = Proof::record(leg, pid);
         after
             .as_ref()
             .is_some_and(|record| active_image_record(record, &new_version, pid))
@@ -191,7 +214,7 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
     ) + HANG;
     let mut deadline_record = after.clone();
     let acted = Proof::wait_for(wait, Duration::from_millis(250), || {
-        if let Some(record) = Proof::record(&leg, pid)
+        if let Some(record) = Proof::record(leg, pid)
             && active_image_record(&record, &new_version, pid)
             && let Some(restored) = record
                 .get("owed")
@@ -217,7 +240,7 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
         );
     }
     let completed = Proof::wait_for(HANG, Duration::from_millis(250), || {
-        Proof::record(&leg, pid).is_some_and(|record| {
+        Proof::record(leg, pid).is_some_and(|record| {
             record.get("status").and_then(J::as_str) == Some("idle")
                 && record
                     .get("owed")
@@ -235,17 +258,268 @@ pub(super) fn legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail
         &format!("upgrade-only: the carried continuation ran exactly once at or after {not_before}, and its reply completed"),
         acted && completed && one_carried_request(&rows, owed, not_before)
             && proof.proven_pid(&leg.sid) == Some(pid)
-            && Proof::record(&leg, pid).as_ref().is_some_and(|after| same_custody(&before, after)),
+            && Proof::record(leg, pid).as_ref().is_some_and(|after| same_custody(&before, after)),
     );
     if !proof.fails.is_empty() {
-        proof.diagnose(&[&leg]);
+        proof.diagnose(&[leg]);
     }
     Ok(())
+}
+
+fn logical_resume(record: &J, entry: &Path) -> bool {
+    entry.to_str().is_some_and(|entry| {
+        record.get("launchArgv0").and_then(J::as_str) == Some(entry)
+            && matches!(record.get("resumeArgv"), Some(J::Arr(argv))
+                if argv.first().and_then(J::as_str) == Some(entry))
+    })
+}
+
+fn same_conversation(before: &J, after: &J) -> bool {
+    ["sessionId", "atermSession", "resumeArgv"]
+        .iter()
+        .all(|key| {
+            before
+                .get(key)
+                .is_some_and(|value| value != &J::Null && after.get(key) == Some(value))
+        })
+}
+
+fn launch_snapshot(
+    proof: &Proof,
+    record: &J,
+    pid: i32,
+    argv0: &Path,
+    image: &Path,
+    entry: &Path,
+    name: &str,
+) -> Result<bool, Fail> {
+    let kernel_argv = aterm_uds::process::read_process_argv(pid);
+    let kernel_argv0 = kernel_argv
+        .as_ref()
+        .and_then(|argv| argv.first())
+        .map(PathBuf::from);
+    let kernel_exec_path = u32::try_from(pid)
+        .ok()
+        .and_then(atpkg::caller_shell::process_args)
+        .map(|args| PathBuf::from(args.exec_path));
+    let kernel_image = aterm_uds::process::read_process_path(pid);
+    let expected_image = std::fs::canonicalize(image).ok();
+    let image_matches = expected_image.as_ref().is_some_and(|expected| {
+        kernel_image
+            .as_ref()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .as_ref()
+            == Some(expected)
+            && record
+                .get("exe")
+                .and_then(J::as_str)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .as_ref()
+                == Some(expected)
+    });
+    let shown = |path: Option<&Path>| {
+        path.map_or(J::Null, |path| J::s(path.to_string_lossy().into_owned()))
+    };
+    let snapshot = J::obj([
+        ("pid", J::Int(i64::from(pid))),
+        ("kernelArgv0", shown(kernel_argv0.as_deref())),
+        ("kernelExecPath", shown(kernel_exec_path.as_deref())),
+        ("kernelImage", shown(kernel_image.as_deref())),
+        ("expectedArgv0", shown(Some(argv0))),
+        ("expectedImage", shown(Some(image))),
+        ("logicalEntry", shown(Some(entry))),
+        ("record", record.clone()),
+    ]);
+    let path = proof.s.join(name);
+    std::fs::write(&path, snapshot.py()).map_err(|error| format!("{}: {error}", path.display()))?;
+    println!("  kernel/record witness: {}", path.display());
+    Ok(kernel_argv0.as_deref() == Some(argv0)
+        && kernel_exec_path.as_deref() == Some(argv0)
+        && image_matches
+        && logical_resume(record, entry))
+}
+
+fn absent(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(error)
+        if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Exercise the producer's physical fallback, then the native crash repair, before
+/// handing the same paced conversation to the ordinary live-upgrade witness.
+pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail> {
+    let prefix = proof.h.join("Library/Application Support/aterm/pkg");
+    let entry = prefix.join("store/codex/exec/codex");
+    let primary = prefix.join("bin/codex");
+    let physical = old.join("bin/codex");
+    let newly_created = absent(&entry);
+    proof.link(old).map_err(Fail::die)?;
+    proof.inst.await_socket(instance::BOOT)?;
+    let _ = proof.inst.ctl(&["ready"]);
+    println!(
+        "raw-upgrade-only (produced primary, missing entry, automatic crash repair, live handoff)"
+    );
+    let producer = std::fs::read_to_string(&primary)
+        .map_err(|error| format!("{}: {error}", primary.display()))?;
+    let exports = [
+        "export ATPKG_MANAGED_LAUNCH_PID=\"$$\"".to_string(),
+        format!(
+            "export ATPKG_MANAGED_LAUNCH_PATH={}",
+            sh_quote(&entry.to_string_lossy())
+        ),
+        format!(
+            "export ATPKG_MANAGED_LAUNCH_TARGET={}",
+            sh_quote(&physical.to_string_lossy())
+        ),
+    ];
+    let produced = std::fs::symlink_metadata(&primary)
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+        && exports
+            .iter()
+            .all(|line| producer.lines().any(|actual| actual == line));
+    proof.check(
+        "raw: the supplied native host produced all managed fallback exports",
+        produced,
+    );
+    let removable = newly_created
+        && std::fs::symlink_metadata(&entry)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && std::fs::canonicalize(&physical)
+            .ok()
+            .is_some_and(|physical| std::fs::canonicalize(&entry).ok() == Some(physical));
+    proof.check(
+        "raw: only the newly produced stable entry symlink is removed",
+        removable,
+    );
+    if !produced || !removable {
+        return Ok(());
+    }
+    std::fs::write(proof.s.join("raw-produced-primary.txt"), producer)
+        .map_err(|error| format!("cannot preserve produced primary: {error}"))?;
+    std::fs::remove_file(&entry)
+        .map_err(|error| format!("cannot remove the owned entry symlink: {error}"))?;
+    let leg = proof.start_leg_using(
+        "continue",
+        Some("Write a plan, then stop."),
+        "[tui]\nscreen_reader_detection_done = true\n",
+        Folder::Scratch,
+        Some("cruise"),
+        Some(&primary),
+    )?;
+    let Some(pid) = proof.claim_with_limit(&leg, HANG)? else {
+        return Ok(());
+    };
+    let old_version = package_version(old)?;
+    let Some(initial) = paced_record(proof, &leg, pid, Some(&old_version))? else {
+        return Ok(());
+    };
+    let initial_launch = launch_snapshot(
+        proof,
+        &initial,
+        pid,
+        &physical,
+        &physical,
+        &entry,
+        "raw-initial-kernel-record.json",
+    )?;
+    proof.check(
+        "raw: kernel argv0, exec route and image are physical A while the record resumes the logical entry",
+        initial_launch && active_image_record(&initial, &old_version, pid),
+    );
+    let missing_before_kill = absent(&entry) && proof.proven_pid(&leg.sid) == Some(pid);
+    proof.check(
+        "raw: the stable entry is still missing immediately before the owned crash",
+        missing_before_kill,
+    );
+    if !initial_launch || !missing_before_kill {
+        proof.diagnose(&[&leg]);
+        return Ok(());
+    }
+    let Some(relaunched_pid) =
+        proof.crash_once_with_limit(&leg, pid, "raw: crash the proven physical fallback", HANG)?
+    else {
+        return Ok(());
+    };
+    let Some(recovered) = paced_record(proof, &leg, relaunched_pid, Some(&old_version))? else {
+        return Ok(());
+    };
+    let repaired = std::fs::symlink_metadata(&entry)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && std::fs::canonicalize(&physical)
+            .ok()
+            .is_some_and(|physical| std::fs::canonicalize(&entry).ok() == Some(physical));
+    let recovered_launch = launch_snapshot(
+        proof,
+        &recovered,
+        relaunched_pid,
+        &entry,
+        &physical,
+        &entry,
+        "raw-relaunched-kernel-record.json",
+    )?;
+    proof.check(
+        "raw: automatic native crash relaunch repaired the entry and changed kernel argv0 and exec route from physical A to the logical entry",
+        repaired && recovered_launch && active_image_record(&recovered, &old_version, relaunched_pid),
+    );
+    let carried = same_conversation(&initial, &recovered)
+        && initial
+            .get("owed")
+            .zip(recovered.get("owed"))
+            .is_some_and(|(before, after)| same_owed(before, after))
+        && initial
+            .get("owed")
+            .and_then(|owed| owed.get("notBefore"))
+            .and_then(J::as_i64)
+            .is_some_and(|deadline| crate::util::now_ms() < deadline)
+        && proof
+            .tags(leg.name)
+            .iter()
+            .all(|tag| tag != "continue:continue");
+    proof.check("raw: crash repair resumed the same conversation and owed act without shortening its deadline", carried);
+    if !repaired || !recovered_launch || !carried {
+        proof.diagnose(&[&leg]);
+        return Ok(());
+    }
+    handoff(proof, &leg, relaunched_pid, recovered, old, new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_fallback_witness_keeps_logical_resume_and_conversation_across_new_processes() {
+        let entry = Path::new("/private/pkg/store/codex/exec/codex");
+        let record = |pid, launch, resume, session, tab| {
+            J::obj([
+                ("pid", J::Int(pid)),
+                ("launchArgv0", J::s(launch)),
+                (
+                    "resumeArgv",
+                    J::Arr(vec![J::s(resume), J::s("resume"), J::s(session)]),
+                ),
+                ("sessionId", J::s(session)),
+                ("atermSession", J::s(tab)),
+            ])
+        };
+        let logical = entry.to_str().expect("fixture path");
+        let before = record(41, logical, logical, "conversation", "owned tab");
+        let after = record(42, logical, logical, "conversation", "owned tab");
+        assert!(logical_resume(&before, entry));
+        assert!(same_conversation(&before, &after));
+        for bad in [
+            record(42, "/physical/A", logical, "conversation", "owned tab"),
+            record(42, logical, "/physical/A", "conversation", "owned tab"),
+        ] {
+            assert!(!logical_resume(&bad, entry));
+        }
+        for bad in [
+            record(42, logical, logical, "other conversation", "owned tab"),
+            record(42, logical, logical, "conversation", "other tab"),
+            record(42, logical, "/other/resume", "conversation", "owned tab"),
+        ] {
+            assert!(!same_conversation(&before, &bad));
+        }
+    }
 
     #[test]
     fn handoff_witness_rejects_new_conversation_process_or_act_and_shortened_deadline() {

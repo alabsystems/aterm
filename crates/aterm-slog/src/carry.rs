@@ -17,10 +17,9 @@ use crate::rec::{Rec, Stamp};
 use crate::turn::rebase;
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
 
-/// A carry's byte budget (design §5.2): 128 KiB.
+/// A carry's byte budget: 128 KiB.
 pub const CARRY_TOTAL_BYTES: usize = 128 * 1024;
-/// The most the mandatory part of a carry may take (the open path, the skeleton's state, the fold
-/// and the host's lines): 32 KiB.
+/// Maximum byte budget for the mandatory part of a carry: 32 KiB.
 pub const CARRY_SKELETON_BYTES: usize = 32 * 1024;
 /// The longest carry line a receiver reads.
 pub const CARRY_MAX_LINE: usize = 1024;
@@ -45,7 +44,7 @@ pub struct CarryBudget {
 }
 
 impl CarryBudget {
-    /// A session's (§5.2): 128 KiB, the skeleton within 32 KiB, a ring's records.
+    /// A session's: 128 KiB, the skeleton within 32 KiB, a ring's records.
     pub const SESSION: CarryBudget = CarryBudget {
         total: CARRY_TOTAL_BYTES,
         skeleton: CARRY_SKELETON_BYTES,
@@ -108,8 +107,7 @@ impl CarryError {
 pub struct CarryAdopt {
     /// Its epoch: above the carried one.
     pub ep: u32,
-    /// Its first seq: above every seq the predecessor could have used (the manifest's count plus
-    /// one).
+    /// First seq above every seq the predecessor could have used.
     pub next_seq: u64,
     /// The node-id counters the manifest carried (with their reserve).
     pub ids: IdCounters,
@@ -235,8 +233,7 @@ fn line_bytes(lines: &[String]) -> usize {
 }
 
 impl Log {
-    /// The snapshot a carry is cut from: the log's state, its fold's snapshot, and its records in
-    /// the order the cut sheds them.
+    /// Snapshot the log's state, fold, and records in eviction order.
     #[must_use]
     pub fn carry_snapshot(&self) -> CarrySnapshot {
         let n = self.ring.len();
@@ -355,13 +352,14 @@ impl Log {
         None
     }
 
-    /// This log as a carry within `budget`, the host's `host` lines passed through.
+    /// This log as a carry within `budget`, the host's `host` lines passed through. `None` for a
+    /// closed session or when the mandatory part exceeds any requested bound.
     #[must_use]
     pub fn carry(&self, budget: CarryBudget, host: &[String]) -> Option<CarryOut> {
         self.carry_snapshot().prepare().encode(budget, host)
     }
 
-    /// Fence this log's readers at its head (the carry an update just took, design §5.2).
+    /// Fence this log's readers at its head.
     pub fn fence_reads(&mut self) {
         self.fence = Some(Box::new((self.last_seq, self.fold.clone())));
         self.fence_ms = self.ms_head;
@@ -382,8 +380,7 @@ impl Log {
         self.fence.as_ref().map(|f| f.0)
     }
 
-    /// The state a reader is shown: the fold's, or, while fenced, the fold as it stood at the
-    /// fence.
+    /// Fold state shown to a reader (live fold, or the fenced fold while fenced).
     #[must_use]
     pub fn reader_state(&self) -> &crate::fold::SessionState {
         self.fence
@@ -1104,8 +1101,7 @@ impl CarrySnapshot {
         out
     }
 
-    /// Encode the carry lines of the records that always cross, once (after the log's lock is
-    /// released): the [`PreparedCarry`] every cut is made from.
+    /// Pre-encode the mandatory records that always cross into a [`PreparedCarry`].
     #[must_use]
     pub fn prepare(mut self) -> PreparedCarry {
         let mut keep_lines = Vec::with_capacity(self.keep.len());
@@ -1187,7 +1183,8 @@ impl PreparedCarry {
         self.snap.victims.len()
     }
 
-    /// Encode the carry within `budget` with `host` lines passed through, or `None` if over budget.
+    /// Encode the carry within `budget` with `host` lines passed through, or `None` for a closed
+    /// session or over budget.
     #[must_use]
     pub fn encode(&self, budget: CarryBudget, host: &[String]) -> Option<CarryOut> {
         let snap = &self.snap;

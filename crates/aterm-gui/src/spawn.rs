@@ -1100,7 +1100,9 @@ impl HandedMaster {
         #[cfg(unix)]
         let _ = aterm_pty::set_cloexec(self.0, true);
         let master = std::mem::ManuallyDrop::new(self).0;
-        // SAFETY: `master` is the handed-off descriptor this handle owned solely (`HandedMaster::new` takes ownership, and nothing else closes it).
+        // SAFETY: `master` is the handed-off descriptor this handle owned solely
+        // (`HandedMaster::new` takes ownership, and nothing else closes it); the
+        // `ManuallyDrop` above gave that ownership up to the sink.
         unsafe { master_sink(master) }
     }
 }
@@ -1114,6 +1116,12 @@ impl Drop for HandedMaster {
     }
 }
 
+/// # Safety
+///
+/// The caller owns `master` outright — no other owner will close it — and gives
+/// that ownership up by this call. On Unix it is an open descriptor; on Windows
+/// it is the opaque ConPTY registry key, which `OwnedMaster::adopt` takes over
+/// under the same contract.
 unsafe fn master_sink(master: i32) -> Arc<SinkWriter> {
     // SAFETY: the caller's contract above — `master` is open and solely ours.
     #[cfg(unix)]
@@ -1698,7 +1706,8 @@ pub(crate) fn spawn_session(
                     shell_version = crate::spare::shell_version(pid);
                 }
                 start.say();
-                // SAFETY: `master` is this session's forkpty master, freshly returned and owned solely here.
+                // SAFETY: `master` is this session's forkpty master, freshly returned
+                // and owned solely here; the sink takes it over.
                 let sink = unsafe { master_sink(master) };
                 (
                     master,
@@ -2446,7 +2455,8 @@ mod pty_keyboard_posture_tests {
                 name: *const u16,
             ) -> isize;
         }
-        // SAFETY: NULL attrs and name.
+        // SAFETY: NULL attrs and name; manual-reset, initially unsignaled.
+        // `adopt_handoff` owns the handle from its `Ok` on.
         let client = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
         assert_ne!(client, 0, "CreateEventW");
         let master = aterm_pty::adopt_handoff(0, 0, 0, client)
@@ -5028,7 +5038,8 @@ fn kitty_temp_dirs() -> Vec<std::path::PathBuf> {
 #[cfg(unix)]
 fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
     let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `cname` is a valid NUL-terminated C string.
+    // SAFETY: `cname` is a valid NUL-terminated C string; `shm_open` with O_RDONLY
+    // either returns a valid fd or -1, which we check.
     let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
     if fd < 0 {
         return None;
@@ -5058,7 +5069,8 @@ fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
         if addr == libc::MAP_FAILED {
             return None;
         }
-        // SAFETY: `addr`/`len` describe a valid read-only mapping just established.
+        // SAFETY: `addr`/`len` describe a valid read-only mapping just established;
+        // copy the bytes out before unmapping.
         let bytes = unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), len) }.to_vec();
         // SAFETY: unmapping the exact `addr`/`len` we mapped above.
         unsafe { libc::munmap(addr, len) };
@@ -5795,7 +5807,8 @@ impl ShellExit {
                     libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
                 )
             };
-            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under `WNOHANG`, left it zeroed.
+            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under `WNOHANG`,
+            // left it zeroed; `si_pid` is defined in both.
             let collectable = rc == 0 && unsafe { info.si_pid() } == pid;
             let finished = rc != 0 || collectable || Instant::now() >= deadline;
             // A negative descriptor is ignored by `poll`, which then only naps.
@@ -8325,7 +8338,8 @@ mod reroute_path_env_tests {
             );
         }
         let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
-        // SAFETY: two live descriptors this test owns, each taken by exactly one `OwnedFd`.
+        // SAFETY: two live descriptors this test owns, each taken by exactly
+        // one `OwnedFd`; the stand-in's stdin is the copy std makes of `slave`.
         let (master, slave) = unsafe {
             use std::os::fd::{FromRawFd as _, OwnedFd};
             (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))

@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The message band's colour tests, run on [`ink::paint_band`], which decides
-//! every colour of the band: the ground a meter cell and a chip keep, a word's
-//! ink on the fill, the High Contrast capsules, whether a label clears AA.
-//! Where only a host test's colour half lives here, the host keeps its
-//! structure half under the same name. The inputs are the host's default
-//! theme, builtin schemes and stock High Contrast palettes, transcribed below.
-//! The palette is derived on the theme blend ([`BarBase::Blend`]), the host's
-//! base on every platform but Linux.
+//! Message band colour tests over [`ink::paint_band`] against the default theme, builtin schemes,
+//! and stock High Contrast palettes on [`BarBase::Blend`].
 
 use crate::ink::{
     self, BandInks, BarBase, ForcedPalette, InkedCell, MeterInks, RowRaster, ThemeInks, WORD_AA,
@@ -23,26 +17,18 @@ use crate::{
     tags,
 };
 
-// ---- The host's inputs -----------------------------------------------------
-
-/// `aterm_render::Theme::default()`: the default dark theme.
 const DEFAULT: ThemeInks = ThemeInks {
     bg: [0x11, 0x13, 0x18],
     fg: [0xd0, 0xd0, 0xd0],
     cursor: [0x50, 0xfa, 0x7b],
 };
 
-/// The light theme `the_comet_never_flips_a_words_ink` paints on (GitHub
-/// Light's chrome).
 const LIGHT: ThemeInks = ThemeInks {
     bg: [0xff, 0xff, 0xff],
     fg: [0x1f, 0x23, 0x28],
     cursor: [0x09, 0x69, 0xda],
 };
 
-/// Every builtin scheme as a theme, `Default` first — the host's
-/// `aterm_types::scheme::builtin_names()` through `to_theme_parts()` (the
-/// cursor falls back to the foreground), with no ANSI palette.
 const BUILTIN: [(&str, ThemeInks); 17] = [
     (
         "Default",
@@ -182,8 +168,6 @@ const BUILTIN: [(&str, ThemeInks); 17] = [
     ),
 ];
 
-/// The four stock Windows High Contrast schemes: the host's
-/// `chrome_band::hc_fixtures::STOCK`.
 const STOCK: [(&str, ForcedPalette); 4] = [
     (
         "Aquatic",
@@ -227,10 +211,6 @@ const STOCK: [(&str, ForcedPalette); 4] = [
     ),
 ];
 
-// ---- The host's painter, on the engine's cells -----------------------------
-
-/// The host's `chrome_band::band_colors(theme)` off Linux: the theme's inks
-/// derived on the blend, with no ANSI palette.
 fn inks(theme: ThemeInks) -> BandInks {
     BandInks::derive(theme, None, BarBase::Blend)
 }
@@ -243,18 +223,14 @@ fn stamp() -> WallStamp {
     WallStamp { unix_ms: 1 }
 }
 
-/// The host's band measure: one `char` per cell.
 fn cell_width(s: &str) -> usize {
     crate::text::char_width(s)
 }
 
-/// The host's own presentation: every row ending in its link.
 fn present(center: &MessageCenter, cols: usize) -> Presentation {
     center.presentation(cols, &cell_width, None, Links::Painted)
 }
 
-/// Every row's resolved cells at `motion` on the unit grid (the host's
-/// `paint_rows`); `forced` is the High Contrast latch.
 fn paint_rows(
     p: &Presentation,
     c: &BandInks,
@@ -268,7 +244,6 @@ fn paint_rows(
         .collect()
 }
 
-/// The band at `center`'s still frame over `p` on the unit grid.
 fn paint_still(
     p: &Presentation,
     c: &BandInks,
@@ -279,8 +254,6 @@ fn paint_still(
     paint_rows(p, c, forced, hover, &center.motion(p, t0(), Look::STILL))
 }
 
-/// One frame of `center`'s motion over `p` at `at` in `look`, on the unit
-/// grid.
 fn frame_at(
     center: &MessageCenter,
     p: &Presentation,
@@ -292,7 +265,6 @@ fn frame_at(
     (paint_rows(p, c, false, None, &m), m)
 }
 
-/// [`frame_at`] with each row's pixel raster (on the unit grid).
 fn frame_rasters(
     center: &MessageCenter,
     p: &Presentation,
@@ -307,15 +279,12 @@ fn frame_rasters(
         .unzip()
 }
 
-/// The inks row `l`'s surface resolves against (the host's `row_inks`).
 fn row_inks(c: &BandInks, l: &RowLayout, hc: bool) -> (MeterInks, Option<[u8; 3]>) {
     let alarm = matches!(l.severity, Severity::Warn | Severity::Error);
     let fill = if hc || !alarm { c.meter } else { c.warn };
     ink::inks_for(c, fill, l.track.is_some(), hc)
 }
 
-/// A center with the toolchain meter row and a downloading update row
-/// committed (the host's `two_rows`).
 fn two_rows() -> MessageCenter {
     let now = t0();
     let mut center = MessageCenter::new(MessageLog::empty(), now);
@@ -354,7 +323,6 @@ fn two_rows() -> MessageCenter {
     center
 }
 
-/// A busy row alone, committed at `now` (the host's `busy_center`).
 fn busy_center(now: Instant) -> MessageCenter {
     let mut center = MessageCenter::new(MessageLog::empty(), now);
     center.post(
@@ -370,8 +338,7 @@ fn busy_center(now: Instant) -> MessageCenter {
     center
 }
 
-/// The `(ink, ground)` pairs under column `x`'s glyph as the renderer draws
-/// it (the host's `word_grounds`, on the engine's cells).
+/// Resolved `(ink, ground)` pairs under column `x`'s glyph.
 fn word_grounds(
     row: &[InkedCell],
     raster: Option<&RowRaster>,
@@ -409,13 +376,8 @@ fn word_grounds(
     }
 }
 
-// ---- The band's colours -----------------------------------------------------
-
-/// The colour half of the host's
-/// `paint_rows_are_exactly_cols_wide_and_carry_the_words`: 42.7 % lights the
-/// cells left of the edge in the full accent, the cells right of it are the
-/// track, and the cell under the edge takes its coverage as a whole-cell
-/// background tone; the glyph and title wear the row's crisp ink.
+/// A 42.7 % meter lights the cells left of the edge in the full accent, the cells right of it in
+/// the track, and the edge cell in their coverage mix; the glyph and title wear the row's crisp ink.
 #[test]
 fn the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink() {
     let center = two_rows();
@@ -445,8 +407,6 @@ fn the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink() {
         ) == partial),
         "the edge cell is a mix of track and fill: {partial:?}"
     );
-    // Both sit on the fill and wear the row's crisp ink (the band's ink that
-    // reads best on it), floored against it.
     let fill = rows[0][MARGIN].bg;
     assert_eq!(fill, c.accent, "the glyph sits on the fill");
     let crisp = floor_word(fill_ink(&c, c.accent), fill, fill_anchor(c.accent));
@@ -457,9 +417,8 @@ fn the_meter_row_is_its_fill_and_track_and_its_words_the_crisp_ink() {
     );
 }
 
-/// On a metered row, at 60, 80, 120 and 160 columns: the Secondary `Packages`
-/// draws no ground of its own and rides the meter in the value ink floored on
-/// the track; `Details ›` rides it in the label ink; a Primary wears the accent.
+/// On a metered row, Secondary and Details capsules ride the meter track with floored value/label
+/// ink while Primary wears the accent.
 #[test]
 fn each_chip_wears_its_roles_ground_and_ink_on_a_metered_row() {
     let center = two_rows();
@@ -499,10 +458,8 @@ fn each_chip_wears_its_roles_ground_and_ink_on_a_metered_row() {
     }
 }
 
-/// The colour half of the host's `high_contrast_draws_capsules_as_brackets`:
-/// under each stock High Contrast palette every capsule cell is WINDOWTEXT on
-/// the band with no fill, the glyph on the metered row's fill is
-/// HIGHLIGHTTEXT, and the hovered capsule is HIGHLIGHT.
+/// Under each stock High Contrast palette every capsule cell is WINDOWTEXT on the band with no
+/// fill, the glyph on the metered row's fill is HIGHLIGHTTEXT, and a hovered capsule is HIGHLIGHT.
 #[test]
 fn high_contrast_capsules_are_one_ink_on_the_band() {
     let center = two_rows();
@@ -535,10 +492,8 @@ fn high_contrast_capsules_are_one_ink_on_the_band() {
     }
 }
 
-/// Over one comet period, on a dark band and a light one, every tone the comet
-/// draws leaves the words' anchor AA from it, and every word and the glyph cell
-/// stay on the anchor's side of the ground under them, at least as far toward
-/// the anchor as on the resting track.
+/// Over one comet period on dark and light bands, every comet tone clears AA against the words'
+/// anchor and keeps every word and the glyph cell on the anchor's side of the ground.
 #[test]
 fn the_comet_never_flips_a_words_ink() {
     for theme in [DEFAULT, LIGHT] {
@@ -596,9 +551,8 @@ fn the_comet_never_flips_a_words_ink() {
     }
 }
 
-/// The ETA slot's words: a hidden estimate leaves it blank, a latched
-/// `… left` wears the value ink floored against the cell under it, and a
-/// Complete echo leaves it blank.
+/// The ETA slot stays blank while unlatched or after Complete, and wears floored value ink when
+/// latched (`… left`).
 #[test]
 fn the_time_slot_words_wear_their_meanings_ink() {
     let c = inks(DEFAULT);
@@ -653,7 +607,6 @@ fn the_time_slot_words_wear_their_meanings_ink() {
         words, "",
         "a hidden estimate leaves the slot blank (ruling 241)"
     );
-    // Fed steadily, the estimate latches: `… left` in the value ink.
     let mut t = now;
     for k in 1..=16u64 {
         t = now + crate::Duration::from_millis(500 * k);
@@ -669,18 +622,13 @@ fn the_time_slot_words_wear_their_meanings_ink() {
     let (words, ink, bg, _) = slot(&center, t);
     assert!(words.ends_with(" left"), "latched: {words:?}");
     assert_eq!(ink, floored(c.value, bg));
-    // Delivered: the ✓ and the finished words only; the slot says nothing.
     assert!(center.resolve(id, crate::Outcome::Ok, t));
     let (words, _, _, _) = slot(&center, t + crate::Duration::from_millis(100));
     assert_eq!(words, "");
 }
 
-/// The band's repaint key is exactly `0` with no row committed, whatever the
-/// hover, geometry or motion term; otherwise nonzero, the same for the same
-/// inputs, and moved by a hover change, a resize that keeps the column count
-/// (the meter maps onto the window) and a motion frame that draws something
-/// new. Held rows have a motion fingerprint of 0 in both looks; a busy row's
-/// still frame does not move with time, and its moving frames do.
+/// `band_fp` is `0` with no row committed and otherwise changes with hover, window geometry, or
+/// moving motion frames (while staying fixed on held rows and still busy rows).
 #[test]
 fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     let g = Geometry::cells_only(100);
@@ -719,7 +667,6 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     assert_ne!(key, band_fp(fp, None, wide, 0), "the window moves it");
     assert_ne!(key, band_fp(fp, None, g, 0x1234), "a frame moves it");
     assert_ne!(band_fp(fp, None, g, 0x1234), band_fp(fp, None, g, 0x5678));
-    // Held rows only: no motion term, in either look.
     let now = t0();
     let mut center = MessageCenter::new(MessageLog::empty(), now);
     center.post(
@@ -732,7 +679,6 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     for look in [Look::MOVING, Look::STILL] {
         assert_eq!(center.motion(&p, now, look).fingerprint(), 0);
     }
-    // A busy row: still, the frame holds; moving, it moves.
     let center = busy_center(now);
     let p = present(&center, 100);
     let at = |k: u32, look| {
@@ -753,10 +699,8 @@ fn band_fp_is_zero_with_no_row_and_moves_only_with_what_it_draws() {
     );
 }
 
-/// On every builtin scheme, a Primary, a Secondary and `Details ›`, resting and
-/// lit, on the plain band, a meter's track, its fill and a busy row: each label
-/// glyph clears 4.5:1 against its cell. The Primary keeps its polarity (the
-/// band's ink on a deepened accent).
+/// On every builtin scheme, resting and hovered Primary, Secondary, and Details capsules clear
+/// 4.5:1 on plain, track, fill, and busy grounds while Primary keeps its polarity.
 #[test]
 fn every_chip_label_clears_aa_on_every_builtin_theme() {
     let now = t0();
@@ -802,9 +746,6 @@ fn every_chip_label_clears_aa_on_every_builtin_theme() {
                 "{name}: the deepened accent keeps its hue"
             );
         }
-        // …and the lit Primary is a whole lift off its rest: at least
-        // `PRIMARY_HOVER_LIFT` of the way from the worn accent to the theme's
-        // ink on every channel, up to rounding.
         let rest = chip_inks(&c, CapsuleRole::Primary, false, false).1;
         let lit = chip_inks(&c, CapsuleRole::Primary, true, false).1;
         assert_eq!(
@@ -861,12 +802,9 @@ fn every_chip_label_clears_aa_on_every_builtin_theme() {
     }
 }
 
-/// On every builtin scheme and in every frame of a determinate row's life (the
-/// glide, the glint, the Complete echo's wipe and bloom, the Fault's flash),
-/// every word cell over the fill wears the row's one crisp ink (`bar_bg` or
-/// `value`, whichever reads better on the resting fill): 4.5:1 always, 7:1 on
-/// the resting fill wherever a candidate reaches it, and never changing side
-/// of the ground under it.
+/// Across every builtin scheme and determinate-row phase (glide, glint, Complete echo, Fault
+/// flash), word cells over the fill wear the row's crisp ink at >= 4.5:1 (7:1 where reachable)
+/// without flipping polarity.
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -899,8 +837,6 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
             sevens += 1;
         }
         let crisp_lighter = fill_anchor(c.accent) == ink::WHITE;
-        // (start fill, the life to run): a glide from 20 % to 95 %, the
-        // glint at 95 %, a Complete echo from 95 %, a Fault echo from 95 %.
         for (life, outcome) in [
             ("glide", None),
             ("glint", None),
@@ -951,7 +887,6 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
             };
             let p = present(&center, cols);
             let l = &p.rows[0];
-            // Every word cell on the row: glyph, title, percent, stats.
             let mut words: Vec<usize> = vec![l.glyph.0];
             let mut add = |col: usize, text: &str| {
                 for (k, ch) in text.chars().enumerate() {
@@ -974,8 +909,6 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
                 let geom = Geometry::cells_only(cols);
                 let span_of = MeterSpan { geom, cols };
                 for &x in &words {
-                    // Wholly on the fill: the cell the edge crosses wears
-                    // the track's ink, split by the renderer.
                     let on_fill = m.rows[0].surface.is_empty()
                         || u32::from(span_of.fine(&m.rows[0].surface, x).fill)
                             + u32::from(span_of.fine(&m.rows[0].surface, x).warn)
@@ -1014,15 +947,12 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
         }
     }
     assert!(sevens > 0, "some scheme reaches 7:1 on its fill");
-    // The default ground: the band's own dark on the neon cursor green.
     let c = inks(DEFAULT);
     let crisp = contrast(fill_ink(&c, c.accent), c.accent);
     assert!(crisp >= 7.0, "the default ground's crisp ink: {crisp:.2}:1");
 }
 
-/// Every hover target on a row is its own key, or a hover moving between
-/// capsules never repaints the highlight. Negative control: a term that ORs
-/// its presence bit into the target collides on every even/odd pair.
+/// Every hover target on a row hashes to a distinct key.
 #[test]
 fn every_hover_target_on_a_row_is_its_own_key() {
     let fp = 0x1234_5678;

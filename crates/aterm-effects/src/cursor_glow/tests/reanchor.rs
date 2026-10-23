@@ -5,12 +5,6 @@
 
 use super::*;
 
-/// Typed re-anchor law: a typed-hinted one-row move beyond the typed advance
-/// (an Ink input box rewrapping its inset prompt, launching from the interior
-/// right edge and landing right of column 1, which the bare-terminal shape
-/// detector misses) is continued typing for every style: no fire meteor,
-/// rainbow zoom, lightning bolt, landing ring or jump-scale particle burst, and
-/// the only new wake is the single landing spark. The paired flare stays cold.
 #[test]
 fn claude_code_wrap_reanchors_all_styles() {
     let g = geom(); // rows:6 cols:40 — the Ink wrap is (4,36) -> (5,3)
@@ -30,11 +24,7 @@ fn claude_code_wrap_reanchors_all_styles() {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((4, 36)), t0, &c, g, &mut out); // caret at the box's right edge
-        // A scripted typed candidate exercises the post-admission
-        // re-anchor morphology without treating its timestamp as proof.
         glow.note_synthetic_typed(t0 + Duration::from_millis(5), 1);
-        // …and the Ink repaint re-anchors the caret one row down, left of
-        // its launch column (dr=1, dc=-33, which the shape detector misses).
         glow.tick(
             Some((5, 3)),
             t0 + Duration::from_millis(10),
@@ -59,8 +49,6 @@ fn claude_code_wrap_reanchors_all_styles() {
             "{style:?}: a typed re-anchor never slams the flare ({})",
             glow.flare
         );
-        // The wake is the single landing spark: nothing swept across cells
-        // the caret never travelled.
         assert!(
             !glow.sparks.iter().any(|s| s.row == 5 && s.col > 3),
             "{style:?}: no wrap smear right of the landing: {:?}",
@@ -70,9 +58,6 @@ fn claude_code_wrap_reanchors_all_styles() {
                 .map(|s| s.col)
                 .collect::<Vec<_>>()
         );
-        // …and none on the departed row either. The first tick lays no wake
-        // (spawn needs a previous position), so after both ticks the only
-        // legitimate spark is the landing cell.
         assert!(
             !glow.sparks.iter().any(|s| s.row == 4),
             "{style:?}: no smear on the departed row: {:?}",
@@ -91,9 +76,6 @@ fn claude_code_wrap_reanchors_all_styles() {
     }
 }
 
-/// The hide-bridge law under explicit candidates: a ConPTY-bridged move is
-/// chebyshev ≤ 2, and the re-anchor's `raw_dist > 2` guard keeps generic and
-/// typed synthetic morphology byte-identical frame for frame.
 #[test]
 fn bridged_two_cell_move_is_byte_identical_with_hint() {
     let g = geom();
@@ -104,7 +86,6 @@ fn bridged_two_cell_move_is_byte_identical_with_hint() {
         let mut out = Vec::new();
         let mut fps = Vec::new();
         fps.push(glow.tick(Some((2, 5)), t0, &c, g, &mut out));
-        // ConPTY echo choreography: a hidden frame presents…
         fps.push(glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out));
         let armed = t0 + Duration::from_millis(20);
         if hint {
@@ -112,7 +93,6 @@ fn bridged_two_cell_move_is_byte_identical_with_hint() {
         } else {
             glow.note_synthetic_move(armed);
         }
-        // …then the cursor reappears a bridgeable (dr=1, dc=2) hop away.
         for ms in [45u64, 61, 77, 200] {
             fps.push(glow.tick(
                 Some((3, 7)),
@@ -131,10 +111,6 @@ fn bridged_two_cell_move_is_byte_identical_with_hint() {
     );
 }
 
-/// Box-growth wrap morphology: the bottom-anchored input box grows a row up,
-/// so the caret's terminal row stays constant while its column jumps. An
-/// admitted typed preview plus repaint blink re-anchors without a meteor; the
-/// same shape with no press behind it stays dark.
 #[test]
 fn box_growth_preview_reanchors_but_cold_output_stays_dark() {
     let g = geom();
@@ -142,7 +118,6 @@ fn box_growth_preview_reanchors_but_cold_output_stays_dark() {
     let t0 = Instant::now();
     let mut out = Vec::new();
 
-    // An explicitly scripted typed dr==0 wrap under alt+blink re-anchors.
     let mut glow = CursorGlow::default();
     glow.note_context(true);
     glow.tick(Some((5, 36)), t0, &c, g, &mut out);
@@ -156,7 +131,6 @@ fn box_growth_preview_reanchors_but_cold_output_stays_dark() {
     );
     assert!(glow.flare < 0.5, "no flare slam on the wrap");
 
-    // The same shape with no key behind it stays wholly dark.
     let mut cold = CursorGlow::default();
     cold.note_context(true);
     cold.tick(Some((5, 36)), t0, &c, g, &mut out);
@@ -172,7 +146,6 @@ fn synthetic_alt_without_blink_keeps_the_jump() {
     let t0 = Instant::now();
     let mut out = Vec::new();
 
-    // Explicit alt-screen preview, no blink: the jump keeps its drama.
     let mut fire = CursorGlow::default();
     fire.note_context(true);
     fire.tick(Some((4, 36)), t0, &cfg(GlowStyle::Fire, true), g, &mut out);
@@ -191,8 +164,6 @@ fn synthetic_alt_without_blink_keeps_the_jump() {
         "admitted alt-screen preview + no blink: the fire meteor still flies"
     );
 
-    // With a fresh repaint blink the same typed wrap re-anchors. (Rainbow
-    // kitty's meteor has its own admission laws in `rainbow_kitty::meteor`.)
     let mut cc = CursorGlow::default();
     cc.note_context(true);
     cc.tick(Some((4, 36)), t0, &cfg(GlowStyle::Fire, true), g, &mut out);

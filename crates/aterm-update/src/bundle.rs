@@ -63,6 +63,12 @@ pub(crate) fn grant_chunks_judged(
 }
 
 /// Resolve the installed bundle the updater may replace, or `None` when it must not act:
+///
+/// * not the `…/<name>.app/Contents/MacOS/<exe>` layout (a `target/` binary): nothing to
+///   swap;
+/// * an App Translocation path (`…/AppTranslocation/…`): a read-only, randomized copy;
+/// * under `/Volumes/…`: running from a mounted DMG (read-only);
+/// * a bundle carrying [`DEV_BUILD_KEY`]: a local build installed in place.
 pub fn resolve() -> Option<Bundle> {
     let bundle = resolve_layout()?;
     if is_dev_marked(&bundle.app_root) {

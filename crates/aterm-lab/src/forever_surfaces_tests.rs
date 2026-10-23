@@ -188,7 +188,7 @@ fn a_landing_is_counted_once_a_land_act() {
     assert_eq!(landings_of(&journal, |_| true), 2);
     // a session's first note counts (a cut may have dropped its act)
     assert_eq!(landings_of(&journal[1..3], |_| true), 1);
-    // only the day asked for
+    // only the day asked for counts
     assert_eq!(landings_of(&journal, |t| t >= 4), 1);
     assert_eq!(landings_of(&[], |_| true), 0);
 }

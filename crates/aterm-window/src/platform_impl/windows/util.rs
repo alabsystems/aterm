@@ -5,7 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Update BOOL imports and module-handle null checks for windows-sys 0.61.
 
 use std::ffi::{c_void, OsStr, OsString};
 use std::iter::once;
@@ -123,8 +122,6 @@ pub fn get_cursor_clip() -> Result<RECT, io::Error> {
 }
 
 /// Sets the cursor's clip rect.
-///
-/// Note that calling this will automatically dispatch a `WM_MOUSEMOVE` event.
 pub fn set_cursor_clip(rect: Option<RECT>) -> Result<(), io::Error> {
     unsafe {
         let rect_ptr = rect.as_ref().map(|r| r as *const RECT).unwrap_or(ptr::null());
@@ -154,13 +151,6 @@ pub fn is_minimized(window: HWND) -> bool {
 }
 
 pub fn get_instance_handle() -> HMODULE {
-    // Gets the instance handle by taking the address of the
-    // pseudo-variable created by the microsoft linker:
-    // https://devblogs.microsoft.com/oldnewthing/20041025-00/?p=37483
-
-    // This is preferred over GetModuleHandle(NULL) because it also works in DLLs:
-    // https://stackoverflow.com/questions/21718027/getmodulehandlenull-vs-hinstance
-
     extern "C" {
         static __ImageBase: IMAGE_DOS_HEADER;
     }
@@ -169,18 +159,17 @@ pub fn get_instance_handle() -> HMODULE {
 }
 
 pub(crate) fn to_windows_cursor(cursor: CursorIcon) -> PCWSTR {
-    // LOCAL PATCH (aterm), 2026-10-15 (winit-core step 5): `CursorIcon` is the crate's own six
-    // icons, so the arms for the 29 it no longer has left with them; each kept arm maps as
-    // upstream's did.
+    // LOCAL PATCH (aterm): `CursorIcon` is the crate's own type, so the arms for the icons it does
+    // not have are gone; each kept arm maps as upstream's did.
     match cursor {
         CursorIcon::Default => IDC_ARROW,
         CursorIcon::Pointer => IDC_HAND,
         CursorIcon::Text => IDC_IBEAM,
         CursorIcon::Grabbing => IDC_SIZEALL,
-        // LOCAL PATCH (aterm), LW.5: the edge-resize icons, which aterm sets only on its own
-        // Wayland frame (Windows draws its own). The edges map as upstream's did; the corners
-        // would need `IDC_SIZENESW`/`IDC_SIZENWSE`, which the generated windows-sys facade does
-        // not declare while nothing on Windows sets them, so they are the arrow.
+        // LOCAL PATCH (aterm): the edge-resize icons, which aterm sets only on its own Wayland
+        // frame (Windows draws its own). The edges map as upstream's did; the corners would need
+        // `IDC_SIZENESW`/`IDC_SIZENWSE`, which the generated windows-sys facade does not declare
+        // while nothing on Windows sets them, so they are the arrow.
         CursorIcon::ColResize | CursorIcon::EResize | CursorIcon::WResize => IDC_SIZEWE,
         CursorIcon::RowResize | CursorIcon::NResize | CursorIcon::SResize => IDC_SIZENS,
         CursorIcon::NeResize
@@ -190,15 +179,10 @@ pub(crate) fn to_windows_cursor(cursor: CursorIcon) -> PCWSTR {
     }
 }
 
-// Helper function to dynamically load function pointer as some functions
-// may not be available on all Windows platforms supported by winit.
-//
-// `library` and `function` must be zero-terminated.
 pub(super) fn get_function_impl(library: &str, function: &str) -> Option<*const c_void> {
     assert_eq!(library.chars().last(), Some('\0'));
     assert_eq!(function.chars().last(), Some('\0'));
 
-    // Library names we will use are ASCII so we can use the A version to avoid string conversion.
     let module = unsafe { LoadLibraryA(library.as_ptr()) };
     if module.is_null() {
         return None;

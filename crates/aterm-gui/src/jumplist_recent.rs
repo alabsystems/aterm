@@ -474,7 +474,9 @@ mod tests {
             let line = format!("aterm-gui.exe {}", row_arguments(dir));
             let wide = crate::win_ffi::wide(&line);
             let mut argc = 0i32;
-            // SAFETY: `wide` is a NUL-terminated UTF-16 string and the returned argv block is freed once with `LocalFree`.
+            // SAFETY: `wide` is a NUL-terminated UTF-16 line that outlives the
+            // call; the returned block is read within its `argc` entries, each a
+            // NUL-terminated string, and freed once with LocalFree as documented.
             let argv: Vec<String> = unsafe {
                 let block = CommandLineToArgvW(wide.as_ptr(), &mut argc);
                 assert!(!block.is_null());

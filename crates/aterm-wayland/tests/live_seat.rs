@@ -197,7 +197,8 @@ struct Client {
 impl Client {
     fn connect(lane: &Lane) -> Client {
         let display = OwnedDisplay::connect(Some(&lane.display)).expect("Mutter's display");
-        // SAFETY: Client drops registry, queue, then display.
+        // SAFETY: Client drops registry, queue, then display; all dispatch
+        // and object teardown is serialized on this test thread.
         let queue = Queue::new(unsafe { display.display() }).unwrap();
         let registry = Registry::new(&queue).unwrap();
         Client {
@@ -243,7 +244,8 @@ fn a_real_seat_reaches_the_helpers() {
         )
     };
 
-    // SAFETY: The toplevel is maximized beneath the seat pointer.
+    // A maximized toplevel, so the seat's pointer is over it wherever it is.
+    // SAFETY: The compositor bound above.
     let surface = unsafe { wl_compositor::create_surface(compositor) }.unwrap();
     // SAFETY: A fresh surface with no role, outliving the toplevel.
     let toplevel = unsafe { Toplevel::new(&shell, surface, c"aterm seat", c"aterm.seat") }.unwrap();

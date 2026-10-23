@@ -2,10 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `--record` and `--replay` through the CLI: the refusals and the tape checks a taped
-//! command line meets before its verb runs, over a scripted transport that must see nothing;
-//! then (`over_the_fake`) real read verbs recorded against agh-fake and replayed offline.
-//! No test records `release wait`: a recording sleeps for real.
+//! CLI `--record` and `--replay` tape verification and round-trip tests.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,7 +17,6 @@ use astream_effects::EffectRecord;
 
 use crate::common::{run_cli, scratch, tape_path};
 
-/// A test context over `transport` and github.com's endpoints, with an empty environment.
 fn scripted_ctx(root: &Path, transport: &Arc<ScriptedTransport>) -> (Ctx, Captured) {
     Ctx::for_tests(
         root,
@@ -30,7 +26,6 @@ fn scripted_ctx(root: &Path, transport: &Arc<ScriptedTransport>) -> (Ctx, Captur
     )
 }
 
-/// Whether stderr's error line carries the field `key=value`.
 fn has_field(captured: &Captured, field: &str) -> bool {
     captured
         .stderr_text()
@@ -38,7 +33,6 @@ fn has_field(captured: &Captured, field: &str) -> bool {
         .any(|word| word == field)
 }
 
-/// The `why` of the JSON `error` object on stderr's error line.
 fn error_why(captured: &Captured) -> String {
     let text = captured.stderr_text();
     text.lines()
@@ -47,7 +41,6 @@ fn error_why(captured: &Captured) -> String {
         .unwrap_or_else(|| panic!("an error line with a why: {text}"))
 }
 
-/// A tape at `path` whose run was `argv`, its stdout `out` and its exit 0.
 fn write_tape(path: &Path, argv: &[&str], out: &[u8]) {
     let argv: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
     let header = TapeHeader::for_run(&argv, &Endpoints::github_com());
@@ -111,12 +104,10 @@ fn a_command_line_that_holds_a_token_shape_is_never_taped() {
     let transport = Arc::new(ScriptedTransport::new());
     let t = tape_path(dir.path(), "t");
     let t_arg = t.to_str().expect("a UTF-8 path");
-    // A tape holds each argument shaped, so its bare replay would run another command line.
     let shaped = format!("/repos/fixture-dev/{}", agh_fake::token("argv"));
     let (mut ctx, captured) = scripted_ctx(dir.path(), &transport);
     let exit = run_cli(&mut ctx, &["--record", t_arg, "api", &shaped]);
     assert_eq!(exit, 2, "{}", captured.stderr_text());
-    // The why carries the argument's count, 2 (the path after `api`); its wording is free.
     let why = error_why(&captured);
     assert!(why.split_whitespace().any(|w| w == "2"), "{why}");
     assert!(!t.exists());
@@ -128,14 +119,11 @@ fn a_replay_compares_the_typed_command_line_shaped_as_the_tape_holds_it() {
     let dir = scratch("tapes");
     let transport = Arc::new(ScriptedTransport::new());
     let p = tape_path(dir.path(), "p");
-    // A tape some other writer made of a command line the shapes rewrote.
     write_tape(&p, &["api", "/repos/fixture-dev/[redacted]"], b"{}\n");
     let shaped = format!("/repos/fixture-dev/{}", agh_fake::token("argv"));
     let (mut ctx, captured) = scripted_ctx(dir.path(), &transport);
     let p_arg = p.to_str().expect("a UTF-8 path");
     let exit = run_cli(&mut ctx, &["--replay", p_arg, "api", &shaped]);
-    // The command line is the tape's, so the run starts: its first door is the verb's start
-    // time (`mono`), where this tape holds the stdout emit, and the replay stops there.
     assert_eq!(exit, 3, "{}", captured.stderr_text());
     assert!(
         has_field(&captured, "sub=replay.kind"),
@@ -197,7 +185,6 @@ fn a_replay_with_another_command_line_is_a_usage_error() {
         );
         assert!(captured.stderr_text().contains("fixture-dev/app"));
     }
-    // The argv check comes before any file is created.
     assert!(!q.exists());
     assert!(transport.requests().is_empty());
 }
@@ -265,7 +252,6 @@ mod over_the_fake {
 
     const APP: &str = "fixture-dev/app";
 
-    /// One run's exit, stdout and stderr.
     struct Ran {
         exit: u8,
         stdout: Vec<u8>,
@@ -290,12 +276,10 @@ mod over_the_fake {
             World { root, fake }
         }
 
-        /// A tape path under the world's root.
         fn tape(&self, label: &str) -> PathBuf {
             common::tape_path(self.root.path(), label)
         }
 
-        /// A run against the fake, as `common::ctx` builds it.
         fn live(&self, args: &[&str]) -> Ran {
             let (mut ctx, captured) = common::ctx(self.root.path(), &self.fake, common::env());
             let exit = run_cli(&mut ctx, args);
@@ -306,8 +290,6 @@ mod over_the_fake {
             }
         }
 
-        /// A run in a fresh context (its own scratch root) over an empty scripted transport
-        /// and the fake's endpoints; the transport must see no request.
         fn offline(&self, args: &[&str]) -> Ran {
             let fresh = common::scratch("tapes-replay");
             let transport = Arc::new(ScriptedTransport::new());
@@ -340,7 +322,6 @@ mod over_the_fake {
         tape::parse(&text).unwrap_or_else(|e| panic!("{e:?}: {text}"))
     }
 
-    /// The tape's exchanges at `door`, in order.
     fn exchanges(records: &[EffectRecord], door: &str) -> Vec<EffectRecord> {
         records
             .iter()
@@ -349,7 +330,6 @@ mod over_the_fake {
             .collect()
     }
 
-    /// The bytes of the tape's emit at `door` (there is exactly one).
     fn emit(records: &[EffectRecord], door: &str) -> Vec<u8> {
         let emits: Vec<&Vec<u8>> = records
             .iter()
@@ -362,7 +342,6 @@ mod over_the_fake {
         emits[0].clone()
     }
 
-    /// The error line's (stderr's second line) JSON `error` object.
     fn error(ran: &Ran) -> aterm_json::Value {
         let line = ran
             .stderr
@@ -376,7 +355,6 @@ mod over_the_fake {
             .expect("an error object")
     }
 
-    /// Every file under `dir`, recursively.
     fn files_under(dir: &Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut todo = vec![dir.to_path_buf()];
@@ -393,8 +371,6 @@ mod over_the_fake {
         out
     }
 
-    /// Record `repo view fixture-dev/app` into `p`, checking what the fake saw and what the
-    /// tape holds; answers the run.
     fn record_repo_view(w: &World, p: &Path) -> Ran {
         let ran = w.live(&["--record", arg(p), "repo", "view", APP]);
         assert_eq!(ran.exit, 0, "{}", ran.stderr);
@@ -431,7 +407,6 @@ mod over_the_fake {
         assert_eq!(emit(&records, DOOR_STDOUT), ran.stdout);
         assert_eq!(emit(&records, DOOR_EXIT), b"0");
 
-        // No rate book: the state directory was not made, and nothing under the root is one.
         assert!(!Dirs::under(w.root.path()).rate().exists());
         assert_eq!(Dirs::under(w.root.path()).state.exists(), state_before);
         for file in files_under(w.root.path()) {
@@ -494,7 +469,6 @@ mod over_the_fake {
                 })
                 .count()
         };
-        // Two pages of 100, then the snapshot's revalidation of each.
         assert_eq!(answered(b"status 200\n"), 2, "the listing's page exchanges");
         assert_eq!(answered(b"status 304\n"), 2, "the listing's page exchanges");
 
@@ -577,8 +551,6 @@ mod over_the_fake {
         let w = World::new("tapes-retry");
         let p = w.tape("p");
         let recorded = record_repo_view(&w, &p);
-        // The recording as the shipped binary's retries would have taped a 502 on the first
-        // request: the 502, the 2 s pause, then the same request again.
         let (header, mut records) = read_tape(&p);
         let at = records
             .iter()
@@ -607,7 +579,6 @@ mod over_the_fake {
         let q = w.tape("retried");
         std::fs::write(&q, tape::render(&header, &records)).expect("the tape");
 
-        // `offline` is `Ctx::for_tests`, whose own policy is `RetryPolicy::NONE`.
         let ran = w.offline(&["--replay", arg(&q)]);
         assert_eq!(ran.exit, recorded.exit, "{}", ran.stderr);
         assert_eq!(ran.stdout, recorded.stdout);
@@ -618,12 +589,10 @@ mod over_the_fake {
     fn arguments_that_read_as_a_shape_once_joined_are_never_taped() {
         let w = World::new("tapes-joined");
         let p = w.tape("p");
-        // Neither argument alone is a shape; the taped `argv` line, `.Bearer {APP}`, is one.
         let ran = w.live(&["--record", arg(&p), "repo", "view", "--jq", ".Bearer", APP]);
         assert_eq!(ran.exit, 2, "{}", ran.stderr);
         assert!(!p.exists());
         assert!(w.fake.seen().is_empty());
-        // The control, one letter apart, records.
         let ran = w.live(&["--record", arg(&p), "repo", "view", "--jq", ".Bearex", APP]);
         assert_eq!(ran.exit, 0, "{}", ran.stderr);
         read_tape(&p);
@@ -641,7 +610,6 @@ mod over_the_fake {
         );
         let taped = std::fs::read(&p).expect("the tape");
         run_cli(&mut ctx, &["repo", "view", APP]);
-        // No record follows the tape's exit, and the tape still replays.
         assert_eq!(std::fs::read(&p).expect("the tape"), taped);
         let ran = w.offline(&["--replay", arg(&p)]);
         assert_eq!(ran.exit, 0, "{}", ran.stderr);

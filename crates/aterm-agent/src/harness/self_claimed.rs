@@ -125,6 +125,8 @@ fn live_of(pid: u32) -> Option<(PathBuf, Live)> {
         codex_home: args.env_var("CODEX_HOME").map(str::to_owned),
         cwd: aterm_sysprobe::process_cwd(pid),
         twin: None,
+        managed_launch: atpkg::store::resolve_configured()
+            .and_then(|layout| atpkg::managed_launch::Hints::capture(&layout, &args)),
     };
     let home = codex_home_of(live.codex_home.as_deref(), args.env_var("HOME"))?;
     Some((home, live))
@@ -222,6 +224,8 @@ pub struct Live {
     pub cwd: Option<PathBuf>,
     /// Managed `atpkg` Codex twin path (`<prefix>/agents/codex`), if configured.
     pub twin: Option<PathBuf>,
+    /// Untrusted managed-launch fields from that same kernel snapshot and configured prefix.
+    pub managed_launch: Option<atpkg::managed_launch::Hints>,
 }
 
 /// Validated resume command and environment for relaunching a crashed session.
@@ -260,7 +264,12 @@ pub fn validate(record: &Record, pid: u32, live: &Live) -> Result<Resume, Refusa
     if !(Path::new(launch).is_absolute()
         && (*launch == live.exec_path
             || image.as_deref() == Some(launch.as_str())
-            || twin.as_deref() == Some(launch.as_str())))
+            || twin.as_deref() == Some(launch.as_str())
+            || live
+                .managed_launch
+                .as_ref()
+                .zip(live.image.as_deref())
+                .is_some_and(|(hints, image)| hints.admits(pid, image, Path::new(launch)))))
     {
         return Err("launch-path");
     }

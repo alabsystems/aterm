@@ -141,7 +141,8 @@ fn release_held() {
         .rdev();
     for fd in HELD {
         assert_ne!(flags(fd), -1, "fd {fd}, which the launcher held, is closed");
-        // SAFETY: `fd` is open (just checked).
+        // SAFETY: `fd` is open (just checked); the `File` is never dropped, so
+        // it only borrows the descriptor for one `fstat`.
         let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         let meta = file.metadata().expect("fstat a held descriptor");
         assert!(
@@ -186,7 +187,7 @@ fn launch_staged(mut launch: std::process::Command, stage: &str) -> String {
 
 /// Move `fd` to the lowest free number at or above `floor`, close-on-exec (as `UnixStream::pair()` hands its ends out), the original closed.
 pub(super) fn park(fd: OwnedFd, floor: RawFd) -> OwnedFd {
-    // SAFETY: `fd` is live.
+    // SAFETY: `fd` is live; the copy is a fresh descriptor owned only here.
     let copy = unsafe { fcntl(fd.as_raw_fd(), F_DUPFD_CLOEXEC, floor) };
     assert!(
         copy >= floor,
@@ -207,7 +208,8 @@ fn place(fd: OwnedFd, number: RawFd) -> OwnedFd {
         -1,
         "fd {number} is already open in the staged child"
     );
-    // SAFETY: `fd` is live, `number` free.
+    // SAFETY: `fd` is live, `number` free; `from_raw_fd` takes exactly the
+    // descriptor `dup2` created, after the original is dropped.
     unsafe {
         assert_eq!(dup2(fd.as_raw_fd(), number), number, "dup2 onto {number}");
         assert_ne!(fcntl(number, F_SETFD, FD_CLOEXEC), -1, "flag {number}");
@@ -220,7 +222,7 @@ fn place(fd: OwnedFd, number: RawFd) -> OwnedFd {
 pub(super) fn unflagged_at_or_above(floor: RawFd) -> OwnedFd {
     const F_DUPFD: i32 = 0;
     let file = std::fs::File::open("/dev/null").expect("open /dev/null");
-    // SAFETY: `file` is live.
+    // SAFETY: `file` is live; `F_DUPFD` returns a fresh descriptor or -1.
     let fd = unsafe { fcntl(file.as_raw_fd(), F_DUPFD, floor) };
     assert!(
         fd >= floor,
@@ -258,7 +260,8 @@ fn set_soft_limit(soft: u64) -> u64 {
     // SAFETY: a live out-parameter.
     assert_eq!(unsafe { getrlimit(NOFILE, &mut limit) }, 0, "getrlimit");
     limit.cur = soft.min(limit.max);
-    // SAFETY: a live, initialised limit that keeps the hard one.
+    // SAFETY: a live, initialised limit that keeps the hard one; moving the
+    // soft limit below the hard one needs no privilege.
     assert_eq!(unsafe { setrlimit(NOFILE, &limit) }, 0, "setrlimit");
     limit.cur
 }
@@ -965,7 +968,8 @@ fn libnotify_gate() -> isize {
     unsafe extern "C" {
         static _os_alloc_once_table: [AllocOnce; 1];
     }
-    // SAFETY: an exported libSystem table, read in place.
+    // SAFETY: an exported libSystem table, read in place; `once` is the word
+    // `os_once` itself updates atomically, and slot 0 lies within the table.
     unsafe { _os_alloc_once_table[0].once.load(Ordering::Acquire) }
 }
 
@@ -1030,9 +1034,10 @@ fn preparing_a_fork_passes_the_libnotify_gate() {
 fn adoption_takes_an_exclusively_owned_inherited_socket() {
     let (near, mut far) = UnixStream::pair().expect("socketpair");
     let fd = std::os::fd::IntoRawFd::into_raw_fd(near);
-    // SAFETY: this fixture alone holds the unowned raw number.
+    // SAFETY: this fixture alone holds the unowned raw number; the other end
+    // has a different descriptor, and nobody closes/replaces this one.
     assert_eq!(unsafe { fcntl(fd, F_SETFD, 0) }, 0);
-    // SAFETY: the owner was given up above.
+    // SAFETY: the owner was given up above; this call consumes it exactly once.
     let adopted = unsafe { adopt_inherited_socket(fd) }.expect("adopt inherited socket");
     assert_ne!(adopted.as_raw_fd(), fd, "the adoption is a copy");
     assert_ne!(flags(adopted.as_raw_fd()) & FD_CLOEXEC, 0);
@@ -1069,7 +1074,8 @@ fn an_inherited_socket_is_adopted_while_its_number_is_looked_up_elsewhere() {
         );
         drop(near);
         looker.probe();
-        // SAFETY: `fd` was just made here and has no other owner.
+        // SAFETY: `fd` was just made here and has no other owner; nothing else
+        // in this process names it.
         match unsafe { adopt_inherited_socket(fd) } {
             Ok(adopted) => drop(adopted),
             Err(e) => {
@@ -1125,7 +1131,7 @@ fn staged_shell_probe() {
             held,
             "dup2 to {held}"
         );
-        // SAFETY: just made here.
+        // SAFETY: just made here; nothing else owns it.
         let _held = unsafe { OwnedFd::from_raw_fd(held) };
         let script = format!(
             "m=0; i=0; while [ $i -lt {PER_ROUND} ]; do {} || m=$((m+1)); {} && m=$((m+1)); \
@@ -1187,7 +1193,8 @@ fn staged_guarded() {
     let (near, _far) = UnixStream::pair().expect("socketpair");
     let guarded = std::os::fd::IntoRawFd::into_raw_fd(near);
     let mut fdflags = 0;
-    // SAFETY: guards a descriptor this stage made and alone names (its owner given up above, so nothing closes it).
+    // SAFETY: guards a descriptor this stage made and alone names (its owner given up
+    // above, so nothing closes it); every pointer is a live local or NULL.
     let rc = unsafe {
         change_fdguard_np(
             guarded,

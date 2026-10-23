@@ -7,7 +7,8 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-/// An advisory exclusive lock held for the lifetime of the value and released by `LOCK_UN` on drop.
+/// An advisory exclusive lock held for the lifetime of the value; on unix, drop releases it by
+/// `LOCK_UN`.
 pub struct FileLock {
     _file: File,
 }

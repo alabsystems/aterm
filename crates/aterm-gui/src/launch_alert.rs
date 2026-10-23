@@ -76,7 +76,12 @@ impl AlertHost for Live {
             AppActivation::Accessory => 1,
             AppActivation::Prohibited => 2,
         };
-        // SAFETY: main thread checked above; Objective-C selectors match NSApplication signatures.
+        // SAFETY: main thread (checked above). `+sharedApplication` is
+        // `@16#0:8` on `NSApplication`, +0 and process-lifetime;
+        // `+currentApplication` is `@16#0:8` on `NSRunningApplication` and
+        // `-bundleIdentifier` is `@16@0:8`, nil for an unbundled binary;
+        // `-setActivationPolicy:` is `B24@0:8q16`, whose answer winit ignores
+        // too.
         unsafe {
             let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
             if app.is_null() {
@@ -107,7 +112,10 @@ impl AlertHost for Live {
         let Some(alert) = crate::menu::ok_alert(title, body) else {
             return false;
         };
-        // SAFETY: main thread checked above; selectors match NSAlert/NSWindow signatures.
+        // SAFETY: main thread (checked above), the live alert `ok_alert` built.
+        // `-layout` is `v16@0:8`; `-window` is `@16@0:8`, the alert's own +0
+        // panel; `-makeKeyAndOrderFront:` is `v24@0:8@16`, sent with a nil
+        // sender. `-runModal` later shows this same panel.
         let shown = unsafe {
             appkit::send_v(alert.id(), sel!(layout));
             let panel = appkit::send_id(alert.id(), sel!(window));
@@ -124,7 +132,9 @@ impl AlertHost for Live {
         let Some(app) = self.app else {
             return;
         };
-        // SAFETY: `app` is the live shared application on the main thread.
+        // SAFETY: `app` is the live shared application [`Self::make_app`] got on
+        // this main thread; `-activateIgnoringOtherApps:` is `v20@0:8B16`, the
+        // send winit makes at launch.
         unsafe {
             crate::appkit::send_v_bool(app, aterm_objc::sel!(activateIgnoringOtherApps:), true);
         }
@@ -135,7 +145,8 @@ impl AlertHost for Live {
             return;
         };
         let _park = crate::watchdog::park_modal();
-        // SAFETY: `alert` was created on this main thread in `Self::present`.
+        // SAFETY: main thread ([`Self::present`] checked it and built the alert
+        // on it); `-runModal` is `-(NSModalResponse)` on the live alert.
         let _ = unsafe { crate::appkit::send_isize(alert.id(), aterm_objc::sel!(runModal)) };
     }
 }

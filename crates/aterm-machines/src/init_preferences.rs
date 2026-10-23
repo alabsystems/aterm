@@ -3,8 +3,9 @@
 
 //! The local `aterm init` desktop preferences.
 
+use crate::items::catalog::{CATALOG, CatalogRow, Lit};
 use crate::items::defaults::{self, Target};
-use crate::items::{Activation, Ctx, Item, keyboard};
+use crate::items::{Activation, Ctx, Item, keyboard, widgets};
 use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::plist::Entries;
 use crate::port::{Cmd, System};
@@ -15,7 +16,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 const SRC: &str = "HIDKeyboardModifierMappingSrc";
 const WINDOW_MANAGER: &str = "com.apple.WindowManager";
-const NOTIFICATION_CENTER: &str = "com.apple.notificationcenterui";
 const FINDER: &str = "com.apple.finder";
 const DOCK: &str = "com.apple.dock";
 const DST: &str = "HIDKeyboardModifierMappingDst";
@@ -69,7 +69,7 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
         user,
         Reach::all(ctx.facts.full_disk_access),
     ));
-    for (setting, kind) in DESKTOP {
+    for (setting, kind) in desktop() {
         if selected.contains(setting) {
             items.push(Box::new(Desktop::new(user, kind, &activation)));
         }
@@ -77,22 +77,55 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
     Ok(items)
 }
 
-/// The setup row of the desktop item with `id` (`init.widgets@alice`: the widgets row), for a caller that recorded the items a pass withheld ([`Item::withheld`]) and follows them up ([`withheld_items`]).
+/// The setup row of the desktop item with `id` (`consumer.widgets.notification-center@alice`:
+/// the widgets row), for a caller that recorded the items a pass withheld
+/// ([`Item::withheld`]) and follows them up ([`withheld_items`]); an id an older aterm
+/// recorded is read through [`current_ids`] first.
 #[must_use]
 pub fn setting_of(id: &str) -> Option<Setting> {
-    let (family, _) = id.strip_prefix("init.")?.split_once('@')?;
-    DESKTOP
-        .into_iter()
-        .find(|(_, kind)| kind.family() == family)
+    let (name, _) = id.split_once('@')?;
+    desktop()
+        .find(|(_, kind)| kind.name() == name)
         .map(|(setting, _)| setting)
 }
 
-/// The desktop rows, each with its family, in run order.
-const DESKTOP: [(Setting, DesktopKind); 3] = [
-    (Setting::Widgets, DesktopKind::Widgets),
-    (Setting::Desktop, DesktopKind::Desktop),
-    (Setting::Dock, DesktopKind::Dock),
-];
+/// The items of this build that `id`, from a record an older aterm wrote, stands for. aterm
+/// 0.118.0 and older ran one widgets item, `init.widgets@<user>`, whose keys are now each a
+/// `[consumer] widgets` row's own item; `withheld` keeps only those a pass leaves for want of
+/// Full Disk Access (Notification Center's), the one key a record of withheld items could
+/// owe. Any other id stands for itself.
+#[must_use]
+pub fn current_ids(id: &str, withheld: bool) -> Vec<String> {
+    match id.split_once('@') {
+        Some((LEGACY_WIDGETS_ITEM, user)) => desktop()
+            .filter_map(|(_, kind)| match kind {
+                DesktopKind::Widget(row) if !withheld || defaults::contained(row.domain) => {
+                    Some(format!("{}@{user}", row.id))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => vec![id.to_owned()],
+    }
+}
+
+/// The id, less `@<user>`, of the one widgets item aterm 0.118.0 and older ran
+/// ([`current_ids`]).
+const LEGACY_WIDGETS_ITEM: &str = "init.widgets";
+
+/// The desktop rows, each with its setup row, in run order: the `[consumer] widgets`
+/// catalog rows, one key each under the catalog's id (one key, one owner: machines design
+/// §5.1), then the desktop and the Dock.
+fn desktop() -> impl Iterator<Item = (Setting, DesktopKind)> {
+    CATALOG
+        .iter()
+        .filter(|row| row.preset == "widgets")
+        .map(|row| (Setting::Widgets, DesktopKind::Widget(row)))
+        .chain([
+            (Setting::Desktop, DesktopKind::Desktop),
+            (Setting::Dock, DesktopKind::Dock),
+        ])
+}
 
 /// The follow-up of a pass that left keys in another app's container alone ([`Item::withheld`]).
 ///
@@ -109,8 +142,7 @@ pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
             contained_only: true,
         },
     ));
-    Ok(DESKTOP
-        .into_iter()
+    Ok(desktop()
         .filter(|(setting, kind)| {
             selected.contains(*setting)
                 && kind
@@ -407,12 +439,26 @@ fn parse_mapping(value: &str) -> Result<Vec<(i64, i64)>, String> {
     Ok(mappings)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A desktop item's kind: one `[consumer] widgets` catalog row's key, or a family of keys.
+#[derive(Debug, Clone, Copy)]
 enum DesktopKind {
-    Widgets,
+    /// One widgets row of the catalog ([`desktop`]): its key, under its id.
+    Widget(&'static CatalogRow),
     Desktop,
     Dock,
 }
+
+impl PartialEq for DesktopKind {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Widget(a), Self::Widget(b)) => a.id == b.id,
+            (Self::Desktop, Self::Desktop) | (Self::Dock, Self::Dock) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DesktopKind {}
 
 /// Which keys of its families a pass reads and writes ([`DesktopKind::reached`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,7 +492,7 @@ impl Reach {
 fn marker(kind: DesktopKind, domain: &str) -> &'static str {
     if defaults::contained(domain) {
         crate::init_activation::CONTAINED_MARKER
-    } else if kind == DesktopKind::Widgets {
+    } else if matches!(kind, DesktopKind::Widget(_)) {
         crate::init_activation::WIDGETS_MARKER
     } else {
         kind.family()
@@ -462,23 +508,43 @@ enum Wanted {
     /// The [`DOCK_APPS`] pins, aterm where it is installed ([`dock_apps_available`]), as the
     /// Dock rewrites them ([`same_apps`]).
     DockApps,
-    /// Notification Center's widget list with no widget ([`cleared_widgets`]).
+    /// Notification Center's widget list with no widget ([`widgets::cleared`]).
     NoWidgets,
+    /// A catalog row's value ([`Lit::value`]).
+    Value(Lit),
+}
+
+impl Wanted {
+    /// What a catalog row's `off` asks for.
+    const fn of(lit: Lit) -> Self {
+        match lit {
+            Lit::NoWidgets => Self::NoWidgets,
+            lit => Self::Value(lit),
+        }
+    }
 }
 
 impl DesktopKind {
     /// The family's journal name, and the marker of its keys but the widgets' ([`marker`]).
     const fn family(self) -> &'static str {
         match self {
-            Self::Widgets => "widgets",
+            Self::Widget(_) => "widgets",
             Self::Desktop => "desktop",
             Self::Dock => "dock",
         }
     }
 
-    /// The id of `user`'s item of this family.
+    /// The id of an item of this kind, less `@<user>`: a widgets row's is its catalog id.
+    fn name(self) -> String {
+        match self {
+            Self::Widget(row) => row.id.to_owned(),
+            Self::Desktop | Self::Dock => format!("init.{}", self.family()),
+        }
+    }
+
+    /// The id of `user`'s item of this kind.
     fn id(self, user: &User) -> String {
-        format!("init.{}@{}", self.family(), user.name)
+        format!("{}@{}", self.name(), user.name)
     }
 
     /// The processes that read the keys `marker` records of those the family reaches, in
@@ -488,6 +554,7 @@ impl DesktopKind {
             .into_iter()
             .filter(|process| {
                 self.recorded(reach, marker)
+                    .iter()
                     .any(|(domain, _, _)| crate::init_activation::readers(domain).contains(process))
             })
             .collect()
@@ -496,23 +563,19 @@ impl DesktopKind {
     /// The keys of [`DesktopKind::keys`] a pass reads and writes ([`Reach::reaches`]): all
     /// of them, less any in another app's container while the grant is not known held
     /// ([`defaults::withheld`]); in a follow-up, those alone.
-    fn reached(
-        self,
-        reach: Reach,
-    ) -> impl Iterator<Item = &'static (&'static str, &'static str, Wanted)> {
+    fn reached(self, reach: Reach) -> Vec<Key> {
         self.keys()
-            .iter()
-            .filter(move |(domain, _, _)| reach.reaches(domain))
+            .into_iter()
+            .filter(|(domain, _, _)| reach.reaches(domain))
+            .collect()
     }
 
     /// The keys the family reaches whose writes `marker` records.
-    fn recorded(
-        self,
-        reach: Reach,
-        marker: &str,
-    ) -> impl Iterator<Item = &'static (&'static str, &'static str, Wanted)> {
+    fn recorded(self, reach: Reach, marker: &str) -> Vec<Key> {
         self.reached(reach)
-            .filter(move |(domain, _, _)| self::marker(self, domain) == marker)
+            .into_iter()
+            .filter(|(domain, _, _)| self::marker(self, domain) == marker)
+            .collect()
     }
 
     /// The markers of the keys the family reaches, each once, in key order: a pass begins,
@@ -543,18 +606,10 @@ impl DesktopKind {
 
     /// Every key the family may write, in the order it reads them, and what each should
     /// hold: what its item changes and what its activation waits to read the same, of those
-    /// a pass reaches ([`DesktopKind::reached`]).
-    const fn keys(self) -> &'static [(&'static str, &'static str, Wanted)] {
-        match self {
-            Self::Widgets => &[
-                (WINDOW_MANAGER, "StandardHideWidgets", Wanted::Bool(true)),
-                (
-                    WINDOW_MANAGER,
-                    "StageManagerHideWidgets",
-                    Wanted::Bool(true),
-                ),
-                (NOTIFICATION_CENTER, "widgets", Wanted::NoWidgets),
-            ],
+    /// a pass reaches ([`DesktopKind::reached`]). A widgets row's is its catalog row's key.
+    fn keys(self) -> Vec<Key> {
+        let keys: &[Key] = match self {
+            Self::Widget(row) => return vec![(row.domain, row.key, Wanted::of(row.off))],
             Self::Desktop => &[
                 (
                     WINDOW_MANAGER,
@@ -583,9 +638,13 @@ impl DesktopKind {
                 (DOCK, "static-only", Wanted::Bool(false)),
                 (DOCK, "minimize-to-application", Wanted::Bool(true)),
             ],
-        }
+        };
+        keys.to_vec()
     }
 }
+
+/// A desktop key: its domain, its name, and what it should hold.
+type Key = (&'static str, &'static str, Wanted);
 
 #[derive(Debug)]
 struct Desktop {
@@ -624,7 +683,9 @@ impl Desktop {
 
     /// Whether an earlier write of the keys this pass reaches still awaits its readers'
     /// relaunch: a marker of those keys is pending, or an older aterm's marker of every
-    /// widgets key ([`Desktop::legacy`]).
+    /// widgets key ([`Desktop::legacy`]). A marker this pass found clear and another of its
+    /// items then began is the pass's own relaunch to make, not an earlier write
+    /// ([`DesktopActivation::earlier`]): the two Window Manager widgets rows share one.
     fn pending(&self, sys: &dyn System) -> Result<bool, String> {
         for marker in self
             .kind
@@ -632,7 +693,7 @@ impl Desktop {
             .into_iter()
             .chain(self.legacy())
         {
-            if crate::init_activation::pending(sys, &self.user, marker)? {
+            if self.activation.earlier(sys, marker)? {
                 return Ok(true);
             }
         }
@@ -640,11 +701,12 @@ impl Desktop {
     }
 
     /// The marker an older aterm wrote before every widgets write, Notification Center's with
-    /// the Window Manager's ([`crate::init_activation::LEGACY_WIDGETS_MARKER`]), for the
-    /// widgets item of a pass that reaches the Window Manager's keys (not a follow-up, which
-    /// never relaunches the Dock).
+    /// the Window Manager's ([`crate::init_activation::LEGACY_WIDGETS_MARKER`]), for a
+    /// widgets item of a Window Manager key in a pass that reaches it (not a follow-up,
+    /// which never relaunches the Dock): the first of them carries it.
     fn legacy(&self) -> Option<&'static str> {
-        (self.kind == DesktopKind::Widgets && !self.reach().contained_only)
+        let wm = matches!(self.kind, DesktopKind::Widget(row) if !defaults::contained(row.domain));
+        (wm && !self.reach().contained_only)
             .then_some(crate::init_activation::LEGACY_WIDGETS_MARKER)
     }
 
@@ -659,8 +721,13 @@ impl Desktop {
         if !crate::init_activation::pending(sys, &self.user, legacy)? {
             return Ok(());
         }
-        crate::init_activation::begin(sys, &self.user, crate::init_activation::WIDGETS_MARKER)?;
-        crate::init_activation::begin(sys, &self.user, crate::init_activation::CONTAINED_MARKER)?;
+        for marker in [
+            crate::init_activation::WIDGETS_MARKER,
+            crate::init_activation::CONTAINED_MARKER,
+        ] {
+            crate::init_activation::begin(sys, &self.user, marker)?;
+            self.activation.carried(marker);
+        }
         crate::init_activation::finish(sys, &self.user, legacy)
     }
 
@@ -681,16 +748,17 @@ impl Desktop {
             Vec::new()
         };
         let mut changes = Vec::new();
-        for &(domain, key, wanted) in self.kind.reached(self.reach()) {
+        for (domain, key, wanted) in self.kind.reached(self.reach()) {
             let target = self.target(domain, key);
             let read = target.read(sys);
             let want = match wanted {
-                Wanted::NoWidgets => cleared_widgets(sys, &self.user, &read)?,
+                Wanted::NoWidgets => widgets::cleared(sys, &self.user, &read)?,
                 Wanted::DockApps => unmet(&read, dock_apps(&apps), |now, want| {
                     same_apps(sys, now, want)
                 })?,
                 Wanted::Empty => unmet(&read, PValue::Array(Vec::new()), equivalent)?,
                 Wanted::Bool(value) => unmet(&read, PValue::Bool(value), equivalent)?,
+                Wanted::Value(value) => unmet(&read, value.value(), equivalent)?,
             };
             if let Some(want) = want {
                 changes.push((target, read, want));
@@ -725,13 +793,13 @@ struct DesktopActivation {
     reach: Reach,
     /// The families whose items started writing in this pass, in run order.
     owed: Mutex<Vec<DesktopKind>>,
+    /// Each marker the pass's items looked at, and whether it was pending at the first
+    /// look, until the pass's relaunch discharges it ([`DesktopActivation::earlier`]).
+    seen: Mutex<Vec<(&'static str, bool)>>,
 }
 
 /// One relaunch a pass owes: a family, and the marker of the keys it wrote.
 type Obligation = (DesktopKind, &'static str);
-
-/// The Dock's keys whose tiles it gives a GUID as it loads them ([`dock_apps`] writes none).
-const TILE_KEYS: [&str; 2] = ["persistent-apps", "persistent-others"];
 
 impl DesktopActivation {
     fn new(user: &User, reach: Reach) -> Self {
@@ -739,7 +807,33 @@ impl DesktopActivation {
             user: user.clone(),
             reach,
             owed: Mutex::new(Vec::new()),
+            seen: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Whether `marker` holds a write of an earlier pass still awaiting its readers'
+    /// relaunch: pending now, and already when this pass first looked. One the pass found
+    /// clear and an item of it then began is this pass's to discharge, so another item
+    /// that shares it (the two Window Manager widgets rows) reads its own key alone.
+    fn earlier(&self, sys: &dyn System, marker: &'static str) -> Result<bool, String> {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        match seen.iter().find(|(looked, _)| *looked == marker) {
+            Some(&(_, false)) => Ok(false),
+            Some(&(_, true)) => crate::init_activation::pending(sys, &self.user, marker),
+            None => {
+                let pending = crate::init_activation::pending(sys, &self.user, marker)?;
+                seen.push((marker, pending));
+                Ok(pending)
+            }
+        }
+    }
+
+    /// `marker` now carries what an older aterm's marker owed ([`Desktop::carry_legacy`]):
+    /// an earlier write, for every item that shares it.
+    fn carried(&self, marker: &'static str) {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|(looked, _)| *looked != marker);
+        seen.push((marker, true));
     }
 
     /// `kind`'s marker is written and its writes begin: this pass relaunches its readers.
@@ -780,59 +874,23 @@ impl DesktopActivation {
             .collect()
     }
 
-    /// What `process` reads of what `due` records, as it now holds it, each domain read
-    /// once; `Err` while it is the Dock and has not yet loaded the tiles it was handed: a
-    /// Dock gives each tile it loads a GUID, and a write of [`dock_apps`] carries none.
+    /// What `process` reads of what `due` records, as it now holds it
+    /// ([`crate::init_activation::reading`]): `Err` while it is the Dock and has not yet
+    /// loaded the tiles it was handed.
     fn look(
         &self,
         sys: &dyn System,
         due: &[Obligation],
         process: &str,
     ) -> Result<Vec<Result<Entries, String>>, String> {
-        let keys: Vec<(&str, &str)> = due
+        let keys: Vec<Target> = due
             .iter()
             .flat_map(|&(kind, marker)| kind.recorded(self.reach, marker))
             .filter(|(domain, _, _)| crate::init_activation::readers(domain).contains(&process))
-            .map(|&(domain, key, _)| (domain, key))
+            .map(|(domain, key, _)| Target::user(domain, key, &self.user))
             .collect();
-        let mut domains: Vec<&str> = Vec::new();
-        for &(domain, _) in &keys {
-            if !domains.contains(&domain) {
-                domains.push(domain);
-            }
-        }
-        let mut seen = Vec::with_capacity(domains.len());
-        for domain in domains {
-            let entries =
-                Target::user(domain, "", &self.user)
-                    .entries(sys)
-                    .map(|entries| -> Entries {
-                        entries
-                            .into_iter()
-                            .filter(|(key, _)| keys.contains(&(domain, key.as_str())))
-                            .collect()
-                    });
-            if domain == DOCK
-                && let Ok(entries) = &entries
-                && entries.iter().any(|(key, value)| {
-                    TILE_KEYS.contains(&key.as_str())
-                        && value.as_ref().is_ok_and(|tiles| !loaded(tiles))
-                })
-            {
-                return Err("the Dock has not yet loaded the tiles it was given".into());
-            }
-            seen.push(entries);
-        }
-        Ok(seen)
+        crate::init_activation::reading(sys, &keys)
     }
-}
-
-/// Whether every tile of `tiles` carries the GUID a Dock gives a tile it loads.
-fn loaded(tiles: &PValue) -> bool {
-    let PValue::Array(tiles) = tiles else {
-        return true;
-    };
-    tiles.iter().all(|tile| field(tile, "GUID").is_some())
 }
 
 /// `a`, `a and b`, `a, b and c`.
@@ -922,6 +980,10 @@ impl Activation for DesktopActivation {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|kind| !due.iter().any(|(owed, _)| owed == kind));
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(looked, _)| !due.iter().any(|(_, marker)| marker == looked));
         Ok(failed)
     }
 }
@@ -948,17 +1010,13 @@ impl Item for Desktop {
 
     fn title(&self) -> String {
         match self.kind {
-            DesktopKind::Widgets if self.reach().contained_only => {
-                "No widgets in Notification Center".into()
+            DesktopKind::Widget(row)
+                if !self.reach().contained_only
+                    && !self.kind.withheld(self.full_disk_access()).is_empty() =>
+            {
+                format!("No {}; they wait for Full Disk Access", row.what)
             }
-            DesktopKind::Widgets if !self.kind.withheld(self.full_disk_access()).is_empty() => {
-                "No widgets on the desktop or in Stage Manager; Notification Center's wait for \
-                 Full Disk Access"
-                    .into()
-            }
-            DesktopKind::Widgets => {
-                "No widgets on the desktop, in Stage Manager or Notification Center".into()
-            }
+            DesktopKind::Widget(row) => format!("No {}", row.what),
             DesktopKind::Desktop => {
                 "Desktop icons visible; clicking wallpaper keeps windows in place".into()
             }
@@ -1062,83 +1120,6 @@ fn field<'a>(value: &'a PValue, key: &str) -> Option<&'a PValue> {
         return None;
     };
     entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-}
-
-fn cleared_widgets(
-    sys: &dyn System,
-    user: &User,
-    read: &Read<PValue>,
-) -> Result<Option<PValue>, String> {
-    let fields = match read {
-        Read::Unusable(why) => return Err(why.clone()),
-        Read::Absent => {
-            return Ok(Some(PValue::Dict(vec![
-                ("vers".into(), PValue::Int(1)),
-                ("instances".into(), PValue::Array(Vec::new())),
-            ])));
-        }
-        Read::Value(PValue::Dict(fields)) => fields,
-        Read::Value(_) => {
-            return Err("widget configuration is not a dictionary; left untouched".into());
-        }
-    };
-    let instances = fields.iter().find(|(k, _)| k == "instances");
-    match instances {
-        Some((_, PValue::Array(values))) if values.is_empty() => {
-            match fields
-                .iter()
-                .find(|(key, _)| key == "DesktopWidgetPlacementStorage")
-            {
-                None => return Ok(None),
-                Some((_, value)) if empty_widget_placement(sys, user, value)? => return Ok(None),
-                Some(_) => {}
-            }
-        }
-        None => {}
-        Some((_, PValue::Array(_))) => {}
-        _ => return Err("widget instances are not an array; left untouched".into()),
-    }
-    let mut next: Vec<_> = fields
-        .iter()
-        .filter(|(k, _)| k != "instances" && k != "DesktopWidgetPlacementStorage")
-        .cloned()
-        .collect();
-    next.push(("instances".into(), PValue::Array(Vec::new())));
-    Ok(Some(PValue::Dict(next)))
-}
-
-fn widget_placement_conversion(user: &User) -> Cmd {
-    Cmd::new("/usr/bin/plutil")
-        .args(["-convert", "xml1", "-o", "-", "--", "-"])
-        .as_user(user)
-}
-
-/// NotificationCenter recreates this binary plist even with no widgets. Its empty
-/// display list is metadata, not a configured widget; removing it on every probe
-/// would cause an endless write/relaunch cycle.
-fn empty_widget_placement(sys: &dyn System, user: &User, value: &PValue) -> Result<bool, String> {
-    let PValue::Data(bytes) = value else {
-        return Ok(false);
-    };
-    let ran = sys
-        .run_complete_stdout_input(&widget_placement_conversion(user), bytes)
-        .map_err(|_| "cannot completely inspect desktop widget placement".to_owned())?;
-    if !ran.success() {
-        return Ok(false);
-    }
-    let PValue::Dict(fields) = crate::plist::parse(&ran.stdout)
-        .map_err(|_| "unrecognized desktop widget placement property list".to_owned())?
-    else {
-        return Ok(false);
-    };
-    Ok(fields.len() == 2
-        && fields
-            .iter()
-            .any(|(key, value)| key == "CompatibilityVersion" && *value == PValue::Int(1))
-        && fields.iter().any(|(key, value)| {
-            key == "NumberedDisplays"
-                && matches!(value, PValue::Array(displays) if displays.is_empty())
-        }))
 }
 
 /// The pins of `apps` (each a path, a bundle identifier and a label), in order.
@@ -1363,6 +1344,9 @@ mod tests {
     /// The marker of the widgets' Window Manager keys.
     const WIDGETS: &str = crate::init_activation::WIDGETS_MARKER;
 
+    /// Notification Center's preferences, in its app container.
+    const NOTIFICATION_CENTER: &str = "com.apple.notificationcenterui";
+
     /// A desktop item of its own pass, whose process holds Full Disk Access (the arm that
     /// reaches Notification Center's container).
     fn desktop(who: &User, kind: DesktopKind) -> Desktop {
@@ -1515,96 +1499,6 @@ mod tests {
         );
         assert_eq!(rows[0].outcome, crate::model::Outcome::Unknown);
         assert!(sys.calls().iter().all(|call| !call.contains("--set")));
-    }
-
-    #[test]
-    fn widget_clear_removes_instances_and_placement_but_keeps_unknown_widget_fields() {
-        let sys = Fake::root();
-        let who = user("alice", 501);
-        sys.on(
-            &widget_placement_conversion(&who).display(),
-            Ran::exit(1, "invalid plist"),
-        );
-        let read = Read::Value(PValue::Dict(vec![
-            (
-                "instances".into(),
-                PValue::Array(vec![PValue::Data(vec![1, 2])]),
-            ),
-            (
-                "DesktopWidgetPlacementStorage".into(),
-                PValue::Data(vec![3]),
-            ),
-            ("vers".into(), PValue::Int(1)),
-            ("future".into(), PValue::Bool(true)),
-        ]));
-        let want = cleared_widgets(&sys, &who, &read).unwrap().unwrap();
-        assert_eq!(field(&want, "instances"), Some(&PValue::Array(vec![])));
-        assert_eq!(field(&want, "future"), Some(&PValue::Bool(true)));
-        assert_eq!(field(&want, "DesktopWidgetPlacementStorage"), None);
-        assert_eq!(
-            cleared_widgets(&sys, &who, &Read::Value(want)).unwrap(),
-            None
-        );
-        assert!(
-            cleared_widgets(&sys, &who, &Read::Absent)
-                .unwrap()
-                .is_some()
-        );
-        let residual = Read::Value(PValue::Dict(vec![
-            ("instances".into(), PValue::Array(Vec::new())),
-            (
-                "DesktopWidgetPlacementStorage".into(),
-                PValue::Data(vec![3]),
-            ),
-            ("future".into(), PValue::Bool(true)),
-        ]));
-        let cleared = cleared_widgets(&sys, &who, &residual).unwrap().unwrap();
-        assert_eq!(field(&cleared, "DesktopWidgetPlacementStorage"), None);
-        assert_eq!(field(&cleared, "future"), Some(&PValue::Bool(true)));
-        assert_eq!(
-            cleared_widgets(&sys, &who, &Read::Value(cleared)).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn notificationcenters_regenerated_empty_binary_placement_is_already_clear() {
-        let bytes = aterm_codec::base64::decode("YnBsaXN0MDDSAQIDBF8QFENvbXBhdGliaWxpdHlWZXJzaW9uXxAQTnVtYmVyZWREaXNwbGF5cxQAAAAAAAAAAAAAAAAAAAABoAgNJDdIAAAAAAAAAQEAAAAAAAAABQAAAAAAAAAAAAAAAAAAAEk=").unwrap();
-        let sys = Fake::root();
-        let who = user("alice", 501);
-        let cmd = widget_placement_conversion(&who);
-        let empty = PValue::Dict(vec![
-            ("CompatibilityVersion".into(), PValue::Int(1)),
-            ("NumberedDisplays".into(), PValue::Array(Vec::new())),
-        ]);
-        sys.on(&cmd.display(), export(&crate::plist::fragment(&empty)));
-        let read = Read::Value(PValue::Dict(vec![
-            ("vers".into(), PValue::Int(1)),
-            ("instances".into(), PValue::Array(Vec::new())),
-            ("DesktopWidgetPlacementStorage".into(), PValue::Data(bytes)),
-        ]));
-        assert_eq!(cleared_widgets(&sys, &who, &read).unwrap(), None);
-        assert_eq!(sys.calls(), [cmd.display()]);
-        for shape in [
-            PValue::Dict(vec![
-                ("CompatibilityVersion".into(), PValue::Int(1)),
-                (
-                    "NumberedDisplays".into(),
-                    PValue::Array(vec![PValue::Int(1)]),
-                ),
-            ]),
-            PValue::Dict(vec![
-                ("CompatibilityVersion".into(), PValue::Int(1)),
-                ("NumberedDisplays".into(), PValue::Array(Vec::new())),
-                ("future".into(), PValue::Bool(true)),
-            ]),
-        ] {
-            let next = Fake::root();
-            next.on(&cmd.display(), export(&crate::plist::fragment(&shape)));
-            assert!(cleared_widgets(&next, &who, &read).unwrap().is_some());
-        }
-        sys.refuse_complete_stdout(&cmd.display(), "incomplete XML capture");
-        assert!(cleared_widgets(&sys, &who, &read).is_err());
     }
 
     #[test]
@@ -1928,7 +1822,7 @@ mod tests {
     fn a_failed_namespace_flush_allows_no_write_and_a_retry_flushes_the_whole_chain() {
         let who = user("alice", 501);
         let windowmanager = "alice$ /usr/bin/defaults export com.apple.WindowManager -";
-        let notificationcenter = "alice$ /usr/bin/defaults export com.apple.notificationcenterui -";
+        let finder = "alice$ /usr/bin/defaults export com.apple.finder -";
         let c = ctx(std::slice::from_ref(&who));
         let directories = [
             "/Users//alice/Library/Application Support/aterm/init-activation",
@@ -1942,20 +1836,20 @@ mod tests {
         for (failed_at, directory) in directories.iter().enumerate() {
             let mut sys = Fake::root();
             sys.euid = who.uid;
-            sys.on(windowmanager, export("<dict><key>StandardHideWidgets</key><false/><key>StageManagerHideWidgets</key><false/></dict>"));
+            sys.on(windowmanager, export("<dict><key>EnableStandardClickToShowDesktop</key><false/><key>StandardHideDesktopIcons</key><true/><key>StageManagerHideDesktopIcons</key><true/></dict>"));
             sys.on(
-                notificationcenter,
-                export("<dict><key>widgets</key><dict><key>instances</key><array/></dict></dict>"),
+                finder,
+                export("<dict><key>CreateDesktop</key><true/></dict>"),
             );
-            for key in ["StandardHideWidgets", "StageManagerHideWidgets"] {
+            for key in ["StandardHideDesktopIcons", "StageManagerHideDesktopIcons"] {
                 let cmd = Target::user("com.apple.WindowManager", key, &who)
-                    .write_cmd(&PValue::Bool(true));
+                    .write_cmd(&PValue::Bool(false));
                 sys.on(&cmd.display(), Ran::ok(""));
             }
             sys.durable_dir_fails(Path::new(directory), Some(std::io::ErrorKind::Other));
-            let item = desktop(&who, DesktopKind::Widgets);
+            let item = desktop(&who, DesktopKind::Desktop);
             assert!(item.apply(&sys, &c).is_err());
-            assert!(crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
+            assert!(crate::init_activation::pending(&sys, &who, "desktop").unwrap());
             let calls = sys.calls();
             assert!(
                 calls
@@ -1977,7 +1871,7 @@ mod tests {
             sys.durable_dir_fails(Path::new(directory), None);
             let retry = calls.len();
             item.apply(&sys, &c).unwrap();
-            assert!(crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
+            assert!(crate::init_activation::pending(&sys, &who, "desktop").unwrap());
             let calls = sys.calls();
             let retry_calls = &calls[retry..];
             let first_write = retry_calls
@@ -2379,11 +2273,174 @@ mod tests {
             .collect()
     }
 
-    const DESKTOP_IDS: [&str; 3] = [
-        "init.widgets@alice",
+    /// The widgets rows' ids: the `[consumer]` catalog's.
+    const WIDGET_IDS: [&str; 3] = [
+        "consumer.widgets.desktop@alice",
+        "consumer.widgets.stage-manager@alice",
+        NC_ID,
+    ];
+
+    /// The widgets row of Notification Center's list, in its app container.
+    const NC_ID: &str = "consumer.widgets.notification-center@alice";
+
+    const DESKTOP_IDS: [&str; 5] = [
+        WIDGET_IDS[0],
+        WIDGET_IDS[1],
+        WIDGET_IDS[2],
         "init.desktop@alice",
         "init.dock@alice",
     ];
+
+    /// Setup's widgets rows are the `[consumer] widgets` catalog's (design §9 A30): with
+    /// Full Disk Access, init's widget items carry the ids a fleet baseline's
+    /// `widgets = false` expands to for the same account, in the catalog's order, and each
+    /// plans its own row's key, so one key has one owner. A pass from a desktop that shows
+    /// a widget then reads Notification Center's list back cleared, keeping the field it
+    /// does not know. Negative control: init's ids spelled apart from the rows'
+    /// (`init.widgets.<key>@alice`) fail the first assertion.
+    #[test]
+    fn inits_widget_items_are_the_catalogs_rows_and_the_clear_reads_back() {
+        let who = user("alice", 501);
+        let mut context = ctx(std::slice::from_ref(&who));
+        context.facts.full_disk_access = Some(true);
+        let fleet = crate::items::catalog::expand(
+            &crate::items::catalog::Table {
+                widgets: Some(false),
+                ..crate::items::catalog::Table::default()
+            },
+            &context,
+        )
+        .unwrap();
+        let init = selected_desktop_items(&who, &[Setting::Widgets]);
+        let ids = |items: &[Box<dyn Item>]| items.iter().map(|item| item.id()).collect::<Vec<_>>();
+        assert_eq!(ids(&init), ids(&fleet));
+        assert_eq!(ids(&init), WIDGET_IDS);
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        let keys = |item: &dyn Item| -> Vec<(String, String)> {
+            item.preference_changes(&sys, &context)
+                .unwrap()
+                .into_iter()
+                .map(|(target, _)| (target.domain, target.key))
+                .collect()
+        };
+        let rows: Vec<&CatalogRow> = CATALOG
+            .iter()
+            .filter(|row| row.preset == "widgets")
+            .collect();
+        assert_eq!(rows.len(), WIDGET_IDS.len());
+        for ((row, init), fleet) in rows.iter().zip(&init).zip(&fleet) {
+            let own = vec![(row.domain.to_owned(), row.key.to_owned())];
+            assert_eq!(keys(init.as_ref()), own, "{}", init.id());
+            assert_eq!(keys(fleet.as_ref()), own, "{}", fleet.id());
+        }
+        desk.lock().unwrap().write(
+            NOTIFICATION_CENTER,
+            "widgets",
+            PValue::Dict(vec![
+                ("vers".into(), PValue::Int(1)),
+                ("future".into(), PValue::Bool(true)),
+                (
+                    "instances".into(),
+                    PValue::Array(vec![PValue::Data(vec![42])]),
+                ),
+            ]),
+        );
+        let run = pass(&sys, init, Mode::Apply);
+        assert_eq!(
+            outcomes(&run),
+            WIDGET_IDS.map(|id| (id, Outcome::Changed)),
+            "{:?}",
+            run.rows
+        );
+        assert!(run.attempts.iter().all(|attempt| attempt.verified));
+        let desk = desk.lock().unwrap();
+        let Some(PValue::Dict(list)) = desk.read(NOTIFICATION_CENTER, "widgets") else {
+            panic!("{:?}", desk.read(NOTIFICATION_CENTER, "widgets"));
+        };
+        assert!(
+            list.contains(&("instances".into(), PValue::Array(Vec::new())))
+                && list.contains(&("future".into(), PValue::Bool(true))),
+            "{list:?}"
+        );
+        assert_eq!(
+            desk.count("kill NotificationCenter"),
+            1,
+            "{:?}",
+            desk.events
+        );
+    }
+
+    /// The two Window Manager widgets rows share the Dock's marker: one whose key already
+    /// holds what it wants reads Ok beside the other's write, which begins that marker in
+    /// the same pass, so it is neither journaled nor reported as a change aterm made, and
+    /// the Dock relaunches once for both. A marker an earlier pass left still makes each
+    /// row that shares it report the relaunch it awaits. Negative control: a probe that
+    /// counts the pass's own marker as an earlier write reads the stage-manager row Changed
+    /// and journals it.
+    #[test]
+    fn a_widgets_row_already_set_reads_ok_beside_one_that_begins_the_shared_marker() {
+        let who = user("alice", 501);
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        desk.lock().unwrap().write(
+            WINDOW_MANAGER,
+            "StageManagerHideWidgets",
+            PValue::Bool(true),
+        );
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Widgets]),
+            Mode::Apply,
+        );
+        assert_eq!(
+            outcomes(&run),
+            [
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Ok),
+                (WIDGET_IDS[2], Outcome::Changed),
+            ],
+            "{:?}",
+            run.rows
+        );
+        assert!(
+            journaled(&sys).iter().all(|(id, _)| id != WIDGET_IDS[1]),
+            "{:?}",
+            journaled(&sys)
+        );
+        assert_eq!(desk.lock().unwrap().count("kill Dock"), 1);
+        assert!(!crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
+
+        let (sys, desk) = desktop_of(&who, Desk::before());
+        for key in ["StandardHideWidgets", "StageManagerHideWidgets"] {
+            desk.lock()
+                .unwrap()
+                .write(WINDOW_MANAGER, key, PValue::Bool(true));
+        }
+        crate::init_activation::begin(&sys, &who, WIDGETS).unwrap();
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Widgets]),
+            Mode::Apply,
+        );
+        assert_eq!(
+            outcomes(&run)[..2],
+            [
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+            ],
+            "{:?}",
+            run.rows
+        );
+        for row in &run.rows[..2] {
+            assert!(
+                row.from
+                    .as_deref()
+                    .is_some_and(|from| from.contains("after an earlier write")),
+                "{row:?}"
+            );
+        }
+        assert_eq!(desk.lock().unwrap().count("kill Dock"), 1);
+        assert!(!crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
+    }
 
     /// The owner's Mac, 2026-10-21 23:01 to 02:24: each unattended pass wrote the desktop
     /// with no aterm the Dock could pin (then any not at `/Applications/aterm.app`; now none
@@ -2407,7 +2464,9 @@ mod tests {
         assert_eq!(
             outcomes(&run),
             [
-                ("init.widgets@alice", Outcome::Changed),
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (WIDGET_IDS[2], Outcome::Changed),
                 ("init.desktop@alice", Outcome::Changed),
                 ("init.dock@alice", Outcome::Unknown),
             ],
@@ -2415,17 +2474,22 @@ mod tests {
             run.rows
         );
         assert_eq!(
-            run.rows[2].why.as_deref(),
+            run.rows[4].why.as_deref(),
             Some(
                 "aterm is not installed at /Applications/aterm.app or \
                  /Users//alice/Applications/aterm.app; Dock left untouched"
             ),
             "{:?}",
-            run.rows[2]
+            run.rows[4]
         );
         assert_eq!(
             verified(&run),
-            [("init.widgets@alice", true), ("init.desktop@alice", true)]
+            [
+                (WIDGET_IDS[0], true),
+                (WIDGET_IDS[1], true),
+                (WIDGET_IDS[2], true),
+                ("init.desktop@alice", true)
+            ]
         );
         assert!(!crate::init_activation::pending(&sys, &who, "dock").unwrap());
         let desk = desk.lock().unwrap();
@@ -2519,7 +2583,9 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "init.widgets@alice",
+                WIDGET_IDS[0],
+                WIDGET_IDS[1],
+                WIDGET_IDS[2],
                 "init.desktop@alice",
                 "init.dock@alice",
                 "init.relaunch@alice"
@@ -2559,19 +2625,23 @@ mod tests {
         assert_eq!(
             outcomes(&run),
             [
-                ("init.widgets@alice", Outcome::Changed),
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (WIDGET_IDS[2], Outcome::Changed),
                 ("init.desktop@alice", Outcome::Changed),
                 ("init.dock@alice", Outcome::Failed),
             ]
         );
         assert_eq!(
-            run.rows[2].why.as_deref(),
+            run.rows[4].why.as_deref(),
             Some("applied, but it still reads com.apple.dock persistent-apps")
         );
         assert_eq!(
             verified(&run),
             [
-                ("init.widgets@alice", true),
+                (WIDGET_IDS[0], true),
+                (WIDGET_IDS[1], true),
+                (WIDGET_IDS[2], true),
                 ("init.desktop@alice", true),
                 ("init.dock@alice", false)
             ]
@@ -2584,7 +2654,9 @@ mod tests {
         assert_eq!(
             outcomes(&run),
             [
-                ("init.widgets@alice", Outcome::Changed),
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (WIDGET_IDS[2], Outcome::Changed),
                 ("init.desktop@alice", Outcome::Changed),
                 ("init.dock@alice", Outcome::Failed),
             ],
@@ -2647,12 +2719,12 @@ mod tests {
     }
 
     /// A relaunch that cannot be made (the GUI session lookup for the Dock failed) fails
-    /// every family the Dock reads, here all three, and keeps the written preferences and
-    /// their markers, while the readers that could relaunch were (each once) and were
-    /// waited on, and the marker those alone discharge (Notification Center's) is cleared:
-    /// a plan still plans the three, and the next pass relaunches the Dock and the Finder
-    /// once each, without writing again, and not Notification Center, which already read
-    /// its write.
+    /// every row the Dock reads, here all but Notification Center's widgets, and keeps the
+    /// written preferences and their markers, while the readers that could relaunch were
+    /// (each once) and were waited on, and the marker those alone discharge (Notification
+    /// Center's) is cleared, its row changed: a plan still plans the others, and the next
+    /// pass relaunches the Dock and the Finder once each, without writing again, and not
+    /// Notification Center, which already read its write.
     #[test]
     fn a_relaunch_that_fails_keeps_the_writes_pending_for_the_next_pass() {
         let who = user("alice", 501);
@@ -2660,16 +2732,17 @@ mod tests {
         failing.session_failures = 1;
         let (sys, desk) = desktop_of(&who, failing);
         let first = pass(&sys, desktop_items(&who), Mode::Apply);
+        let but_center = |center: Outcome, rest: Outcome| {
+            DESKTOP_IDS.map(|id| (id, if id == NC_ID { center } else { rest }))
+        };
         assert_eq!(
             outcomes(&first),
-            DESKTOP_IDS.map(|id| (id, Outcome::Failed))
+            but_center(Outcome::Changed, Outcome::Failed)
         );
-        for row in &first.rows {
+        for row in first.rows.iter().filter(|row| row.id != NC_ID) {
             let why = row.why.as_deref().unwrap();
             assert!(
-                why.starts_with(
-                    "applied, but not activated: written, but /bin/launchctl print gui/501"
-                ),
+                why.starts_with("applied, but not activated: /bin/launchctl print gui/501"),
                 "{why}"
             );
         }
@@ -2700,12 +2773,12 @@ mod tests {
         let checked = pass(&sys, desktop_items(&who), Mode::Plan);
         assert_eq!(
             outcomes(&checked),
-            DESKTOP_IDS.map(|id| (id, Outcome::Planned))
+            but_center(Outcome::Ok, Outcome::Planned)
         );
         let recovered = pass(&sys, desktop_items(&who), Mode::Apply);
         assert_eq!(
             outcomes(&recovered),
-            DESKTOP_IDS.map(|id| (id, Outcome::Changed))
+            but_center(Outcome::Ok, Outcome::Changed)
         );
         let desk = desk.lock().unwrap();
         assert_eq!(
@@ -2725,12 +2798,12 @@ mod tests {
         );
     }
 
-    /// Each family settles alone: a reader that does not start again (Notification Center,
-    /// here never started again by launchd) fails the families whose keys it reads and
-    /// keeps the marker of those keys (Notification Center's own), while the families all
-    /// of whose readers are up are read back, verified, and cleared, as is the widgets'
-    /// marker of the Window Manager's keys, whose Dock is up; the doctor then rolls back
-    /// only the widgets, and leaves the Dock's change that took.
+    /// Each row settles alone: a reader that does not start again (Notification Center,
+    /// here never started again by launchd) fails the rows whose keys it reads and keeps
+    /// the marker of those keys (Notification Center's own), while the rows all of whose
+    /// readers are up are read back, verified, and cleared, as is the widgets' marker of the
+    /// Window Manager's keys, whose Dock is up; the doctor then rolls back only Notification
+    /// Center's widgets, and leaves the changes that took.
     #[test]
     fn a_reader_that_does_not_start_again_fails_only_the_families_whose_keys_it_reads() {
         let who = user("alice", 501);
@@ -2741,7 +2814,9 @@ mod tests {
         assert_eq!(
             outcomes(&run),
             [
-                ("init.widgets@alice", Outcome::Failed),
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (WIDGET_IDS[2], Outcome::Failed),
                 ("init.desktop@alice", Outcome::Changed),
                 ("init.dock@alice", Outcome::Changed),
             ],
@@ -2749,7 +2824,7 @@ mod tests {
             run.rows
         );
         assert_eq!(
-            run.rows[0].why.as_deref(),
+            run.rows[2].why.as_deref(),
             Some(
                 "applied, but not activated: NotificationCenter has not started again a \
                  minute after its relaunch; activation remains pending"
@@ -2758,7 +2833,9 @@ mod tests {
         assert_eq!(
             verified(&run),
             [
-                ("init.widgets@alice", false),
+                (WIDGET_IDS[0], true),
+                (WIDGET_IDS[1], true),
+                (WIDGET_IDS[2], false),
                 ("init.desktop@alice", true),
                 ("init.dock@alice", true)
             ]
@@ -2800,16 +2877,18 @@ mod tests {
         assert_eq!(
             outcomes(&run),
             [
-                ("init.widgets@alice", Outcome::Changed),
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (WIDGET_IDS[2], Outcome::Changed),
                 ("init.desktop@alice", Outcome::Failed),
                 ("init.dock@alice", Outcome::Changed),
             ],
             "{:?}",
             run.rows
         );
-        let why = run.rows[1].why.as_deref().unwrap();
+        let why = run.rows[3].why.as_deref().unwrap();
         assert!(
-            why.starts_with("applied, but not activated: written, but ")
+            why.starts_with("applied, but not activated: ")
                 && why.contains("killall -u alice Finder"),
             "{why}"
         );
@@ -2855,19 +2934,21 @@ mod tests {
         assert_eq!(
             outcomes(&run),
             [
-                ("init.widgets@alice", Outcome::Changed),
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (WIDGET_IDS[2], Outcome::Changed),
                 ("init.dock@alice", Outcome::Failed),
             ],
             "{:?}",
             run.rows
         );
         assert!(
-            run.rows[1]
+            run.rows[3]
                 .why
                 .as_deref()
                 .is_some_and(|why| why.contains("static-apps")),
             "{:?}",
-            run.rows[1]
+            run.rows[3]
         );
         {
             let desk = desk.lock().unwrap();
@@ -2911,20 +2992,26 @@ mod tests {
                 "{snapshot:?}"
             );
             let run = first.run_recording(&sys, Mode::Apply).unwrap();
+            // Notification Center's row reaches no key of its own, so it reads as wanted
+            // and is withheld; the Window Manager's widget rows change.
             assert_eq!(
                 outcomes(&run),
-                DESKTOP_IDS.map(|id| (id, Outcome::Changed)),
+                DESKTOP_IDS.map(|id| (
+                    id,
+                    if id == NC_ID {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Changed
+                    }
+                )),
                 "{:?}",
                 run.rows
             );
-            let widgets = &run.rows[0];
-            assert!(
-                widgets.title.contains("Full Disk Access")
-                    && !widgets
-                        .title
-                        .contains("in Stage Manager or Notification Center"),
-                "{}",
-                widgets.title
+            assert_eq!(run.withheld, [NC_ID]);
+            let widgets = &run.rows[2];
+            assert_eq!(
+                widgets.title,
+                "No Notification Center widgets; they wait for Full Disk Access"
             );
             assert!(
                 widgets
@@ -2997,9 +3084,17 @@ mod tests {
         let (sys, desk) = desktop_of(&who, Desk::before());
         let run = pass(&sys, desktop_items_at(&who, Some(true)), Mode::Apply);
         assert_eq!(
-            run.rows[0].title,
-            "No widgets on the desktop, in Stage Manager or Notification Center"
+            run.rows
+                .iter()
+                .map(|row| row.title.as_str())
+                .collect::<Vec<_>>()[..3],
+            [
+                "No desktop widgets",
+                "No Stage Manager widgets",
+                "No Notification Center widgets"
+            ]
         );
+        assert!(run.withheld.is_empty());
         assert!(
             sys.calls()
                 .iter()
@@ -3019,15 +3114,23 @@ mod tests {
         let mut hidden = Desk::before();
         hidden.denied = Some(NOTIFICATION_CENTER);
         let (sys, desk) = desktop_of(&who, hidden);
-        for _ in 0..2 {
+        for first in [true, false] {
             let run = pass(
                 &sys,
                 selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]),
                 Mode::Apply,
             );
-            assert_eq!(outcomes(&run), [("init.widgets@alice", Outcome::Failed)]);
+            let window_manager = if first { Outcome::Changed } else { Outcome::Ok };
             assert_eq!(
-                run.rows[0].why.as_deref(),
+                outcomes(&run),
+                [
+                    (WIDGET_IDS[0], window_manager),
+                    (WIDGET_IDS[1], window_manager),
+                    (NC_ID, Outcome::Failed)
+                ]
+            );
+            assert_eq!(
+                run.rows[2].why.as_deref(),
                 Some("applied, but it still reads com.apple.notificationcenterui widgets")
             );
         }
@@ -3044,9 +3147,16 @@ mod tests {
         let (sys, desk) = desktop_of(&who, hidden);
         let widgets = || selected_desktop_items_at(&who, None, &[Setting::Widgets]);
         let first = pass(&sys, widgets(), Mode::Apply);
-        assert_eq!(outcomes(&first), [("init.widgets@alice", Outcome::Changed)]);
+        assert_eq!(
+            outcomes(&first),
+            [
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (NC_ID, Outcome::Ok)
+            ]
+        );
         let second = pass(&sys, widgets(), Mode::Apply);
-        assert_eq!(outcomes(&second), [("init.widgets@alice", Outcome::Ok)]);
+        assert_eq!(outcomes(&second), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
         let desk = desk.lock().unwrap();
         assert_eq!(
             (
@@ -3092,8 +3202,15 @@ mod tests {
             selected_desktop_items_at(&who, None, &[Setting::Widgets]),
             Mode::Apply,
         );
-        assert_eq!(outcomes(&first), [("init.widgets@alice", Outcome::Changed)]);
-        assert_eq!(first.withheld, ["init.widgets@alice"]);
+        assert_eq!(
+            outcomes(&first),
+            [
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (NC_ID, Outcome::Ok)
+            ]
+        );
+        assert_eq!(first.withheld, [NC_ID]);
         desk.lock()
             .unwrap()
             .write(WINDOW_MANAGER, "StandardHideWidgets", PValue::Bool(false));
@@ -3104,8 +3221,8 @@ mod tests {
             follow_up_items(&who, None, &[Setting::Widgets, Setting::Dock]),
             Mode::Apply,
         );
-        assert_eq!(outcomes(&waiting), [("init.widgets@alice", Outcome::Ok)]);
-        assert_eq!(waiting.withheld, ["init.widgets@alice"]);
+        assert_eq!(outcomes(&waiting), [(NC_ID, Outcome::Ok)]);
+        assert_eq!(waiting.withheld, [NC_ID]);
         assert!(
             !sys.calls()[calls..]
                 .iter()
@@ -3123,11 +3240,11 @@ mod tests {
         );
         assert_eq!(
             outcomes(&follow_up),
-            [("init.widgets@alice", Outcome::Changed)],
+            [(NC_ID, Outcome::Changed)],
             "{:?}",
             follow_up.rows
         );
-        assert_eq!(follow_up.rows[0].title, "No widgets in Notification Center");
+        assert_eq!(follow_up.rows[0].title, "No Notification Center widgets");
         assert!(follow_up.withheld.is_empty());
         {
             let desk = desk.lock().unwrap();
@@ -3170,7 +3287,7 @@ mod tests {
             follow_up_items(&who, Some(true), &[Setting::Widgets]),
             Mode::Apply,
         );
-        assert_eq!(outcomes(&again), [("init.widgets@alice", Outcome::Ok)]);
+        assert_eq!(outcomes(&again), [(NC_ID, Outcome::Ok)]);
         assert_eq!(desk.lock().unwrap().events.len(), events);
 
         let granted = pass(
@@ -3209,14 +3326,18 @@ mod tests {
         );
         assert_eq!(
             outcomes(&waiting),
-            [("init.widgets@alice", Outcome::Changed)]
+            [
+                (WIDGET_IDS[0], Outcome::Changed),
+                (WIDGET_IDS[1], Outcome::Changed),
+                (NC_ID, Outcome::Ok)
+            ]
         );
         let quiet = pass(
             &sys,
             selected_desktop_items_at(&who, None, &[Setting::Widgets]),
             Mode::Apply,
         );
-        assert_eq!(outcomes(&quiet), [("init.widgets@alice", Outcome::Ok)]);
+        assert_eq!(outcomes(&quiet), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
         assert!(!owed(WIDGETS));
         assert!(owed(crate::init_activation::CONTAINED_MARKER));
         assert!(
@@ -3247,7 +3368,11 @@ mod tests {
         );
         assert_eq!(
             outcomes(&granted),
-            [("init.widgets@alice", Outcome::Changed)]
+            [
+                (WIDGET_IDS[0], Outcome::Ok),
+                (WIDGET_IDS[1], Outcome::Ok),
+                (NC_ID, Outcome::Changed)
+            ]
         );
         assert!(!owed(crate::init_activation::CONTAINED_MARKER));
         {
@@ -3291,7 +3416,7 @@ mod tests {
             selected_desktop_items_at(&who, Some(true), &[Setting::Widgets]),
             Mode::Apply,
         );
-        assert_eq!(outcomes(&granted), [("init.widgets@alice", Outcome::Ok)]);
+        assert_eq!(outcomes(&granted), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
         assert_eq!(desk.lock().unwrap().count("kill NotificationCenter"), 0);
     }
 
@@ -3345,9 +3470,20 @@ mod tests {
                     "{:#?}",
                     &sys.calls()[calls..]
                 );
+                // The Window Manager's rows carry the marker; Notification Center's row
+                // relaunches its reader only for an older aterm's marker, with the grant.
+                let center = if legacy && granted.is_some() {
+                    Outcome::Changed
+                } else {
+                    Outcome::Ok
+                };
                 assert_eq!(
                     outcomes(&first),
-                    [("init.widgets@alice", Outcome::Changed)],
+                    [
+                        (WIDGET_IDS[0], Outcome::Changed),
+                        (WIDGET_IDS[1], Outcome::Changed),
+                        (NC_ID, center)
+                    ],
                     "{marker} {granted:?}: {:?}",
                     first.rows
                 );
@@ -3369,18 +3505,22 @@ mod tests {
                 let again = pass(&sys, widgets(Some(true)), Mode::Apply);
                 assert_eq!(
                     outcomes(&again),
-                    [(
-                        "init.widgets@alice",
-                        if nc_owed {
-                            Outcome::Changed
-                        } else {
-                            Outcome::Ok
-                        }
-                    )],
+                    [
+                        (WIDGET_IDS[0], Outcome::Ok),
+                        (WIDGET_IDS[1], Outcome::Ok),
+                        (
+                            NC_ID,
+                            if nc_owed {
+                                Outcome::Changed
+                            } else {
+                                Outcome::Ok
+                            }
+                        )
+                    ],
                     "{marker} {granted:?}"
                 );
                 let quiet = pass(&sys, widgets(Some(true)), Mode::Apply);
-                assert_eq!(outcomes(&quiet), [("init.widgets@alice", Outcome::Ok)]);
+                assert_eq!(outcomes(&quiet), WIDGET_IDS.map(|id| (id, Outcome::Ok)));
                 assert!(!owed(crate::init_activation::CONTAINED_MARKER));
                 assert_eq!(
                     kills(&desk),

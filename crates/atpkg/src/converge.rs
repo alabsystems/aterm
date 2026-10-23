@@ -7,117 +7,117 @@ use aterm_converge::{Class, Explain, Item, ItemReport, Layer, Mode, Outcome, Pro
 
 pub mod repair;
 
-/// (0) Which atpkg is speaking.
+/// Which atpkg is speaking.
 pub const ATPKG: &str = "base.pkg.atpkg";
-/// (0) The aterm app's own update posture.
+/// The aterm app's own update posture.
 pub const APP: &str = "base.pkg.aterm-app";
-/// (1) The index source.
+/// The index source.
 pub const INDEX_SOURCE: &str = "base.pkg.index-source";
-/// (1) The trust root compiled in.
+/// The trust root compiled in.
 pub const TRUST_ROOT: &str = "base.pkg.trust-root";
-/// (1) The `[packages]` table's own spelling.
+/// The `[packages]` table's own spelling.
 pub const CONFIG: &str = "base.pkg.config";
-/// (1) A retired opt-out still exported, `@<variable>`.
+/// A retired opt-out still exported, `@<variable>`.
 pub const RETIRED_ENV: &str = "base.pkg.env";
-/// (2) The prefix.
+/// The prefix.
 pub const PREFIX: &str = "base.pkg.prefix";
-/// (3) The managed `bin/` on PATH.
+/// The managed `bin/` on PATH.
 pub const PATH: &str = "base.pkg.path";
-/// (3b) The reroute stubs, abrew's `brew` included, `@<name>`.
+/// The reroute stubs, abrew's `brew` included, `@<name>`.
 pub const STUBS: &str = "base.pkg.stubs";
-/// (3b) The reroute directory's place on PATH.
+/// The reroute directory's place on PATH.
 pub const REROUTE: &str = "base.pkg.reroute";
-/// (4) A bin/ shim, `@<name>`.
+/// A bin/ shim, `@<name>`.
 pub const SHIMS: &str = "base.pkg.shims";
-/// (4b) The exposed names an active build was refused a shim (design S13).
+/// The exposed names an active build was refused a shim.
 pub const REFUSED: &str = "base.pkg.refused";
-/// (4) A shim an older atpkg laid under a name no shim may carry now, `@<name>`.
+/// A shim an older atpkg laid under a name no shim may carry now, `@<name>`.
 pub const REFUSED_SHIM: &str = "base.pkg.refused.shim";
-/// (5) The active builds' store trees.
+/// The active builds' store trees.
 pub const STORE: &str = "base.pkg.store";
-/// (5c) A solver the trust bundle pins privately, `@<program>`.
+/// A solver the trust bundle pins privately, `@<program>`.
 pub const SOLVER: &str = "base.pkg.solver";
-/// (5f)(a) The trust bundle's compiler as tippy needs it.
+/// The trust bundle's compiler as tippy needs it.
 pub const TRUST_COMPILER: &str = "base.pkg.trust.compiler";
-/// (5f)(b) A stock name in the rustup view, `@<seam>.<name>`.
+/// A stock name in the rustup view, `@<seam>.<name>`.
 pub const RUSTUP_VIEW: &str = "base.pkg.rustup.view";
-/// (5f)(g) A directory on the trust build's chain `targo trust` refuses, `@<dir>`.
+/// A directory on the trust build's chain `targo trust` refuses, `@<dir>`.
 pub const TRUST_CHAIN: &str = "base.pkg.trust.chain";
-/// (5f)(c)(f) The trust build's exec root.
+/// The trust build's exec root.
 pub const EXEC_ROOTS: &str = "base.pkg.exec-roots";
-/// (5f)(d) An exec root no build needs, `@<path>`.
+/// An exec root no build needs, `@<path>`.
 pub const EXEC_ROOT_STRAY: &str = "base.pkg.exec-roots.stray";
-/// (5d) The workspace's `[trust]` policy against the installed targo.
+/// The workspace's `[trust]` policy against the installed targo.
 pub const WORKSPACE: &str = "base.pkg.workspace";
-/// (5e) A local toolchain behind rustup's `trust` channel.
+/// A local toolchain behind rustup's `trust` channel.
 pub const RUSTUP_LOCAL: &str = "base.pkg.rustup.local";
 /// The held toolchain update.
 pub const HELD_UPDATE: &str = "base.pkg.held-update";
 /// The build leases.
 pub const LEASES: &str = "base.pkg.leases";
-/// (5b) The live builds.
+/// The live builds.
 pub const LIVE: &str = "base.pkg.live";
-/// (6) The shell.d hooks.
+/// The shell.d hooks.
 pub const HOOKS: &str = "base.shell.hooks";
-/// (6) A POSIX `.sh` in shell.d, which breaks fish, `@<file>`.
+/// A POSIX `.sh` in shell.d, which breaks fish, `@<file>`.
 pub const FISH_SAFE: &str = "base.shell.fish-safe";
-/// (6b) The rc files' wiring.
+/// The rc files' wiring.
 pub const RC: &str = "base.shell.rc";
-/// (6c) A copied command at a command path, `@<path>`.
+/// A copied command at a command path, `@<path>`.
 pub const COPIED_COMMANDS: &str = "base.shell.copied-commands";
-/// (6) A login-sourced directory others can write, `@<dir>`.
+/// A login-sourced directory others can write, `@<dir>`.
 pub const PRIVATE: &str = "base.shell.private";
-/// (7) Disk headroom.
+/// Disk headroom.
 pub const DISK: &str = "base.pkg.disk";
-/// (7b) The Developer Tools list.
+/// The Developer Tools list.
 pub const DEVTOOLS: &str = "base.privacy.devtools";
-/// (7c) Universal Control.
+/// Universal Control.
 pub const UNIVERSAL_CONTROL: &str = "base.machine.universal-control";
-/// (7d) Rosetta 2, on Apple silicon.
+/// Rosetta 2, on Apple silicon.
 pub const ROSETTA: &str = "base.machine.rosetta";
-/// (8) The last completed update pass.
+/// The last completed update pass.
 pub const INDEX_AGE: &str = "base.pkg.index-age";
-/// (8) Whether the signed index has been reached lately.
+/// Whether the signed index has been reached lately.
 pub const INDEX_REACHED: &str = "base.pkg.index-reached";
-/// (8) Whether publishing looks frozen upstream.
+/// Whether publishing looks frozen upstream.
 pub const INDEX_FROZEN: &str = "base.pkg.index-frozen";
-/// (8) The accepted index build and roster generation.
+/// The accepted index build and roster generation.
 pub const INDEX_FLOOR: &str = "base.pkg.index-floor";
-/// (8) The roster generation, when the floor row does not name it.
+/// The roster generation, when the floor row does not name it.
 pub const ROSTER_FLOOR: &str = "base.pkg.roster-floor";
-/// (8) Whether the accepted index is the newest.
+/// Whether the accepted index is the newest.
 pub const INDEX_HEAD: &str = "base.pkg.index-head";
-/// (8c) Who watches the vendor heads.
+/// Who watches the vendor heads.
 pub const VENDOR_WATCH: &str = "base.pkg.vendor-watch";
-/// (9) rustup.
+/// rustup.
 pub const RUSTUP: &str = "base.pkg.rustup";
-/// (9) rustup's `trust` entry against the managed seam.
+/// rustup's `trust` entry against the managed seam.
 pub const RUSTUP_SEAM: &str = "base.pkg.rustup.seam";
-/// (9) A stale `trust` link the machine replaced.
+/// A stale `trust` link the machine replaced.
 pub const RUSTUP_REPLACED: &str = "base.pkg.rustup.replaced";
-/// (10) A record row that cannot be a program, `@<key>`.
+/// A record row that cannot be a program, `@<key>`.
 pub const RECORD_STRAY: &str = "base.pkg.record.stray";
-/// (10a) A member satisfied by the system, `@<program>`.
+/// A member satisfied by the system, `@<program>`.
 pub const SYSTEM: &str = "base.pkg.system";
-/// (10g) A member held on its current build, `@<program>`.
+/// A member held on its current build, `@<program>`.
 pub const HELD: &str = "base.pkg.held";
-/// (10d) A managed member and what PATH runs for it, `@<program>`.
+/// A managed member and what PATH runs for it, `@<program>`.
 pub const SHADOW: &str = "base.pkg.shadow";
-/// (10f) A managed member's shim environment, `@<program>`.
+/// A managed member's shim environment, `@<program>`.
 pub const SHIM_ENV: &str = "base.pkg.shim-env";
-/// (10h) Claude Code's defaults.
+/// Claude Code's defaults.
 pub const CLAUDE_DEFAULTS: &str = "base.agents.claude-defaults";
-/// (11) A dev link.
+/// A dev link.
 pub const DEV_LINK: &str = "base.pkg.dev-link";
-/// (11) The toolset against the signed index.
+/// The toolset against the signed index.
 pub const TOOLSET: &str = "base.pkg.toolset";
-/// (11a) The toolset on a platform no build is published for.
+/// The toolset on a platform no build is published for.
 pub const TOOLSET_PLATFORM: &str = "base.pkg.toolset.platform";
-/// (11) A recorded problem the toolset row lists, `@<program>`.
+/// A recorded problem the toolset row lists, `@<program>`.
 pub const TOOLSET_MEMBER: &str = "base.pkg.toolset.member";
-/// (11) A member removed on purpose, `@<program>`.
+/// A member removed on purpose, `@<program>`.
 pub const REMOVED: &str = "base.pkg.removed";
-/// (11) The C toolchain.
+/// The C toolchain.
 pub const CLT: &str = "base.clt";
 
 /// The `detail` of a row whose warn says a managed tool cannot run.
@@ -154,7 +154,8 @@ pub struct Finding {
     pub probe: Probe,
     /// The row's sentence and its one remedy.
     pub explain: Explain,
-    /// What a caller acts on: the active count on the toolset row ([`CANNOT_RUN`], [`UNPROVEN`]).
+    /// What a caller acts on: the active count on the toolset row, or a tool claim
+    /// ([`CANNOT_RUN`], [`UNPROVEN`]) on a warn about a managed tool.
     pub detail: Option<String>,
 }
 
@@ -329,7 +330,6 @@ pub fn first_clause_end(text: &str) -> usize {
     text.len()
 }
 
-/// The family a doctor id belongs to: its second segment.
 fn family_of(id: &str) -> &'static str {
     match id
         .split('.')

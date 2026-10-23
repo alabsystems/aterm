@@ -29,8 +29,6 @@ fn press(app: &mut App, action: &str, value: Option<SemanticInput>) {
     .unwrap();
 }
 
-/// The control `key` as the page draws it now: its value, and whether it
-/// takes a press.
 fn control(app: &App, key: &str) -> (SemanticValue, bool) {
     let compiled = app.compiled_native_ui(WindowId(0)).unwrap();
     let node = compiled
@@ -49,7 +47,6 @@ fn status(app: &App) -> Option<String> {
     state.feedback.clone()
 }
 
-/// The writes queued from the view, in order: what each follows.
 fn queued_follows(app: &App) -> Vec<Vec<crate::native_app::OperationId>> {
     app.native_config_pending
         .iter()
@@ -60,9 +57,6 @@ fn queued_follows(app: &App) -> Vec<Vec<crate::native_app::OperationId>> {
         .collect()
 }
 
-/// The lane head lands as the worker would land it: reduced at the lane
-/// head (its following base included), then published with the snapshot it
-/// produced. `refuse` stands in for a write the worker could not make.
 fn land_next(app: &mut App, refuse: Option<&str>) -> ConfigPatchOutcome {
     let request = app
         .native_config_pending
@@ -117,14 +111,6 @@ fn applied(outcome: &ConfigPatchOutcome) -> bool {
     matches!(outcome, ConfigPatchOutcome::Applied { .. })
 }
 
-/// TWO CLICKS ON A SWITCH WITHIN ONE SAVE ARE TWO TOGGLES. The first click
-/// shows Off at once and the switch takes the second, which shows On and
-/// follows the first; the lane lands both, each its own step, and the file
-/// ends as it began. Negative control: the same second write checked at the
-/// revision the page last read (what it carried before it followed the
-/// first) conflicts with the page's own first write, so the follow is what
-/// lands it; the guard this replaced drew the switch disabled after the
-/// first click, so the second never reached the page at all.
 #[test]
 fn a_second_click_on_a_saving_switch_is_a_second_toggle() {
     let switch = "settings/control/cursor_blink";
@@ -184,10 +170,6 @@ fn a_second_click_on_a_saving_switch_is_a_second_toggle() {
     }
 }
 
-/// A WRITE THAT FAILS SAYS SO AND THE CONTROL GOES BACK to what the file
-/// holds, with the press composed over it: the second click, made on the
-/// first's value, fails with it, and the status keeps the first one's
-/// reason.
 #[test]
 fn a_failed_save_goes_back_and_says_so() {
     let switch = "settings/control/cursor_blink";
@@ -225,10 +207,6 @@ fn a_failed_save_goes_back_and_says_so() {
     assert_eq!(file(&app), "");
 }
 
-/// EVERY CONTROL KIND TAKES A PRESS WHILE ITS LAST ONE SAVES: a segment, a
-/// slider's arrow key (a step), a slider's release (a value), a picker's
-/// choice and a Reset. Each pair of presses lands as two writes in order,
-/// the second following the first, and the file holds the second's value.
 #[test]
 fn every_control_kind_takes_a_press_while_it_saves() {
     type Step = (&'static str, Option<SemanticInput>);
@@ -337,7 +315,6 @@ fn every_control_kind_takes_a_press_while_it_saves() {
     assert_eq!(file(&app), "theme = \"Dracula\"\n");
 }
 
-/// The label of the status bar's Undo button as the page draws it now.
 fn undo_button(app: &App) -> Option<String> {
     let compiled = app.compiled_native_ui(WindowId(0)).unwrap();
     compiled
@@ -345,14 +322,6 @@ fn undo_button(app: &App) -> Option<String> {
         .map(|node| node.label.clone())
 }
 
-/// UNDO IS TAKEN WHILE THE CHANGE IT NAMES SAVES. A click on a switch, then
-/// Undo before the click's write lands: the Undo follows the write in the
-/// lane and takes back what it landed with, so the file ends as it began,
-/// and the switch shows its old value from the press on. The Redo it then
-/// offers and the Undo after it, pressed at once, the second while the
-/// first saves, land as two steps.
-/// Negative control: the same Undo queued without following the write
-/// never learns what it landed with, and takes nothing back.
 #[test]
 fn an_undo_pressed_while_its_change_saves_takes_it_back() {
     let switch = "settings/control/cursor_blink";
@@ -430,9 +399,6 @@ fn an_undo_pressed_while_its_change_saves_takes_it_back() {
     }
 }
 
-/// AN UNDO OF A WRITE THAT FAILED TAKES NOTHING BACK AND SAYS NOTHING NEW:
-/// the write's keys went back to what the file holds, and the status keeps
-/// the write's own reason.
 #[test]
 fn an_undo_of_a_refused_write_keeps_its_reason() {
     let switch = "settings/control/cursor_blink";
@@ -452,13 +418,6 @@ fn an_undo_of_a_refused_write_keeps_its_reason() {
     assert_eq!(undo_button(&app), None, "nothing to undo");
 }
 
-/// THEMES' KEEP AND ITS REVERT WITHIN ONE SAVE ARE TWO WRITES IN ORDER,
-/// through the real reducer, the host's enqueue and the lane: the theme is
-/// tried, Keep is pressed while the worker still owns a write, and Revert,
-/// drawn enabled meanwhile, is taken and follows the Keep; the lane lands
-/// both and aterm.toml ends as it began, the trial over and Dracula in use.
-/// Before, Revert was drawn disabled while the Keep saved, so the press was
-/// dropped and the kept theme stayed.
 #[test]
 fn a_keep_and_its_revert_within_one_save_land_in_order() {
     let source = "theme = \"Dracula\"\n";

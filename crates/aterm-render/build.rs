@@ -1,54 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! COMPILE-TIME licence gate for the bundled DISPLAY FACES (`assets/game/`),
-//! the non-macOS terminal font STACK (`assets/bundled/`) and the faces only the
-//! tests embed (`assets/test/`).
-//!
-//! Every file there is a candidate for `include_bytes!`, and embedding is redistribution.
-//! So each asset needs an exact sibling `<stem>.LICENSE.txt` (`Cinzel-var.ttf` ->
-//! `Cinzel-var.LICENSE.txt`, never a prefix match, so no asset inherits a neighbour's
-//! notice) that names an OFL, Apache-2.0 or MIT grant; anything else fails the build, not
-//! merely the tests.
-//!
-//! It exists because the alternative failed in practice: four faces with no
-//! redistribution grant (Gill Sans UltraBold, FinkHeavy, Hylia Serif Beta,
-//! Mario Kart F2) reached a release branch, and catching them depended on a
-//! human opening four `LICENSE.txt` files and reading to the end. This encodes
-//! that reading where a violation cannot ship — the same shape as the census
-//! gates.
-//!
-//! The sibling match is EXACT (`Cinzel-var.ttf` -> `Cinzel-var.LICENSE.txt`),
-//! not a prefix or a fuzzy stem, so a new asset can never inherit cover from a
-//! neighbour's notice by being named near it.
-//!
-//! It also asks the compiler for `cfg(clean_islands)`, and Cargo's cfg query for
-//! `cfg(anchor_rules)` (crates/aterm-spec-anchor/anchor_rules.rs).
+
+//! Compile-time licence gate for bundled display, terminal, and test font assets.
 
 use std::path::{Path, PathBuf};
 
 #[path = "../aterm-log/clean_islands.rs"]
 mod clean_islands;
 
-// `cfg(anchor_rules)`: which anchor attributes this crate writes.
+// `cfg(anchor_rules)`
 #[path = "../aterm-spec-anchor/anchor_rules.rs"]
 mod anchor_rules;
 
-/// The directories holding gated bundled faces, relative to the manifest: the
-/// display faces (`assets/game/`), the terminal font STACK (`assets/bundled/` —
-/// JetBrains Mono, Cascadia Mono PL, both Iosevka Term sets and the Noto
-/// symbol/math faces) and the faces only the tests embed (`assets/test/` — the
-/// variable Cascadia Mono): no shipped binary carries a test face, but the
-/// source tree redistributes it all the same, so it is held to exactly the same
-/// exact-sibling grant rule.
 const ASSET_DIRS: &[&str] = &["assets/game", "assets/bundled", "assets/test"];
 
-/// The suffix that marks a file as a licence notice rather than an asset.
 const LICENSE_SUFFIX: &str = ".LICENSE.txt";
 
-/// Grant markers that permit redistribution inside a binary, matched case-insensitively
-/// against the whole notice. Deliberately short: the grant must be legible in the notice
-/// itself, not a matter of interpretation.
 const GRANT_MARKERS: &[&str] = &[
     "sil open font license",
     "open font license",
@@ -83,8 +50,6 @@ fn main() {
     }
 }
 
-/// Walk one directory, recording a line per unlicensed asset. Recurses so a
-/// subdirectory cannot be used as a place to park bytes out of the gate's view.
 fn gate_dir(dir: &Path, root: &Path, failures: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -93,13 +58,11 @@ fn gate_dir(dir: &Path, root: &Path, failures: &mut Vec<String>) {
             return;
         }
     };
-    // Sorted so the failure list is stable across filesystems.
     let mut paths: Vec<PathBuf> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
     paths.sort();
     for path in paths {
-        // Per file, so an edited notice re-runs the gate.
         println!("cargo:rerun-if-changed={}", path.display());
         if path.is_dir() {
             gate_dir(&path, root, failures);
@@ -109,8 +72,6 @@ fn gate_dir(dir: &Path, root: &Path, failures: &mut Vec<String>) {
             failures.push(format!("  - {}: non-UTF-8 file name", path.display()));
             continue;
         };
-        // Dotfiles are filesystem debris (`.DS_Store`), never a face: nothing
-        // references one, so gating them would only break macOS builds.
         if name.starts_with('.') || name.ends_with(LICENSE_SUFFIX) {
             continue;
         }

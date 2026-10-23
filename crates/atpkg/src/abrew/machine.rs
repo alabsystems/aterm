@@ -4,9 +4,6 @@
 
 use std::sync::OnceLock;
 
-/// macOS releases abrew can name, newest first: (major version, Homebrew's
-/// name for it in bottle tags and `variations` keys, the major version of the
-/// Xcode released with it: one ahead until both took the year's number at 26).
 const RELEASES: [(u64, &str, u64); 8] = [
     (27, "golden_gate", 27),
     (26, "tahoe", 26),
@@ -18,10 +15,8 @@ const RELEASES: [(u64, &str, u64); 8] = [
     (10, "catalina", 11),
 ];
 
-/// The oldest release a bottle tag is selected for: no catalina bottle pours.
 const OLDEST_BOTTLE_MAJOR: u64 = 11;
 
-/// The architectures Homebrew builds bottles for, in its spelling.
 const ARCHES: [&str; 2] = ["arm64", "x86_64"];
 
 /// Homebrew's name for a macOS major version.
@@ -238,7 +233,6 @@ impl Machine {
     }
 }
 
-/// `sw_vers -productVersion`, when it is a plain numeric version.
 fn probe_macos() -> Option<String> {
     let out = super::fetch::run_capture("/usr/bin/sw_vers", &["-productVersion"]).ok()?;
     if !out.status.success() {
@@ -248,11 +242,6 @@ fn probe_macos() -> Option<String> {
     super::formula::numeric_macos_version(&version).then_some(version)
 }
 
-/// The selected Xcode's version, read off disk ([`DeveloperDir::bundle_version`]).
-/// Never `xcodebuild -version`: `/usr/bin/xcodebuild` is an `xcode-select`
-/// shim that raises Apple's install dialog on a Mac without the developer
-/// tools, and with only the Command Line Tools selected it names no Xcode
-/// anyway.
 fn probe_xcode() -> Option<String> {
     DeveloperDir::this().bundle_version()
 }
@@ -281,10 +270,6 @@ impl DeveloperDir {
         }
     }
 
-    /// The developer directory: `DEVELOPER_DIR` (a bundle names its
-    /// `Contents/Developer`, as `xcode-select` accepts), else the link's
-    /// target, else the first default that is a directory. `None` when
-    /// nothing is selected and no default is there.
     fn active(&self) -> Option<std::path::PathBuf> {
         let mut dir = match &self.developer_dir_env {
             Some(env) if !env.is_empty() => std::path::PathBuf::from(env),
@@ -309,11 +294,6 @@ impl DeveloperDir {
             .find(|tool| crate::toolchain::is_executable_file(tool))
     }
 
-    /// `CFBundleShortVersionString` from the `version.plist` of the Xcode
-    /// bundle the developer directory sits in (`26.1`). `None` when the
-    /// directory is not an Xcode bundle's `Contents/Developer` (the Command
-    /// Line Tools), or the plist is missing, unreadable or names no numeric
-    /// version.
     fn bundle_version(&self) -> Option<String> {
         let dir = self.active()?;
         let contents = dir.parent()?;
@@ -619,8 +599,6 @@ mod tests {
         );
     }
 
-    /// Xcode and macOS share a number only from 26 on: no Sequoia ran an
-    /// Xcode 15.5.
     #[test]
     fn a_release_runs_the_xcode_released_with_it() {
         for (macos, xcode) in [

@@ -1698,7 +1698,6 @@ mod tests {
             })
             .collect();
         for d in dirs {
-            // synth\n".to_string()));
             files.push((format!("{d}/src/lib.rs"), "// synth\n".to_string()));
         }
         files

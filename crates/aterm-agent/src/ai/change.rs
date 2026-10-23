@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CHANGE A REVIEW SEES (design §9.1): by default the branch's change, the diff from
-//! `merge-base(HEAD, @{upstream} or origin/HEAD)` to the working tree, plus untracked,
-//! non-ignored files as new-file hunks; `--uncommitted` narrows the base to `HEAD`.
-//!
-//! Git runs hardened, as a reviewer's input must not run anything the repository
-//! configures: no system config, no lazy fetch, no prompt, `core.fsmonitor` and hooks off,
-//! submodules ignored, no external diff, no textconv, no colour, and the person's own filter
-//! drivers (git-lfs, for one) switched off. A repository whose own configuration names a
-//! filter driver (which a diff of the working tree would run) is refused, naming it, and so
-//! is one whose configuration cannot be read; and so is one whose `git config aterm.aiReview`
-//! is false. Files whose names look like secrets (`approval::default_secrets`) are held back;
-//! links are named and never read through.
+//! Hardened git diff and untracked-file collector for AI code review.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,8 +39,7 @@ pub struct Change {
     pub files: usize,
     /// Paths held back because their names look like secrets, repository-relative.
     pub held_back: Vec<String>,
-    /// Paths that are symbolic links, repository-relative: never read through, and denied
-    /// to a reviewer that reads the repository.
+    /// Repository-relative symbolic link paths denied to reviewers.
     pub links: Vec<String>,
 }
 
@@ -65,8 +53,7 @@ pub fn real(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The repositories a directory is in, found without running anything: every ancestor
-/// (itself included) holding a `.git` entry, nearest first, each resolved.
+/// Ancestor directories of `cwd` (nearest first, resolved) containing `.git`.
 #[must_use]
 pub fn repo_roots_of(cwd: &Path) -> Vec<PathBuf> {
     real(cwd)
@@ -76,11 +63,7 @@ pub fn repo_roots_of(cwd: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The git a review runs: the first `PATH` entry with a `git` file (`git.exe` on Windows)
-/// whose resolved directory and executable target are inside neither `cwd` nor any
-/// repository `cwd` is in. A repository's git would run before any hardening applies, even
-/// when an outside directory links to it. This checks the selected paths; it does not pin
-/// identities against swaps.
+/// First `git` executable on `PATH` resolved outside `cwd` and its repositories.
 #[must_use]
 pub fn git_program(path_var: Option<&str>, cwd: &Path) -> Option<PathBuf> {
     let mut fenced = repo_roots_of(cwd);
@@ -109,10 +92,6 @@ pub fn git_program(path_var: Option<&str>, cwd: &Path) -> Option<PathBuf> {
         })
 }
 
-/// The person's own variables git reads (where their global config is), and the hardening.
-/// Git for Windows finds the home, and so the person's global config (a global
-/// `aterm.aiReview = false` among it), from `USERPROFILE` (or `HOMEDRIVE`/`HOMEPATH`) where
-/// no `HOME` is set, as on Windows it rarely is.
 fn git_env(var: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let homes: &[&str] = if cfg!(windows) {
         &[
@@ -144,13 +123,11 @@ fn git_env(var: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     env
 }
 
-/// Runs git hardened in `cwd`; its stdout on exit 0 (or on `ok_exits`).
 struct Git<'a> {
     runner: &'a dyn Runner,
     program: PathBuf,
     env: Vec<(String, String)>,
     cwd: PathBuf,
-    /// `-c` settings that switch the person's own filter drivers off.
     filters_off: Vec<String>,
 }
 
@@ -188,8 +165,6 @@ impl Git<'_> {
                 budget: GIT_BUDGET,
             })
             .map_err(|e| format!("git {}: {e:?}", args.first().copied().unwrap_or_default()))?;
-        // Runner keeps a bounded tail. A full capture may have lost paths or filter
-        // settings at its front, so it cannot authorize or describe a complete change.
         if ran.stdout.len() >= super::facts::OUTPUT_KEEP {
             return Err("git output reached the capture limit".to_string());
         }
@@ -204,8 +179,7 @@ impl Git<'_> {
     }
 }
 
-/// The secret rules a review applies: the approval policy's, for `$HOME` as given and as
-/// resolved (a home reached through a link is the same home).
+/// Secret rules from the approval policy for `$HOME` as given and as resolved.
 #[must_use]
 pub fn secret_rules(home: Option<&Path>) -> Vec<crate::supervise::policy::approval::SecretRule> {
     let mut rules = crate::supervise::policy::approval::default_secrets(home);
@@ -220,11 +194,7 @@ pub fn secret_rules(home: Option<&Path>) -> Vec<crate::supervise::policy::approv
     rules
 }
 
-/// Whether a path in the repository at `root` looks like a secret: by a component or
-/// basename of the secret rules, or by lying under one of their secret places that the
-/// repository CONTAINS (a dotfiles repository rooted at `$HOME` holds `.config/gh` and
-/// `.claude.json`). A repository that itself sits inside such a place (one in a cloud folder
-/// under `~/Library`) is not secret for that.
+/// Returns whether repository-relative path `rel` under `root` matches `rules`.
 #[must_use]
 pub fn looks_secret(
     root: &Path,
@@ -242,7 +212,6 @@ pub fn looks_secret(
     })
 }
 
-/// Where an open file really is, as the kernel names it.
 #[cfg(target_os = "macos")]
 fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     use std::os::fd::AsRawFd as _;
@@ -257,14 +226,12 @@ fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
 }
 
-/// Where an open file really is, as the kernel names it.
 #[cfg(target_os = "linux")]
 fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     use std::os::fd::AsRawFd as _;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
-/// Where an open file really is, as the kernel names it (`\\?\C:\…`, every link resolved).
 #[cfg(windows)]
 fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt as _;
@@ -278,7 +245,6 @@ fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
             flags: u32,
         ) -> u32;
     }
-    // The longest path the wide-character file APIs take.
     let mut buf = vec![0u16; 32_768];
     let len = u32::try_from(buf.len()).ok()?;
     // SAFETY: the handle is the open file's own for the length of the call, and the call
@@ -290,17 +256,11 @@ fn path_of_open(file: &std::fs::File) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..got])))
 }
 
-/// Where an open file really is: unknown on this platform, so no untracked file is read.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn path_of_open(_file: &std::fs::File) -> Option<PathBuf> {
     None
 }
 
-/// An untracked file as a new-file hunk; `None` for one that is binary, too large,
-/// unreadable, or not where its name says: it is opened without following a link at its
-/// last component, and kept only when the kernel's path of the open file is the repository's
-/// own path for it, so a directory swapped for a link between listing and reading is never
-/// read through.
 fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     use std::io::Read as _;
     let path = root.join(rel);
@@ -311,8 +271,6 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    // A link (or junction) at the last component is opened as itself, never followed:
-    // FILE_FLAG_OPEN_REPARSE_POINT.
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -323,8 +281,6 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     if !meta.is_file() || meta.len() > UNTRACKED_FILE_MAX {
         return None;
     }
-    // Git names the file with `/` between its components; the repository's own path for it
-    // is built a component at a time, so a platform separator other than `/` compares too.
     let own = rel.split('/').fold(real(root), |at, part| at.join(part));
     if path_of_open(&file)? != own {
         return None;
@@ -350,10 +306,6 @@ fn new_file_hunk(root: &Path, rel: &str) -> Option<String> {
     Some(out)
 }
 
-/// Reads the filter drivers git would load, by scope. The person's own (global) ones are
-/// switched off for the review's git runs; one the repository configures refuses. Read with
-/// `--show-origin`, known to every git this runs on; a configuration that cannot be read
-/// refuses too, so the guard fails closed.
 fn filters(git: &Git<'_>) -> Result<Vec<String>, Refused> {
     let listed = git
         .run(
@@ -361,9 +313,6 @@ fn filters(git: &Git<'_>) -> Result<Vec<String>, Refused> {
             &[1],
         )
         .map_err(|_| Refused("this repository's filter drivers could not be read".to_string()))?;
-    // The person's own files: where `--global` finds its settings. A line from any other
-    // file (the repository's `.git/config`, a file it includes) or from the command line is
-    // the repository's, even under a key the global file uses too.
     let global_origins: Vec<String> = git
         .run(
             &[
@@ -381,7 +330,6 @@ fn filters(git: &Git<'_>) -> Result<Vec<String>, Refused> {
         .collect();
     let mut off = Vec::new();
     for line in listed.lines() {
-        // `file:<path>\t<key> <value>` (or `command line:` for `-c`).
         let Some((origin, rest)) = line.split_once('\t') else {
             return Err(Refused(
                 "this repository's filter drivers could not be read".to_string(),
@@ -414,7 +362,6 @@ fn filters(git: &Git<'_>) -> Result<Vec<String>, Refused> {
     Ok(off)
 }
 
-/// Tracked paths that are links in the index or the working tree, repository-relative.
 fn tracked_links(git: &Git<'_>) -> Result<Vec<String>, Refused> {
     Ok(git
         .run(&["ls-files", "-s", "-z"], &[])
@@ -458,8 +405,6 @@ pub fn collect(
     let root = git
         .run(&["rev-parse", "--show-toplevel"], &[])
         .map_err(|_| Refused("not inside a git repository".to_string()))?;
-    // Git writes the raw path and one line terminator. Other whitespace belongs to the
-    // directory name, including any preceding newlines on Unix.
     let root = root
         .strip_suffix('\n')
         .ok_or_else(|| Refused("git did not terminate its repository path".to_string()))?;
@@ -467,8 +412,6 @@ pub fn collect(
     let root = root.strip_suffix('\r').unwrap_or(root);
     let root_path = PathBuf::from(root);
     git.cwd = root_path.clone();
-    // Read as git reads a boolean (`no`, `off`, `0` are false too); a value git cannot read
-    // as one, or a configuration that cannot be read, refuses: the opt-out fails closed.
     match git.run(&["config", "--bool", "--get", "aterm.aiReview"], &[1]) {
         Ok(v) if v.trim() == "false" => {
             return Err(Refused(

@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Control wire request line parser for optional `@<selector>`, verb, and payload.
-//!
-//! Words are separated by SP or HT, and separators before the first word and after the selector
-//! are skipped; a trailing `\r` is not part of the line; `rest` is everything after the one
-//! separator that ends the verb. A lone `@` is read as the verb, never as a selector.
 
 use core::ops::Range;
 
@@ -31,7 +27,7 @@ impl<'a> Sid<'a> {
     }
 }
 
-/// A parsed `@<selector>`: the body after the `@`.
+/// A parsed `@<selector>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selector<'a> {
     /// `@.`: the connection's own session.
@@ -66,7 +62,7 @@ impl<'a> Selector<'a> {
     }
 }
 
-/// A request line read by the grammar: what [`head`] answers.
+/// A request line read by the grammar ([`head`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Head<'a> {
     /// The leading `@<selector>`, if the line has one.
@@ -113,7 +109,9 @@ const fn word_end(bytes: &[u8], mut at: usize, end: usize) -> usize {
 }
 
 impl Spans {
-    /// Read `line` by the grammar (see the module doc).
+    /// Read `line` by the grammar: words separated by SP or HT, separators skipped before the
+    /// first word and after the selector, a trailing `\r` not part of the line, `rest` all after
+    /// the one separator that ends the verb, and a lone `@` read as the verb.
     #[inline]
     #[must_use]
     pub fn of(line: &str) -> Self {
@@ -151,7 +149,7 @@ impl Spans {
     }
 }
 
-/// Read a request line: its selector, verb and rest (see the module doc).
+/// Read a request line.
 #[inline]
 #[must_use]
 pub fn head(line: &str) -> Head<'_> {
@@ -188,8 +186,6 @@ mod tests {
         (selector, verb, rest)
     }
 
-    /// A sid is `s-` and lower-case hex, the form ids are minted in; anything
-    /// else (an upper-case digit included) is no session's id.
     #[test]
     fn a_sid_is_s_dash_and_hex() {
         for good in ["s-0", "s-0f1e", "s-abcdef0123456789abcd"] {
@@ -214,9 +210,6 @@ mod tests {
         }
     }
 
-    /// The selector body: `.` is self, digits a local number (past `u64` it
-    /// names nothing, never a wrapped number or an id), a sid an id, and every
-    /// other spelling, the empty body included, is invalid.
     #[test]
     fn selector_parses_the_wire_forms() {
         assert_eq!(Selector::parse(""), Selector::Invalid(""));
@@ -237,9 +230,6 @@ mod tests {
         assert!(Selector::SelfTok.is_self() && !Selector::Local(0).is_self());
     }
 
-    /// One line, one reading: leading separators and a run after the selector
-    /// are skipped, either separator ends a word, and `rest` starts after
-    /// exactly one separator, so a payload keeps its spacing.
     #[test]
     fn head_reads_separators_once() {
         let sid = Selector::Sid(Sid::parse("s-1a").expect("a sid"));
@@ -266,8 +256,6 @@ mod tests {
         assert_eq!(&line[spans.rest.clone()], " hi");
     }
 
-    /// A verb's words split at SP and HT only, never at another space
-    /// character, and no word is empty.
     #[test]
     fn words_split_where_the_head_does() {
         let split = |text| words(text).collect::<Vec<_>>();
@@ -277,8 +265,6 @@ mod tests {
         assert!(split("").is_empty() && split(" \t ").is_empty());
     }
 
-    /// A `subscribe` names one remote session only by a single `@<sid>` as its
-    /// first word; the text after it is kept as written.
     #[test]
     fn subscribe_names_one_session_only_by_a_sid() {
         let (sid, tail) = subscribe_target("@s-1a screen trim").expect("one sid");

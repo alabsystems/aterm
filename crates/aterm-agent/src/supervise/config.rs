@@ -267,7 +267,9 @@ pub struct SupervisorConfig {
     pub continue_per_hour: u32,
     /// A file whose text is appended to a continuation (standing rules).
     pub rules_file: Option<PathBuf>,
-    /// Answer an API error or an overload, however many, by what it says went wrong (`policy::turn_end`'s module docs: the network, a reply cut off, the server), never with an ask.
+    /// Answer an API error or an overload, however many, by what it says went wrong (the network, a
+    /// reply cut off, the server), never with an ask, but for a Gemini CLI error other than a 429
+    /// or 5xx and agy's non-retryable 4xx, which go to a person.
     pub retry_api_errors: bool,
     /// Let the window's host probe API reachability (`api.anthropic.com` TLS handshake) while a session waits on a network API error.
     pub probe_api: bool,

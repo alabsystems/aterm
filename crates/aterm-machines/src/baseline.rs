@@ -251,8 +251,14 @@ mod tests {
         assert!(kept.names.is_some());
         assert!(kept.power.is_none() && kept.keyboard.is_none() && kept.apps.is_empty());
         assert!(kept.homebrew.is_none() && kept.developer.is_none() && kept.aterm.is_none());
-        let both = parse(&keep_only(starter, &["names".into(), "app".into()]).unwrap()).unwrap();
-        assert!(both.names.is_some() && both.apps.len() == 2 && both.power.is_none());
+        let owned = format!(
+            "{starter}\n[[app]]\nname = \"Caffeine\"\nkind = \"dmg-app\"\n\
+             url = \"https://example.com/Caffeine.dmg\"\nsha256 = \"{}\"\n\
+             team_id = \"YD6LEYT6WZ\"\nbundle = \"Caffeine.app\"\nversion = \"1.1.4\"\n",
+            "0".repeat(64)
+        );
+        let both = parse(&keep_only(&owned, &["names".into(), "app".into()]).unwrap()).unwrap();
+        assert!(both.names.is_some() && both.apps.len() == 1 && both.power.is_none());
         let text = "schema = 1\nusers = [\"admin\"]\n[names]\ncomputer_name = \"x\"\n\
                     [power.ac]\nsleep = 0\n";
         let kept = parse(&keep_only(text, &["power".into()]).unwrap()).unwrap();

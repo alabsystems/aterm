@@ -2995,7 +2995,10 @@ fn session_title(s: &SessionRow) -> &str {
         .unwrap_or("-")
 }
 
-/// Which node a NODES row is, from where this report stands: `this` — the node the command's state dir names; `local` — another instance on this machine answers as it (its own state dir); `remote` — no instance here answers as it: on this one-machine bus, an unhosted or ghost node of this machine (the module docs, NODES), never another host.
+/// Which node a NODES row is, from where this report stands: `this` — the node the command's
+/// state dir names; `local` — another instance on this machine answers as it (its own state
+/// dir); `remote` — no instance here answers as it: on this one-machine bus, an unhosted or
+/// ghost node of this machine, never another host.
 #[must_use]
 pub fn node_where(r: &Report, node: &str) -> &'static str {
     if r.node.as_deref() == Some(node) {

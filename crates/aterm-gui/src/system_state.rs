@@ -817,7 +817,7 @@ impl NativeAppModel for SystemStateApp {
         );
         let (vault_hint, vault_h) = wrapped_text(
             "system-state/vault-help",
-            "Leave password blank for approval from another Mac.",
+            "Leave the password blank to join an open vault at once, or to wait for approval from another Mac.",
             StyleRef::Secondary,
             inner,
             None,
@@ -898,26 +898,40 @@ impl NativeAppModel for SystemStateApp {
         }
         let total = rows.len();
         let start = view.scroll.min(total.saturating_sub(1));
-        // The title, guidance, vault fields, Apply and Cancel, and the column's gaps. A page with
-        // no room for two checklist rows and the scroll caption gives up, in turn, the banner,
-        // the restore hint (and a narrow page's Check and Restore row), and the vault hint: a
-        // first window (80×24 under the vitals band) leaves System State 334 points.
-        let core = padding * 2.0 + 40.0 + help_h + 68.0 + 36.0 + 5.0 * 6.0;
-        let optional = [vault_h + 6.0, action_h - 36.0 + restore_h + 6.0, 48.0 + 6.0];
-        let room_with =
-            |shown: usize| cx.viewport.height - core - optional[..shown].iter().sum::<f32>();
-        let wanted = rows
+        // The title, guidance, vault fields, buttons, and the column's gaps. A page with no room
+        // for two checklist rows and the scroll caption gives up, in turn, the banner, the
+        // restore hint (and a narrow page's second row of buttons, whose Check and Restore join
+        // Apply and Cancel where all four labels fit in one row), and the vault hint: a first
+        // window (80×24 under the vitals band) leaves System State 334 points. The two rows are
+        // the checklist's tallest neighbours and the guidance is counted at a result's three
+        // lines, so neither scrolling nor a result moves the fields or regroups the buttons.
+        let one_row_share = (inner - 3.0 * 8.0) / 4.0;
+        let one_row_fits = ["Apply (30)", "Cancel", "Check", "Restore"]
             .iter()
-            .skip(start)
-            .take(2)
-            .map(|(_, height)| height)
-            .sum::<f32>()
+            .all(|label| {
+                crate::native_ui::native_button_label_width(label) + 24.0 <= one_row_share
+            });
+        let second_row = action_h - 36.0;
+        let (kept_row, optional_row) = if one_row_fits {
+            (0.0, second_row)
+        } else {
+            (second_row, 0.0)
+        };
+        let core = |help: f32| padding * 2.0 + 40.0 + help + 68.0 + 36.0 + kept_row + 5.0 * 6.0;
+        let optional = [vault_h + 6.0, optional_row + restore_h + 6.0, 48.0 + 6.0];
+        let room_with = |shown: usize, help: f32| {
+            cx.viewport.height - core(help) - optional[..shown].iter().sum::<f32>()
+        };
+        let wanted = rows[..Setting::ALL.len()]
+            .windows(2)
+            .map(|pair| pair[0].1 + pair[1].1)
+            .fold(0.0, f32::max)
             + 20.0;
         let mut shown = optional.len();
-        while shown > 0 && room_with(shown) < wanted {
+        while shown > 0 && room_with(shown, help_h.max(60.0)) < wanted {
             shown -= 1;
         }
-        let room = room_with(shown).max(34.0);
+        let room = room_with(shown, help_h).max(34.0);
         let page_end = |room| {
             let mut end = start;
             let mut used = 0.0;
@@ -962,6 +976,12 @@ impl NativeAppModel for SystemStateApp {
         } else {
             "Apply".to_owned()
         };
+        let stacked = compact && (shown >= 2 || !one_row_fits);
+        let restore_share = if stacked {
+            (inner - 8.0) / 2.0
+        } else {
+            one_row_share
+        };
         let mut buttons = [
             ("apply", apply),
             ("cancel", "Cancel".to_owned()),
@@ -971,10 +991,16 @@ impl NativeAppModel for SystemStateApp {
         .into_iter()
         .map(|(name, label)| {
             let key = format!("system-state/{name}");
+            let mut spec = ButtonSpec::new(label);
+            if name == "restore"
+                && crate::native_ui::native_button_label_width(&spec.label) + 24.0 > restore_share
+            {
+                spec = spec.visual_label("Restore");
+            }
             UiNode::new(
                 key.clone(),
                 UiContent::Button(
-                    Control::new(ButtonSpec::new(label), ActionId::new(key))
+                    Control::new(spec, ActionId::new(key))
                         .state(ControlState {
                             enabled: !self.status.busy,
                             ..ControlState::default()
@@ -993,42 +1019,33 @@ impl NativeAppModel for SystemStateApp {
             )
         })
         .collect::<Vec<_>>();
-        let actions = if compact {
+        let actions = if stacked {
             let second = buttons.split_off(2);
-            let mut groups = vec![
+            UiNode::new(
+                "system-state/actions",
+                UiContent::Group(GroupSpec::new("System State actions")),
+            )
+            .layout(Layout::column().gap(8.0).height(Length::Fixed(action_h)))
+            .children(vec![
                 UiNode::new(
                     "system-state/actions/main",
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
                 .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
                 .children(buttons),
-            ];
-            if shown >= 2 {
-                groups.push(
-                    UiNode::new(
-                        "system-state/actions/maintenance",
-                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-                    )
-                    .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
-                    .children(second),
-                );
-            }
-            UiNode::new(
-                "system-state/actions",
-                UiContent::Group(GroupSpec::new("System State actions")),
-            )
-            .layout(
-                Layout::column()
-                    .gap(8.0)
-                    .height(Length::Fixed(if shown >= 2 { action_h } else { 36.0 })),
-            )
-            .children(groups)
+                UiNode::new(
+                    "system-state/actions/maintenance",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                )
+                .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
+                .children(second),
+            ])
         } else {
             UiNode::new(
                 "system-state/actions",
                 UiContent::Group(GroupSpec::new("System State actions")),
             )
-            .layout(Layout::row().gap(8.0).height(Length::Fixed(action_h)))
+            .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
             .children(buttons)
         };
         let brand = UiNode::new(
@@ -2157,15 +2174,19 @@ mod tests {
 
     /// A first window is 80×24 under the vitals band: System State had 624×334 points in a
     /// macOS 26.6 and 27.0 VM, where the page drew no checklist row and clipped Check and
-    /// Restore while its countdown ran. A short page, wide or narrow, leaves out its banner,
-    /// hints and maintenance buttons first; a tall one keeps everything.
+    /// Restore while its countdown ran. A short page, wide or narrow, leaves out its banner
+    /// and hints and puts its four buttons in one row where their labels fit; a tall one keeps
+    /// everything. What a page shows, and where its fields and buttons sit, follows its size
+    /// alone: never how far its list is scrolled, an offer's countdown, or a result.
     #[test]
     fn a_short_page_keeps_the_checklist_apply_and_the_vault_fields_in_view() {
         use crate::native_app::ViewMotionCx;
         use crate::native_ui::LogicalRect;
-        let app = SystemStateApp::new(Plan::default());
-        let view = SystemStateViewState::default();
-        let compile = |viewport: LogicalRect| {
+        let compile = |app: &SystemStateApp, scroll: usize, viewport: LogicalRect| {
+            let view = SystemStateViewState {
+                scroll,
+                ..SystemStateViewState::default()
+            };
             app.view(
                 &view,
                 &ViewCx {
@@ -2190,40 +2211,124 @@ mod tests {
                         && node.rect.bottom() <= viewport.bottom()
                 })
             };
-        for width in [624.0, 999.0, 1400.0] {
+        let plain = SystemStateApp::new(Plan::default());
+        let (send, _receive) = mpsc::channel();
+        let mut offered = SystemStateApp::new(Plan::default());
+        offered.offer(Request::new(Plan::default(), send));
+        let mut reported = SystemStateApp::new(Plan::default());
+        reported.publish(SetupStatus {
+            busy: false,
+            rows: vec![
+                SetupStatusRow {
+                    name: "Previous preferences".into(),
+                    status: "applied".into(),
+                    detail: String::new(),
+                },
+                SetupStatusRow {
+                    name: "Check".into(),
+                    status: "error".into(),
+                    detail: format!("ERR42 {}", "extended diagnostic ".repeat(200)),
+                },
+            ],
+            ..SetupStatus::default()
+        });
+        let optional = [
+            "system-state/brand",
+            "system-state/vault-help",
+            "system-state/restore-help",
+            "system-state/actions/maintenance",
+        ];
+        let buttons = [
+            "system-state/apply",
+            "system-state/cancel",
+            "system-state/check",
+            "system-state/restore",
+        ];
+        for width in [300.0, 360.0, 480.0, 624.0, 999.0, 1400.0] {
             for height in (334..=742).step_by(24) {
                 let page = LogicalRect::new(0.0, 0.0, width, height as f32);
-                let compiled = compile(page);
-                for key in [
-                    "system-state/title",
-                    "system-state/setting/0",
-                    "system-state/setting/1",
-                    "system-state/url",
-                    "system-state/password",
-                    "system-state/apply",
-                    "system-state/cancel",
+                let mut first = None;
+                for (app, state) in [
+                    (&plain, "plain"),
+                    (&offered, "offered"),
+                    (&reported, "reported"),
                 ] {
-                    assert!(
-                        in_view(&compiled, page, key),
-                        "{key} in a {width}×{height} page"
-                    );
+                    let total = Setting::ALL.len()
+                        + app.status.rows_for(Some(&app.reviewed_plan())).count();
+                    for scroll in 0..total {
+                        let compiled = compile(app, scroll, page);
+                        let at = format!("a {state} {width}×{height} page scrolled to {scroll}");
+                        for key in [
+                            "system-state/title",
+                            "system-state/url",
+                            "system-state/password",
+                        ]
+                        .into_iter()
+                        .chain(buttons)
+                        {
+                            assert!(in_view(&compiled, page, key), "{key} in {at}");
+                        }
+                        for key in buttons {
+                            let fit = compiled.text_fit_audit_line(&UiKey::new(key)).unwrap();
+                            assert!(!fit.contains("overflow=true"), "{key} in {at}: {fit}");
+                        }
+                        assert_eq!(
+                            compiled
+                                .semantic(&UiKey::new("system-state/restore"))
+                                .unwrap()
+                                .label,
+                            "Restore preferences",
+                            "Restore's name in {at}"
+                        );
+                        if width >= 624.0 && scroll < Setting::ALL.len() {
+                            let mut listed = vec![scroll];
+                            if state != "reported" && scroll + 1 < Setting::ALL.len() {
+                                listed.push(scroll + 1);
+                            }
+                            for row in listed {
+                                let key = format!("system-state/setting/{row}");
+                                assert!(in_view(&compiled, page, &key), "{key} in {at}");
+                            }
+                        }
+                        let frame: (Vec<&str>, Vec<_>) = (
+                            optional
+                                .into_iter()
+                                .filter(|key| compiled.semantic(&UiKey::new(*key)).is_some())
+                                .collect(),
+                            ["system-state/url"]
+                                .into_iter()
+                                .chain(buttons)
+                                .map(|key| compiled.semantic(&UiKey::new(key)).unwrap().rect)
+                                .collect(),
+                        );
+                        match &first {
+                            None => first = Some(frame),
+                            Some(before) => assert_eq!(&frame, before, "what {at} shows"),
+                        }
+                    }
                 }
             }
             let short = LogicalRect::new(0.0, 0.0, width, 334.0);
             assert!(
-                in_view(&compile(short), short, "system-state/scroll-caption"),
+                in_view(
+                    &compile(&plain, 0, short),
+                    short,
+                    "system-state/scroll-caption"
+                ),
                 "the scroll caption in a {width}×334 page"
             );
-            let tall = LogicalRect::new(0.0, 0.0, width, 740.0);
-            let compiled = compile(tall);
-            for key in [
-                "system-state/brand",
-                "system-state/vault-help",
-                "system-state/restore-help",
-                "system-state/check",
-                "system-state/restore",
-            ] {
-                assert!(in_view(&compiled, tall, key), "{key} in a {width}×740 page");
+            if width >= 624.0 {
+                let tall = LogicalRect::new(0.0, 0.0, width, 740.0);
+                for app in [&plain, &reported] {
+                    let compiled = compile(app, 0, tall);
+                    for key in [
+                        "system-state/brand",
+                        "system-state/vault-help",
+                        "system-state/restore-help",
+                    ] {
+                        assert!(in_view(&compiled, tall, key), "{key} in a {width}×740 page");
+                    }
+                }
             }
         }
     }

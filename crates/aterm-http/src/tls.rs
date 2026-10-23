@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The trust model: how a server certificate is verified.
-//!
-//! * [`Trust::PlatformVerifier`] — the OPERATING SYSTEM's trust store, through
-//!   [`crate::verifier::PlatformVerifier`]: Security.framework on macOS/iOS
-//!   (verification date pinned to the instant `rustls` supplies, network
-//!   fetching disabled), `CertGetCertificateChain` +
-//!   `CertVerifyCertificateChainPolicy` under the SSL policy on Windows, and
-//!   the distribution's CA store (`$SSL_CERT_FILE`, `$SSL_CERT_DIR`,
-//!   `/etc/ssl/certs` and friends) through `rustls`'s webpki on Linux/BSD.
-//!   Anywhere else construction FAILS rather than falling back to a bundled
-//!   root set. The default, and what every endpoint without its own roots gets.
-//! * [`Trust::Roots`] — exactly the DER certificates a caller supplies, and
-//!   NOTHING else. An override, not an addition: the platform roots are not
-//!   consulted, so the roots pin the endpoint to its own issuer.
+//! Server certificate verification trust model and `rustls` client configuration.
 
 use std::sync::Arc;
 
@@ -26,21 +13,16 @@ use rustls::{ClientConfig, RootCertStore};
 pub enum Trust {
     /// Verify against the operating system's trust store.
     PlatformVerifier,
-    /// Verify against exactly these DER certificates, REPLACING the platform
-    /// roots (a caller's explicit per-endpoint override).
+    /// Verify against only the caller-supplied DER root certificates.
     Roots(Vec<Vec<u8>>),
 }
 
-/// The one place this crate names a rustls `CryptoProvider`: `ring`, the
-/// bridge half of the KEEP pair (docs/AUDIT-third-party-2026-10-15.md).
+/// Returns the default `ring`-backed `rustls` [`rustls::crypto::CryptoProvider`].
 pub(crate) fn provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
 
-/// Install `provider()` as the process default, once.
-///
-/// Idempotent, and it tolerates another component having already installed one:
-/// whichever runs first wins.
+/// Installs `provider()` as the process default `CryptoProvider` once.
 pub fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -49,11 +31,9 @@ pub fn init_crypto() {
 }
 
 /// Build a rustls client configuration for `trust`.
-///
 /// # Errors
-///
-/// A malformed certificate in caller-supplied roots, or a platform verifier the
-/// OS refuses to construct.
+/// A malformed certificate in caller-supplied roots or none at all, a platform verifier the OS
+/// refuses to construct, or protocol versions the provider rejects.
 pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
     init_crypto();
     let provider = rustls::crypto::CryptoProvider::get_default()
@@ -61,8 +41,6 @@ pub fn client_config(trust: &Trust) -> Result<Arc<ClientConfig>, String> {
         .unwrap_or_else(|| Arc::new(provider()));
     let config = match trust {
         Trust::PlatformVerifier => {
-            // The extra-anchor constructor is `#[cfg(test)]`, so this path
-            // cannot trust anything beyond the operating system's own anchors.
             let verifier = crate::verifier::PlatformVerifier::new(Arc::clone(&provider))
                 .map_err(|error| format!("platform certificate verifier unavailable: {error}"))?;
             ClientConfig::builder_with_provider(provider)

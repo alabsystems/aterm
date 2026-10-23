@@ -6,8 +6,7 @@
 
 use std::sync::atomic::{Ordering, compiler_fence};
 
-/// Bytes that must not outlive their use: scrubbed on drop, never printed. No `Clone`,
-/// `Display` or `Serialize`; `Debug` names the length only.
+/// Bytes scrubbed on drop, with `Debug` reporting only the byte length.
 pub struct Secret(Box<[u8]>);
 
 impl Secret {
@@ -17,14 +16,10 @@ impl Secret {
         Secret(Box::from(bytes))
     }
 
-    /// A secret holding `bytes`. The vector is copied into an exact-size box, then filled
-    /// with zeros to its capacity (`resize(capacity, 0)`) and scrubbed whole, so no copy
-    /// survives in its spare capacity.
+    /// Build a secret from `bytes`, scrubbing its full allocation including spare capacity.
     #[must_use]
     pub fn from_vec(mut bytes: Vec<u8>) -> Secret {
         let kept = Secret(Box::from(bytes.as_slice()));
-        // Within the capacity: no reallocation, so the scrub reaches every byte of the
-        // vector's allocation, spare capacity included.
         bytes.resize(bytes.capacity(), 0);
         scrub(&mut bytes);
         kept
@@ -64,10 +59,7 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-/// Overwrite `bytes` with zeros through `std::ptr::write_volatile`, one byte at a time,
-/// then `std::sync::atomic::compiler_fence(Ordering::SeqCst)`, so the compiler cannot
-/// drop the writes. Each `unsafe` block carries a `// SAFETY:` line: the pointer comes
-/// from a live exclusive reference, so it is valid, aligned and unaliased.
+/// Overwrite `bytes` with volatile zeroes followed by a `SeqCst` compiler fence.
 // Skip: a volatile write is outside what the Trust verifier models.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn scrub(bytes: &mut [u8]) {
@@ -79,13 +71,7 @@ pub fn scrub(bytes: &mut [u8]) {
     compiler_fence(Ordering::SeqCst);
 }
 
-/// Turn this process's core dumps off (`setrlimit(RLIMIT_CORE, {0, 0})`), so the kernel
-/// writes no core file of a crash, and no credential in one. Where Linux pipes core dumps
-/// to a handler program (a `core_pattern` that starts with `|`, as systemd-coredump and
-/// apport set it), the kernel ignores this limit and the handler decides for itself what
-/// it keeps. The result is ignored: a limit already at 0 is the
-/// same outcome. A no-op off unix. The call follows atpkg-keys' `forbid_core_dumps`
-/// (`master.rs`), including its SAFETY comment.
+/// Disable core dumps for this process via `setrlimit(RLIMIT_CORE, {0, 0})` on Unix.
 // Skip: bottoms out at the `setrlimit(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn no_core_dumps() {
@@ -107,11 +93,8 @@ pub fn no_core_dumps() {
 mod tests {
     use super::{Secret, scrub};
 
-    /// `Debug` names the length and none of the bytes.
     #[test]
     fn debug_names_the_length_and_no_byte() {
-        // Two secrets of one length render alike whatever their bytes, so no rendering
-        // of a byte (as a character, a number or hex) can be in it; the length changes it.
         let shown = format!("{:?}", Secret::new(b"zqxwvkjgm"));
         assert_eq!(
             shown,
@@ -125,7 +108,6 @@ mod tests {
         );
     }
 
-    /// `scrub` zeroes a buffer.
     #[test]
     fn scrub_zeroes_a_buffer() {
         let mut bytes = *b"not zero yet";
@@ -133,7 +115,6 @@ mod tests {
         assert_eq!(bytes, [0; 12]);
     }
 
-    /// `from_vec` keeps the bytes, whatever spare capacity the vector had.
     #[test]
     fn from_vec_keeps_the_bytes() {
         let mut bytes = Vec::with_capacity(64);

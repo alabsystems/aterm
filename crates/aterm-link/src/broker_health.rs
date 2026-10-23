@@ -22,7 +22,7 @@ pub(crate) fn poll() -> Duration {
     }
 }
 
-/// How often a serving broker has astream rewrite `<log>.health` (the module docs).
+/// How often a serving broker has astream rewrite `<log>.health`.
 pub const HEALTH_EVERY: Duration = Duration::from_secs(30);
 
 /// The exit status of a broker that left its poisoned log for its supervisor to reopen.

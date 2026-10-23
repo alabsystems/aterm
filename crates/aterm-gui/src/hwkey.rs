@@ -2,6 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! Hardware-path key injection, for measuring keystroke latency.
+//!
+//! Thread safety: events are posted from the control thread. `-[NSApplication
+//! postEvent:atStart:]` is one of the few `NSApplication` methods Apple documents as safe from
+//! any thread.
 
 /// A parsed hardware-key injection request: everything needed to build the `NSEvent` pair, with no AppKit types, so the grammar is unit-testable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,7 +332,9 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
     };
     let flags = spec.flags as usize;
 
-    // SAFETY: `+sharedApplication` is `-(id)`; the caller resolved a live window number on the main thread first, so `NSApp` exists and this returns the singleton rather than constructing it off-main.
+    // SAFETY: `+sharedApplication` is `-(id)`; the caller resolved a live window number on the
+    // main thread first, so `NSApp` exists and this returns the singleton rather than
+    // constructing it off-main. The runtime retains it for the process lifetime; borrowed here.
     let app = unsafe { appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
     if app.is_null() {
         return Err("ERR hwkey: no shared NSApplication\n".to_string());
@@ -351,7 +357,11 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 }
                 appkit::send_f64(info, sel!(systemUptime))
             };
-            // SAFETY: the AppKit event factory with a non-nil characters pair (winit dereferences both unconditionally) and a nil graphics context, exactly as upstream winit's `replace_event` builds a synthetic key event (aterm-window no longer carries it).
+            // SAFETY: the AppKit event factory with a non-nil characters pair (winit
+            // dereferences both unconditionally) and a nil graphics context, exactly as
+            // upstream winit's `replace_event` builds a synthetic key event (aterm-window
+            // no longer carries it). The returned event is AUTORELEASED into this per-key
+            // pool. `postEvent:atStart:` is documented thread-safe.
             let built = |kind: usize| unsafe {
                 let make: unsafe extern "C-unwind" fn(
                     Id,
@@ -437,7 +447,10 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
     unsafe extern "C" {
         fn CFRelease(cf: *const c_void);
     }
-    // SAFETY: the CoreGraphics prototypes above are the headers'; a null source is documented.
+    // SAFETY: the CoreGraphics prototypes above are the headers'; a null source is
+    // documented. `+eventWithCGEvent:` is `@@:^{__CGEvent=}`: its result is autoreleased
+    // and holds its own reference to the CGEvent, so releasing the one
+    // `CGEventCreateKeyboardEvent` returned is the documented balance.
     unsafe {
         let cg = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, down);
         if cg.is_null() {

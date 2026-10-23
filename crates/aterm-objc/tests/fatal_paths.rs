@@ -15,9 +15,13 @@ use aterm_objc::{
 
 use crate::reexec;
 
-/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked.
+/// The [`MainThread`](aterm_objc::MainThread) witness, minted unchecked:
+/// libtest runs every test on a worker, so `MainThread::new()` answers `None`.
+/// Every class here touches no AppKit state and is created and released on the
+/// same worker, which is `new_unchecked`'s second obligation.
 fn mtm() -> aterm_objc::MainThread {
-    // SAFETY: see this function's doc comment.
+    // SAFETY: these classes have no main-thread affinity, and their ivars are born and dropped on
+    // this one worker.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
@@ -67,7 +71,8 @@ const PANIC_CHILD: &str = "ATERM_OBJC_PANIC_CHILD";
 fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation() {
     if reexec::is_child(PANIC_CHILD) {
         let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
-        // SAFETY: `-performSelector:` is `-(id)performSelector:(SEL)`.
+        // SAFETY: `-performSelector:` is `-(id)performSelector:(SEL)`, and `obj` is a live instance
+        // that declares `-boom`.
         unsafe {
             let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
             perform(obj.as_id(), sel!(performSelector:), sel!(boom));
@@ -117,7 +122,8 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
             let _ = std::io::stdout().flush();
         }));
         let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
-        // SAFETY: `fds` is a live two-element array.
+        // SAFETY: `fds` is a live two-element array; `dup2`/`close` take plain
+        // descriptors and this thread owns fd 2.
         unsafe {
             let mut fds = [0_i32; 2];
             assert_eq!(pipe(fds.as_mut_ptr()), 0, "pipe()");
@@ -161,7 +167,8 @@ const OBJC_MINTED_CHILD: &str = "ATERM_OBJC_MINTED_CHILD";
 #[test]
 fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
     if reexec::is_child(OBJC_MINTED_CHILD) {
-        // SAFETY: `+alloc` and `-init` on a registered class reached by name.
+        // SAFETY: `+alloc` and `-init` on a registered class reached by name, then `-marker`, which
+        // the class declares with this prototype.
         let _ = Minted::class();
         unsafe {
             let cls: ClassPtr = class(c"ATermObjcMintedProbe");

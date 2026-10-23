@@ -91,6 +91,11 @@ prim! {
 }
 
 /// `@encode(BOOL)` for the target being compiled:
+///
+/// ```text
+/// clang -arch arm64  : @encode(BOOL) = "B", __OBJC_BOOL_IS_BOOL = 1
+/// clang -arch x86_64 : @encode(BOOL) = "c", __OBJC_BOOL_IS_BOOL = 0
+/// ```
 #[cfg(target_arch = "aarch64")]
 const BOOL_ENCODING: &str = "B";
 /// See the `aarch64` arm.
@@ -190,7 +195,8 @@ unsafe impl Encode for crate::runtime::ClassPtr {
 unsafe impl Encode for crate::runtime::ProtocolPtr {
     const ENCODING: &'static str = "@";
 }
-// SAFETY: Selectors encode as `":"`.
+// SAFETY: selectors encode as `":"`; `Sel` is a newtype so this can differ from
+// the `void *` impls below.
 unsafe impl Encode for crate::runtime::Sel {
     const ENCODING: &'static str = ":";
 }

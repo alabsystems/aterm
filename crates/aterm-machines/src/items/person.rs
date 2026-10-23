@@ -275,7 +275,9 @@ impl PersonStep {
 /// Resolves `app` from [`APPS`] or validates it as a bundle identifier.
 ///
 /// # Errors
-/// Returns an error if `app` is neither a known short name nor a valid bundle ID.
+/// Returns an error if `app` is neither a known short name nor a valid bundle ID. A bundle
+/// id is letters, digits, `.`, `-` and `_` only, so it can be quoted into the TCC query as
+/// it is.
 pub fn bundle_id(app: &str) -> Result<String, String> {
     if let Some((_, bundle)) = APPS.iter().find(|(name, _)| name.eq_ignore_ascii_case(app)) {
         return Ok((*bundle).to_owned());

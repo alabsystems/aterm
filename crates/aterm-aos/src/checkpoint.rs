@@ -260,8 +260,12 @@ impl Checkpoint {
     /// Validates task/schema/profile against `expect` (the code may differ: applying other code is
     /// a separately recorded transition), re-derives the state digest under `schema`'s digest, and
     /// returns the decoded state.
+    ///
     /// # Errors
-    /// [`RestoreRefusal::Identity`], [`RestoreRefusal::StateDigest`], or [`RestoreRefusal::Wire`].
+    ///
+    /// [`RestoreRefusal::Identity`] (task, schema or profile, in that order),
+    /// [`RestoreRefusal::StateDigest`], or [`RestoreRefusal::Wire`] (the state does not decode, or
+    /// does not re-encode to its own bytes).
     pub fn restore<S: Schema>(
         &self,
         schema: &S,

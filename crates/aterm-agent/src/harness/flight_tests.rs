@@ -113,7 +113,7 @@ fn text_row(msg: &str, stop: Option<&str>, s: u32) -> String {
 }
 
 /// THE WAYS A WORKFLOW'S AGENT ENDS (the shapes MEASURED on one run of 22
-/// agents, module docs): on its answered [`FINAL_TOOL`] call with no
+/// agents): on its answered [`FINAL_TOOL`] call with no
 /// assistant row after it, or on a text row whose turn stops on
 /// `stop_sequence` (or `max_tokens`, `refusal`): each is done, so a run
 /// whose other agent sits in a long Bash call waits on that call, not on

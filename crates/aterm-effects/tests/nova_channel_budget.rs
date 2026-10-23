@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The shared `nova_add` channel has two producers and one budget.
-//
-// `nova::MAX_NOVA_QUADS` (1536) funds only the decoration pass: each nova and
-// supernova is funded from `MAX_NOVA_QUADS.saturating_sub(nova.len())`
-// (`word_decorations.rs`), and the burst mutex keeps that cap from truncating a
-// live effect. The prism wake (`output_streak`) appends its per-pane quads after
-// it (`EffectsPipeline::streak_pane`), unfunded and uncounted, so the channel can
-// exceed 1536. Pinned here: the streak's share is tail-bounded, and an overrun
-// channel is drawn in full.
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::Geom;
@@ -33,8 +23,6 @@ fn geom(cw: usize, ch: usize, cols: usize, rows: usize) -> Geom {
     }
 }
 
-/// The most demanding reachable config: the host clamps `tail` into
-/// `TAIL_MIN..=TAIL_MAX` and `max_streaks` into `1..=MAX_COMETS`.
 fn cfg() -> StreakConfig {
     StreakConfig {
         enabled: true,
@@ -50,9 +38,6 @@ fn cfg() -> StreakConfig {
     }
 }
 
-/// Drive one engine through `frames` of full-width build output (one fresh row
-/// per frame at 120 Hz), appending into `out`, and return the largest
-/// per-frame quad count.
 fn drive(seed: u64, g: Geom, frames: u64, out: &mut Vec<GlowQuad>) -> usize {
     let mut e = OutputStreak::new(seed);
     let c = cfg();
@@ -69,10 +54,6 @@ fn drive(seed: u64, g: Geom, frames: u64, out: &mut Vec<GlowQuad>) -> usize {
     peak
 }
 
-/// The streak's share is tail-bounded: a comet lights at most `tail + 2` cells
-/// (`OutputStreak::emit` sweeps `tail_start.floor() ..= head.round()`, one quad per
-/// cell), so one engine's worst case is one ribbon (<= cols) plus `MAX_COMETS`
-/// heads, not `cols * (MAX_COMETS + 1)`.
 #[test]
 fn the_streak_share_is_tail_bounded_not_column_bounded() {
     for cols in [80usize, 120, 200, 400] {
@@ -85,7 +66,6 @@ fn the_streak_share_is_tail_bounded_not_column_bounded() {
             peak <= structural,
             "cols={cols}: peak {peak} must sit under the ribbon+heads bound {structural}"
         );
-        // Non-vacuity: the flood opened its full-width ribbon.
         assert!(
             peak >= cols,
             "cols={cols}: peak {peak} — the flood ribbon never opened, the bound is vacuous"
@@ -93,12 +73,8 @@ fn the_streak_share_is_tail_bounded_not_column_bounded() {
     }
 }
 
-/// An overrun channel is drawn in full: `Renderer::draw_nova` -> `draw_flat_add`
-/// has no fixed buffer, clamp or assert, so quads past 1536 reach the glass. Pinned
-/// as a difference: the frame truncated at the backstop differs from the full one.
 #[test]
 fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
-    // The bundled face, checked in: no host's font set decides whether this runs.
     let mut rend = Renderer::from_bytes(
         include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf"),
         18.0,
@@ -112,8 +88,6 @@ fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25lcompiling aterm-effects v0.69.0");
 
-    // The decoration share is stacked on one cell so it cannot saturate the cells
-    // the streak lights: only the streak's quads decide the difference.
     let mut channel: Vec<GlowQuad> = (0..MAX_NOVA_QUADS)
         .map(|_| GlowQuad {
             row: 0,

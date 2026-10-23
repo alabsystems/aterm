@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Regression corpora for the procedural glyphs: an FNV-1a 64 hash of every
-//! glyph's coverage per lattice size, one corpus for the orthogonal families
-//! (box lines, junctions, doubles, blocks, shades at phase 0, quadrants,
-//! braille, sextants; hard 0/255) and one for the anti-aliased families (arcs,
-//! diagonals, Powerline, wedges).
-//!
-//! Re-bless with `ATERM_BLESS_GOLDEN=1 targo --unverified test -p aterm-render
-//! --test render_suite -- procedural_orthogonal_regression::` and justify the
-//! diff in the commit.
+//! FNV-1a 64 coverage regression corpora for orthogonal and anti-aliased procedural glyphs.
 
 use aterm_render::procedural;
 
-/// Odd/even, squat, tall and degenerate sizes: the seam-hazard lattice.
 const SIZES: &[(usize, usize)] = &[
     (1, 1),
     (2, 2),
@@ -28,9 +19,6 @@ const SIZES: &[(usize, usize)] = &[
     (20, 8),
 ];
 
-/// Every orthogonal (axis-aligned, hard 0/255) procedural code point: the box
-/// range minus arcs (U+256D–2570) and diagonals (U+2571–2573), blocks, braille
-/// and sextants.
 fn orthogonal_chars() -> impl Iterator<Item = char> + Clone {
     (0x2500u32..=0x256C)
         .chain(0x2574..=0x259F)
@@ -39,7 +27,6 @@ fn orthogonal_chars() -> impl Iterator<Item = char> + Clone {
         .map(|cp| char::from_u32(cp).expect("valid code points"))
 }
 
-/// FNV-1a 64 over a byte stream — dependency-free, stable across platforms.
 struct Fnv(u64);
 
 impl Fnv {
@@ -54,9 +41,6 @@ impl Fnv {
     }
 }
 
-/// Every anti-aliased procedural code point ([`procedural::antialiased`]): the
-/// arcs and diagonals (U+256D–2573), the wedge/triangle range
-/// (U+1FB3C–1FB6F) and Powerline (U+E0B0–E0BF).
 fn aa_chars() -> impl Iterator<Item = char> + Clone {
     (0x256Du32..=0x2573)
         .chain(0x1FB3C..=0x1FB6F)
@@ -64,9 +48,6 @@ fn aa_chars() -> impl Iterator<Item = char> + Clone {
         .map(|cp| char::from_u32(cp).expect("valid code points"))
 }
 
-/// One corpus line per size: `{w}x{h} {hash:016x}`, hashing every glyph's code
-/// point + coverage bytes in code-point order. `hard` requires every coverage
-/// byte to be 0 or 255 (the orthogonal families' law).
 fn corpus(chars: impl Iterator<Item = char> + Clone, hard: bool) -> String {
     let mut out = String::new();
     for &(w, h) in SIZES {
@@ -87,7 +68,6 @@ fn corpus(chars: impl Iterator<Item = char> + Clone, hard: bool) -> String {
     out
 }
 
-/// Compare `got` against the fixture `name`, or re-bless it.
 fn check_corpus(got: &str, name: &str) -> Option<String> {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
     if std::env::var_os("ATERM_BLESS_GOLDEN").is_some() {

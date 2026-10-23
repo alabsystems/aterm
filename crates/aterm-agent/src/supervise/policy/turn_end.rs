@@ -9537,15 +9537,15 @@ pub(crate) fn met_under_another(met: Option<Program>, here: Program) -> bool {
 }
 
 /// THE SEAT A SCREEN NAMES: the model and the login a screen-alone agent
-/// draws ([`screen_alone`]; X2 of the walls-3 stage) — agy's footer model and
-/// its launch card's login row (`Gemini API key`, or the signed-in account),
-/// Gemini CLI's footer `/model` value and its banner's login
-/// (`Authenticated with gemini-api-key`). A limit met under one seat binds
-/// another no longer ([`TurnEndState::observe`]: the account's limit is that
-/// account's, a model's limit that model's). Muse Code's limit is its
-/// account's and its screen names no account; Claude Code's are read from
-/// its conversation. `None` where the screen does not draw it (the launch
-/// card and the banner scroll off; the footer may be hidden).
+/// draws ([`screen_alone`]) — agy's footer model and its launch card's login
+/// row (`Gemini API key`, or the signed-in account), Gemini CLI's footer
+/// `/model` value and its banner's login (`Authenticated with
+/// gemini-api-key`). A limit met under one seat binds another no longer
+/// ([`TurnEndState::observe`]: the account's limit is that account's, a
+/// model's limit that model's). Muse Code's limit is its account's and its
+/// screen names no account; Claude Code's are read from its conversation.
+/// `None` where the screen does not draw it (the launch card and the banner
+/// scroll off; the footer may be hidden).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Seat {
     pub model: Option<String>,
@@ -9591,8 +9591,7 @@ impl Seat {
     /// (`user@example.com (Google AI Pro)`, `Signed in with Google:
     /// user@example.com`) — never a key's label (`Gemini API key`,
     /// `Authenticated with gemini-api-key`), which every key draws alike: a
-    /// relaunch under another key draws the same words (F1 of the review of
-    /// walls-3).
+    /// relaunch under another key draws the same words.
     fn same_account(&self, now: &Self) -> bool {
         matches!((&self.login, &now.login), (Some(a), Some(b)) if a == b && a.contains('@'))
     }
@@ -10181,8 +10180,8 @@ struct WallTrack {
     /// longer — its reset dropped, the point going at once — and it holds no
     /// host's step ([`TurnEndState::limit_holds_host`]). Only until the wall
     /// is met again: that wall is the new seat's own, its seat taken and
-    /// this cleared (C1 of the review of walls-3), so it holds the host's
-    /// steps again and a further move is a move from it.
+    /// this cleared, so it holds the host's steps again and a further
+    /// move is a move from it.
     seat_moved: bool,
 }
 
@@ -11506,11 +11505,10 @@ impl TurnEndState {
     /// limit episode closed on the relaunched screen — until `grace` past the
     /// reset it named, and for good where it names none (a reset is never
     /// guessed: the policy's own tries, or a person's turn, end it). Past
-    /// that the host steps as at any idle point. Measured before (the
-    /// walls-3 probe of 2026-10-21): Muse Code relaunched under its limit had
-    /// no episode open at its first idle point, and the host's carry-on was
-    /// offered it. Claude Code's are the episode's and its transcript's
-    /// (`Session::standing_holds`).
+    /// that the host steps as at any idle point. Measured before: Muse Code
+    /// relaunched under its limit had no episode open at its first idle
+    /// point, and the host's carry-on was offered it. Claude Code's are the
+    /// episode's and its transcript's (`Session::standing_holds`).
     #[must_use]
     pub fn limit_holds_host(&self, now: Instant, grace: Duration) -> bool {
         let Some(t) = self.wall.as_ref().filter(|t| named_class(t.class)) else {
@@ -13616,18 +13614,16 @@ impl TurnEndState {
                 // screen names where it was first read, or met again at a
                 // turn's end — over what the tab's earlier screens of the
                 // agent named ([`Self::seat_now`]: the launch card's login,
-                // scrolled off by now; F1 of the review of walls-3, where a
-                // limit met past the first screen bound no login and no
-                // relaunch under another account moved it). Not a remembered
+                // scrolled off by now, so a limit met past the first screen
+                // still binds the login the card drew). Not a remembered
                 // wall's: the memory supplies the notice, and this screen's
                 // seat is the session's now. AND THE WALL MET AGAIN AFTER A
                 // SEAT MOVE ([`WallTrack::seat_moved`], no work read before
                 // it: a fast 429 on the new model or login) is the NEW SEAT'S
                 // OWN: its seat taken, the move done with — so it holds the
-                // host's steps again ([`Self::limit_holds_host`]) and a
-                // further move is told (C1 of the review: the move stuck, a
-                // relaunch then had the host's carry-on typed into the new
-                // seat's standing wall, and a third seat was held to it).
+                // host's steps again ([`Self::limit_holds_host`]), so no
+                // carry-on is typed into it, and a further move from it is
+                // told, so a third seat is not held to it.
                 let seat_now = self.seat_now(reading.program, &reading.seat);
                 if !reading.wall_remembered
                     && let Some(t) = self.wall.as_mut().filter(|t| {
@@ -13721,19 +13717,18 @@ impl TurnEndState {
                         })
                         .map(|t| (t, seat_now))
                 } {
-                    // ANOTHER SEAT THAN THE LIMIT'S (X2 of the walls-3
-                    // stage): a screen-alone agent's screen names another
-                    // login than the one the limit was met under (agy's
-                    // launch card, Gemini CLI's banner: a relaunch on
-                    // another account or key), or another model where the
-                    // limit is a model's (their footers: a person's
-                    // `/model`). The limit is that account's, or that
-                    // model's: its reset binds the session no longer, and
-                    // the point goes at once — the turn resumed under the
-                    // new seat, which the track takes (a limit that holds it
-                    // too is met again: the new seat's own wall, above).
-                    // Measured before (the walls-3 probe): the old account's
-                    // reset held the new one.
+                    // ANOTHER SEAT THAN THE LIMIT'S: a screen-alone agent's
+                    // screen names another login than the one the limit was
+                    // met under (agy's launch card, Gemini CLI's banner: a
+                    // relaunch on another account or key), or another model
+                    // where the limit is a model's (their footers: a
+                    // person's `/model`). The limit is that account's, or
+                    // that model's: its reset binds the session no longer,
+                    // and the point goes at once — the turn resumed under
+                    // the new seat, which the track takes (a limit that
+                    // holds it too is met again: the new seat's own wall,
+                    // above). Measured before: the old account's reset held
+                    // the new one.
                     t.named = None;
                     t.seat_moved = true;
                     t.seat.update(&seat_now);
@@ -14337,49 +14332,48 @@ impl TurnEndState {
         self.drop_gone_launch_latch();
     }
 
-    /// THE RELAUNCH'S START-UP UNDER A LIMIT (X2 of the walls-3 stage): a
-    /// usage limit, spend limit or model bucket ([`named_class`]) met under
-    /// an agent whose screen is all its evidence ([`screen_alone`]: Muse
-    /// Code, agy, Gemini CLI), whose process came back since the limit was
-    /// last read — the host names a start later than that read
-    /// ([`Self::agent_started`]), or, with no host's word, a point of no
-    /// agent's (a shell's prompt: it crashed, exited or upgraded) was read
-    /// in between. The FIRST point of the relaunched agent is its start-up:
-    /// what it drew (its conversation replayed, read busy; a resumed-after-
-    /// crash card) is no turn anyone asked and lifts no limit, so it is
-    /// folded and decided as no work (`reading.worked` taken), and the limit
-    /// is decided by the reset it named ([`still_shown`]) — never by the
-    /// continue policy's back-off into the standing limit. Until a turn runs
-    /// the start-up stands ([`RelaunchBooks::startup`]): a fresh banner with
-    /// no task does not end the limit ([`Self::observe`]'s `/clear` rule) —
-    /// the account's limit holds the next process as it held the last. A
-    /// turn that runs past it ends the limit as any work does. Measured
-    /// before (the walls-3 probe of 2026-10-21): Muse Code's resume after a
-    /// crash, read with four seconds of start-up work, dropped the limit and
-    /// typed `continue@v1` (Cruise) or `land@v1` (Land) into it at the two-
-    /// minute back-off; agy relaunched on a fresh banner dropped it as a
-    /// conversation with no task. Claude Code's relaunches are its own rules'
-    /// (its transcript names its limit). Call before the point is folded
-    /// ([`Self::observe`]) and decided.
+    /// THE RELAUNCH'S START-UP UNDER A LIMIT: a usage limit, spend limit or
+    /// model bucket ([`named_class`]) met under an agent whose screen is all
+    /// its evidence ([`screen_alone`]: Muse Code, agy, Gemini CLI), whose
+    /// process came back since the limit was last read — the host names a
+    /// start later than that read ([`Self::agent_started`]), or, with no
+    /// host's word, a point of no agent's (a shell's prompt: it crashed,
+    /// exited or upgraded) was read in between. The FIRST point of the
+    /// relaunched agent is its start-up: what it drew (its conversation
+    /// replayed, read busy; a resumed-after-crash card) is no turn anyone
+    /// asked and lifts no limit, so it is folded and decided as no work
+    /// (`reading.worked` taken), and the limit is decided by the reset it
+    /// named ([`still_shown`]) — never by the continue policy's back-off into
+    /// the standing limit. Until a turn runs the start-up stands
+    /// ([`RelaunchBooks::startup`]): a fresh banner with no task does not end
+    /// the limit ([`Self::observe`]'s `/clear` rule) — the account's limit
+    /// holds the next process as it held the last. A turn that runs past it
+    /// ends the limit as any work does. Measured before: Muse Code's resume
+    /// after a crash, read with four seconds of start-up work, dropped the
+    /// limit and typed `continue@v1` (Cruise) or `land@v1` (Land) into it at
+    /// the two-minute back-off; agy relaunched on a fresh banner dropped it
+    /// as a conversation with no task. Claude Code's relaunches are its own
+    /// rules' (its transcript names its limit). Call before the point is
+    /// folded ([`Self::observe`]) and decided.
     ///
-    /// THE SEAT AT THE RELAUNCH (F1 of the review of walls-3): the limit
-    /// holds the relaunched process only where its seat is vouched for — the
-    /// relaunch is the host's own (`ours`: a crash's relaunch on exit, the
-    /// live upgrade's, the restart in place, which type the line with the
-    /// env and login the agent ran under, `IdleHost::relaunch_owed`), or
-    /// the new process's screen names the account the limit was met under
-    /// ([`Seat::same_account`], its login an address read now and before).
-    /// A relaunch nobody here made, on a seat nothing vouches for — another
-    /// key (every key draws the same label), a login the limit's screens
-    /// never drew, Muse Code (its screen names no account) — is another seat
-    /// for all the loop can tell: the limit binds it no longer, and the turn
-    /// is resumed at once (`usage-resume@v1`), ONE TRY, which a limit that
-    /// holds the new process too answers with its wall: met again, a wall of
-    /// its own, held to the reset it names ([`Self::observe`]). Measured
-    /// before (the review's probe `zz_f`): agy's card scrolled off by the
-    /// 429, its relaunch under another login was held to the old account's
-    /// reset and the host's carry-on withheld past it; a key switch never
-    /// moved the seat at all. `ours` is asked only at such a relaunch.
+    /// THE SEAT AT THE RELAUNCH: the limit holds the relaunched process only
+    /// where its seat is vouched for — the relaunch is the host's own
+    /// (`ours`: a crash's relaunch on exit, the live upgrade's, the restart
+    /// in place, which type the line with the env and login the agent ran
+    /// under, `IdleHost::relaunch_owed`), or the new process's screen names
+    /// the account the limit was met under ([`Seat::same_account`], its
+    /// login an address read now and before). A relaunch nobody here made,
+    /// on a seat nothing vouches for — another key (every key draws the same
+    /// label), a login the limit's screens never drew, Muse Code (its screen
+    /// names no account) — is another seat for all the loop can tell: the
+    /// limit binds it no longer, and the turn is resumed at once
+    /// (`usage-resume@v1`), ONE TRY, which a limit that holds the new
+    /// process too answers with its wall: met again, a wall of its own, held
+    /// to the reset it names ([`Self::observe`]). Measured before: agy's
+    /// card scrolled off by the 429, its relaunch under another login was
+    /// held to the old account's reset and the host's carry-on withheld past
+    /// it; a key switch never moved the seat at all. `ours` is asked only at
+    /// such a relaunch.
     pub fn relaunch_startup(
         &mut self,
         reading: &mut TurnEndReading,

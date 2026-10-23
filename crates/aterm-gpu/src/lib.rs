@@ -295,6 +295,11 @@ fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
 
 /// GPU selection development seams ([`aterm_types::dev_seam!`]; shipped
 /// binaries read none of them):
+///
+/// * `ATERM_GPU_ADAPTER=<substring>`: pick the adapter whose name contains
+///   this, case-insensitive; falls back to default selection with a warning.
+/// * `ATERM_GPU_POWER=low|high`: power preference, default `low` (keeps hybrid
+///   laptops on the iGPU).
 #[inline]
 #[cfg(wgpu_arm)]
 const fn default_backends() -> wgpu::Backends {

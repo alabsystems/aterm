@@ -594,8 +594,8 @@ fn lossy_paste(bytes: &[u8]) -> String {
     text
 }
 
-/// The key, modifiers and text a lone character spells, with the legacy readings of
-/// the module docs.
+/// The key, modifiers and text a lone character spells, in the one reading the decoder
+/// picks where legacy bytes are ambiguous (BS and DEL are both Backspace, `A` is Shift+a).
 fn plain(c: char) -> (Key, Modifiers, Option<char>) {
     let none = Modifiers::empty();
     let ctrl = |c: char| (Key::Character(c), Modifiers::CTRL, None);
@@ -1113,7 +1113,7 @@ fn kitty_key(fields: &[Field]) -> Csi {
     }
 }
 
-/// The canonical reading (module docs) of a key a sequence names by its code: a keypad
+/// The canonical reading of a key a sequence names by its code: a keypad
 /// key is its main-block twin, its glyph typing itself unless a chord modifier is held;
 /// a Shift chord with its `shifted` key is that glyph as legacy bytes spell it; and a
 /// character or space with no modifier types itself.

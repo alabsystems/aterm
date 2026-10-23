@@ -16,12 +16,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const GIT: &str = crate::checkout::GIT;
-// Full repository objects contain many URL templates. Smaller pages leave room
-// under the strict capture bound without jq/header ordering assumptions.
 const PAGE_SIZE: usize = 30;
 const CLONE_BUDGET: Duration = Duration::from_secs(1800);
 
-/// Build the reconciliation item for repositories owned by the configured account or org.
 pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<dyn Item> {
     Box::new(Repositories {
         user: user.clone(),
@@ -38,21 +35,16 @@ pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<
 struct Repositories {
     user: User,
     config: Github,
-    /// The develop items' checkouts: never fetched or moved here.
     recorded: Vec<PathBuf>,
 }
 
-/// What one scan found: every repository, the missing ones, and the matching worktrees this
-/// item aligns, each with where it stands.
 struct Scan {
     all: usize,
     missing: Vec<Repo>,
     existing: Vec<(Repo, PathBuf, Stands)>,
-    /// Present worktrees `[develop]` records, left to the develop items.
     recorded: usize,
 }
 
-/// At most this many kept worktrees are named in a row.
 const NAMED: usize = 4;
 
 impl Scan {
@@ -63,7 +55,6 @@ impl Scan {
             .count()
     }
 
-    /// What the worktrees left as they are say, a few named.
     fn kept(&self) -> Option<String> {
         let kept: Vec<String> = self
             .existing
@@ -149,7 +140,6 @@ impl Item for Repositories {
         for repo in scan.missing {
             clone_one(sys, &self.user, &repo.owner, &repo)?;
         }
-        // Each worktree on its own: one that cannot be fetched leaves the others to move.
         let mut failed = Vec::new();
         for (repo, path, stands) in scan.existing {
             if !stands.moves() {
@@ -179,9 +169,6 @@ impl Repositories {
                 recorded += 1;
                 continue;
             }
-            // A worktree whose origin cannot be read now (offline, an SSH origin with no
-            // key loaded, access revoked) is left as it is, saying why: it never keeps the
-            // missing repositories from being cloned or the others from moving.
             let stands = crate::checkout::read(sys, &self.user, &path, &repo.origin())
                 .unwrap_or_else(|unread| Stands::Kept(unread.why));
             aligned.push((repo, path, stands));
@@ -195,7 +182,6 @@ impl Repositories {
     }
 }
 
-/// Return verified GitHub checkouts in `~` that are `aterm` workspaces.
 pub(super) fn aterm_checkouts(
     sys: &dyn System,
     user: &User,
@@ -218,10 +204,8 @@ pub(super) fn missing(sys: &dyn System, user: &User, all: &[Repo]) -> Result<Vec
     partition(sys, user, all).map(|(missing, _)| missing)
 }
 
-/// The verified matching worktrees present in the home, each with its path.
 type Present = Vec<(Repo, PathBuf)>;
 
-/// The repositories missing from the home, and the verified matching worktrees present.
 fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<(Vec<Repo>, Present), String> {
     admit_home(sys, user)?;
     let home = Path::new(&user.home);
@@ -269,7 +253,6 @@ pub(super) struct Repo {
 }
 
 impl Repo {
-    /// The one origin a matching worktree of this repository has.
     fn origin(&self) -> Origin {
         Origin(vec![crate::checkout::Remote::Github {
             owner: self.owner.clone(),
@@ -312,7 +295,6 @@ fn text(sys: &dyn System, cmd: &Cmd, why: &str) -> Result<String, String> {
     String::from_utf8(ran.stdout).map_err(|_| why.to_owned())
 }
 
-/// Every repository `config.owner` holds, read with `token` through agh's read door.
 fn enumerate(
     sys: &dyn System,
     user: &User,
@@ -345,7 +327,6 @@ fn enumerate(
     })
 }
 
-/// Read all pages from `base` and validate repository records before any mutation.
 pub(super) fn enumerate_pages(
     base: &str,
     owner: Option<&str>,
@@ -433,10 +414,8 @@ fn verify_existing(
         || !git_read(sys, user, path, &["rev-parse", "--show-prefix"])?
             .trim()
             .is_empty()
-        // Git reports a physical root (/private/var on macOS) even when the
-        // admitted path uses a system alias (/var). An empty show-prefix proves
-        // this -C directory is the root without mistaking that alias for nesting.
-        || !Path::new(git_read(sys, user, path, &["rev-parse", "--show-toplevel"])?.trim()).is_absolute()
+        || !Path::new(git_read(sys, user, path, &["rev-parse", "--show-toplevel"])?.trim())
+            .is_absolute()
     {
         return Err(format!(
             "~/{} is not a top-level Git worktree; left untouched",
@@ -527,7 +506,6 @@ fn remote(text: &str) -> Result<Remote, String> {
             ) {
                 return Err("invalid remote Git reference name".into());
             }
-            // Peeled annotated-tag rows have a different oid and are checked by fsck.
             if line.ends_with("^{}") {
                 continue;
             }
@@ -543,7 +521,6 @@ fn remote(text: &str) -> Result<Remote, String> {
     })
 }
 
-// Refuse stable URL rewrites outside this repository before contacting the remote.
 fn admit_endpoint(
     sys: &dyn System,
     user: &User,
@@ -837,8 +814,6 @@ mod tests {
         Secret::new(KEYCHAIN.as_bytes()).unwrap()
     }
 
-    /// A home, CLT git, and the login keychain's GitHub credential ready for alice: git's
-    /// github.com settings name the helper, and the token it holds signs in as alice.
     fn fixture() -> (Fake, User, Github) {
         let mut sys = Fake::root();
         let who = user("alice", 501);
@@ -1044,8 +1019,6 @@ mod tests {
         );
     }
 
-    /// The reads [`crate::checkout::read`] makes of a matching worktree on `main` at `A`
-    /// whose `git status` says `status`.
     fn script_read(sys: &Fake, who: &User, path: &Path, name: &str, status: &str) {
         for (args, output) in [
             (
@@ -1075,11 +1048,6 @@ mod tests {
         }
     }
 
-    /// THE GITHUB ITEM'S FAST-FORWARD (design §4.3): a clean worktree on GitHub's default
-    /// branch, behind it, is fetched and fast-forwarded through the shared function; a dirty
-    /// one is left as it is, saying why; the one `[develop]` records is the develop items'
-    /// and is never read past its identity. Nothing is reset, stashed, checked out, pulled or
-    /// pushed. Negative control: the same scan with nothing behind reads `Ok`.
     #[test]
     fn a_clean_worktree_behind_github_is_fast_forwarded_and_a_recorded_one_left_to_develop() {
         use std::sync::{Arc, Mutex};
@@ -1231,10 +1199,6 @@ mod tests {
         }
     }
 
-    /// ONE WORKTREE WHOSE ORIGIN CANNOT BE READ STOPS NOTHING: a clean worktree whose
-    /// `ls-remote` fails (an SSH origin with no key loaded, or no network) is left as it is,
-    /// saying why, while the missing repository is still planned and cloned. Negative
-    /// control: the shared read of that worktree does fail, so the scan stood on it before.
     #[test]
     fn a_worktree_whose_origin_cannot_be_read_never_stops_a_clone() {
         for (stderr, offline) in [
@@ -1312,10 +1276,6 @@ mod tests {
         }
     }
 
-    /// THE GITHUB ITEM LEAVES `[develop]`'S CHECKOUTS TO THE DEVELOP ITEMS, as init.toml
-    /// records them: `items` hands the table to the repository item, which reads the
-    /// recorded `~/aterm` no further than its identity. Negative control: the same profile
-    /// without `[develop]` reads `~/aterm`'s origin.
     #[test]
     fn the_profile_s_develop_checkouts_are_left_to_the_develop_items() {
         for develop in [true, false] {

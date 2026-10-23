@@ -2161,6 +2161,1064 @@ fn nothing_is_typed_behind_input_the_worker_has_not_read() {
     }
 }
 
+/// agy 1.4.0's end of turn with `text` in its composer (the cursor after it).
+fn agy_typed(text: &str) -> Vec<String> {
+    use aterm_phase::agy::fixtures as a;
+    let mut rows = aterm_phase::prompt::fixtures::screen(a::END_OF_TURN);
+    let caret = aterm_phase::agy::composer(&rows).expect("the composer");
+    rows[caret] = format!("> {text}");
+    rows
+}
+
+/// What one fenced write of the continuation came to: the requests, the
+/// supervisor's attention, and the run's clock at the write, at each read
+/// and key, and at the escalation.
+struct Typed {
+    m: Mock,
+    lines: Vec<String>,
+}
+
+impl Typed {
+    fn sends(&self) -> Vec<&String> {
+        self.m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("send "))
+            .collect()
+    }
+
+    fn enters(&self) -> Vec<&String> {
+        self.m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" enter"))
+            .collect()
+    }
+
+    /// The requests from the write on, up to the first Enter or the
+    /// escalation, whichever came first.
+    fn after_send(&self) -> Vec<&String> {
+        self.m
+            .requests
+            .iter()
+            .skip_while(|r| !r.starts_with("send "))
+            .skip(1)
+            .take_while(|r| {
+                !(r.starts_with("key ") && r.ends_with(" enter"))
+                    && !r.starts_with("meta set attention owner=supervisor ")
+            })
+            .collect()
+    }
+
+    /// The supervisor's attention that left the text typed, as it was set
+    /// (the run unsets its attention when it stops).
+    fn left_typed(&self) -> Option<&str> {
+        self.m
+            .requests
+            .iter()
+            .filter_map(|r| r.strip_prefix("meta set attention owner=supervisor "))
+            .find(|a| a.contains("(typed, not submitted ("))
+    }
+
+    /// When the script's screen `index` was first read, on the run's clock.
+    fn first_read_of(&self, index: usize) -> Option<Instant> {
+        self.m
+            .read_times
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, at)| *at)
+    }
+
+    fn enter_at(&self) -> Option<Instant> {
+        self.m
+            .key_times
+            .iter()
+            .find(|(r, _)| r.ends_with(" enter"))
+            .map(|(_, at)| *at)
+    }
+
+    fn evidence(&self) -> String {
+        format!(
+            "attention: {:?}\nlines: {:#?}\nrequests: {:#?}",
+            self.m.attention, self.lines, self.m.requests
+        )
+    }
+}
+
+/// One turn end continued by a fenced write over `screens`: the script's third
+/// screen (index 2) is the first read after the write. `hold` keeps that
+/// screen up until a key is pressed (the echo sits); `program` names the
+/// reader; `unsettled` is the `await idle <ms>` that never latches.
+fn fenced_echo(
+    screens: Vec<Vec<String>>,
+    program: &'static str,
+    hold: bool,
+    unsettled: Option<&'static str>,
+    person_after_send: usize,
+) -> Typed {
+    fenced_echo_with(screens, program, |m| {
+        if hold {
+            m.key_gates = vec![(2, 0)];
+        }
+        m.idle_never_for = unsettled;
+        m.person_after_send = person_after_send;
+    })
+}
+
+/// [`fenced_echo`] with the mock as `shape` leaves it (its holds, its
+/// settles, the person, the grids its reads report).
+fn fenced_echo_with(
+    screens: Vec<Vec<String>>,
+    program: &'static str,
+    shape: impl FnOnce(&mut Mock),
+) -> Typed {
+    let mut m = match program {
+        "agy" => agy_mock(screens),
+        "muse" => muse_mock(screens),
+        other => panic!("no mock for {other}"),
+    };
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    // The cursor stands after a typed composer's text (at column 2 it is a
+    // placeholder's, [`aterm_phase::ScreenReader::placeholder`]).
+    let cols: Vec<(usize, usize)> = m
+        .screens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let caret = match program {
+                "agy" => aterm_phase::agy::composer(r),
+                _ => aterm_phase::muse::composer(r),
+            }?;
+            let typed: String = r[caret].chars().skip(1).collect();
+            let typed = typed.trim();
+            (!typed.is_empty()).then(|| (i, 2 + typed.chars().count()))
+        })
+        .collect();
+    m.screen_cols.extend(cols);
+    m.vanish_after = Some(2);
+    m.exit_when = Some(|m| m.attention.is_some());
+    shape(&mut m);
+    let (lines, _) = watch_lines_with(&mut m, &hosted(600), |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    Typed { m, lines }
+}
+
+/// THE ECHO OF A FENCED WRITE IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY
+/// A BUDGET ([`Session::await_echo`]). agy 1.4.0 (no paste guard), as `lab
+/// forever` measured it under load (`ie-fb`): the read after the settle shows
+/// the start of the continuation.
+///
+/// - THE ECHO COMES LATE: the first read shows `> keep`, the screen moves on,
+///   the next read shows `> keep going`. One write and one Enter, fenced on
+///   the whole read, and nothing escalated. Before, the first read was
+///   escalated `typed, not submitted (the composer does not show it as
+///   written)`, and the Enter waited for the next point.
+/// - THE ECHO NEVER FINISHES: the composer sits on `> keep`. Nothing is
+///   pressed, and the text is escalated as a hang, no sooner than
+///   [`turn_end_loop::ECHO_HANG`] after the write on the run's clock.
+///
+/// NEGATIVE CONTROLS, escalated at once (the write's reaction wait the only
+/// `await seq` before the escalation): a composer that shows another text
+/// (`> wkeep going`), and a person who keyed since the write.
+#[test]
+fn a_late_echo_is_waited_for_and_never_judged_by_a_budget() {
+    use aterm_phase::agy::fixtures as a;
+    use aterm_phase::prompt::fixtures::screen;
+    assert_eq!(
+        turn_end_loop::ECHO_HANG,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the echo's wait is the one-minute hang detector"
+    );
+    let seq_waits = |t: &Typed| {
+        t.after_send()
+            .iter()
+            .filter(|r| r.starts_with("await seq "))
+            .count()
+    };
+
+    // THE ECHO COMES LATE.
+    let t = fenced_echo(
+        vec![
+            screen(a::BUSY),
+            screen(a::END_OF_TURN),
+            agy_typed("keep"),
+            agy_typed("keep going"),
+            screen(a::BUSY),
+        ],
+        "agy",
+        false,
+        None,
+        0,
+    );
+    assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
+    assert!(t.sends()[0].ends_with(" -- keep going"), "{}", t.evidence());
+    assert_eq!(t.enters().len(), 1, "one Enter: {}", t.evidence());
+    assert!(
+        t.enters()[0].contains("if=^>\\x20keep\\x20going\\s*$"),
+        "fenced on the read that showed it whole: {}",
+        t.evidence()
+    );
+    assert!(t.left_typed().is_none(), "{}", t.evidence());
+    assert!(
+        seq_waits(&t) >= 2,
+        "the screen waited past the read that showed a start of it: {}",
+        t.evidence()
+    );
+    assert!(
+        t.lines.iter().any(|l| l.starts_with("CONTINUED ")),
+        "{}",
+        t.evidence()
+    );
+
+    // THE ECHO NEVER FINISHES.
+    let t = fenced_echo(
+        vec![screen(a::BUSY), screen(a::END_OF_TURN), agy_typed("keep")],
+        "agy",
+        true,
+        None,
+        0,
+    );
+    assert!(t.enters().is_empty(), "nothing pressed: {}", t.evidence());
+    assert_eq!(t.sends().len(), 1, "{}", t.evidence());
+    assert!(
+        t.left_typed().is_some_and(|a| a.contains(
+            "(typed, not submitted (the composer had not shown it whole a minute after it was \
+             written)"
+        )),
+        "escalated as a hang: {}",
+        t.evidence()
+    );
+    let waited =
+        t.m.attention_at
+            .zip(t.m.first_send_at)
+            .map(|(told, sent)| told.saturating_duration_since(sent));
+    assert!(
+        waited.is_some_and(|w| w >= turn_end_loop::ECHO_HANG),
+        "escalated {waited:?} after the write: {}",
+        t.evidence()
+    );
+
+    // NEGATIVE CONTROLS: another text; a person's key.
+    for (tag, shown, person) in [("other", "wkeep going", 0), ("person", "keep going", 1)] {
+        let t = fenced_echo(
+            vec![
+                screen(a::BUSY),
+                screen(a::END_OF_TURN),
+                agy_typed(shown),
+                agy_typed("keep going"),
+                screen(a::BUSY),
+                screen(a::END_OF_TURN),
+            ],
+            "agy",
+            false,
+            None,
+            person,
+        );
+        assert!(t.enters().is_empty(), "{tag}: {}", t.evidence());
+        assert!(t.left_typed().is_some(), "{tag}: {}", t.evidence());
+        assert_eq!(
+            seq_waits(&t),
+            1,
+            "{tag}: escalated at once: {}",
+            t.evidence()
+        );
+    }
+}
+
+/// A PASTE-GUARDED ENTER WAITS OUT THE GUARD SINCE THE ECHO WAS WHOLE
+/// ([`Session::await_echo`]). Muse Code 1.4.10 takes an Enter in the same burst
+/// as the text as a newline, as `lab forever` measured it under load
+/// (`ie-fm2` land-h): its `await idle 600` ran out with the nudge just drawn
+/// whole, the Enter went at once and became a newline in the composer.
+///
+/// With the screen never still 600 ms, the Enter goes no sooner than
+/// [`turn_end_loop::PASTE_GUARD_HOLD`] after the first read that showed the text
+/// whole, on the run's clock, and once. Before, it went at that read.
+///
+/// NEGATIVE CONTROLS: a settle that latches (the screen held still 600 ms) lets
+/// the Enter go at the first whole read; agy, which has no paste guard, is
+/// pressed at its first whole read whether or not its settle latched.
+#[test]
+fn a_paste_guarded_enter_waits_out_the_guard_since_the_echo_was_whole() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let muse_typed = |text: &str| {
+        let mut rows = screen(u::END_OF_TURN_1_4_10);
+        let caret = aterm_phase::muse::composer(&rows).expect("the composer");
+        rows[caret] = format!("❯ {text}");
+        rows
+    };
+    let muse = || {
+        vec![
+            screen(u::BUSY_1_4_10),
+            screen(u::END_OF_TURN_1_4_10),
+            muse_typed("keep going"),
+            screen(u::BUSY_1_4_10),
+        ]
+    };
+    let since_whole = |t: &Typed| {
+        t.enter_at()
+            .zip(t.first_read_of(2))
+            .map(|(enter, whole)| enter.saturating_duration_since(whole))
+    };
+    let settles = |t: &Typed, ms: &str| {
+        t.after_send()
+            .iter()
+            .filter(|r| r.starts_with(&format!("await idle {ms} ")))
+            .count()
+    };
+
+    // The screen never holds still 600 ms.
+    let t = fenced_echo(muse(), "muse", true, Some("600"), 0);
+    assert_eq!(
+        (t.sends().len(), t.enters().len()),
+        (1, 1),
+        "one write, one Enter: {}",
+        t.evidence()
+    );
+    assert!(t.left_typed().is_none(), "{}", t.evidence());
+    let held = since_whole(&t);
+    assert!(
+        held.is_some_and(|h| h >= turn_end_loop::PASTE_GUARD_HOLD),
+        "the Enter {held:?} after the first whole read: {}",
+        t.evidence()
+    );
+
+    // NEGATIVE CONTROL: the settle latches.
+    let t = fenced_echo(muse(), "muse", true, None, 0);
+    assert_eq!(t.enters().len(), 1, "{}", t.evidence());
+    assert_eq!(
+        settles(&t, "600"),
+        1,
+        "pressed at the first whole read: {}",
+        t.evidence()
+    );
+
+    // NEGATIVE CONTROL: no paste guard.
+    use aterm_phase::agy::fixtures as a;
+    let t = fenced_echo(
+        vec![
+            screen(a::BUSY),
+            screen(a::END_OF_TURN),
+            agy_typed("keep going"),
+            screen(a::BUSY),
+        ],
+        "agy",
+        true,
+        Some("500"),
+        0,
+    );
+    assert_eq!(t.enters().len(), 1, "{}", t.evidence());
+    assert_eq!(
+        settles(&t, "500"),
+        1,
+        "agy pressed at its first whole read: {}",
+        t.evidence()
+    );
+    assert!(
+        since_whole(&t).is_some_and(|h| h < turn_end_loop::PASTE_GUARD_HOLD),
+        "{}",
+        t.evidence()
+    );
+}
+
+/// THE ACCEPT KEY IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY A BUDGET
+/// ([`Session::await_accept`]). The worker's suggestion `keep going`, accepted
+/// with `right`, as `supervise_turn_end_live_headless` measured it under load:
+/// the worker takes the key seconds late.
+///
+/// - THE KEY IS TAKEN LATE: two reads after the press still show the
+///   suggestion as a placeholder, the third shows it filled. Nothing is
+///   written: `right`, then Enter fenced on the filled read. Before, the first
+///   read had the words typed behind the key, and the worker took both (`keep
+///   goingkeep going` submitted).
+/// - THE KEY IS NEVER TAKEN (a build without the accept key): the placeholder
+///   stands, and its words are typed once, no sooner than
+///   [`turn_end_loop::ECHO_HANG`] after the press, on the run's clock.
+#[test]
+fn an_accept_key_taken_late_is_waited_for_and_nothing_is_typed_behind_it() {
+    let said = "Stage 1 is in.";
+    let world = |screens: Vec<Vec<String>>, filled: Option<usize>, sits: bool| {
+        let mut m = Mock::new(screens);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        if let Some(at) = filled {
+            m.screen_cols.insert(at, 12);
+        }
+        if sits {
+            // The placeholder stands past the accept key.
+            m.key_gates = vec![(2, 1)];
+        }
+        m.vanish_after = Some(2);
+        m.exit_when = Some(|m| m.attention.is_some());
+        let (lines, _) = watch_lines(&mut m, &hosted(600));
+        let sends = m.requests.iter().filter(|r| r.starts_with("send ")).count();
+        let evidence = format!("{lines:#?}\n{:#?}", m.requests);
+        (m, lines, sends, evidence)
+    };
+
+    // THE KEY IS TAKEN LATE.
+    let (m, lines, sends, evidence) = world(
+        vec![
+            busy_screen(),
+            suggesting(said),
+            suggesting(said),
+            suggesting(said),
+            suggesting(said),
+            busy_screen(),
+            ended(STOP),
+        ],
+        Some(4),
+        false,
+    );
+    assert_eq!(sends, 0, "nothing typed behind the key: {evidence}");
+    let presses = m.presses();
+    assert!(
+        presses.len() == 2
+            && presses[0].ends_with(" right")
+            && presses[1].ends_with(" enter")
+            && presses[1].contains(" if-gen=1.105 "),
+        "the accept key, then Enter on the filled read: {evidence}"
+    );
+    assert!(
+        lines.contains(&format!(
+            "CONTINUED seq=102 rule={RULE_SUGGESTION} keep going"
+        )),
+        "{evidence}"
+    );
+
+    // THE KEY IS NEVER TAKEN.
+    let (m, _, sends, evidence) = world(
+        vec![busy_screen(), suggesting(said), suggesting(said)],
+        None,
+        true,
+    );
+    assert_eq!(sends, 1, "its words typed once: {evidence}");
+    let pressed = m
+        .key_times
+        .iter()
+        .find(|(r, _)| r.ends_with(" right"))
+        .map(|(_, at)| *at);
+    let waited = m
+        .first_send_at
+        .zip(pressed)
+        .map(|(sent, right)| sent.saturating_duration_since(right));
+    assert!(
+        waited.is_some_and(|w| w >= turn_end_loop::ECHO_HANG),
+        "typed {waited:?} after the accept key: {evidence}"
+    );
+}
+
+/// A SCREEN THAT HAS NOT MOVED SINCE THE WRITE SAYS NOTHING OF ITS ECHO
+/// ([`Session::await_echo`]). The live suite measured it at load 303: at a
+/// weekly wall's reset the loop wrote `keep going` over the wall's dim
+/// suggestion on a grid whose cursor stood a row below the composer. Claude had
+/// not drawn when the write's reaction wait ran out, and the read showed the
+/// screen as the write found it, the suggestion under a displaced cursor, which
+/// reads as another text.
+///
+/// - THE SCREEN SITS PAST THE REACTION WAIT (15 s after the write, at the
+///   write's seq), then shows the text whole: one write, one Enter fenced on
+///   the read that showed it, nothing escalated. Before, the first read was
+///   escalated `typed, not submitted (the composer does not show it as
+///   written)`.
+/// - NEGATIVE CONTROL: the program draws a new frame that still shows the
+///   suggestion (the screen moved, to another text): escalated at once, the
+///   write's reaction wait the only `await seq` before the escalation.
+#[test]
+fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_text() {
+    let world = |unmoved: bool| {
+        let mut shown = weekly_limited();
+        let caret = shown.iter().position(|row| row == "❯").expect("caret row");
+        shown[caret] = "❯ keep going, then merge when ready".to_string();
+        let mut typed = shown.clone();
+        typed[caret] = "❯ keep going".to_string();
+        let mut screens = vec![busy_screen(), shown.clone()];
+        if !unmoved {
+            screens.push(shown);
+        }
+        screens.extend([typed, busy_screen()]);
+        let mut m = Mock::new(screens);
+        m.cell_attrs = "dim";
+        m.cursor_row = Some(caret + 1);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        if unmoved {
+            m.unmoved_after_send = Some(Duration::from_secs(15));
+        }
+        m.vanish_after = Some(2);
+        m.exit_when = Some(|m| m.attention.is_some());
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: 0,
+                ..owners_policy()
+            },
+            ..resuming(&auto(30), None)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_clock(AFTER_RESET, PDT);
+            s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
+        });
+        Typed { m, lines }
+    };
+    let seq_waits = |t: &Typed| {
+        t.after_send()
+            .iter()
+            .filter(|r| r.starts_with("await seq "))
+            .count()
+    };
+
+    // THE SCREEN SITS PAST THE REACTION WAIT.
+    let t = world(true);
+    assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
+    assert!(t.sends()[0].ends_with(" -- keep going"), "{}", t.evidence());
+    assert_eq!(t.enters().len(), 1, "one Enter: {}", t.evidence());
+    assert!(
+        t.enters()[0].contains("if=^❯\\x20keep\\x20going\\s*$"),
+        "fenced on the read that showed it whole: {}",
+        t.evidence()
+    );
+    assert!(t.left_typed().is_none(), "{}", t.evidence());
+    let waited =
+        t.m.first_send_at
+            .zip(t.enter_at())
+            .map(|(sent, enter)| enter.saturating_duration_since(sent));
+    assert!(
+        waited.is_some_and(|w| w >= Duration::from_secs(15)),
+        "Enter {waited:?} after the write: {}",
+        t.evidence()
+    );
+
+    // NEGATIVE CONTROL: the screen moved, to another text.
+    let t = world(false);
+    assert!(t.enters().is_empty(), "{}", t.evidence());
+    assert!(
+        t.left_typed()
+            .is_some_and(|a| a.contains("the composer does not show it as written")),
+        "{}",
+        t.evidence()
+    );
+    assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
+}
+
+/// Muse Code 1.4.10's end of turn with `text` in its composer.
+fn muse_typed(text: &str) -> Vec<String> {
+    use aterm_phase::muse::fixtures as u;
+    let mut rows = aterm_phase::prompt::fixtures::screen(u::END_OF_TURN_1_4_10);
+    let caret = aterm_phase::muse::composer(&rows).expect("the composer");
+    rows[caret] = format!("❯ {text}");
+    rows
+}
+
+/// One turn end of Claude Code continued by a fenced write over `screens`
+/// (the third, index 2, the first read after the write), the cursor after
+/// the typed text on each screen `typed` names, the mock as `shape` leaves
+/// it.
+fn claude_echo(
+    screens: Vec<Vec<String>>,
+    typed: &[(usize, usize)],
+    shape: impl FnOnce(&mut Mock),
+) -> Typed {
+    let mut m = Mock::new(screens);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    m.screen_cols.extend(typed.iter().copied());
+    m.vanish_after = Some(2);
+    m.exit_when = Some(|m| m.attention.is_some());
+    shape(&mut m);
+    let (lines, _) = watch_lines_with(&mut m, &hosted(600), |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            ..TurnEndTiming::default()
+        });
+    });
+    Typed { m, lines }
+}
+
+/// A FRAME CAUGHT MID-REDRAW, AN EMPTY COMPOSER OR ITS PLACEHOLDER IS AN ECHO
+/// STILL ARRIVING, ON A SCREEN THAT HAS MOVED SINCE THE WRITE ([`echo_of`],
+/// [`Session::await_echo`]). A starved worker clears its composer and draws
+/// it again, and a read can land between. Each read here comes after the
+/// screen moved past the write (its seq later than the write's), so only
+/// what it shows keeps the wait going; the read after it shows the text
+/// whole, and the text is entered once, fenced on that read.
+///
+/// - A TORN FRAME: Muse Code's composer drawn down to its bottom rule, its
+///   footer not yet: no composer reads on it, and its frame reads torn.
+/// - AN EMPTY COMPOSER: Claude Code's composer cleared, the text not drawn.
+/// - ITS PLACEHOLDER: Claude Code's dim suggestion in the composer, the
+///   cursor at its start.
+///
+/// NEGATIVE CONTROL: the moved screen showing another text, typed, is
+/// escalated at once (the write's reaction wait the only `await seq`).
+#[test]
+fn a_torn_frame_or_an_empty_composer_after_the_write_is_an_echo_still_arriving() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let entered_once = |tag: &str, t: &Typed| {
+        assert_eq!(
+            (t.sends().len(), t.enters().len()),
+            (1, 1),
+            "{tag}: one write, one Enter: {}",
+            t.evidence()
+        );
+        assert!(t.left_typed().is_none(), "{tag}: {}", t.evidence());
+        assert!(
+            t.enter_at()
+                .zip(t.first_read_of(3))
+                .is_some_and(|(enter, whole)| enter >= whole),
+            "{tag}: the Enter is fenced on the read that showed the text whole: {}",
+            t.evidence()
+        );
+    };
+
+    // A TORN FRAME.
+    let mut torn = muse_typed("");
+    let caret = aterm_phase::muse::composer(&torn).expect("the composer");
+    torn.truncate(caret + 2);
+    let muse = Program::Muse.reader();
+    assert!(
+        muse.composer(&torn).is_none() && muse.frame_torn(&torn),
+        "the fixture is a torn frame no composer reads on: {torn:#?}"
+    );
+    let t = fenced_echo_with(
+        vec![
+            screen(u::BUSY_1_4_10),
+            screen(u::END_OF_TURN_1_4_10),
+            torn,
+            muse_typed("keep going"),
+            screen(u::BUSY_1_4_10),
+        ],
+        "muse",
+        |_| {},
+    );
+    entered_once("torn", &t);
+
+    // AN EMPTY COMPOSER; ITS PLACEHOLDER.
+    let said = "Fixed the parser; the suite is green.";
+    let mut placeholder = ended(said);
+    let caret = placeholder
+        .iter()
+        .position(|row| row == "❯")
+        .expect("caret row");
+    placeholder[caret] = "❯ Try \"fix the flaky test\"".to_string();
+    for (tag, read) in [("empty", ended(said)), ("placeholder", placeholder)] {
+        let t = claude_echo(
+            vec![
+                busy_screen(),
+                ended(said),
+                read,
+                typed_in(said, "keep going"),
+                busy_screen(),
+            ],
+            &[(3, 12)],
+            |_| {},
+        );
+        entered_once(tag, &t);
+    }
+
+    // NEGATIVE CONTROL: another text, typed, on the moved screen.
+    let t = claude_echo(
+        vec![
+            busy_screen(),
+            ended(said),
+            typed_in(said, "fix the flaky test"),
+            typed_in(said, "keep going"),
+            busy_screen(),
+        ],
+        &[(2, 20), (3, 12)],
+        |_| {},
+    );
+    assert!(t.enters().is_empty(), "{}", t.evidence());
+    assert!(
+        t.left_typed()
+            .is_some_and(|a| a.contains("the composer does not show it as written")),
+        "{}",
+        t.evidence()
+    );
+    assert_eq!(
+        t.after_send()
+            .iter()
+            .filter(|r| r.starts_with("await seq "))
+            .count(),
+        1,
+        "escalated at once: {}",
+        t.evidence()
+    );
+}
+
+/// THE GUARD'S CLOCK STARTS AGAIN AT A WHOLE READ AFTER ONE THAT WAS NOT
+/// ([`Session::await_echo`]). Muse Code draws its composer again while the
+/// screen never holds still 600 ms: a read shows the text whole, the next
+/// only its start, the next whole again. The Enter goes no sooner than
+/// [`turn_end_loop::PASTE_GUARD_HOLD`] after the second whole read, and
+/// once: the first whole read's clock says nothing of a text drawn again
+/// since.
+///
+/// NEGATIVE CONTROL: the text whole at every read, the Enter is fenced on
+/// the read the hold after the first, the next screen.
+#[test]
+fn a_paste_guarded_enter_times_its_hold_from_the_last_whole_read_after_a_redraw() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let world = |redrawn: bool| {
+        let middle = if redrawn {
+            muse_typed("keep")
+        } else {
+            muse_typed("keep going")
+        };
+        fenced_echo_with(
+            vec![
+                screen(u::BUSY_1_4_10),
+                screen(u::END_OF_TURN_1_4_10),
+                muse_typed("keep going"),
+                middle,
+                muse_typed("keep going"),
+                muse_typed("keep going"),
+                screen(u::BUSY_1_4_10),
+            ],
+            "muse",
+            |m| m.idle_never_for = Some("600"),
+        )
+    };
+    let held_from = |t: &Typed, index: usize| {
+        t.enter_at()
+            .zip(t.first_read_of(index))
+            .map(|(enter, whole)| enter.saturating_duration_since(whole))
+    };
+
+    let t = world(true);
+    assert_eq!(
+        (t.sends().len(), t.enters().len()),
+        (1, 1),
+        "{}",
+        t.evidence()
+    );
+    assert!(t.left_typed().is_none(), "{}", t.evidence());
+    let held = held_from(&t, 4);
+    assert!(
+        held.is_some_and(|h| h >= turn_end_loop::PASTE_GUARD_HOLD)
+            && t.enters()[0].contains(" if-gen=1.106 "),
+        "the Enter {held:?} after the whole read that followed the redraw: {}",
+        t.evidence()
+    );
+
+    // NEGATIVE CONTROL: whole at every read.
+    let t = world(false);
+    assert_eq!(t.enters().len(), 1, "{}", t.evidence());
+    assert!(
+        held_from(&t, 2).is_some_and(|h| h >= turn_end_loop::PASTE_GUARD_HOLD)
+            && t.enters()[0].contains(" if-gen=1.104 "),
+        "entered the hold after the first whole read, on the next: {}",
+        t.evidence()
+    );
+}
+
+/// A SETTLE THAT LATCHED BEFORE THE ECHO'S LAST DRAW IS NO HOLD
+/// ([`Session::await_echo`]). Muse Code's `await idle 600` latched, and the
+/// last of the text was drawn between the latch and the read: the host's
+/// `OK idle <seq>` names a seq before the read's. The Enter goes no sooner
+/// than [`turn_end_loop::PASTE_GUARD_HOLD`] after that read, as after a
+/// settle that ran out. Before, a latched settle let the Enter go at that
+/// read, close behind the keys the program had just drawn.
+///
+/// NEGATIVE CONTROL: a latch on the read's own seq (the screen held still
+/// through the settle and the read) lets the Enter go at that read.
+#[test]
+fn a_settle_that_latched_before_the_echos_last_draw_holds_nothing() {
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let world = |behind: bool| {
+        fenced_echo_with(
+            vec![
+                screen(u::BUSY_1_4_10),
+                screen(u::END_OF_TURN_1_4_10),
+                muse_typed("keep going"),
+                screen(u::BUSY_1_4_10),
+            ],
+            "muse",
+            |m| {
+                m.key_gates = vec![(2, 0)];
+                m.idle_latch_behind = behind;
+            },
+        )
+    };
+    let since_whole = |t: &Typed| {
+        t.enter_at()
+            .zip(t.first_read_of(2))
+            .map(|(enter, whole)| enter.saturating_duration_since(whole))
+    };
+    let settles = |t: &Typed| {
+        t.after_send()
+            .iter()
+            .filter(|r| r.starts_with("await idle 600 "))
+            .count()
+    };
+
+    let t = world(true);
+    assert_eq!(
+        (t.sends().len(), t.enters().len()),
+        (1, 1),
+        "{}",
+        t.evidence()
+    );
+    let held = since_whole(&t);
+    assert!(
+        held.is_some_and(|h| h >= turn_end_loop::PASTE_GUARD_HOLD) && settles(&t) >= 2,
+        "the Enter {held:?} after the first whole read: {}",
+        t.evidence()
+    );
+
+    // NEGATIVE CONTROL: the latch is the read's own seq.
+    let t = world(false);
+    assert_eq!(t.enters().len(), 1, "{}", t.evidence());
+    assert_eq!(settles(&t), 1, "entered at that read: {}", t.evidence());
+}
+
+/// ANOTHER GRID IS NO SCREEN UNMOVED SINCE THE WRITE ([`unmoved_since`]). The
+/// worker left for another grid after the write (an alternate screen
+/// entered or left, the program gone back to its shell), and that grid's
+/// content seq restarted below the write's. A read there showing another
+/// text is escalated at once, as the composer showing something else, never
+/// waited on for a minute as the screen the write found.
+///
+/// NEGATIVE CONTROL: the same read on the write's grid, at the write's seq,
+/// is the screen the write found: waited past, and escalated only as a hang.
+#[test]
+fn a_read_on_another_grid_is_never_the_screen_the_write_found() {
+    use aterm_phase::agy::fixtures as a;
+    use aterm_phase::prompt::fixtures::screen;
+    let world = |grid: (u64, u64)| {
+        fenced_echo_with(
+            vec![
+                screen(a::BUSY),
+                screen(a::END_OF_TURN),
+                agy_typed("wkeep going"),
+            ],
+            "agy",
+            |m| {
+                m.key_gates = vec![(2, 0)];
+                m.screen_gens.insert(2, grid);
+            },
+        )
+    };
+    let seq_waits = |t: &Typed| {
+        t.after_send()
+            .iter()
+            .filter(|r| r.starts_with("await seq "))
+            .count()
+    };
+
+    // Nothing entered before the escalation (the draft left standing is the
+    // loop's to judge again later).
+    let entered_first = |t: &Typed| {
+        t.after_send()
+            .len()
+            .checked_add(1)
+            .and_then(|n| {
+                t.m.requests
+                    .iter()
+                    .skip_while(|r| !r.starts_with("send "))
+                    .nth(n)
+            })
+            .is_some_and(|r| r.starts_with("key ") && r.ends_with(" enter"))
+    };
+
+    let t = world((2, 3));
+    assert!(!entered_first(&t), "{}", t.evidence());
+    assert!(
+        t.left_typed()
+            .is_some_and(|a| a.contains("(the composer does not show it as written)")),
+        "{}",
+        t.evidence()
+    );
+    assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
+
+    // NEGATIVE CONTROL: the write's grid, at the write's seq.
+    let t = world((1, 102));
+    assert!(!entered_first(&t), "{}", t.evidence());
+    assert!(
+        t.left_typed()
+            .is_some_and(|a| a.contains("had not shown it whole a minute after")),
+        "{}",
+        t.evidence()
+    );
+}
+
+/// THE HAND OUTLASTS AN ECHO WAITED FOR PAST ITS LEASE ([`Session::keep_hand`]).
+/// The window's host types the continuation under its hard hand, a lease of
+/// [`HAND_TTL_MS`], and the worker draws nothing for 50 s after the write.
+/// The hand is renewed while the echo is waited for: no stretch between two
+/// takes of it, or between the last take and the Enter, is longer than two
+/// renewal periods, so it never lapses before the Enter. Before, it was
+/// taken once, and an echo drawn near the minute had its Enter typed after
+/// the lease ran out, when another connection's keys were no longer refused.
+///
+/// NEGATIVE CONTROL: an echo drawn at once takes the hand once
+/// (`the_windows_host_types_the_fenced_continuation_under_its_hand`), and
+/// with no hand asked for nothing is renewed.
+#[test]
+fn a_hand_held_through_a_slow_echo_is_renewed_before_it_lapses() {
+    use crate::harness::upgrade_drive::{HAND_RENEW, HAND_TTL_MS};
+    let said = "Fixed the parser; the suite is green.";
+    let acquired =
+        || ok("OK lease acquired holder=aterm-harness@1 ttl_ms=60000 expires_in_ms=60000 hard=1\n");
+    let run = |hand: bool| {
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            ended(said),
+            typed_in(said, "keep going"),
+            busy_screen(),
+            ended(STOP),
+        ]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        m.screen_cols.insert(2, 12);
+        m.vanish_after = Some(2);
+        m.unmoved_after_send = Some(Duration::from_secs(50));
+        m.verb_replies.insert(
+            "lease",
+            VecDeque::from([
+                acquired(),
+                acquired(),
+                acquired(),
+                acquired(),
+                acquired(),
+                ok("OK lease released\n"),
+            ]),
+        );
+        let (lines, _) = watch_lines_with(&mut m, &hosted(600), |s| {
+            s.set_supervisor_name(Some(HAND_HOLDER.to_string()));
+            s.type_under_hand(hand);
+        });
+        let evidence = format!("{lines:#?}\n{:#?}\n{:#?}", m.requests, m.lease_times);
+        assert!(
+            lines.contains(&format!(
+                "CONTINUED seq=102 rule={RULE_CONTINUE} keep going"
+            )),
+            "{evidence}"
+        );
+        (m, evidence)
+    };
+
+    let (m, evidence) = run(true);
+    let take = crate::harness::upgrade_drive::hand_take_here_request_as(HAND_HOLDER);
+    let takes: Vec<Instant> = m
+        .lease_times
+        .iter()
+        .filter(|(r, _)| *r == take)
+        .map(|(_, at)| *at)
+        .collect();
+    let enter = m
+        .key_times
+        .iter()
+        .find(|(r, _)| r.ends_with(" enter"))
+        .map(|(_, at)| *at)
+        .expect("the Enter");
+    assert!(takes.len() >= 2, "taken and renewed: {evidence}");
+    let longest = takes
+        .iter()
+        .chain(std::iter::once(&enter))
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|w| w[1].saturating_duration_since(*w[0]))
+        .max()
+        .unwrap_or_default();
+    assert!(
+        longest <= HAND_RENEW * 2 && longest < Duration::from_millis(HAND_TTL_MS),
+        "the hand went {longest:?} without a renewal: {evidence}"
+    );
+
+    // NEGATIVE CONTROL: no hand asked for, none taken or renewed.
+    let (m, evidence) = run(false);
+    assert!(m.lease_times.is_empty(), "{evidence}");
+}
+
+/// A TEXT LEFT TYPED ON A SCREEN THAT NEVER MOVED IS NEVER TYPED AGAIN ON IT
+/// ([`Session::type_fenced`], [`Session::input_unread`]). The worker draws
+/// nothing for two minutes after the continuation is written: the echo's
+/// hang detector runs out and the text is escalated `typed, not submitted`.
+/// An act decided again on that same screen (the seq the write found, on
+/// which the write's fences pass again) writes nothing: the text is input the
+/// worker has not drawn, held as unread input is, until the screen moves or
+/// [`turn_end_loop::UNDRAWN_INPUT_HANG`] has passed. Measured (`t4-attr-r1`,
+/// `t4-diag-r3`, the loop before [`Session::await_echo`]): decided again
+/// 0.5 s after the escalation on the same seq, the continuation was typed a
+/// second time, and the worker submitted both as one prompt.
+///
+/// NEGATIVE CONTROL: the echo drawn whole 5 s after the write is entered,
+/// and holds nothing back.
+#[test]
+fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
+    let said = "Fixed the parser; the suite is green.";
+    let act = |unmoved: Duration| {
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            ended(said),
+            typed_in(said, "keep going"),
+            busy_screen(),
+        ]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        m.screen_cols.insert(2, 12);
+        m.unmoved_after_send = Some(unmoved);
+        let mut s = virtual_session(&mut m, None);
+        let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+        let mut heard = Heard::default();
+        let typed = s
+            .type_text(&point, "keep going", RULE_CONTINUE, &mut heard)
+            .expect("the act");
+        let held = s.input_unread(point.screen.seq, RULE_CONTINUE, &mut heard);
+        drop(s);
+        let evidence = format!("{:#?}\n{:#?}", heard.noted, m.requests);
+        let attention = m
+            .requests
+            .iter()
+            .find(|r| r.starts_with("meta set attention owner=supervisor "))
+            .cloned();
+        (typed, held, heard.noted, attention, evidence)
+    };
+
+    let (typed, held, noted, attention, evidence) = act(Duration::from_secs(120));
+    assert!(!typed, "left typed: {evidence}");
+    assert!(
+        attention.is_some_and(|a| a.contains(
+            "(typed, not submitted (the composer had not shown it whole a minute after it was \
+             written)"
+        )),
+        "escalated as a hang: {evidence}"
+    );
+    assert!(held, "the next act on that screen is held: {evidence}");
+    assert!(
+        noted.iter().any(|n| n.starts_with("SKIPPED seq=102 ")
+            && n.contains("the worker has not drawn the input it read")),
+        "{evidence}"
+    );
+
+    // NEGATIVE CONTROL: the echo drawn 5 s on.
+    let (typed, held, _, attention, evidence) = act(Duration::from_secs(5));
+    assert!(typed, "entered: {evidence}");
+    assert!(attention.is_none(), "{evidence}");
+    assert!(!held, "nothing held back: {evidence}");
+}
+
 /// A WINDOW HOST'S HOLDER, AS ITS LOOPS ARE NAMED (`aterm-gui`'s
 /// `harness_host::holder`, its hand name), and no pid of this test process:
 /// a loop takes its hand under its own setup's holder, never this process's
@@ -4395,20 +5453,20 @@ fn gemini_clis_command_menu_is_never_typed_into() {
 }
 
 /// GEMINI CLI'S PER-DAY USAGE LIMIT ANSWERED `Stop` IS KEPT TRYING WHILE A
-/// PERSON IS TOLD (X1 of the walls-3 stage; FOREVER, the owner's direction
-/// of 2026-10-21: NEEDS YOU is loud and never blocks), end to end under
-/// `program=node` at full power. The dialog that names no reset (a key's
-/// per-day quota, `1. Keep trying` / `2. Stop`) is badged with its own words
-/// at its first read (`names no reset`) and held for its ladder's first
-/// rung, no key pressed; a person's `2. Stop` leaves `✕ [API Error: An
-/// unknown error occurred.]`, which is read as that limit: waited on to the
-/// rung the dialog's next `Keep trying` was due (`WAITING … until=<first
-/// read + 30 min> … usage-session resets`), the badge carried there — never
-/// lowered, never raised again, nothing escalated about the error — and
-/// `usage-resume@v1` typed at that rung, a try of the episode. The dialog
-/// drawn again on it climbs the ladder (`… (drawn again after its typed
-/// resume, try 1)`, 2 h from the resume), and the `Keep trying` that gets
-/// through takes the badge down (`CLEARED … box`). Measured before (walls-2,
+/// PERSON IS TOLD (FOREVER, the owner's direction of 2026-10-21: NEEDS YOU
+/// is loud and never blocks), end to end under `program=node` at full power.
+/// The dialog that names no reset (a key's per-day quota, `1. Keep trying` /
+/// `2. Stop`) is badged with its own words at its first read (`names no
+/// reset`) and held for its ladder's first rung, no key pressed; a person's
+/// `2. Stop` leaves `✕ [API Error: An unknown error occurred.]`, which is
+/// read as that limit: waited on to the rung the dialog's next `Keep trying`
+/// was due (`WAITING … until=<first read + 30 min> … usage-session resets`),
+/// the badge carried there — never lowered, never raised again, nothing
+/// escalated about the error — and `usage-resume@v1` typed at that rung, a
+/// try of the episode. The dialog drawn again on it climbs the ladder (`…
+/// (drawn again after its typed resume, try 1)`, 2 h from the resume), and
+/// the `Keep trying` that gets through takes the badge down (`CLEARED …
+/// box`). Measured before (walls-2,
 /// `gemini_clis_usage_limit_and_its_stop_are_handed_to_a_person`): the
 /// Stop's error was escalated as an API error not retried, the badge up and
 /// nothing typed, for good. NEGATIVE CONTROLS: the same error with no
@@ -4663,20 +5721,19 @@ fn gemini_reset_redrawn(rows: &[String], reset: &str) -> Vec<String> {
 }
 
 /// GEMINI CLI'S BUCKET DIALOG IS WAITED ON, THEN TRIED BY ITS `Stop` AND A
-/// TYPED RESUME (X2 of the walls-3 stage: the model's own bucket, `Usage
-/// limit reached for all Pro models.` over `Switch to gemini-3.5-flash` and
-/// `Stop`), end to end under `program=node` at full power: held to the end
-/// of its reset's minute and the grace (`WAITING … until=<9:07 AM PDT>
-/// rule=limit-retry@v1 … Stop is pressed and the turn resumed past it`, the
-/// same wait as the account's dialog), its `2` (`Stop`) pressed then — never
-/// the switch, never before — and the error that `Stop` leaves read as that
-/// limit, its reset passed, so `usage-resume@v1` is typed at once: the try,
-/// whose turn goes on to its end. Never handed to a person. The Google
-/// login's dialog (`Upgrade for higher limits` between them) gets its `3`.
-/// Measured before: escalated as `only Keep trying over Stop is pressed`,
-/// nothing pressed or typed, for good. NEGATIVE CONTROL: the account's
-/// dialog at the same reset gets its `1` (`Keep trying`), never its `Stop`,
-/// and no resume is typed.
+/// TYPED RESUME (the model's own bucket, `Usage limit reached for all Pro
+/// models.` over `Switch to gemini-3.5-flash` and `Stop`), end to end under
+/// `program=node` at full power: held to the end of its reset's minute and
+/// the grace (`WAITING … until=<9:07 AM PDT> rule=limit-retry@v1 … Stop is
+/// pressed and the turn resumed past it`, the same wait as the account's
+/// dialog), its `2` (`Stop`) pressed then — never the switch, never before —
+/// and the error that `Stop` leaves read as that limit, its reset passed, so
+/// `usage-resume@v1` is typed at once: the try, whose turn goes on to its
+/// end. Never handed to a person. The Google login's dialog (`Upgrade for
+/// higher limits` between them) gets its `3`. Measured before: escalated as
+/// `only Keep trying over Stop is pressed`, nothing pressed or typed, for
+/// good. NEGATIVE CONTROL: the account's dialog at the same reset gets its
+/// `1` (`Keep trying`), never its `Stop`, and no resume is typed.
 #[test]
 fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() {
     use aterm_phase::gemini::fixtures as g;
@@ -4820,7 +5877,7 @@ fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() 
 }
 
 /// THE ERROR A `Stop` LEAVES WHERE NO POINT DECIDED THE DIALOG IS THE LIMIT
-/// A READ DREW (X1 of the walls-3 stage, `Session::limit_stopped_adopt`):
+/// A READ DREW (`Session::limit_stopped_adopt`):
 /// Gemini CLI's dialog read on a busy wait's read or inside a settle, then
 /// answered `2. Stop` before any point held it, leaves
 /// `✕ [API Error: An unknown error occurred.]` with no episode standing.
@@ -4937,9 +5994,9 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
     );
     // CONTROLS.
     assert_eq!(adopted(&[], &opts), None, "no dialog read");
-    // The worker working past the dialog (A1 of the review of walls-3): an
-    // hour of a turn's spinner after it, then an error that ends the turn —
-    // no dialog this read drew is what it answered.
+    // The worker working past the dialog: an hour of a turn's spinner after
+    // it, then an error that ends the turn — no dialog this read drew is
+    // what it answered.
     assert_eq!(
         adopted_as(
             &[
@@ -4969,12 +6026,12 @@ fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() 
         None,
         "limit_wait off"
     );
-    // The dialog with its head off the rows (T5 of the review of walls-3):
-    // scrolled so its first rows read are its options, every row above them
-    // (its top border, its head) off the screen, so the reader reads a box
-    // whose head it cannot see (`head_off_screen`), which it names no
-    // usage-limit dialog — alone it names no limit, and after the dialog's
-    // read it forgets that read, as another box does.
+    // The dialog with its head off the rows: scrolled so its first rows
+    // read are its options, every row above them (its top border, its head)
+    // off the screen, so the reader reads a box whose head it cannot see
+    // (`head_off_screen`), which it names no usage-limit dialog — alone it
+    // names no limit, and after the dialog's read it forgets that read, as
+    // another box does.
     let head_end = day
         .iter()
         .position(|r| r.contains("/model to switch models."))
@@ -27504,18 +28561,17 @@ fn a_turn_the_verdict_never_saw_busy_is_rechecked_under_a_short_settle() {
 }
 
 /// GEMINI CLI'S PER-DAY USAGE LIMIT ANSWERED `Stop` BEFORE ANY POINT DECIDED
-/// ITS DIALOG IS READ AS THAT LIMIT (X1 of the walls-3 stage), end to end
-/// under `program=node` at full power: the dialog is read once, too young to
-/// judge (the box settle), and the next read is already the error its
-/// `Stop` left — no episode stands. The read that drew the dialog names the
-/// limit (`Session::limit_stopped_adopt`): the error is waited on to the
-/// ladder's first rung from that read (`WAITING … usage-session resets`),
-/// NEEDS YOU is raised at it (`… after Stop, resumed on a back-off ladder`,
-/// its reason the limit's, not the error's), and `usage-resume@v1` is typed there; the
-/// try that gets through takes the badge down. Measured before: escalated
-/// as an API error not retried, nothing typed. NEGATIVE CONTROL: another box
-/// read before the error in the dialog's place (the shell box) names no
-/// limit, and the error is still a person's, nothing typed.
+/// ITS DIALOG IS READ AS THAT LIMIT, end to end under `program=node` at full power:
+/// the dialog is read once, too young to judge (the box settle), and the next read is
+/// already the error its `Stop` left — no episode stands. The read that drew the
+/// dialog names the limit (`Session::limit_stopped_adopt`): the error is waited on to
+/// the ladder's first rung from that read (`WAITING … usage-session resets`), NEEDS
+/// YOU is raised at it (`… after Stop, resumed on a back-off ladder`, its reason the
+/// limit's, not the error's), and `usage-resume@v1` is typed there; the try that gets
+/// through takes the badge down. Measured before: escalated as an API error not
+/// retried, nothing typed. NEGATIVE CONTROL: another box read before the error in the
+/// dialog's place (the shell box) names no limit, and the error is still a person's,
+/// nothing typed.
 #[test]
 fn gemini_clis_usage_limit_stopped_before_any_point_decided_it_is_read_as_its_limit() {
     use aterm_phase::gemini::fixtures as g;

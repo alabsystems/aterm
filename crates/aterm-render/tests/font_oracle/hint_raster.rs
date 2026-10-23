@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hinting half of the font oracle, written once for both hinters: what
-//! one line of `tests/fixtures/font-oracle/hinting.txt` answers, given a
-//! hinter that draws a glyph's grid-fitted outline.
-//!
-//! The recorder (`recorder/src/hint.rs`) implements [`Hinter`] on skrifa
-//! 0.46.2, the hinter the corpus was recorded from; aterm-font's replay
-//! (`crates/aterm-font/tests/hint_oracle.rs`) implements it on
-//! `aterm_font::autohint`, the carve (TF.4 of
-//! docs/AUDIT-third-party-2026-10-15.md). Everything else in an answer is
-//! this file's: the copies of aterm-render's grid-fitted raster paths
-//! (src/hinted.rs `hinted_glyph_raster`, `PathPen`; src/subpixel.rs
-//! `subpixel_glyph_raster`, RGB order), filling through aterm-render's own
-//! src/raster.rs (`super::raster`), and the digests (`super::Fnv`).
-//!
-//! The answer format is in the corpus header (the recorder's `HINT_HEADER`).
+//! Hinting half of the font oracle over [`Hinter`], [`super::raster`], and [`super::Fnv`].
 
 use super::{Fnv, raster};
 
@@ -36,11 +22,8 @@ pub(crate) enum Mode {
 
 /// A hinter and the reader around it.
 pub(crate) trait Hinter {
-    /// One face at one size, mode and instance.
     type Instance;
 
-    /// The instance for `px` at the user-space `coords`; `None` answers `no
-    /// hinting instance`.
     fn instance(
         &self,
         bytes: &[u8],
@@ -50,8 +33,6 @@ pub(crate) trait Hinter {
         coords: &[(u32, f32)],
     ) -> Option<Self::Instance>;
 
-    /// Draws glyph `gid` grid-fitted into `pen`, in pixels (y up); `None`
-    /// when its outline cannot be loaded or drawn.
     fn draw(
         &self,
         hint: &Self::Instance,
@@ -61,8 +42,6 @@ pub(crate) trait Hinter {
         pen: &mut PathPen,
     ) -> Option<()>;
 
-    /// Draws glyph `gid` unhinted into `pen`, scaled to `px` (the
-    /// `lcd-unhinted` mode: src/subpixel.rs `Scaled`).
     fn unhinted(
         &self,
         bytes: &[u8],
@@ -72,8 +51,6 @@ pub(crate) trait Hinter {
         pen: &mut PathPen,
     ) -> Option<()>;
 
-    /// src/variation.rs `VariedFace::parse` + `linear_advance`: `hmtx` (with
-    /// `HVAR` at the coords) times `px / units_per_em`, in f32.
     fn linear_advance(
         &self,
         bytes: &[u8],
@@ -103,7 +80,6 @@ pub(crate) fn answer<H: Hinter>(
         "lcd-unhinted" => None,
         _ => return None,
     };
-    // The subpixel raster is only ever asked at the default instance.
     let inst = mode.map(|m| {
         hinter.instance(
             bytes,
@@ -180,9 +156,6 @@ fn crop_padded_coverage(ras: &raster::Rasterizer, w: usize, h: usize) -> Vec<u8>
     cov
 }
 
-/// `hinted_glyph_raster`, with the drawn outline stream's digest added to
-/// `stream`: the advance comes first (a face without one declines before
-/// drawing), then the outline.
 fn hinted_glyph_raster(
     advance: f32,
     stream: &mut Fnv,
@@ -212,8 +185,6 @@ fn hinted_glyph_raster(
 
 const FIR5: [u32; 5] = [8, 77, 86, 77, 8];
 
-/// `subpixel_glyph_raster` (RGB order), with the drawn outline stream's
-/// digest added to `stream`.
 fn subpixel_glyph_raster(
     px: f32,
     stream: &mut Fnv,

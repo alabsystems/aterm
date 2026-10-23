@@ -494,7 +494,14 @@ fn begin_launch_validated(
     let watch = LaunchWatch::pending();
     let slot = Arc::clone(&watch.slot);
     let completion = move |app: Id, error: Id| {
-        // SAFETY: LaunchServices hands the completion a live, autoreleased `NSRunningApplication` or a live `NSError`, valid for the call and borrowed only here.
+        // SAFETY: LaunchServices hands the completion a live, autoreleased
+        // `NSRunningApplication` or a live `NSError`, valid for the call and borrowed only
+        // here. Reading them off the main thread is sound: `NSRunningApplication` is not
+        // main-thread-only (Apple's main-actor annotations mark `NSWindow` and `NSAlert`, not
+        // it) and an `NSError` is immutable. `-domain` and
+        // `-localizedDescription` are `-(NSString *)`, `-code` is `-(NSInteger)`,
+        // `-processIdentifier` is `-(pid_t)` (an `int`, not `NSInteger`, hence the explicit
+        // prototype) and `-isTerminated` is `-(BOOL)`.
         let answer = unsafe {
             if !error.is_null() {
                 Err(LaunchError::Rejected {
@@ -556,7 +563,14 @@ fn begin_launch_validated(
     let key_ids = key_objs.iter().map(Obj::id).collect::<Vec<Id>>();
     let value_ids = value_objs.iter().map(Obj::id).collect::<Vec<Id>>();
 
-    // SAFETY: standard AppKit construction, none of it main-thread-only.
+    // SAFETY: standard AppKit construction, none of it main-thread-only (Apple's main-actor annotations mark `NSWindow` and `NSAlert`).
+    // `+arrayWithObjects:count:` is `-(id)(const id *, NSUInteger)` and
+    // `+dictionaryWithObjects:forKeys:count:` is `-(id)(const id *, const id *, NSUInteger)`; both
+    // COPY the C arrays and RETAIN the elements, which the `Vec<Obj>`s above keep alive across the
+    // call. `+fileURLWithPath:isDirectory:` is `-(id)(NSString *, BOOL)` and is handed a live
+    // string. `+configuration` mints a fresh `NSWorkspaceOpenConfiguration` and every setter below
+    // is `-(void)(BOOL)` or `-(void)(id)` on it. Everything returned here is AUTORELEASED into the
+    // pool this whole body runs in.
     autoreleasepool(|_| unsafe {
         let array_with: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id =
             aterm_objc::checked_msg();

@@ -4,14 +4,12 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/types/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
+//! Wayland cursor-shape-v1 shapes and cursor theme lookup names.
 //!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the named
-//! cursors as cursor-shape-v1 shapes and as cursor theme names, which the pointer hands to
-//! first-party `aterm-wayland` (its cursor-shape tables, and libwayland-cursor), where upstream
-//! converted to cursor-icon's type for smithay-client-toolkit's themed pointer
-//! (`cursor_icon_to_shape`; the names are cursor-icon 1.2.0's, which `CursorIcon` records).
-//! The custom cursor image and its shm buffer are CUT: no aterm caller.
+//! LOCAL PATCH (aterm): the pointer hands these to first-party `aterm-wayland` (its cursor-shape
+//! tables, and libwayland-cursor), where upstream converted to cursor-icon's type for
+//! smithay-client-toolkit's themed pointer. The custom cursor image and its shm buffer are cut:
+//! no aterm caller.
 
 use std::ffi::CString;
 
@@ -19,7 +17,7 @@ use aterm_wayland::protocols::cursor_shape_v1::wp_cursor_shape_device_v1::shape;
 
 use crate::window::CursorIcon;
 
-/// The icon's cursor-shape-v1 shape (sctk 0.19.2's `cursor_icon_to_shape`).
+/// The icon's `cursor-shape-v1` protocol shape.
 pub(crate) fn shape(icon: CursorIcon) -> u32 {
     match icon {
         CursorIcon::Default => shape::DEFAULT,
@@ -39,8 +37,7 @@ pub(crate) fn shape(icon: CursorIcon) -> u32 {
     }
 }
 
-/// The names a cursor theme may hold the icon under, in the order sctk tried them: its CSS name,
-/// then its legacy Xcursor names.
+/// Cursor theme names in lookup order (CSS name followed by legacy Xcursor names).
 pub(crate) fn theme_names(icon: CursorIcon) -> Vec<CString> {
     std::iter::once(icon.name())
         .chain(icon.alt_names().iter().copied())
@@ -69,8 +66,6 @@ mod tests {
         CursorIcon::NwResize,
     ];
 
-    /// Each icon has a shape of its own, and the protocol names the shape by the icon's CSS
-    /// name (`n-resize` is `N_RESIZE`).
     #[test]
     fn every_icon_has_its_own_shape_named_as_its_css_name() {
         let mut shapes: Vec<u32> = ALL.iter().map(|i| shape(*i)).collect();

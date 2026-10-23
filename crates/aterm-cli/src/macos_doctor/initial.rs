@@ -206,7 +206,7 @@ fn progress(root: &Path) -> Result<Option<Progress>, String> {
                 .ok_or("invalid initial setup vault at admission")?,
         ),
     };
-    flush_record_with(&path, durable_directory)?;
+    flush_record_with(&path, durable_name)?;
     Ok(Some(Progress {
         done,
         completed,
@@ -259,7 +259,7 @@ fn saved_plan_record(root: &Path) -> Result<Option<(Plan, bool)>, String> {
         },
     };
     validate_plan(&plan)?;
-    flush_record_with(&path, durable_directory)?;
+    flush_record_with(&path, durable_name)?;
     Ok(Some((plan, value.get("vault_url").is_some())))
 }
 
@@ -1001,7 +1001,7 @@ fn decision_at(root: &Path) -> Result<Decision, String> {
         Some("restored") => Decision::Stopped(Stop::Restored),
         _ => return Err("unrecognized first-run decision".into()),
     };
-    flush_record_with(&path, durable_directory)?;
+    flush_record_with(&path, durable_name)?;
     Ok(decision)
 }
 

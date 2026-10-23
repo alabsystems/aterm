@@ -180,7 +180,7 @@ impl std::fmt::Debug for AskpassAnswer {
     }
 }
 
-/// The verb's reply line for an answer (module docs). The secret is hex so the
+/// The verb's reply line for an answer. The secret is hex so the
 /// one line carries no control byte; it is the only place the bytes cross the
 /// socket, point to point, never logged.
 pub(crate) fn reply_line(answer: &AskpassAnswer) -> aterm_uds::sudo::WireBuffer {

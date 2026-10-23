@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-/// How a replay ended ([module docs](self)).
+/// How a replay ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Reproduced,
@@ -50,7 +50,9 @@ impl Verdict {
     }
 }
 
-/// Which kind of difference the first divergence is ([module docs](self)).
+/// Which kind of difference the first divergence is: an act or a decision's mark (`Decision`),
+/// an output at the door the tape holds or a run that returned otherwise than recorded (`Output`),
+/// or anything else (`Drift`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Decision,

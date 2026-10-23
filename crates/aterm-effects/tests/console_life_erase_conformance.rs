@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real erase sequences cross the terminal snapshot / pet boundary. Rewriting
-//! cells refreshes occupancy; discarding history does not move live coordinates;
-//! RIS explicitly retires their owner. The harness supplies input intent only
-//! through the public host entry point, never by interpreting PTY bytes.
+//! Conformance tests for erase sequences (`ED2`, `ED3`, `RIS`) across the terminal snapshot and pet boundary.
 
 use std::time::{Duration, Instant};
 
@@ -28,8 +25,6 @@ struct Scene {
 impl Scene {
     fn new(history: bool) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
-        // This is host configuration, so RIS restores the same authoritative
-        // background instead of making the reset snapshot COLOR_UNSET.
         term.set_default_background(Rgb { r: 0, g: 0, b: 0 });
         if history {
             for _ in 0..40 {
@@ -105,8 +100,6 @@ impl Scene {
     }
 
     fn write_at(&mut self, row: usize, col: usize, ch: char) {
-        // Preserve the visible caret: this is a program's stationary overwrite,
-        // not a second input gesture or a cursor-motion contact witness.
         let cursor = self.term.cursor();
         let (caret_row, caret_col) = (cursor.row, cursor.col);
         self.term.process(
@@ -197,9 +190,6 @@ fn ed3_discards_history_without_relocating_live_cells_the_running_block_or_pet()
     assert_eq!(next.uniform_up_rows, stamp.uniform_up_rows);
     assert_ne!(next.content_seq, stamp.content_seq);
     assert_eq!(world.ink_at(8, 2), Some(true));
-    // ED3 takes only the shell integration metadata wholly in the erased
-    // history (handler_csi). The running block is on the screen, so it, its
-    // anchor and the pet's interest in it stay as they were.
     assert_eq!(
         s.term.all_blocks().map(|b| b.id).collect::<Vec<_>>(),
         [anchor.block_id]
@@ -212,8 +202,6 @@ fn ed3_discards_history_without_relocating_live_cells_the_running_block_or_pet()
         "history removal does not relocate the pet"
     );
     assert!(world.under_text_clear(body(after), 0.0));
-    // Ink under the drawn body puts it under the glyphs; the caret's
-    // keep-off ring is protection, not ink, and does not.
     assert!(after.under_ink || world.ink_clearance(body(after), 0.0) == Some(true));
     assert_ne!(s.brain.console_attention(), PetAttention::Contact);
 }
@@ -222,18 +210,11 @@ fn ed3_discards_history_without_relocating_live_cells_the_running_block_or_pet()
 fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
     for (erase, removes_live_ink) in [(b"\x1b[2J".as_slice(), true), (b"\x1b[3J", false)] {
         let mut s = Scene::new(true);
-        // The reading perch sits inside the caret's keep-off ring (`pet_escort_primacy`), so
-        // beside a visible caret the halo is always within the body's contact margin. Hiding the
-        // caret and moving the selection leaves the body at its last home on clear ground, so
-        // what follows measures ink contact, not cursor proximity.
         s.select(9, 12);
         s.warm();
         s.term.process(b"\x1b[?25l");
         s.select(3, 70);
         let held = body(s.tick(0));
-        // The natural sprite top has a fractional gap above it. This row is
-        // outside the clear body margin but inside its contact margin, so the
-        // later positive control exercises actual near-body contact geometry.
         let row = held.row.floor() as usize - 1;
         let col = (held.col + held.cols * 0.5).floor() as usize;
         assert!(s.world().clear(held, 0.45));
@@ -247,7 +228,6 @@ fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
         assert_eq!(s.brain.console_attention(), PetAttention::Reading);
         assert_eq!(s.world().cell(row, col), PetCell::Protected);
 
-        // Explicit input is live, but the erase bytes themselves are not input.
         s.brain.note_console_input(s.now, PetInputKind::Text);
         let seq = s.brain.console_input_seq();
         s.term.process(erase);
@@ -260,8 +240,6 @@ fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
         assert_eq!(s.brain.console_attention(), PetAttention::Typing);
         assert_eq!(s.brain.console_input_seq(), seq);
 
-        // Positive control: new displayed ink at the same body edge reacts under the same input
-        // episode. ED3 kept the old X, so it writes the adjacent blank cell instead.
         let new_col = if removes_live_ink { col } else { col + 1 };
         assert_eq!(s.world().ink_at(row, new_col), Some(false));
         s.write_at(row, new_col, 'Y');

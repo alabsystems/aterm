@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cross-machine release-lease proofs. The race fixture drives real Git
-//! protocol/ref semantics against a local bare remote; the injected fixture
-//! covers the one transport ambiguity real local Git cannot reproduce.
+//! Cross-machine release-lease proofs.
 
 use crate::{ledger, publish};
 
@@ -59,9 +57,6 @@ fn bare_fixture(name: &str) -> BareFixture {
     }
 }
 
-/// [`bare_fixture`]'s tree, built from nothing under `root` (once per process,
-/// [`crate::template::Template`]): a bare origin holding two claim
-/// commits and two clones of it; the two commits.
 fn build_bare(root: &Path) -> (String, String) {
     let remote = root.join("origin.git");
     let seed = root.join("seed");
@@ -130,8 +125,6 @@ fn build_bare(root: &Path) -> (String, String) {
     (first, second)
 }
 
-/// Pause same-claim sessions after both observed the same fence token (or
-/// absence), forcing the create/rotation CAS itself to decide the winner.
 struct FenceProbeBarrier {
     inner: Git,
     barrier: Arc<Barrier>,
@@ -163,8 +156,6 @@ impl GitRunner for FenceProbeBarrier {
     }
 }
 
-/// Pause both publishers after each saw the same absent ref, so the remote's atomic create,
-/// not the test schedule, picks the winner.
 struct FirstProbeBarrier {
     inner: Git,
     barrier: Arc<Barrier>,
@@ -237,8 +228,6 @@ fn real_bare_remote_allows_one_claim_and_only_owner_recovery() {
     assert!(publish::publish_checked(&guard, Some(&winner), Some(7), Some(8)).is_err());
     assert!(publish::publish_checked(&guard, Some(&loser), Some(7), Some(7)).is_err());
 
-    // Crash-before-unlock: the same journal owner resumes; a different claim
-    // cannot acquire or release it and cannot mutate the owner ref.
     assert_eq!(
         publish::acquire_release_lease(&winner_git, &winner)
             .unwrap()
@@ -269,9 +258,6 @@ fn real_bare_remote_allows_one_claim_and_only_owner_recovery() {
         "crash after delete and before journal mark converges without reacquiring"
     );
 
-    // A successor may acquire after that delete but before the old unlock is
-    // marked. Unlock-only replay recognizes create-only succession and leaves
-    // the new owner byte-for-byte untouched.
     publish::acquire_release_lease(&loser_git, &loser).unwrap();
     assert_eq!(
         publish::release_completed_release_lease(&winner_git, &winner).unwrap(),
@@ -429,7 +415,6 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
         fence.token()
     );
 
-    // Cleanup bypasses the production APIs, which refuse this incoherent state.
     command(&repo, &["push", "origin", &format!(":{RELEASE_LEASE_REF}")]);
     command(
         &repo,
@@ -439,7 +424,6 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
 
 #[test]
 fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
-    // Recovery admits no dirty state: a clean tree passes, any dirty path fails closed.
     let fixture = bare_fixture("clean-tree-recovery");
     let repo = fixture.repo_a.clone();
     std::fs::write(repo.join(".gitignore"), "dist/\n").unwrap();
@@ -471,18 +455,14 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
             .collect(),
     };
 
-    // A clean tree is the only accepted state.
     publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).unwrap();
 
-    // An untracked path fails closed.
     std::fs::write(repo.join("claim"), "unrelated mutation\n").unwrap();
     assert!(
         publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).is_err()
     );
     std::fs::remove_file(repo.join("claim")).unwrap();
 
-    // So does a modification to a tracked path: recovery explains away no
-    // journal-derived write.
     std::fs::write(repo.join(".gitignore"), "dist/\nextra/\n").unwrap();
     assert!(
         publish::recovery_resume_worktree_preflight(&repo, &Git::new(&repo), &journal).is_err()

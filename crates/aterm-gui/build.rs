@@ -53,6 +53,7 @@ fn main() {
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // The dev `aterm-gui.exe`'s main-thread stack, as crates/aterm/build.rs reserves
+        // for the shipped images (a link arg reaches only its own package's bins).
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             println!("cargo:rustc-link-arg-bins=/STACK:{}", 8 * 1024 * 1024);
         }

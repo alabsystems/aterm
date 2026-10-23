@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One writer owns where the body is.
-//!
-//! The caret's escort is the pet's own locomotion (the chase and the flight,
-//! continuous and speed-limited). The console layer's only placement role is moving
-//! a body off a surface it may not occupy (a selection, an image, a row with no
-//! certified cell-to-pixel projection), or not drawing it; it never relocates a body
-//! for being far from the caret, which would fight the escort and snap the sprite
-//! out and back while output prints. The oracle is a twin brain with
-//! `set_console_presentable(false)`, as in `pet_escort_primacy`: streaming output
-//! must not tell the two apart.
+//! Conformance tests verifying that console placement never teleports the kitty pet.
 
 use std::time::{Duration, Instant};
 
@@ -23,9 +14,6 @@ const COLS: u16 = 80;
 const CELL_W: u16 = 8;
 const CELL_H: u16 = 16;
 
-/// A single-frame displacement this large is not locomotion: the chase is
-/// speed-limited and the flight is a schedule, so neither crosses two cells between
-/// two 16 ms frames.
 const TELEPORT: f32 = 2.0;
 
 struct Scene {
@@ -35,7 +23,6 @@ struct Scene {
 }
 
 impl Scene {
-    /// `presentable == false` is the plain escort, with no console layer.
     fn new(presentable: bool, home: &[u8]) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b]11;#000000\x07");
@@ -70,8 +57,6 @@ impl Scene {
     }
 }
 
-/// One frame's sample: where the sprite is, where the caret is, and what the console
-/// layer said.
 struct Sample {
     frame: u32,
     col: f32,
@@ -80,10 +65,6 @@ struct Sample {
     reason: &'static str,
 }
 
-/// A command printing into a screen not yet full: the caret walks down
-/// through fresh rows. One 57-column line every 240 ms, the newline landing on
-/// the next frame as a real `echo` does, so the caret is seen at the line's
-/// end for one tick and then at column 0 below.
 fn stream_output(presentable: bool, frames: u32) -> Vec<Sample> {
     let mut now = Instant::now();
     let mut scene = Scene::new(presentable, b"\x1b[1;1H");
@@ -111,7 +92,6 @@ fn stream_output(presentable: bool, frames: u32) -> Vec<Sample> {
     out
 }
 
-/// Every single-frame displacement at least [`TELEPORT`] cells wide.
 fn teleports(series: &[Sample]) -> Vec<(u32, f32)> {
     series
         .windows(2)
@@ -134,11 +114,7 @@ fn trace(tag: &str, series: &[Sample], from: usize, to: usize) -> String {
         .collect()
 }
 
-/// The body is not yanked back to a console home while a command prints: it
-/// may walk, fly or stand still, but not cross the pane in one frame and back.
-/// Seen through the reason string too: `cursor-home` claims the escort's body;
-/// `pet_escort_primacy` refuses it on a typing frame, and output is not a
-/// licence either.
+/// Streaming output never teleports the body or claims it via the console placement layer.
 #[test]
 fn streaming_output_never_teleports_the_body() {
     let live = stream_output(true, 900);
@@ -179,8 +155,7 @@ fn streaming_output_never_teleports_the_body() {
     );
 }
 
-/// A caret that jumps does not teleport the cat: the escort closes distance at a
-/// walking pace. No keystroke, so only the placement pass could move the body.
+/// A jumping caret closes distance at a walking pace without teleporting the body.
 #[test]
 fn a_caret_that_jumps_does_not_teleport_the_body() {
     let mut now = Instant::now();
@@ -196,7 +171,6 @@ fn a_caret_that_jumps_does_not_teleport_the_body() {
     let seated = frame.col;
     assert!(frame.alpha > 0, "precondition: the pet must be on glass");
 
-    // Sixty columns and eight rows away, in one escape sequence.
     scene.term.process(b"\x1b[20;70H");
     let mut worst: (u32, f32, &'static str) = (0, 0.0, "quiet");
     let mut series = Vec::new();

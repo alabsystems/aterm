@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them.
+//! `aterm-libc-oracle regen` — regenerate `crates/aterm-libc`'s four cell modules and the oracle's four conformance modules from measurements of the REFERENCE libc, then format them and stamp each one's seal ([`aterm_census::seal`]).
 //!
 //! The cell this box is native to is documented and probed under Trust; every
 //! other cell under a stock rustup toolchain (`--stock`, default `stable`, with
@@ -29,6 +29,9 @@ use crate::verdict::CouldNotRun;
 
 /// The reference libc's version, in the rustdoc dumps' names.
 pub const REFERENCE_VERSION: &str = "0.2.186";
+
+/// The generator each module's seal line names ([`aterm_census::seal`]).
+pub const GENERATOR: &str = "`aterm-libc-oracle regen`";
 
 /// Where and how to regenerate.
 #[derive(Clone, Debug)]
@@ -452,6 +455,17 @@ fn format(trust: &Trust, files: &[PathBuf]) -> Result<(), Stop> {
     Ok(())
 }
 
+/// Stamp each written module's seal over its final, formatted text.
+fn seal(files: &[PathBuf]) -> Result<(), Stop> {
+    for path in files {
+        let text = std::fs::read_to_string(path).map_err(io("reading", path))?;
+        let sealed = aterm_census::seal::stamp(&text)
+            .map_err(|e| Stop::Failed(format!("{}: {e}", path.display())))?;
+        std::fs::write(path, sealed).map_err(io("writing", path))?;
+    }
+    Ok(())
+}
+
 fn print_report(report: &CellReport, sink: &mut dyn Write) -> std::io::Result<()> {
     let oracle = &report.oracle;
     writeln!(
@@ -522,6 +536,7 @@ pub fn regen(options: &Options, sink: &mut dyn Write) -> Result<Vec<PathBuf>, St
     if options.format {
         format(&toolchains.trust, &written)?;
     }
+    seal(&written)?;
     if !audit.is_empty() {
         return Err(Stop::Failed(format!(
             "COVERAGE AUDIT FAILED: the shim declares something the oracle does not check:\n  {}",

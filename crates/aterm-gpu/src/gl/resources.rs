@@ -50,8 +50,12 @@ pub(crate) struct GlTexture {
     shared: Arc<GlShared>,
     pub(crate) name: GLuint,
     pub(crate) format: GlFormat,
+    /// The texels in use, from the origin: a pass's viewport, and the bounds of a copy, an
+    /// upload and a readback.
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// The storage behind them, at least `width` x `height` ([`GlDevice::texture_2d_resizing`]).
+    stored: (u32, u32),
     /// Whether the storage is `SRGB8_ALPHA8` standing for the native plan's `Rgba8Unorm` texture
     /// with its sRGB alias: drawn and sampled raw (the Unorm view) or encoded (the sRGB view) per
     /// pass, through `EXT_sRGB_write_control` / `EXT_texture_sRGB_decode`.
@@ -68,6 +72,7 @@ impl std::fmt::Debug for GlTexture {
         f.debug_struct("GlTexture")
             .field("name", &self.name)
             .field("size", &(self.width, self.height))
+            .field("stored", &self.stored)
             .field("internal", &self.format.internal)
             .finish_non_exhaustive()
     }
@@ -78,6 +83,26 @@ impl GlTexture {
     #[inline]
     pub(crate) fn on(&self, dev: &GlDevice) -> bool {
         Arc::ptr_eq(&self.shared, dev.shared())
+    }
+
+    /// Whether the storage holds texels past the ones in use.
+    #[inline]
+    pub(crate) fn roomy(&self) -> bool {
+        self.stored != (self.width, self.height)
+    }
+
+    /// Let this texture go once the frame is out ([`GlDevice::free_retired`]) instead of now:
+    /// on NVIDIA a free costs about as much as a mint, and a resize's frame paid both.
+    pub(crate) fn retire(mut self) {
+        let names = [
+            std::mem::take(&mut self.name),
+            self.fbo.swap(0, Ordering::Relaxed),
+        ];
+        self.shared
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(names);
     }
 
     /// The texture's framebuffer object, made and checked complete on first use.
@@ -117,6 +142,9 @@ impl GlTexture {
 
 impl Drop for GlTexture {
     fn drop(&mut self) {
+        if self.name == 0 {
+            return;
+        }
         let Ok(cur) = self.shared.enter() else {
             return;
         };
@@ -214,6 +242,109 @@ impl Drop for GlSampler {
 }
 
 impl GlDevice {
+    /// `slot`'s texture at `width` x `height`, made as [`Self::texture_2d`] makes it: minted at
+    /// that size where the slot is empty, else the first texels of the storage there where it
+    /// holds them and they are a quarter of it or more, else minted a quarter larger per side.
+    /// A window resized once is resized again (a drag is a size per motion), and on NVIDIA a
+    /// mint, its first draw and the free of the one it replaces took 13 ms at 1100x800 and
+    /// about 30 at 3336x1310 (the desk, 2026-10-22); a drag inside the storage mints nothing.
+    /// Returns whether the texels in use are undefined: a mint or a new size.
+    pub(crate) fn texture_2d_resizing(
+        &self,
+        slot: &mut Option<GlTexture>,
+        format: TexelFormat,
+        width: u32,
+        height: u32,
+        alias: Option<TexelFormat>,
+    ) -> Result<bool, String> {
+        let (storage, views) = self.storage_of(format, alias)?;
+        let internal = gl_format(storage)?.internal;
+        let kept = slot
+            .as_mut()
+            .filter(|t| t.on(self) && t.format.internal == internal && t.views == views);
+        if let Some(t) = kept {
+            if (t.width, t.height) == (width, height) {
+                return Ok(false);
+            }
+            let (sw, sh) = t.stored;
+            if width <= sw
+                && height <= sh
+                && u64::from(width) * u64::from(height) * 4 >= u64::from(sw) * u64::from(sh)
+            {
+                t.width = width;
+                t.height = height;
+                return Ok(true);
+            }
+        }
+        let resized = slot.is_some();
+        if let Some(old) = slot.take() {
+            old.retire();
+        }
+        let max = self.caps().max_texture_dim;
+        let room = |n: u32| {
+            if resized {
+                n.saturating_add(n / 4).next_multiple_of(64).min(max).max(n)
+            } else {
+                n
+            }
+        };
+        let mut tex = self.texture_2d(format, room(width), room(height), alias)?;
+        tex.width = width;
+        tex.height = height;
+        *slot = Some(tex);
+        Ok(true)
+    }
+
+    /// Delete the textures retired since the last call ([`GlTexture::retire`]): after a frame is
+    /// posted, and before the next is encoded where nothing posts.
+    pub(crate) fn free_retired(&self) {
+        let names = std::mem::take(
+            &mut *self
+                .shared()
+                .retired
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if names.is_empty() {
+            return;
+        }
+        let Ok(cur) = self.enter() else {
+            return;
+        };
+        let gl = cur.gl();
+        for [texture, fbo] in names {
+            // SAFETY: names made on this context, retired by their only holder; deleting is
+            // always legal.
+            unsafe {
+                if fbo != 0 {
+                    (gl.delete_framebuffers)(1, &raw const fbo);
+                }
+                (gl.delete_textures)(1, &raw const texture);
+            }
+        }
+    }
+
+    /// The storage format of a `format` texture with the view `alias`, and whether it is the
+    /// sRGB storage standing for both.
+    fn storage_of(
+        &self,
+        format: TexelFormat,
+        alias: Option<TexelFormat>,
+    ) -> Result<(TexelFormat, bool), String> {
+        match alias {
+            None => Ok((format, false)),
+            Some(TexelFormat::Rgba8UnormSrgb) if format == TexelFormat::Rgba8Unorm => {
+                if !self.caps().srgb_views {
+                    return Err("gl: an sRGB alias of an Rgba8Unorm texture needs \
+                                EXT_sRGB_write_control and EXT_texture_sRGB_decode"
+                        .to_owned());
+                }
+                Ok((TexelFormat::Rgba8UnormSrgb, true))
+            }
+            Some(other) => Err(format!("gl: no {other:?} view of a {format:?} texture")),
+        }
+    }
+
     /// Create a 2-D texture of one level.
     pub(crate) fn texture_2d(
         &self,
@@ -222,20 +353,7 @@ impl GlDevice {
         height: u32,
         alias: Option<TexelFormat>,
     ) -> Result<GlTexture, String> {
-        let (storage, views) = match alias {
-            None => (format, false),
-            Some(TexelFormat::Rgba8UnormSrgb) if format == TexelFormat::Rgba8Unorm => {
-                if !self.caps().srgb_views {
-                    return Err("gl: an sRGB alias of an Rgba8Unorm texture needs \
-                                EXT_sRGB_write_control and EXT_texture_sRGB_decode"
-                        .to_owned());
-                }
-                (TexelFormat::Rgba8UnormSrgb, true)
-            }
-            Some(other) => {
-                return Err(format!("gl: no {other:?} view of a {format:?} texture"));
-            }
-        };
+        let (storage, views) = self.storage_of(format, alias)?;
         let f = gl_format(storage)?;
         let max = self.caps().max_texture_dim;
         if width == 0 || height == 0 || width > max || height > max {
@@ -266,6 +384,7 @@ impl GlDevice {
             format: f,
             width,
             height,
+            stored: (width, height),
             views,
             fbo: AtomicU32::new(0),
         };
@@ -326,7 +445,8 @@ impl GlDevice {
         let cur = self.enter()?;
         let gl = cur.gl();
         // SAFETY: the context is current; the region is inside the texture and `bytes` covers it at
-        // the stated row length (checked above).
+        // the stated row length (checked above). The unpack state is set for this call and
+        // restored.
         unsafe {
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
             (gl.pixel_storei)(ffi::GL_UNPACK_ALIGNMENT, 1);
@@ -474,5 +594,141 @@ impl GlDevice {
         }
         cur.check("readback")?;
         Ok(out)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::super::encoder::GlFrame;
+    use super::super::test_device as device;
+    use super::*;
+    use crate::device_layer::{ClearColor4, FrameLoad};
+
+    /// Clear `tex` to `rgba` with one pass.
+    fn clear(dev: &GlDevice, tex: &GlTexture, [r, g, b, a]: [f64; 4]) {
+        let uniforms = dev
+            .buffer(GlBufferRole::Uniform, 256)
+            .expect("a uniform buffer");
+        let mut frame = GlFrame::begin(dev).expect("a frame");
+        let load = FrameLoad::Clear(ClearColor4 { r, g, b, a });
+        frame
+            .begin_pass(tex, false, load, None, (&uniforms, 0))
+            .expect("a pass");
+        frame.submit().expect("submitted");
+    }
+
+    /// The names waiting for [`GlDevice::free_retired`].
+    fn retired(dev: &GlDevice) -> Vec<[GLuint; 2]> {
+        dev.shared()
+            .retired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A RESIZED TEXTURE KEEPS ITS STORAGE WHILE THAT HOLDS THE NEW SIZE: the
+    /// first mint is exact; a size past the storage mints a quarter more per
+    /// side and retires the old texture until `free_retired`; a size inside
+    /// mints nothing and a pass clears only the texels in use; a size under a
+    /// quarter of the storage, or another format, mints again.
+    #[test]
+    fn a_resized_texture_keeps_its_storage_while_that_holds_the_new_size() {
+        let dev = device();
+        let rgba = TexelFormat::Rgba8Unorm;
+        let mut slot = None;
+        assert!(
+            dev.texture_2d_resizing(&mut slot, rgba, 100, 80, None)
+                .expect("minted")
+        );
+        let first = slot.as_ref().expect("minted");
+        assert_eq!(
+            (first.width, first.height, first.stored),
+            (100, 80, (100, 80))
+        );
+        let first = first.name;
+        assert!(
+            !dev.texture_2d_resizing(&mut slot, rgba, 100, 80, None)
+                .expect("kept"),
+            "the same size keeps its texels"
+        );
+
+        assert!(
+            dev.texture_2d_resizing(&mut slot, rgba, 200, 90, None)
+                .expect("grown")
+        );
+        let grown = slot.as_ref().expect("grown");
+        assert_ne!(grown.name, first);
+        assert_eq!(
+            (grown.width, grown.height, grown.stored),
+            (200, 90, (256, 128)),
+            "a quarter more per side, in 64s"
+        );
+        let grown = grown.name;
+        assert_eq!(
+            retired(&dev),
+            [[first, 0]],
+            "the old one waits for the frame"
+        );
+        dev.free_retired();
+        assert!(retired(&dev).is_empty());
+
+        assert!(
+            dev.texture_2d_resizing(&mut slot, rgba, 256, 128, None)
+                .expect("refit")
+        );
+        clear(&dev, slot.as_ref().expect("refit"), [1.0, 0.0, 0.0, 1.0]);
+        assert!(
+            dev.texture_2d_resizing(&mut slot, rgba, 150, 70, None)
+                .expect("refit")
+        );
+        let inside = slot.as_ref().expect("refit");
+        assert_eq!((inside.name, inside.width, inside.height), (grown, 150, 70));
+        assert!(inside.roomy());
+        clear(&dev, inside, [0.0, 0.0, 1.0, 1.0]);
+        assert!(
+            dev.texture_2d_resizing(&mut slot, rgba, 256, 128, None)
+                .expect("refit")
+        );
+        let whole = slot.as_ref().expect("refit");
+        assert_eq!(whole.name, grown, "nothing minted inside the storage");
+        let texels = dev.read_rgba8(whole, 256, 128, 256 * 4).expect("read back");
+        for (i, px) in texels.as_chunks::<4>().0.iter().enumerate() {
+            let (x, y) = (i % 256, i / 256);
+            let want: [u8; 4] = if x < 150 && y < 70 {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            assert_eq!(
+                *px, want,
+                "texel ({x}, {y}): the clear kept to the texels in use"
+            );
+        }
+        assert!(retired(&dev).is_empty());
+
+        assert!(
+            dev.texture_2d_resizing(&mut slot, rgba, 100, 60, None)
+                .expect("shrunk")
+        );
+        let shrunk = slot.as_ref().expect("shrunk");
+        assert_ne!(
+            shrunk.name, grown,
+            "under a quarter of the storage mints again"
+        );
+        assert_eq!(shrunk.stored, (128, 128));
+        assert_eq!(retired(&dev).len(), 1);
+        let shrunk = shrunk.name;
+        let r8 = TexelFormat::R8Unorm;
+        assert!(
+            dev.texture_2d_resizing(&mut slot, r8, 100, 60, None)
+                .expect("reformatted")
+        );
+        assert_ne!(
+            slot.as_ref().expect("reformatted").name,
+            shrunk,
+            "another format mints"
+        );
+        dev.free_retired();
+        assert!(retired(&dev).is_empty());
     }
 }

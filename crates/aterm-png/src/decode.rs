@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! PNG chunk framing, scanline unfiltering, Adam7 de-interlacing, and output transforms
-//! ([`Limits`], [`write_pixel`]).
+//! PNG chunk framing, scanline unfiltering, Adam7 de-interlacing, and output transforms.
 
 use std::io::Read;
 
@@ -46,9 +45,9 @@ impl<R: Read> Decoder<R> {
 
     /// Parse the header chunks and collect the compressed image data, WITHOUT decompressing it.
     /// # Errors
-    /// [`DecodingError`] for a bad signature, a truncated or CRC-failing chunk, an illegal header,
-    /// a structure PNG does not allow, or an output buffer or encoded input larger than the
-    /// configured [`Limits`].
+    /// [`DecodingError`] for a failed read of the source, a bad signature, a truncated or
+    /// CRC-failing chunk, an illegal header, a structure PNG does not allow, or an output buffer or
+    /// encoded input larger than the configured [`Limits`].
     pub fn read_info(mut self) -> Result<Reader, DecodingError> {
         let input_limit = self.limits.encoded_bytes();
         let mut bytes = Vec::new();
@@ -73,7 +72,6 @@ pub struct Reader {
     output: OutputInfo,
 }
 
-/// One chunk, as it sits in the file.
 struct Chunk<'a> {
     kind: [u8; 4],
     data: &'a [u8],
@@ -81,7 +79,6 @@ struct Chunk<'a> {
     next: usize,
 }
 
-/// Read the chunk starting at `offset`, verifying its CRC.
 fn read_chunk(bytes: &[u8], offset: usize) -> Result<Chunk<'_>, DecodingError> {
     let header = bytes
         .get(offset..offset + 8)
@@ -110,11 +107,8 @@ fn read_chunk(bytes: &[u8], offset: usize) -> Result<Chunk<'_>, DecodingError> {
     })
 }
 
-/// Pre-resolved `(R, G, B, A)` lookup table for all 256 possible 1/2/4/8-bit palette indices of an
-/// indexed image.
 type PaletteLut = [[u16; 4]; 256];
 
-/// Resolve the palette (and tRNS, when present) into [`PaletteLut`].
 fn build_palette_lut(info: &Info) -> Result<Box<PaletteLut>, DecodingError> {
     let palette = info
         .palette
@@ -400,7 +394,6 @@ impl Reader {
         }
     }
 
-    /// Each pass that has pixels in it, as `(Adam7 pass number, width, height)` ([`ADAM7`]).
     fn passes(&self) -> impl Iterator<Item = (usize, u32, u32)> + '_ {
         let (w, h, interlaced) = (self.info.width, self.info.height, self.info.interlaced);
         (0..if interlaced { 7 } else { 1 }).filter_map(move |pass| {
@@ -413,7 +406,6 @@ impl Reader {
         })
     }
 
-    /// Transform one non-interlaced source row into the output buffer.
     fn place_row(
         &self,
         buf: &mut [u8],
@@ -439,7 +431,6 @@ impl Reader {
         Ok(())
     }
 
-    /// Transform one Adam7 pass row.
     fn place_interlaced_row(
         &self,
         buf: &mut [u8],
@@ -463,7 +454,6 @@ impl Reader {
         Ok(())
     }
 
-    /// Read source pixel `x` out of an unfiltered row and produce its output samples.
     fn transform_pixel(
         &self,
         row: &[u8],
@@ -594,7 +584,6 @@ fn write_pixel(row: &mut [u8], x: usize, samples: &[u16; 4], n: usize, depth: Bi
     }
 }
 
-/// Adam7 pass origins and strides.
 const ADAM7: [(u32, u32, u32, u32); 7] = [
     (0, 0, 8, 8),
     (4, 0, 8, 8),
@@ -614,7 +603,6 @@ const fn adam7_pass_size(pass: usize, w: u32, h: u32) -> (u32, u32) {
     (pw, ph)
 }
 
-/// Fill `buf` from the image's zlib stream.
 fn read_image_data(stream: &mut impl Read, buf: &mut [u8]) -> Result<(), DecodingError> {
     let mut filled = 0;
     while let Some(rest) = buf.get_mut(filled..)
@@ -681,7 +669,6 @@ pub(crate) const fn paeth_predictor(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-/// Work out the colour type and bit depth the decoder will actually produce.
 fn output_info(info: &Info, t: Transformations) -> Result<OutputInfo, DecodingError> {
     let mut color_type = info.color_type;
     let mut bit_depth = info.bit_depth;

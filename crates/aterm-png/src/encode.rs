@@ -120,7 +120,8 @@ impl<W: Write> Encoder<W> {
 
     /// Write the signature and header chunks.
     /// # Errors
-    /// [`EncodingError::Parameter`] for geometry or a colour-type/bit-depth pair PNG forbids.
+    /// [`EncodingError::Parameter`] for geometry or a colour-type/bit-depth pair PNG forbids, or an
+    /// indexed image with no palette; [`EncodingError::Io`] if the sink refuses a write.
     pub fn write_header(mut self) -> Result<Writer<W>, EncodingError> {
         if self.width == 0 || self.height == 0 {
             return Err(EncodingError::Parameter("zero image dimension"));
@@ -227,7 +228,9 @@ pub struct Writer<W: Write> {
 impl<W: Write> Writer<W> {
     /// Write the whole image.
     /// # Errors
-    /// [`EncodingError::WrongDataSize`] if the buffer does not match the declared geometry.
+    /// [`EncodingError::WrongDataSize`] if the buffer does not match the declared geometry,
+    /// [`EncodingError::Parameter`] on a second call or on an indexed sample past the end of the
+    /// palette, or [`EncodingError::Io`] from the sink.
     pub fn write_image_data(&mut self, data: &[u8]) -> Result<(), EncodingError> {
         if self.wrote_data {
             return Err(EncodingError::Parameter(
@@ -260,7 +263,9 @@ impl<W: Write> Writer<W> {
     /// # Errors
     /// [`EncodingError::WrongDataSize`] names a row that is not `row_bytes` long (`expected` and
     /// `got` are that row's), [`EncodingError::Parameter`] on a second call or on an indexed
-    /// sample past the end of the palette, and [`EncodingError::Io`] from the sink.
+    /// sample past the end of the palette, and [`EncodingError::Io`] from the sink. An error after
+    /// the first row may leave `IDAT` chunks in the sink: the file is incomplete, the writer closes
+    /// nothing over it, and the caller discards it.
     pub fn write_rows(
         &mut self,
         mut row: impl FnMut(usize, &mut Vec<u8>),
@@ -294,7 +299,8 @@ impl<W: Write> Writer<W> {
 
     /// Write `IEND` and flush.
     /// # Errors
-    /// [`EncodingError::Io`] if the sink refuses the final write.
+    /// [`EncodingError::Io`] if the sink refuses the final write; [`EncodingError::Parameter`]
+    /// after a failed image-data write, whose file is incomplete.
     pub fn finish(mut self) -> Result<(), EncodingError> {
         let Some(mut sink) = self.sink.take() else {
             return Err(EncodingError::Parameter(
@@ -308,6 +314,7 @@ impl<W: Write> Writer<W> {
 
 impl<W: Write> Drop for Writer<W> {
     fn drop(&mut self) {
+        // Call sites rely on drop closing the file. A failure here cannot be
         // reported; a best-effort IEND beats a file silently missing one.
         if let Some(mut sink) = self.sink.take() {
             let _ = write_chunk(&mut sink, b"IEND", &[]);

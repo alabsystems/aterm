@@ -15,7 +15,6 @@ use crate::app_colorscheme::ThemeChange;
 use crate::app_config::ThemeCatalog;
 use crate::control_theme::{PreviewHold, ThemeCtlOp};
 
-/// Take `session` into the pool as a spawn does ([`App::pool_insert`]).
 fn insert(app: &mut App, session: crate::Session) {
     if let Some(tc) = &app.session_factory.terminal_config {
         crate::term_lock(&session.term).apply_config(tc);
@@ -23,7 +22,6 @@ fn insert(app: &mut App, session: crate::Session) {
     app.pool_insert(session);
 }
 
-/// Builds a two-session headless `App` configured with `toml`.
 fn two_sessions(toml: &str) -> App {
     let mut app = App::headless_for_test();
     app.config = aterm_toml::from_str(toml).expect("valid toml");
@@ -65,10 +63,6 @@ fn field(line: &str, key: &str) -> Option<String> {
         .find_map(|kv| Some(kv.strip_prefix(key)?.strip_prefix('=')?.to_string()))
 }
 
-/// Spec `resolved-colors-generate`: `theme palette` answers 256 `slot` rows of
-/// the drawn palette, each naming who set it: xterm's table for the unset
-/// theme, the derivation for a signature theme, the config for a
-/// `palette_overrides` slot.
 #[test]
 fn theme_palette_rows_name_each_slots_origin() {
     let rows = |toml: &str| {
@@ -93,10 +87,6 @@ fn theme_palette_rows_name_each_slots_origin() {
     assert_eq!(field(&night[1], "origin").as_deref(), Some("theme"));
 }
 
-/// Spec `session-theme-draw`: a session's own theme draws on that session
-/// only — its background, what it reports — and the other session keeps the
-/// instance's. NEGATIVE CONTROL: clearing it re-bases the session on the
-/// instance theme, though the instance projection never moved.
 #[test]
 fn session_theme_draws_only_that_session() {
     let mut app = two_sessions("theme = \"Aterm Night\"\n");
@@ -133,8 +123,6 @@ fn session_theme_draws_only_that_session() {
     assert_eq!(bg(&app, 1), night);
 }
 
-/// Spec `session-theme-install`: a name that does not draw is refused and
-/// changes nothing.
 #[test]
 fn a_session_theme_that_does_not_draw_is_refused() {
     let mut app = two_sessions("");
@@ -152,9 +140,6 @@ fn a_session_theme_that_does_not_draw_is_refused() {
     );
 }
 
-/// Spec `session-theme-install`: an instance preview draws on every session
-/// that follows the instance and on none that draws its own theme; the
-/// status line counts those as `pinned=`.
 #[test]
 fn preview_does_not_reach_pinned_sessions() {
     let mut app = two_sessions("");
@@ -172,9 +157,6 @@ fn preview_does_not_reach_pinned_sessions() {
     assert_eq!(field(&status, "pinned").as_deref(), Some("0"), "{status}");
 }
 
-/// Spec `session-theme-install`: a reload that changes nothing a pinned
-/// session draws costs it no `apply_config`. NEGATIVE CONTROL: a new selector
-/// costs exactly one.
 #[test]
 fn unchanged_reload_costs_no_session_apply() {
     let mut app = two_sessions("theme = \"Nord\"\n");
@@ -193,8 +175,6 @@ fn unchanged_reload_costs_no_session_apply() {
     );
 }
 
-/// Spec `session-theme-install`: an OS flip reaches a session whose own theme
-/// is a `dark:…,light:…` split, which then draws its light side.
 #[test]
 fn os_flip_moves_a_split_session_theme() {
     let mut app = two_sessions("theme = \"Nord\"\n");
@@ -269,9 +249,6 @@ fn mode_2031_push_is_per_session() {
     }
 }
 
-/// Spec `session-theme-draw`: a session theme from the themes folder that
-/// leaves the catalog draws the instance theme, keeps its selector and says
-/// why; the file coming back draws it again.
 #[test]
 fn missing_session_theme_falls_back_to_instance() {
     let mut app = two_sessions("theme = \"Nord\"\n");
@@ -312,9 +289,6 @@ fn missing_session_theme_falls_back_to_instance() {
     assert_eq!(bg(&app, 1), mine.background, "it comes back with the file");
 }
 
-/// Spec `session-theme-install`: a program's own colours on a pinned session
-/// survive a change of its theme, and OSC 111 resets to the SESSION's theme,
-/// not the instance's.
 #[test]
 fn program_colours_survive_a_session_theme_change() {
     let mut app = two_sessions("theme = \"Nord\"\n");
@@ -337,12 +311,6 @@ fn program_colours_survive_a_session_theme_change() {
     assert_ne!(bg(&app, 1), builtin("Nord").background);
 }
 
-/// A new session's shell is told the side of the theme it will draw, which
-/// lands only after the shell has started: its own (asked, inherited by a
-/// split, restored), as `session_draw` ranks them. `None` uses the instance's
-/// side the factory already carries, when it draws none of its own or one
-/// that does not draw. On Windows that side is the shell's
-/// `COLORFGBG`, which named the instance's for a light tab on a dark instance.
 #[test]
 fn a_new_shell_is_told_the_side_of_the_theme_it_will_draw() {
     let mut app = App::headless_for_test();
@@ -375,9 +343,6 @@ fn a_new_shell_is_told_the_side_of_the_theme_it_will_draw() {
     }
 }
 
-/// Spec `session-theme-install`: `spawn theme=` with a name that does not draw
-/// is refused before anything is asked of the spawner: no session, nothing in
-/// flight.
 #[test]
 fn spawn_with_bad_theme_spawns_nothing() {
     let mut app = App::headless_for_test();

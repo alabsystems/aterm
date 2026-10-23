@@ -134,7 +134,8 @@ impl<T, const N: usize> SmallVec<T, N> {
             SmallVecData::Inline { buf, len } => {
                 let n = if *len < N { *len } else { N };
                 *len = 0;
-                // SAFETY: Elements `0..n` were initialized when pushed, and `len` is already 0.
+                // SAFETY: elements `0..n` were initialized when pushed and `n <= len` as it was on
+                // entry; `len` is already 0, so no other path reaches them again.
                 unsafe { crate::drop_initialized(&mut buf[..n]) }
             }
             SmallVecData::Heap(vec) => vec.clear(),
@@ -174,7 +175,9 @@ impl<T, const N: usize> SmallVec<T, N> {
             SmallVecData::Inline { buf, len } => {
                 let n = if *len < N { *len } else { N };
                 let init: &[MaybeUninit<T>] = &buf[..n];
-                // SAFETY: `MaybeUninit<T>` has the same layout as `T`.
+                // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the pointer and length come
+                // from the same in-bounds subslice `init`, and elements `0..len` are initialized
+                // (`n <= len`), so reading them as `T` is sound.
                 unsafe { core::slice::from_raw_parts(init.as_ptr().cast::<T>(), init.len()) }
             }
             SmallVecData::Heap(vec) => vec.as_slice(),
@@ -189,7 +192,10 @@ impl<T, const N: usize> SmallVec<T, N> {
             SmallVecData::Inline { buf, len } => {
                 let n = if *len < N { *len } else { N };
                 let init: &mut [MaybeUninit<T>] = &mut buf[..n];
-                // SAFETY: `MaybeUninit<T>` has the same layout as `T`.
+                // SAFETY: `MaybeUninit<T>` has the same layout as `T`; the
+                // pointer and length come from the same in-bounds subslice
+                // `init`, and elements `0..len` are initialized (`n <= len`),
+                // so reading them as `T` is sound.
                 unsafe {
                     core::slice::from_raw_parts_mut(init.as_mut_ptr().cast::<T>(), init.len())
                 }
@@ -404,7 +410,9 @@ impl<T, const N: usize> Iterator for IntoIter<T, N> {
             IntoIterRepr::Inline { buf, start, end } => {
                 let bound = if *end < N { *end } else { N };
                 if *start < bound {
-                    // SAFETY: `*start < bound <= N` was initialized and not yet yielded.
+                    // SAFETY: element at `*start` was initialized at construction
+                    // (`*start < bound <= N`) and has not yet been yielded; advancing `start`
+                    // afterward guarantees it is never read or dropped again.
                     let value = unsafe { buf[*start].assume_init_read() };
                     *start += 1;
                     Some(value)
@@ -437,7 +445,9 @@ impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
                 *end = bound;
                 if *start < *end {
                     *end -= 1;
-                    // SAFETY: Element at `*end` is initialized (`*end < bound <= N`) and unyielded.
+                    // SAFETY: element at `*end` was initialized at construction
+                    // (`*end < bound <= N`) and has not yet been yielded; retreating `end` first
+                    // guarantees it is never read or dropped again.
                     let value = unsafe { buf[*end].assume_init_read() };
                     Some(value)
                 } else {
@@ -459,7 +469,8 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
         if let IntoIterRepr::Inline { buf, start, end } = &mut self.repr {
             let bound = if *end < N { *end } else { N };
             let s = if *start < bound { *start } else { bound };
-            // SAFETY: The elements `s..bound` were initialized and have not been yielded.
+            // SAFETY: the elements `s..bound` were initialized and have not been yielded, and this
+            // `Drop` runs once, so nothing reads or drops them again.
             unsafe { crate::drop_initialized(&mut buf[s..bound]) }
         }
     }

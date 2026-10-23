@@ -84,7 +84,8 @@ impl std::fmt::Debug for ProxyTarget {
 
 /// Resolve the proxy to use for `target`: `Ok(None)` for a direct connection.
 /// # Errors
-/// [`Error::Invalid`].
+/// [`Error::Invalid`], naming the variable and never its value, when the
+/// variable that decides is set to something this client cannot use.
 pub fn resolve<E: EnvSource>(
     mode: ProxyMode,
     target: &Uri,

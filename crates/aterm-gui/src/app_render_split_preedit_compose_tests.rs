@@ -1,19 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! IME composition on the split present path
-//! (`redraw_compose_after_focused_extract`): the paint honours three gates
-//! (focused leaf only, grid owner only, live viewport only), and the frame
-//! after it ends erases it.
+//! IME composition on the split present path.
 
 use crate::{App, WindowId, pane::PaneRect, term_lock};
 use aterm_core::terminal::UnderlineStyle;
 use std::time::{Duration, Instant};
 
-/// A focused window holding a 2-pane vertical split, each leaf with one
-/// written row and the cursor back at its start, so the composition is
-/// drawn over existing text (engine row snapshots are ragged; a caret past
-/// the written prefix is handled by `overlay_ime_preedit` padding the row).
 fn split_app() -> (App, WindowId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -21,8 +14,6 @@ fn split_app() -> (App, WindowId) {
     app.windows.get_mut(&wid).expect("window").focused = true;
     for s in [0u64, sid] {
         let term = app.pool.get(s).expect("pane session").term.clone();
-        // CR, not LF: both leaves are identically materialized, so only
-        // focus can explain a difference in the presented frame.
         term_lock(&term).process(b"abcdefgh\r");
     }
     (app, wid)
@@ -33,7 +24,6 @@ fn compose(app: &mut App, wid: WindowId, now: Instant) -> bool {
         .is_some()
 }
 
-/// The presented composite's pane rectangles, focused one first.
 fn focused_and_other(app: &App, wid: WindowId) -> (PaneRect, PaneRect) {
     let ws = app.windows.get(&wid).expect("window");
     let tree = &ws.layouts[ws.tabs.active];
@@ -51,8 +41,6 @@ fn focused_and_other(app: &App, wid: WindowId) -> (PaneRect, PaneRect) {
     (focused, other)
 }
 
-/// The text the presented frame carries inside one pane rectangle, with wide
-/// continuation cells dropped so a two-column CJK glyph reads as its lead.
 fn pane_text(app: &App, wid: WindowId, r: &PaneRect) -> String {
     let cells = &app.windows.get(&wid).expect("window").input_scratch.cells;
     let mut out = String::new();
@@ -68,7 +56,6 @@ fn pane_text(app: &App, wid: WindowId, r: &PaneRect) -> String {
     out
 }
 
-/// Everything the gate reads, for failure messages.
 fn diag(app: &App, wid: WindowId) -> String {
     let ws = app.windows.get(&wid).expect("window");
     let tree = &ws.layouts[ws.tabs.active];
@@ -101,8 +88,6 @@ fn diag(app: &App, wid: WindowId) -> String {
     )
 }
 
-/// A split window whose focused leaf carries a composition shows it,
-/// underlined at that leaf's caret, and the background leaf shows none.
 #[test]
 fn split_present_paints_the_composition_in_the_focused_leaf_only() {
     let (mut app, wid) = split_app();
@@ -111,8 +96,6 @@ fn split_present_paints_the_composition_in_the_focused_leaf_only() {
         compose(&mut app, wid, now),
         "the establishing split frame presents"
     );
-    // Caret after the composition (only the byte range's start is kept), so
-    // the presented cursor must have moved.
     let caret = "日本".len();
     app.on_ime_preedit(wid, "日本".to_string(), Some((caret, caret)));
     assert_eq!(
@@ -142,8 +125,6 @@ fn split_present_paints_the_composition_in_the_focused_leaf_only() {
         cold.starts_with("abcdefgh"),
         "…and still shows its own row: {cold:?}"
     );
-    // The IME overlay, not stray output: composed text is underlined and the
-    // caret sits at the platform's byte offset inside the composition.
     let ws = app.windows.get(&wid).expect("window");
     let (crow, ccol) = (usize::from(focused.row_off), usize::from(focused.col_off));
     assert_eq!(
@@ -167,8 +148,6 @@ fn split_present_paints_the_composition_in_the_focused_leaf_only() {
     );
 }
 
-/// A composition that ends repaints the cells it covered (the settled-frame
-/// early-out would otherwise swallow the erase), leaving no residue.
 #[test]
 fn a_split_composition_that_ends_leaves_no_residue() {
     let (mut app, wid) = split_app();
@@ -183,7 +162,6 @@ fn a_split_composition_that_ends_leaves_no_residue() {
         "drawn\n{}",
         diag(&app, wid)
     );
-    // Commit/cancel ends the composition (winit sends an empty preedit).
     app.on_ime_preedit(wid, String::new(), None);
     now += Duration::from_millis(16);
     assert!(
@@ -205,8 +183,6 @@ fn a_split_composition_that_ends_leaves_no_residue() {
     );
 }
 
-/// With the find well open the field owns the composition and paints it,
-/// so the split grid stays clean rather than showing it twice.
 #[test]
 fn a_field_owned_composition_never_paints_in_a_split_leaf() {
     let (mut app, wid) = split_app();

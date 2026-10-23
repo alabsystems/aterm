@@ -160,7 +160,8 @@ pub struct PlatformVerifier {
 impl PlatformVerifier {
     /// A verifier over the platform's own trust anchors, and nothing else.
     /// # Errors
-    /// A platform that has no OS trust store, or a system store that cannot be read.
+    /// A platform that has no OS trust store, or a system store that cannot be read (on Linux, a
+    /// store that yields no usable roots at all).
     pub fn new(provider: Arc<CryptoProvider>) -> Result<Self, rustls::Error> {
         Self::build(Vec::new(), provider)
     }

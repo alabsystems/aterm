@@ -691,6 +691,28 @@ fn a_held_programs_environment_is_never_read() {
     );
 }
 
+/// The live kernel reads a process whose one thread never ran as held whatever the program
+/// check's words call it, so the pass above never reads its environment or signals it: a
+/// start-suspended child (one thread, handle `0`, young and stopped, which the words call
+/// started) reads held, and this process, which runs, does not.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_live_kernel_holds_every_process_whose_thread_never_ran() {
+    let child =
+        aterm_uds::deadline::Held::start(aterm_uds::spawnfd::command("/bin/sleep").arg("30"))
+            .expect("a start-suspended sleep");
+    let pid = i32::try_from(child.id()).expect("pid");
+    assert_eq!(
+        aterm_uds::process::at_program_check(pid),
+        Some(false),
+        "the words do not hold it"
+    );
+    assert_eq!(LiveKernel.held(pid), Some(true), "verify leaves it");
+    let me = i32::try_from(std::process::id()).expect("pid");
+    assert_eq!(LiveKernel.held(me), Some(false), "this process runs");
+    drop(child);
+}
+
 /// The judgment is made again on a fresh read before the signal: a member proven at the
 /// listing that is adopted by a live parent before its end (no longer orphaned, its identity
 /// unchanged) is not signalled, and is named. NEGATIVE CONTROL: pass `still = |_| true` (or

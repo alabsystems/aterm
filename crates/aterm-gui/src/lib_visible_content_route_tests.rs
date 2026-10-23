@@ -213,9 +213,6 @@ fn output_redraw_admission_stamps_headless_co_viewers_and_skips_background_tabs(
         );
     }
 
-    // The original window switches to a background tab, while the second
-    // window still displays the same session. Only that viewer receives the
-    // next output stamp; visibility remains true for title/search gating.
     let sid = app.next_session_id;
     app.push_stub_tab(original, stub_session(sid));
     for ws in app.windows.values_mut() {
@@ -226,8 +223,6 @@ fn output_redraw_admission_stamps_headless_co_viewers_and_skips_background_tabs(
     assert_eq!(app.windows[&original].pending_deco_birth, None);
     assert_eq!(app.windows[&viewer].pending_deco_birth, Some(second));
 
-    // Once both copies are background, optional visible-only work can be
-    // skipped, and neither window is marked for an output-driven present.
     let sid = app.next_session_id;
     app.push_stub_tab(viewer, stub_session(sid));
     app.windows.get_mut(&viewer).unwrap().pending_deco_birth = None;
@@ -272,16 +267,6 @@ fn output_redraw_admission_obeys_zoom_and_stamps_before_os_window_check() {
     assert_eq!(app.windows[&wid].pending_deco_birth, Some(second));
 }
 
-/// Keypress-to-redraw work is O(visible windows) at 1 and 100 background sessions, with
-/// one background terminal's lock held elsewhere, through the real `on_output_wake`,
-/// measured with the thread-local census:
-///
-/// * before redraw admission nothing walks the pool or takes a terminal lock, and
-///   admission examines exactly the windows;
-/// * the priming wake walks every session after admission and skips the contended one
-///   without waiting (checked causally: the holder releases only when the test says);
-/// * a steady keystroke wake inside the status interval walks no session and takes the
-///   same number of locks at every session count.
 #[test]
 fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
     let mut steady_locks: Option<u64> = None;
@@ -294,15 +279,12 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
             app.push_stub_tab(original, stub_session(sid));
         }
         app.switch_tab_in(original, 0);
-        // A second visible window co-viewing the focused session.
         let viewer = app
             .open_active_session_in_new_window_logical()
             .expect("the focused session can be shared into a second window");
         let windows = app.windows.len() as u64;
         assert_eq!(windows, 2);
 
-        // A background session's terminal, locked on another thread for
-        // the whole wake (a reader mid-batch, a control verb).
         let contended = app.pool.get(1).expect("background session").term.clone();
         let probe = contended.clone();
         let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
@@ -310,13 +292,10 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
         let holder = std::thread::spawn(move || {
             let _guard = contended.lock().unwrap_or_else(|p| p.into_inner());
             locked_tx.send(()).expect("test alive");
-            // Released by the test, or after a bound so a regression that waits gets
-            // the lock and fails the still-held check instead of hanging.
             let _ = release_rx.recv_timeout(Duration::from_secs(60));
         });
         locked_rx.recv().expect("holder took the lock");
 
-        // Wake 1 — the status sweep is due (the pool epoch moved).
         for ws in app.windows.values_mut() {
             ws.pending_deco_birth = None;
         }
@@ -360,7 +339,6 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
              contended background lock came free — it waited on it"
         );
 
-        // Wake 2 — a steady keystroke inside the status interval.
         let t1 = t0 + Duration::from_millis(1);
         let (pool1, locks1) = (
             wake_census::pool_visits(),
@@ -391,8 +369,6 @@ fn output_wake_redraw_admission_is_o_visible_windows_at_any_session_count() {
             "the contended newcomer is still unclassified"
         );
 
-        // Released: the next wake classifies the newcomer by retrying it alone, not by
-        // walking the pool.
         release_tx.send(()).expect("holder alive");
         holder.join().expect("holder thread");
         let pool2 = wake_census::pool_visits();

@@ -105,7 +105,18 @@ impl PeerCheck {
         suspect: Duration,
         work: impl FnOnce() -> Result<(), CheckError> + Send + 'static,
     ) -> Self {
-        match aterm_uds::deadline::TRUST.start(suspect, work) {
+        Self::start_on(&aterm_uds::deadline::TRUST, suspect, work)
+    }
+
+    /// [`Self::start`] through `gate`, which a test's scripted check uses to stay off the gate
+    /// real checks share.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn start_on(
+        gate: &'static aterm_uds::deadline::Gate,
+        suspect: Duration,
+        work: impl FnOnce() -> Result<(), CheckError> + Send + 'static,
+    ) -> Self {
+        match gate.start(suspect, work) {
             Ok(pending) => Self(PeerCheckState::Waiting(pending)),
             Err(refused) => Self::settled(Err(peer_refusal(refused))),
         }
@@ -511,7 +522,7 @@ mod sec {
             "CFStringCreateWithBytes",
         )?;
         let mut req: CFTypeRef = std::ptr::null();
-        // SAFETY: `source` is a live CFString.
+        // SAFETY: `source` is a live CFString; an out-parameter for one reference.
         status(
             unsafe { SecRequirementCreateWithString(source.0, 0, &mut req) },
             "SecRequirementCreateWithString",
@@ -526,7 +537,7 @@ mod sec {
     #[cfg_attr(trust_verify, trust::skip)]
     fn designated_requirement_of(code: &Owned) -> Result<(Owned, String), String> {
         let mut req: CFTypeRef = std::ptr::null();
-        // SAFETY: `code` is a live code object.
+        // SAFETY: `code` is a live code object; an out-parameter for one reference.
         status(
             unsafe { SecCodeCopyDesignatedRequirement(code.0, 0, &mut req) },
             "SecCodeCopyDesignatedRequirement",
@@ -540,14 +551,14 @@ mod sec {
     #[cfg_attr(trust_verify, trust::skip)]
     fn requirement_text(req: &Owned) -> Result<String, String> {
         let mut text: CFTypeRef = std::ptr::null();
-        // SAFETY: `req` is a live requirement.
+        // SAFETY: `req` is a live requirement; an out-parameter for one reference.
         status(
             unsafe { SecRequirementCopyString(req.0, 0, &mut text) },
             "SecRequirementCopyString",
         )?;
         let text = owned(text, "SecRequirementCopyString")?;
         let mut buf = vec![0u8; 4096];
-        // SAFETY: `text` is a live CFString.
+        // SAFETY: `text` is a live CFString; `buf` is its stated size.
         let ok = unsafe {
             CFStringGetCString(
                 text.0,
@@ -583,7 +594,7 @@ mod sec {
             "CFURLCreateFromFileSystemRepresentation",
         )?;
         let mut code: CFTypeRef = std::ptr::null();
-        // SAFETY: `url` is a live CFURL.
+        // SAFETY: `url` is a live CFURL; an out-parameter for one reference.
         status(
             unsafe { SecStaticCodeCreateWithPath(url.0, 0, &mut code) },
             "SecStaticCodeCreateWithPath",
@@ -630,7 +641,8 @@ mod sec {
         let key = unsafe { kSecGuestAttributeAudit };
         let keys = [key];
         let values = [data.0];
-        // SAFETY: one key and one value, both live.
+        // SAFETY: one key and one value, both live; the standard CFType
+        // callbacks retain them for the dictionary's life.
         let attrs = owned(
             unsafe {
                 CFDictionaryCreate(
@@ -645,7 +657,7 @@ mod sec {
             "CFDictionaryCreate",
         )?;
         let mut guest: CFTypeRef = std::ptr::null();
-        // SAFETY: `attrs` is a live dictionary.
+        // SAFETY: `attrs` is a live dictionary; an out-parameter for one reference.
         status(
             unsafe { SecCodeCopyGuestWithAttributes(std::ptr::null(), attrs.0, 0, &mut guest) },
             "the peer's code (SecCodeCopyGuestWithAttributes)",

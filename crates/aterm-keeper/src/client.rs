@@ -79,11 +79,11 @@ fn check_failed(e: CheckError) -> io::Error {
 /// three seconds late, the signature of `keeper_restore_live_headless` under four parallel
 /// suites at load 300 and more, `born=cold` and `keeper=absent`).
 ///
-/// It covers ONE check, the dialer's own. The keeper checks the dials queued at its socket in
-/// line, each under that same hang detector, before it reads any connection's frame: a HELLO
-/// that arrives behind another dial whose check `trustd` answers slowly (another window's boot,
-/// a link's reconnect, `aterm keeper status`) waits for both, and past this bound it is answered
-/// as no keeper, as before. Not a minute: a window's boot dial waits on it in line.
+/// It covers ONE check, the dialer's own: the keeper runs the checks of the dials queued at its
+/// socket at once (up to its server's `DIAL_CHECKS_MAX`), each under its own hang detector from
+/// its accept, and keeps serving every other connection meanwhile, so a HELLO behind another
+/// dial whose check `trustd` answers slowly waits only for its own. Not a minute: a window's
+/// boot dial waits on it in line.
 pub const WELCOME_WAIT: Duration = crate::identity::PEER_CHECK_HANG.saturating_add(FRAME_BUDGET);
 
 /// The keeper's budget for a frame once it has begun to arrive, or to be taken (its server's

@@ -4,9 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (libxkbcommon's entry
-// points, types and keysyms are first-party aterm-xkb's, read at run time, where upstream
-// used xkbcommon-dl and xkeysym: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+// Modified by the aterm project in 2026; see the repository NOTICE. (libxkbcommon's entry points,
+// types and keysyms are first-party aterm-xkb's, read at run time, where upstream used xkbcommon-dl
+// and xkeysym.)
 
 use std::ops::Deref;
 use std::os::raw::c_char;
@@ -31,13 +31,10 @@ use keymap::XkbKeymap;
 
 pub use state::XkbState;
 
-/// libxkbcommon's table. aterm-xkb loads it once per process; a missing library panics, as
-/// upstream's `xkbcommon_handle` did, and `Context::new` checks first.
 fn xkbh() -> &'static XkbCommon {
     xkb::xkb().expect("Library libxkbcommon.so could not be loaded.")
 }
 
-/// libxkbcommon's compose table.
 fn xkbch() -> &'static XkbCommonCompose {
     xkb::compose().expect("Library libxkbcommon.so could not be loaded.")
 }
@@ -50,7 +47,7 @@ fn xkbxh() -> &'static xkb::XkbX11 {
 
 #[derive(Debug)]
 pub enum Error {
-    /// libxkbcommon is not available
+    /// `libxkbcommon` is not available.
     XKBNotFound,
 }
 
@@ -79,7 +76,6 @@ impl Context {
         let mut compose_state1 = compose_table.as_ref().and_then(|table| table.new_state());
         let mut compose_state2 = compose_table.as_ref().and_then(|table| table.new_state());
 
-        // Disable compose if anything compose related failed to initialize.
         if compose_table.is_none() || compose_state1.is_none() || compose_state2.is_none() {
             compose_state2 = None;
             compose_state1 = None;
@@ -132,7 +128,7 @@ impl Context {
         self.keymap.as_mut()
     }
 
-    /// Compile the keymap a compositor sent (its text, as aterm-wayland's seat read it).
+    /// Compile the keymap text sent by the Wayland compositor.
     #[cfg(wayland_platform)]
     pub fn set_keymap_from_text(&mut self, text: &[u8]) {
         let keymap = XkbKeymap::from_text(&self.context, text);
@@ -165,9 +161,7 @@ impl Context {
         Some(KeyContext { state, keymap, compose_state1, compose_state2, scratch_buffer })
     }
 
-    /// Key builder context with the user provided xkb state.
-    ///
-    /// Should be used when the original context must not be altered.
+    /// Key builder context with a caller-supplied `XkbState`.
     #[cfg(x11_platform)]
     pub fn key_context_with_state<'a>(
         &'a mut self,
@@ -233,7 +227,6 @@ impl KeyContext<'_> {
             }
         }
 
-        // Remove the null-terminator
         self.scratch_buffer.pop();
         byte_slice_to_smol_str(self.scratch_buffer)
     }
@@ -267,15 +260,9 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
 
         if let ComposeStatus::Accepted(compose_status::COMPOSING) = self.compose {
             let compose_state = self.context.compose_state2.as_mut().unwrap();
-            // When pressing a dead key twice, the non-combining variant of that character will
-            // be produced. Since this function only concerns itself with a single keypress, we
-            // simulate this double press here by feeding the keysym to the compose state
-            // twice.
-
+            // Feed the dead keysym twice to obtain its non-combining character.
             compose_state.feed(self.keysym);
             if matches!(compose_state.feed(self.keysym), ComposeStatus::Accepted(_)) {
-                // Extracting only a single `char` here *should* be fine, assuming that no
-                // dead key's non-combining variant ever occupies more than one `char`.
                 let text = compose_state.get_string(self.context.scratch_buffer);
                 let key = Key::Dead(text.and_then(|s| s.chars().next()));
                 (key, location)
@@ -293,8 +280,6 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
     }
 
     pub fn key_without_modifiers(&mut self) -> (Key, KeyLocation) {
-        // This will become a pointer to an array which libxkbcommon owns, so we don't need to
-        // deallocate it.
         let layout = self.context.state.layout(self.keycode);
         let keysym = self.context.keymap.first_keysym_by_level(layout, self.keycode);
 
@@ -322,9 +307,7 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
         self.composed_text().unwrap_or_else(|_| self.context.keysym_to_utf8_raw(self.keysym))
     }
 
-    /// [`Self::text`] at the press's Shift level with Caps Lock off
-    /// (`KeyEventExtModifierSupplement::text_ignoring_lock`): the keysym read again on the
-    /// state without the keymap's `Lock`. A composed press is its composition.
+    /// Returns [`Self::text`] evaluated with the keymap's `Lock` modifier cleared.
     pub fn text_ignoring_lock(&mut self) -> Option<SmolStr> {
         if let Ok(composed) = self.composed_text() {
             return composed;
@@ -337,9 +320,6 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
         self.context.keysym_to_utf8_raw(keysym)
     }
 
-    // The current behaviour makes it so composing a character overrides attempts to input a
-    // control character with the `Ctrl` key. We can potentially add a configuration option
-    // if someone specifically wants the opposite behaviour.
     pub fn text_with_all_modifiers(&mut self) -> Option<SmolStr> {
         match self.composed_text() {
             Ok(text) => text,
@@ -355,7 +335,6 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
                     Ok(state.get_string(self.context.scratch_buffer))
                 },
                 compose_status::COMPOSING | compose_status::CANCELLED => Ok(None),
-                // NOTHING, and any status a later libxkbcommon adds.
                 _ => Err(()),
             },
             _ => Err(()),
@@ -397,8 +376,7 @@ impl Deref for XkbContext {
     }
 }
 
-/// Shared logic for constructing a string with `xkb_compose_state_get_utf8` and
-/// `xkb_state_key_get_utf8`.
+/// Shared logic for constructing a string with `xkb_compose_state_get_utf8` and `xkb_state_key_get_utf8`.
 fn make_string_with<F>(scratch_buffer: &mut Vec<u8>, mut f: F) -> Option<SmolStr>
 where
     F: FnMut(*mut c_char, usize) -> i32,
@@ -409,12 +387,10 @@ where
     }
     let size = usize::try_from(size).unwrap();
     scratch_buffer.clear();
-    // The allocated buffer must include space for the null-terminator.
     scratch_buffer.reserve(size + 1);
     unsafe {
         let written = f(scratch_buffer.as_mut_ptr().cast(), scratch_buffer.capacity());
         if usize::try_from(written).unwrap() != size {
-            // This will likely never happen.
             return None;
         }
         scratch_buffer.set_len(size);
@@ -423,7 +399,6 @@ where
     byte_slice_to_smol_str(scratch_buffer)
 }
 
-// NOTE: This is track_caller so we can have more informative line numbers when logging
 #[track_caller]
 fn byte_slice_to_smol_str(bytes: &[u8]) -> Option<SmolStr> {
     std::str::from_utf8(bytes)
@@ -439,13 +414,9 @@ mod tests {
     use super::*;
     use aterm_xkb::RuleNames;
 
-    /// The evdev keycodes (plus 8) of the two `i` keys of Turkish Q: `<AC11>` types `i`, and
-    /// `İ` with Shift; `<AD08>` (the US `i`) types `ı`, and `I` with Shift.
     const TR_DOTTED_I: u32 = 40 + 8;
     const TR_DOTLESS_I: u32 = 23 + 8;
 
-    /// A context over the evdev `tr` keymap, or `None` (with `SKIP:`) where the machine has
-    /// no libxkbcommon or keyboard data.
     fn turkish() -> Option<Context> {
         let Ok(mut context) = Context::new() else {
             eprintln!("SKIP: no libxkbcommon");
@@ -476,7 +447,6 @@ mod tests {
         Some(context)
     }
 
-    /// `(text, text_ignoring_lock)` of a press of `keycode` under `shift` and `lock`.
     fn press(context: &mut Context, keycode: u32, shift: bool, lock: bool) -> (String, String) {
         let indices = context.keymap.as_ref().unwrap().mods_indices();
         let mask = |on: bool, index: Option<u32>| if on { 1u32 << index.unwrap() } else { 0 };
@@ -489,11 +459,7 @@ mod tests {
         (text(event.text), text(text_ignoring_lock))
     }
 
-    /// A CHORD'S LETTER TAKES SHIFT'S CASE, NEVER CAPS LOCK'S, ON XKB TOO. xkb
-    /// cancels Shift against Lock on an alphabetic key, so Turkish Caps Lock + Shift+i types
-    /// `i`, and an Alt chord built from that text named `i`'s default capital `I` where Shift
-    /// alone names `İ`. The press read again without the lock is Shift's: `İ`. Without Shift
-    /// it is the lowercase letter; without the lock it is the text itself (the controls).
+    /// Verifies that `text_ignoring_lock` preserves Shift's case without Caps Lock cancellation on Turkish Q.
     #[test]
     fn a_press_under_caps_lock_is_read_again_without_it() {
         let Some(mut tr) = turkish() else { return };

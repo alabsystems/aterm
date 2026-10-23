@@ -369,7 +369,8 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         }
         if poll_must_read(fds[2].revents) {
             let mut sink = [0u8; 64];
-            // SAFETY: reads at most `sink.len()` bytes from the non-blocking wake pipe.
+            // SAFETY: reads at most `sink.len()` bytes into `sink` from the
+            // non-blocking wake pipe.
             unsafe { libc::read(fds[2].fd, sink.as_mut_ptr().cast(), sink.len()) };
         }
 
@@ -718,10 +719,11 @@ mod tests {
         }
         let (host, host_slave) = aterm_pty::open_pty_pair().expect("host pty");
         aterm_pty::resize(host, 30, 100);
-        // SAFETY: duplicates `STDOUT_FILENO` with `F_DUPFD_CLOEXEC`.
+        // SAFETY: duplicating descriptors this test owns: the harness's stdout
+        // is kept aside for its result line, and the host slave takes its place.
         let harness_stdout = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
         assert!(harness_stdout >= 0, "keep the harness's stdout");
-        // SAFETY: duplicates `host_slave` onto `STDOUT_FILENO`.
+        // SAFETY: as above.
         assert_eq!(
             unsafe { libc::dup2(host_slave, libc::STDOUT_FILENO) },
             libc::STDOUT_FILENO
@@ -780,7 +782,7 @@ mod tests {
         }
         aterm_pty::resize(host, 40, 120);
         let code = run(shell, false);
-        // SAFETY: restores `harness_stdout` onto `STDOUT_FILENO`.
+        // SAFETY: restores `harness_stdout`, a descriptor this test owns, onto `STDOUT_FILENO`.
         unsafe { libc::dup2(harness_stdout, libc::STDOUT_FILENO) };
         let out = drained.join().expect("host drain");
         let text = String::from_utf8_lossy(&out);

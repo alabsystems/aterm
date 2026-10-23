@@ -1,14 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Cell attribute flags (16-bit packed bitfield).
 
-/// Cell flags, packed into the Cell's 16-bit flags field.
-///
-/// Bits 0–13 hold visual attributes, wide/spacer markers, protection, super/subscript,
-/// overline, and underline styles; bit 14 is reserved; bit 15 (`COMPLEX`) marks
-/// `char_data` as an overflow table index.
+/// Cell attribute flags packed into a 16-bit field (bits 0–13 visual/layout/protection, bit 15 `COMPLEX`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct CellFlags(pub u16);
@@ -36,15 +31,13 @@ impl CellFlags {
     pub const WIDE: Self = Self(1 << 9);
     /// Wide character continuation (spacer cell); shares bit 10 with PROTECTED.
     pub const WIDE_CONTINUATION: Self = Self(1 << 10);
-    /// Protected from selective erase (DECSCA). Shares bit 10 with
-    /// WIDE_CONTINUATION; only non-spacer cells use it for protection.
+    /// Protected from selective erase (DECSCA); shares bit 10 with `WIDE_CONTINUATION` on non-spacer cells.
     pub const PROTECTED: Self = Self(1 << 10);
     /// Superscript text (SGR 73).
     pub const SUPERSCRIPT: Self = Self(1 << 11);
     /// Subscript text (SGR 74).
     pub const SUBSCRIPT: Self = Self(1 << 12);
-    /// Overline text (SGR 53), encoded as SUPERSCRIPT | SUBSCRIPT, so exclusive
-    /// with both.
+    /// Overline text (SGR 53), encoded as `SUPERSCRIPT | SUBSCRIPT`.
     pub const OVERLINE: Self = Self((1 << 11) | (1 << 12));
     /// Curly underline.
     pub const CURLY_UNDERLINE: Self = Self(1 << 13);

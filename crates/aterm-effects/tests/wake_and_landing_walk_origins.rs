@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host-seam tests for jump landing walk origins and wake colour continuity (`docs/design/RAINBOW-KITTY-V2.md` §35, §41, §42).
+//! Host-seam tests for jump landing walk origins and wake colour continuity.
 
 use crate::common::{
     LIT_COV, caret_sample, class_of, coverage, note_blink, observe_caret_row, observe_ribbon_rows,
@@ -19,14 +19,10 @@ const CW: usize = 8;
 const CH: usize = 16;
 const ROWS: usize = 60;
 const COLS: usize = 140;
-/// 12 cps.
 const KEY_MS: u64 = 83;
-/// A word motion's cadence.
 const HOP_MS: u64 = 150;
 const FRAME_MS: u64 = 16;
-/// Two readings of one colour agree to this (folded arc units).
 const SAME: f32 = 1e-4;
-/// The widest step the walk takes between neighbouring cells: one cell of the fast leg.
 const WALK_STEP_MAX: f32 = 1.0 / WALK_FAST_CELLS;
 
 fn geom() -> Geom {
@@ -68,7 +64,6 @@ impl Landing {
         }
     }
 
-    /// Landing marks whose colour differs from the band under them by more than [`SAME`].
     fn off_band(&self) -> Vec<(&'static str, i32, f32, f32)> {
         let w = self.walk();
         let mut out = Vec::new();
@@ -93,7 +88,6 @@ struct Frame {
 }
 
 impl Frame {
-    /// Widest colour step between two lit neighbouring columns (`(left_col, left_t, right_t)`).
     fn widest_step(&self) -> Option<(u16, f32, f32)> {
         self.lit
             .windows(2)
@@ -103,7 +97,6 @@ impl Frame {
     }
 }
 
-/// `Ribbon::build`'s owner of `(row, col)` at `now` (born `Over`, then `Base`, then unborn `Over`).
 fn owner_at(cells: &[Cell], row: u16, col: u16, now: Instant) -> Option<Cell> {
     let rank = |c: &Cell| match c.layer {
         Layer::Over if now < c.born => 2u8,
@@ -175,7 +168,6 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// Runs one render frame and records its lit-column census.
     fn frame(&mut self) {
         let (c, cur) = caret_sample(&self.term);
         note_blink(&self.term, &mut self.glow, &mut self.blink, self.now);
@@ -191,7 +183,6 @@ impl Host {
         self.frames.push(Frame { ms: self.ms(), lit });
     }
 
-    /// Lit columns on the composer row and their folded band colour at [`LIT_COV`].
     fn lit_now(&self) -> Vec<(u16, f32)> {
         let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
         let cov = coverage(&self.glow, geom(), self.row);
@@ -221,7 +212,6 @@ impl Host {
         self.idle_to(t);
     }
 
-    /// The frames up to `ms` after the last event, then that instant.
     fn schedule(&mut self, ms: u64) {
         let t = self.last_event + Duration::from_millis(ms);
         self.idle_to(t);
@@ -237,7 +227,6 @@ impl Host {
         format!("\x1b[{};{}H", self.row + 1, self.col0 + col + 1)
     }
 
-    /// Repaints `self.text` after changing from `before` with the caret at `self.caret`.
     fn repaint(&mut self, before: &str) {
         let first = before
             .chars()
@@ -268,7 +257,6 @@ impl Host {
         self.frame();
     }
 
-    /// Types `ch` `ms` after the last event, stamped as the host stamps it.
     fn key_after(&mut self, ch: char, ms: u64) {
         self.schedule(ms);
         let (shifted, class) = class_of(ch);
@@ -285,7 +273,6 @@ impl Host {
         }
     }
 
-    /// Moves the caret to text column `col` `ms` after the last event and returns the [`Landing`].
     fn nav(&mut self, col: usize, ms: u64) -> Landing {
         self.schedule(ms);
         self.glow.clear_typed_keeping_hand(self.now);
@@ -316,7 +303,6 @@ impl Host {
         self.read_landing(self.gcol(col))
     }
 
-    /// Readline's ⌥B: to the start of the previous word.
     fn word_left(&mut self, ms: u64) -> Landing {
         let b = self.text.as_bytes();
         let mut i = self.caret;
@@ -329,7 +315,6 @@ impl Host {
         self.nav(i, ms)
     }
 
-    /// Readline's ⌥F: to the end of the current or next word.
     fn word_right(&mut self, ms: u64) -> Landing {
         let b = self.text.as_bytes();
         let n = b.len();
@@ -343,7 +328,6 @@ impl Host {
         self.nav(i, ms)
     }
 
-    /// Writes `s` at the caret without a key stamp (`Shape::Shell` only).
     fn program_writes(&mut self, s: &str, ms: u64) {
         assert_eq!(self.shape, Shape::Shell);
         self.schedule(ms);
@@ -353,7 +337,6 @@ impl Host {
         self.frame();
     }
 
-    /// Writes `s` after the caret and moves the caret back (`Shape::Shell` only).
     fn program_suggests(&mut self, s: &str, ms: u64) {
         assert_eq!(self.shape, Shape::Shell);
         self.schedule(ms);
@@ -363,7 +346,6 @@ impl Host {
         self.frame();
     }
 
-    /// Reads the landing on the jump's tick and advances past `FLIGHT_MAX_MS` to sample the band under it.
     fn read_landing(&mut self, col: u16) -> Landing {
         let rib = self.glow.v2_ribbon().expect("rainbow kitty owns the frame");
         let row = self.row;
@@ -406,7 +388,6 @@ impl Host {
         }
     }
 
-    /// The lit map of the frames from `from` on, one line each.
     fn dump(&self, from: usize) -> String {
         let mut s = String::new();
         for f in self.frames.iter().skip(from) {
@@ -428,7 +409,6 @@ enum Middle {
     Suggested,
 }
 
-/// Types `"cp "`, inserts [`WORD`] via `middle`, and types `" /tmp"`.
 fn cp_line(middle: Middle) -> Host {
     let mut h = Host::new(Shape::Shell);
     h.type_str("cp ");
@@ -446,10 +426,8 @@ fn cp_line(middle: Middle) -> Host {
     h
 }
 
-/// Readline word longer than `JUMP_MIN_CELLS` between the two typed runs.
 const WORD: &str = "rainbowkittytrail";
 
-/// Runs [`cp_line`] followed by `Ctrl-A` back to column 0.
 fn cp_then_home(middle: Middle) -> (Host, Landing, usize) {
     let mut h = cp_line(middle);
     let landing = h.nav(0, 1100);
@@ -457,7 +435,6 @@ fn cp_then_home(middle: Middle) -> (Host, Landing, usize) {
     (h, landing, jump_at)
 }
 
-/// Types a sentence in Claude Code's composer, hops 4 words left, and inserts `ins`.
 fn midline(ins: &str) -> Host {
     let mut h = Host::new(Shape::Claude);
     h.type_str("please update the documentation for this module");
@@ -492,7 +469,6 @@ fn describe(l: &Landing) -> String {
     )
 }
 
-/// Landing marks (`pin/train` and `burst/jets/fan`) match the band colours under them within 3 cells.
 #[test]
 fn a_jump_s_landing_marks_wear_the_band_they_land_on() {
     let mut fails = Vec::new();
@@ -560,7 +536,6 @@ fn a_jump_s_landing_marks_wear_the_band_they_land_on() {
     );
 }
 
-/// Widest recolour and neighbour step across a jump corridor.
 struct Corridor {
     recolour: Option<(u16, f32, f32)>,
     step: Option<(u64, u16, f32, f32)>,
@@ -602,7 +577,6 @@ fn corridor(h: &Host, jump_frame: usize, lo: u16, hi: u16) -> Corridor {
     }
 }
 
-/// `Ribbon::wake` preserves covered band colours and bounds adjacent steps by [`WALK_STEP_MAX`].
 #[test]
 fn a_wake_keeps_the_colours_of_the_band_it_covers() {
     let mut fails = Vec::new();

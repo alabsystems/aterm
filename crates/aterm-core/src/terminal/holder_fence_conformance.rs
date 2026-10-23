@@ -14,11 +14,8 @@ use super::holder_fence::Mark;
 use super::{CutKind, HolderCut, Terminal};
 use crate::scrollback::Scrollback;
 
-/// Tall enough that nothing a trace draws scrolls into history.
 const ROWS: u16 = 48;
 const COLS: u16 = 16;
-/// The width a reflow toggles to: the banner (12 cells) wraps there, so
-/// every row below it is renumbered.
 const NARROW: u16 = 10;
 const BANNER: &[u8] = b"xxxxxxxxxxxx\r\n";
 
@@ -86,7 +83,6 @@ impl Step {
         Self::Admit,
     ];
 
-    /// The model action this real step is.
     const fn action(self) -> &'static str {
         match self {
             Self::LaunchA => "LaunchA",
@@ -147,14 +143,12 @@ impl Drawer {
         std::iter::repeat_n(self.card, 4).collect()
     }
 
-    /// Whether `text` holds a glyph neither of this instance's.
     fn foreign(self, text: &str) -> bool {
         text.chars()
             .any(|c| c != ' ' && c != '\0' && c != self.plain && c != self.card)
     }
 }
 
-/// The terminal and the process world around it.
 struct World {
     t: Terminal,
     fg: Fg,
@@ -169,8 +163,6 @@ struct World {
 }
 
 impl World {
-    /// History under the screen (for the unscroll to pull back), a clear
-    /// screen and the shell's banner on its first row.
     fn new() -> Self {
         let scrollback = Scrollback::new(16, 256, 1_000_000);
         let mut t = Terminal::with_scrollback(ROWS, COLS, 64, scrollback);
@@ -236,22 +228,18 @@ impl World {
         d
     }
 
-    /// A drawer's first draw: its card row and a line, from the cursor.
     fn draw_launch(&mut self, d: Drawer) -> Result<(), String> {
         let bytes = format!("{}\r\n{}\r\n", d.card_line(), d.line());
         self.write(bytes.as_bytes());
         self.settle()
     }
 
-    /// A drawer's line at the cursor.
     fn draw_line(&mut self, d: Drawer) -> Result<(), String> {
         let bytes = format!("{}\r\n", d.line());
         self.write(bytes.as_bytes());
         self.settle()
     }
 
-    /// The main cursor to the frontier: column 0 of the first row with
-    /// nothing drawn from it on.
     fn settle(&mut self) -> Result<(), String> {
         let main = self.t.main_grid();
         let frontier = (0..main.rows())
@@ -273,7 +261,6 @@ impl World {
         self.b.ok_or_else(|| "no B runs".to_string())
     }
 
-    /// `A`'s mark.
     fn mark_a(&self) -> Result<&Mark, String> {
         let a = self.a()?;
         self.t
@@ -284,7 +271,6 @@ impl World {
             .ok_or_else(|| "A holds no mark".to_string())
     }
 
-    /// The screen row of absolute `row` on the main screen.
     fn screen_row(&self, row: u64) -> Result<u16, String> {
         let main = self.t.main_grid();
         row.checked_sub(main.visible_to_absolute(0))
@@ -293,7 +279,6 @@ impl World {
             .ok_or_else(|| format!("row {row} is off the screen"))
     }
 
-    /// Drive one real step.
     fn drive(&mut self, step: Step) -> Result<(), String> {
         match step {
             Step::LaunchA => {
@@ -450,12 +435,10 @@ fn inked(cell: &crate::grid::Cell) -> bool {
     (c != 0 && c != u16::from(b' ')) || !cell.colors().bg_is_default()
 }
 
-/// Whether screen row `row` of `g` holds ink from column `col` on.
 fn row_inked(g: &Grid, row: u16, col: u16) -> bool {
     (col..g.cols()).any(|c| g.cell(row, c).is_some_and(inked))
 }
 
-/// The text of absolute row `row` of `g`, on its screen or in its history.
 fn row_text(g: &Grid, row: u64) -> Option<String> {
     let base = g.visible_to_absolute(0);
     if row >= base {
@@ -467,8 +450,6 @@ fn row_text(g: &Grid, row: u64) -> Option<String> {
         .map(|line| String::from_utf8_lossy(line.as_bytes()).into_owned())
 }
 
-/// The rows `mark`'s spans hold, `[start, end)` each, an open span to the
-/// screen's bottom, bounded to the rows the main grid keeps.
 fn span_rows(g: &Grid, mark: &Mark, closed_only: bool) -> Vec<u64> {
     let anchors = g.anchors();
     let screen_end = g.visible_to_absolute(0) + u64::from(g.rows());
@@ -493,8 +474,6 @@ fn span_rows(g: &Grid, mark: &Mark, closed_only: bool) -> Vec<u64> {
     rows
 }
 
-/// What lies from the main cursor on: 0 nothing, 1 on its own row, 2 only
-/// below it.
 fn ink_from_cursor(g: &Grid) -> i64 {
     let cursor = g.cursor();
     let row = cursor.row.min(g.rows().saturating_sub(1));
@@ -507,7 +486,6 @@ fn ink_from_cursor(g: &Grid) -> i64 {
     }
 }
 
-/// The real state as the model's variables, `hurt` (a ghost) left out.
 fn project(w: &World) -> Result<State, String> {
     let t = &w.t;
     let fence = t.holder_fence();
@@ -582,8 +560,6 @@ fn project(w: &World) -> Result<State, String> {
     ]))
 }
 
-/// The gate admits exactly the rows of `A`'s spans, and none while `A` is
-/// tainted, over every row the main grid keeps.
 fn gate_agrees(t: &Terminal, a: Drawer, rows: &[u64], tainted: bool) -> Result<(), String> {
     let view = t.holder_view();
     if view.token != a.token {
@@ -608,7 +584,6 @@ fn gate_agrees(t: &Terminal, a: Drawer, rows: &[u64], tainted: bool) -> Result<(
     Ok(())
 }
 
-/// The variables `a` and `b` differ in, for a rejection's message.
 fn diff(a: &State, b: &State) -> String {
     a.iter()
         .filter(|&(k, v)| b.get(k) != Some(v))
@@ -626,16 +601,12 @@ fn replay(path: &[Step]) -> Result<World, String> {
     Ok(w)
 }
 
-/// What the walk covered.
 struct Coverage {
     states: usize,
     edges: usize,
     actions: BTreeSet<&'static str>,
 }
 
-/// Walk `model`'s whole reachable space on the real terminal. `Err` names
-/// the first real step the model does not admit under its own action: the
-/// trace, the step and the variables that differ.
 fn walk(model: &Model) -> Result<Coverage, String> {
     let mut init = project(&World::new())?;
     init.insert("hurt", 0);
@@ -712,8 +683,6 @@ fn the_real_fence_conforms_to_the_model_over_its_whole_reachable_space() {
     );
 }
 
-/// Negative control: each knob switched off is rejected at the model action
-/// whose law it breaks.
 #[test]
 fn each_knob_is_rejected_at_its_own_action() {
     let model = holder_fence_model();
@@ -750,8 +719,6 @@ fn each_knob_is_rejected_at_its_own_action() {
     }
 }
 
-/// Negative control, the other way: the shipped fence matches no mutant of
-/// the model.
 #[test]
 fn the_shipped_fence_matches_no_mutant() {
     let model = holder_fence_model();

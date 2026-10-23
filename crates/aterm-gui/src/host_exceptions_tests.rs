@@ -2889,16 +2889,15 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     assert_eq!(app.messages.digest().len(), 1, "still told of");
 }
 
-/// A LIMIT'S LINE NAMES THE AGENT ITS TABS RUN, OR NONE (X4 of the walls-3
-/// stage): a limit held unread past its reset (`Exception::unread_limit`) on
-/// a screen no reader names is titled `Limit still holds in tab 2`, tabs
-/// running different agents likewise, and a spend or bucket line `… limit
-/// reached`; one agent's tabs are named where the glass's six words hold the
-/// name and the place (`Codex`), the name dropped before the place where
-/// they do not (`Gemini CLI`, `Antigravity CLI`). Measured before: every one
-/// of them said `Claude`. NEGATIVE CONTROLS: Claude Code's tabs keep
-/// `Claude`, and `/goal`'s line, Claude Code's alone, keeps its words on
-/// any agent.
+/// A LIMIT'S LINE NAMES THE AGENT ITS TABS RUN, OR NONE: a limit held unread
+/// past its reset (`Exception::unread_limit`) on a screen no reader names is
+/// titled `Limit still holds in tab 2`, tabs running different agents
+/// likewise, and a spend or bucket line `… limit reached`; one agent's tabs
+/// are named where the glass's six words hold the name and the place
+/// (`Codex`), the name dropped before the place where they do not (`Gemini
+/// CLI`, `Antigravity CLI`). Measured before: every one of them said
+/// `Claude`. NEGATIVE CONTROLS: Claude Code's tabs keep `Claude`, and
+/// `/goal`'s line, Claude Code's alone, keeps its words on any agent.
 #[test]
 fn a_limits_line_names_the_agent_its_tabs_run() {
     let spot = |n: u16| mr::UpgradeSpot {

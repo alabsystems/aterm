@@ -775,6 +775,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   human_grace_s [120]             seconds to keep hands off after a person's input (to
                                   15 s before an untouched box's auto-deny at most)
   occupancy ["observe"]           wait measurement: `"observe"`, `"off"` or `"prompt"`
+                                  (`"prompt"` alone types: one fenced line at a drawn
+                                  break, after every guard)
 
   Per-agent switch: `[harness.<agent>] enabled = false` (`claude`, `codex`, `agy`,
   `muse`, `gemini`) disables supervision for that agent alone.
@@ -830,7 +832,11 @@ WHEN TO REACH FOR IT
   `ledger` to audit every box approved, skipped or escalated; `limits` to read a
   session's current rate-limit wall; `disk` (or `aterm ctl @self await sys
   'free>=room'`) when free disk space is low; `accounts` and `upgrade` to manage
-  multi-account pools and live build rollouts.
+  multi-account pools and live build rollouts. `aterm ctl @<sid> occupancy why` says
+  why the occupancy door typed a `wait-nudge@v1` or `hold-room@v1` line at a break,
+  or why nothing did (each rule's terms and each guard, `✓` or `✗`); `aterm ctl
+  @<sid> occupancy check --replay 24h` replays a day of the machine's looks: when
+  each rule would have fired, and which guard held it.
 
 GOTCHAS
   * `usage` reads `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` inside an agent's tool call;

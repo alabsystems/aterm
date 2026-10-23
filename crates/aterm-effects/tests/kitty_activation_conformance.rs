@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Conformance binding for sing-along activation thresholds.
-//!
-//! Drives the shipping state machines with injected clocks, projects the post-state at every
-//! abstract boundary of the derived models, and validates representative traces in the embedded
-//! interpreter and, when installed, external `ty`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -59,8 +55,6 @@ fn sing_projection(detector: &KittySing, now: Instant, abstract_count: u32) -> S
     };
     BTreeMap::from([
         ("phase", phase),
-        // The run is consumed once the celebration arms or winds down. `abstract_count` comes
-        // from the real committed presses; the public lifecycle observations choose the phase.
         (
             "count",
             if phase == 2 {
@@ -70,8 +64,6 @@ fn sing_projection(detector: &KittySing, now: Instant, abstract_count: u32) -> S
             },
         ),
         ("drive_live", i64::from(drive_live)),
-        // The shipping detector has one arm; the model's `Buggy=1` fault
-        // selector is always 0 here.
         ("ramp_fault", 0),
     ])
 }
@@ -85,7 +77,6 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
         "the formal arm threshold must be the shipping constant",
     );
 
-    // An unarmed break discards the genuine detector's partial run.
     let mut partial = KittySing::default();
     let t0 = Instant::now();
     let mut partial_spec = model.init_state();
@@ -107,8 +98,6 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
         "real FULL-NYAN partial-run break",
     );
 
-    // A complete held run stays unarmed through press fifteen and arms on the
-    // sixteenth. Every post-state is projected from the real detector.
     let mut detector = KittySing::default();
     let t0 = Instant::now();
     let mut spec = model.init_state();
@@ -119,9 +108,6 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
         let post = sing_projection(&detector, at, i);
 
         if i == 8 {
-            // Mutant: sing-along armed on the eighth press. The transition
-            // exists only under Buggy=1, and its post-state violates the
-            // healthy threshold invariant.
             let early = BTreeMap::from([
                 ("phase", 1),
                 ("count", 8),
@@ -166,10 +152,6 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
             );
             assert!(detector.is_armed(at));
             assert_eq!(detector.drive(at), 1.0, "the arm is at full drive at once");
-            // Negative control at the projection: no shipping function ramps the drive in, so
-            // this is the real sixteenth-press state with the one field a ramped-in arm changes.
-            // The healthy `Repeat` refuses it, `ArmedRunIsAtFullDrive` names the defect, and it
-            // is the `Buggy=1` successor once the ramped arm is picked.
             let mut silent = post.clone();
             silent.insert("drive_live", 0);
             let (healthy_ok, _) = verify::validate_transition_tiered(
@@ -195,7 +177,6 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
         }
     }
 
-    // Eager release (Backspace) enters the live crossfade immediately.
     let release_at = t0 + Duration::from_millis(u64::from(SING_ARM_REPEATS + 1) * 30);
     let before_release = spec.clone();
     detector.note_backspace(release_at);
@@ -211,8 +192,6 @@ fn real_kitty_sing_arm_break_release_and_finish_conform() {
     assert!(!detector.is_armed(release_at));
     assert!(detector.drive(release_at) > 0.0, "release must crossfade");
 
-    // The host's settle call after the bounded wind-down clears the detector to
-    // its public byte-identical idle projection.
     let finish_at = release_at + Duration::from_secs_f32(SING_WIND_DOWN + 0.05);
     let before_finish = spec.clone();
     detector.settle(finish_at);
@@ -243,9 +222,6 @@ fn real_kitty_sing_lazy_release_maps_to_the_same_bounded_tail() {
     }
     assert!(detector.is_armed(last));
 
-    // No release event arrives when the finger simply lifts. The shipping
-    // detector derives the edge at `last + SING_REPEAT_GAP`; project that
-    // clock-driven post-state onto the same abstract Release action.
     let timeout = last + SING_REPEAT_GAP;
     let prev = spec.clone();
     let timed_out = sing_projection(&detector, timeout, 0);
@@ -282,7 +258,6 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
     let t0 = Instant::now();
     let mut spec = model.init_state();
 
-    // Arm the celebration drive. It pins momentum but cannot itself summon.
     let before_begin = spec.clone();
     cat.set_singing(
         t0,
@@ -319,7 +294,6 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
         let post = cat_projection(true, i, &cat);
 
         if i == 10 {
-            // Mutant: the cat appears at a ten-key floor.
             let early = BTreeMap::from([("singing", 1), ("run", 10), ("active", 1)]);
             assert!(!model.check_invariant("NoCatBeforeSixteen", &early));
             let (healthy_ok, _) = verify::validate_transition_tiered(

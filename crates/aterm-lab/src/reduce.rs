@@ -814,7 +814,10 @@ pub trait Rules {
     }
 }
 
-/// THE REDUCTION RULE (module docs).
+/// THE REDUCTION RULE: outside a free subtree, ids (by key or UUID shape), whole stamps under a
+/// time key, and notices,
+/// a row's lead, tool names and closed words by where they sit, take their own [`Treat`]; anything
+/// else is `""`.
 pub struct P11;
 
 impl Rules for P11 {

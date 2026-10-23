@@ -122,7 +122,8 @@ impl Interface {
     }
 }
 
-// Requires `p` and `n` to come from a static slice (or null and 0).
+/// # Safety
+/// `p` and `n` come from one static slice (or null and 0).
 #[inline]
 unsafe fn messages(p: *const Message, n: c_int) -> &'static [Message] {
     match usize::try_from(n) {

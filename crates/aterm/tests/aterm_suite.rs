@@ -123,17 +123,20 @@ mod worker_held_live_headless;
 #[cfg(unix)]
 mod worker_spawn_live_headless;
 
-/// TWICE AS MANY TESTS AT ONCE AS CORES, unless the run names its own count
+/// FOUR TIMES AS MANY TESTS AT ONCE AS CORES, unless the run names its own count
 /// (`RUST_TEST_THREADS`, or `--test-threads`, which libtest reads over it). The live tests here
 /// spend their time waiting on the instances they boot, not computing (a supervisor answers a
 /// question every 1.8 s, its settles), so at libtest's one test per core the binary was
-/// idle-bound: 24.9-25.9 s at 18 threads against 17.5-17.6 s at 36, at loads of 22 to 54, every
-/// run green (2026-10-22). Set at load time because a test binary has no other say in its
+/// idle-bound: 24.9-25.9 s at 18 threads against 17.5-17.6 s at 36, at loads of 22 to 54
+/// (2026-10-22). Libtest starts tests in name order, so at 36 the late-named live tests
+/// (`supervise_turn_end_*`, `turn_submit_*`, `worker_held_*`) waited 8-9 s for a slot: 16.0-17.1 s
+/// at 36 against 12.3-14.2 s at 72, and 108 or 171 no better than 72, at loads of 47 to 109,
+/// every run green (2026-10-23). Set at load time because a test binary has no other say in its
 /// thread count: libtest reads the variable after `main` starts.
 #[cfg(unix)]
 extern "C" fn widen_test_threads() {
     if std::env::var_os("RUST_TEST_THREADS").is_none() {
-        let n = std::thread::available_parallelism().map_or(2, |n| n.get().saturating_mul(2));
+        let n = std::thread::available_parallelism().map_or(4, |n| n.get().saturating_mul(4));
         // SAFETY: load time, before `main`: no other thread exists to read the environment.
         unsafe { std::env::set_var("RUST_TEST_THREADS", n.to_string()) };
     }

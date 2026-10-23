@@ -17082,15 +17082,14 @@ fn a_sign_in_at_a_usage_limit_is_no_switch_until_the_worker_works_past_it() {
 }
 
 /// A LIMIT ENDED WHERE ANOTHER PROGRAM'S SCREEN IS READ SAYS SO
-/// ([`TurnEndState::limit_ended_elsewhere`], X4 of the walls-3 stage): Claude
-/// Code's session limit, then Muse Code's or Gemini CLI's idle point in the
-/// same tab, which did no work — the track ends there
-/// ([`met_under_another`]), and the end is another program's, so the loop's
-/// end row names that, not the worker's work or another wall. Measured
-/// before: the row the loop wrote there read `work, or another wall`.
-/// NEGATIVE CONTROLS: Claude Code's own point after work ends the same track
-/// as work, never another program; and the limit standing (no end) is
-/// neither.
+/// ([`TurnEndState::limit_ended_elsewhere`]): Claude Code's session limit,
+/// then Muse Code's or Gemini CLI's idle point in the same tab, which did no
+/// work — the track ends there ([`met_under_another`]), and the end is
+/// another program's, so the loop's end row names that, not the worker's
+/// work or another wall. Measured before: the row the loop wrote there read
+/// `work, or another wall`. NEGATIVE CONTROLS: Claude Code's own point after
+/// work ends the same track as work, never another program; and the limit
+/// standing (no end) is neither.
 #[test]
 fn a_limit_ended_at_another_programs_screen_is_said_as_such() {
     use aterm_phase::Program;

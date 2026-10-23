@@ -227,7 +227,7 @@ pub fn why_lines(said: &OccupancySaid, now_ms: i64, offset_s: i64) -> Vec<String
             RuleId::WaitNudge => format!(
                 "hold {} {}  undeclared {}",
                 span_words(held),
-                mark(held >= rules::WAIT_NUDGE_AFTER_MS),
+                mark(held >= rules::wait_nudge_after_ms()),
                 mark(said.hold.is_some_and(|h| !h.declared))
             ),
             RuleId::HoldRoom => {

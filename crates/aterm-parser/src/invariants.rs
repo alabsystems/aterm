@@ -13,6 +13,13 @@ impl Parser {
     /// Assert that every TypeInvariant property holds.
     /// # Panics
     /// Panics in test builds if any invariant is violated.
+    /// Does nothing otherwise for performance.
+    ///
+    /// (The checks are `#[cfg(test)]`-gated rather than
+    /// `#[cfg(debug_assertions)]`-gated: the only callers are this crate's
+    /// own tests, and the Trust lane (`ship trust run`) fails closed on the
+    /// deliberate `assert!` panic paths — which exist precisely to fire on
+    /// violated invariants — when they appear in the shipped lib.)
     #[inline]
     pub fn assert_invariants(&self) {
         #[cfg(test)]

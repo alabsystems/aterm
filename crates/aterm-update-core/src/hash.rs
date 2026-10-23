@@ -1,22 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! SHA-256 of a file, read in process on Unix. macOS (and every Unix but Linux)
-//! hashes with ring, on the CPU's SHA-256 instructions — the bulk path atpkg's
-//! `tree::BulkSha256` takes; it used to spawn `/usr/bin/shasum`, a Perl start plus a
-//! software hash, for every downloaded update container. Linux streams bytes
-//! through aterm-digest's first-party SHA-256, so native update verification does
-//! not depend on Perl's optional `shasum`. Windows uses `certutil -hashfile`, built
-//! through `aterm_uds::spawnfd::command` so a caller with no console (the window)
-//! does not flash one for it.
+//! File SHA-256 hashing across Unix and Windows.
 
 use std::path::Path;
 
-/// Lowercase SHA-256 of the complete file. Unix reads the file directly; Windows
-/// uses its system hash command. Callers establish path ownership and regular-file
-/// identity before trusting the file being hashed. A read that never returns (a
-/// wedged volume) does not return here either: a caller that must bound it runs
-/// this on a thread of its own (`aterm-update`'s `container_sha256`).
+/// Compute the lowercase hex SHA-256 digest of `path`.
 // Skip: format over the open error, and from_utf8_lossy/format over `certutil`
 // OUTPUT (pure-ASCII hex by contract; command output must contain exactly 64 hex
 // digits before it is returned) — hardened byte_loss/format classes. Audited
@@ -49,8 +38,6 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        // A header line, the digest line, a status line. Older Windows builds space the hex
-        // pairs, so strip spaces and take the first line of exactly 64 hex digits.
         let stdout = String::from_utf8_lossy(&out.stdout);
         stdout
             .lines()
@@ -64,9 +51,9 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     }
 }
 
+// Skip: format over the read error, the class `sha256_file` skips.
 /// Feed everything `input` yields to `update`, in 64 KiB chunks with `Interrupted`
 /// retried: the one read loop both Unix arms of [`sha256_file`] hash through.
-// Skip: format over the read error, the class `sha256_file` skips.
 #[cfg(any(unix, test))]
 #[cfg_attr(trust_verify, trust::skip)]
 fn read_stream(mut input: impl std::io::Read, mut update: impl FnMut(&[u8])) -> Result<(), String> {
@@ -80,8 +67,6 @@ fn read_stream(mut input: impl std::io::Read, mut update: impl FnMut(&[u8])) -> 
         if count == 0 {
             return Ok(());
         }
-        // The `Read` contract guarantees `count <= buffer.len()`; `min` keeps a
-        // nonconforming reader from panicking the slice.
         update(&buffer[..count.min(buffer.len())]);
     }
 }
@@ -115,7 +100,6 @@ mod tests {
 
     #[test]
     fn sha256_matches_known_vector() {
-        // SHA-256("abc") — the canonical test vector.
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-sha-")
             .tempdir()
@@ -129,11 +113,6 @@ mod tests {
         );
     }
 
-    /// Both Unix arms' answers, recorded from ring's SHA-256 (the Linux arm's hasher
-    /// until 2026-10-15, the macOS arm's since 2026-10-17) and held against ring on
-    /// every run. The input is
-    /// [`pattern`]; the lengths are empty, one byte, both sides of the 64 KiB
-    /// read buffer, and sixteen whole buffers.
     const RECORDED: [(usize, &str); 6] = [
         (
             0,
@@ -161,8 +140,6 @@ mod tests {
         ),
     ];
 
-    /// `len` bytes of `i % 251`: a prime period, so no 64-byte block repeats
-    /// its neighbour and a block-order slip changes the digest.
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
@@ -171,8 +148,6 @@ mod tests {
         aterm_codec::hex::encode_lower(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
     }
 
-    /// A reader that fails `Interrupted` before every read and then hands out
-    /// at most `step` bytes, so the arm's retry and its short-read path both run.
     struct Choppy<'a> {
         rest: &'a [u8],
         step: usize,
@@ -192,9 +167,6 @@ mod tests {
         }
     }
 
-    /// Both Unix arms — the scalar one Linux ships and the hardware one macOS ships —
-    /// give the recorded answers, whole and through a reader that interrupts every
-    /// read and hands out odd-sized pieces.
     #[test]
     fn stream_hash_matches_ring_and_the_recorded_answers() {
         for (len, want) in RECORDED {

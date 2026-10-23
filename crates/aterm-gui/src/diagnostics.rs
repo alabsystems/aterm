@@ -1167,6 +1167,11 @@ fn shell_config_warning(shell: &str) -> Option<String> {
 }
 
 /// Windows. A value resolves in two stages, and only the second is `execve`-like:
+///
+/// 1. [`aterm_pty::classify_shell_name`], the spawn's own resolution: alias discovery,
+///    then `SearchPathW` with a default `.exe`, so `shell = "pwsh"` validates clean.
+/// 2. `CreateProcessW(lpApplicationName = <result>)`: no search, no extension appended
+///    (aterm-pty's `create_process_application_name_contract`).
 #[cfg(windows)]
 fn shell_config_warning(shell: &str) -> Option<String> {
     // `shell` names one program: a quoted value reaches `lpApplicationName` as a

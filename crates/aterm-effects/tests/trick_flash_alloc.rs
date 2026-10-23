@@ -2,22 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! The kitty-command trick flash allocates nothing on the input path or the frame path.
-//!
-//! The note (`WordDecorations::note_trick_typed`, with `revoke_trick_flash` and
-//! `trick_flash_phase`) runs at a boundary key: O(word length) into fixed inline buffers, whatever
-//! the word. The paint runs once per frame for about a second: at most 32 cells merged into the
-//! host's `ink` scratch, which has its capacity after the first frame. The rescan is not pinned
-//! here: it lends the engine's resident row buffer.
-//!
-//! Counted by the suite's per-thread allocator (`alloc_count`), so the pin shares
-//! `effects_suite` with every other test and no parallel test bleeds into its count.
 
 use aterm_core::terminal::Terminal;
 use aterm_effects::word_decorations::{DecoConfig, EffectGeom, TrickFlashPhase, WordDecorations};
 use aterm_lexicon::{Lexicon, TrickLexicon};
 use aterm_time::{Duration, Instant};
 
-/// How many allocations `f` makes on this thread.
 fn allocations_during(f: impl FnOnce()) -> usize {
     crate::alloc_count::allocations_during(f).1
 }
@@ -31,19 +21,13 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     let (mut out, mut ink, mut free, mut nova) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut now = Instant::now();
 
-    // A wordless screen — `sit` is nobody's lexicon word — and a caret on
-    // record, without which a note stores nothing at all.
     term.process(b"$ sit");
     wd.rescan(&term, 4, 40, &lex, &cfg, 1, now);
 
-    // Every shape a note can take, built before the counter is on. The word the glass holds goes
-    // last, so it is the one left pending.
     let window = "x".repeat(TrickLexicon::MAX_SURFACE_CHARS);
     let too_long = "x".repeat(TrickLexicon::MAX_SURFACE_CHARS + 1);
     let shapes: [&str; 6] = ["", "\u{200d}", "นั่ง", &too_long, &window, "sit"];
 
-    // The input path. No flash has started, so no note is debounced before
-    // its character loop: each one walks its word.
     let mut pending = 0usize;
     let allocations = allocations_during(|| {
         for word in shapes {
@@ -58,8 +42,6 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     );
     assert_eq!(allocations, 0, "a note must not allocate");
 
-    // The Space echoes, the rescan finds the word, and one frame warms the host's `ink` scratch
-    // (neither is counted).
     term.process(b" ");
     wd.rescan(&term, 4, 40, &lex, &cfg, 2, now);
     assert_eq!(wd.trick_flash_phase(now), TrickFlashPhase::Live);
@@ -69,8 +51,6 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     );
     assert_eq!(ink.len(), 3, "one cell per glyph of `sit`");
 
-    // The frame path, from the ramp through the hold: every frame repaints
-    // all three cells and fingerprints differently.
     let (mut painted, mut changed, mut last_fp) = (0usize, 0usize, 0u64);
     let allocations = allocations_during(|| {
         for _ in 0..40 {
@@ -91,7 +71,6 @@ fn a_flash_costs_the_input_path_and_the_frame_path_no_allocation() {
     assert_eq!(changed, 40, "and every one of them was a new frame");
     assert_eq!(allocations, 0, "a flashing frame must not allocate");
 
-    // A revoke mid-flash is input-path work too, and so is the fade it starts.
     let allocations = allocations_during(|| {
         wd.revoke_trick_flash(now);
         for _ in 0..4 {

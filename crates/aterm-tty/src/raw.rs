@@ -44,7 +44,8 @@ impl Termios {
     /// These settings made raw.
     fn raw(self) -> Self {
         let mut raw = self;
-        // SAFETY: the buffer is an aligned termios every bit pattern of which is valid.
+        // SAFETY: the buffer is an aligned termios every bit pattern of which is valid
+        // (integers and arrays of them); cfmakeraw edits it in place.
         unsafe {
             libc::cfmakeraw(raw.as_mut_ptr());
             let t = &mut *raw.as_mut_ptr();
@@ -143,7 +144,8 @@ fn restore() {
 /// signal raised, which is held until this handler returns.
 extern "C" fn restore_and_end(signal: libc::c_int) {
     restore();
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value.
+    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty
+    // mask, no flags).
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
     default.sa_sigaction = libc::SIG_DFL;
     // SAFETY: the default disposition, for the signal this handler took.
@@ -211,7 +213,8 @@ pub struct RawGuard {
 impl RawGuard {
     /// Save the settings of the terminal on `fd` and set it raw.
     /// # Errors
-    /// `fd` is not a terminal.
+    /// `fd` is not a terminal, its settings cannot be read or set, or another guard is
+    /// alive in this process (`ResourceBusy`).
     pub fn enter(fd: RawFd) -> io::Result<Self> {
         if CLAIMED.swap(true, Ordering::AcqRel) {
             return Err(io::Error::new(

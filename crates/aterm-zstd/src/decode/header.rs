@@ -12,8 +12,6 @@ use std::io::{self, Read};
 use super::error::DecodeError;
 use crate::frame::{BLOCK_MAX, WINDOW_MAX};
 
-/// The smallest window a frame has (`Window_Log` 10). A single-segment
-/// frame's window is its content size, raised to this.
 const MIN_WINDOW: u64 = 1 << 10;
 
 /// What the header says about the frame.
@@ -39,7 +37,6 @@ pub(crate) fn read(input: &mut impl Read) -> io::Result<FrameHeader> {
 
     let fcs_flag = descriptor >> 6;
     let single_segment = descriptor & 0x20 != 0;
-    // Bit 4 is unused and ignored; bit 3 is reserved and must be zero.
     if descriptor & 0x08 != 0 {
         return Err(DecodeError::ReservedBit.into());
     }
@@ -62,7 +59,6 @@ pub(crate) fn read(input: &mut impl Read) -> io::Result<FrameHeader> {
         let mut id = [0u8; 4];
         input.read_exact(&mut id[..dict_id_len])?;
         let id = u32::from_le_bytes(id);
-        // An ID of 0 means "no dictionary", as if the field were absent.
         if id != 0 {
             return Err(DecodeError::Dictionary(id).into());
         }
@@ -81,7 +77,6 @@ pub(crate) fn read(input: &mut impl Read) -> io::Result<FrameHeader> {
         let mut field = [0u8; 8];
         input.read_exact(&mut field[..fcs_len])?;
         let value = u64::from_le_bytes(field);
-        // The 2-byte field is offset by 256.
         Some(if fcs_len == 2 { value + 256 } else { value })
     };
 
@@ -93,13 +88,11 @@ pub(crate) fn read(input: &mut impl Read) -> io::Result<FrameHeader> {
             base + (base / 8) * mantissa
         }
         (None, Some(size)) => size,
-        // A single-segment frame always carries a content size.
         (None, None) => 0,
     };
     if declared_window > WINDOW_MAX as u64 {
         return Err(DecodeError::WindowTooLarge(declared_window).into());
     }
-    // Both fit: the window is at most WINDOW_MAX.
     let window = declared_window.max(MIN_WINDOW) as usize;
     let block_max = (declared_window as usize).min(BLOCK_MAX);
     Ok(FrameHeader {
@@ -130,15 +123,12 @@ mod tests {
 
     #[test]
     fn single_segment_window_is_the_content_size() {
-        // FCS flag 0 + single segment: one size byte.
         let h = parse(&[0x20, 3]).unwrap();
         assert_eq!(h.content_size, Some(3));
         assert_eq!((h.window, h.block_max), (1024, 3));
-        // FCS flag 1: two bytes plus 256.
         let h = parse(&[0x60, 0xFF, 0xFF]).unwrap();
         assert_eq!(h.content_size, Some(65_791));
         assert_eq!((h.window, h.block_max), (65_791, 65_791));
-        // FCS flag 2 at the cap, and one past it.
         let at_cap = (1u32 << 27).to_le_bytes();
         let h = parse(&[0xA0, at_cap[0], at_cap[1], at_cap[2], at_cap[3]]).unwrap();
         assert_eq!((h.window, h.block_max), (1 << 27, 128 * 1024));
@@ -151,16 +141,13 @@ mod tests {
 
     #[test]
     fn window_descriptor_sizes() {
-        // Exponent 0, mantissa 0: 1 KiB, no content size, checksum.
         let h = parse(&[0x04, 0x00]).unwrap();
         assert_eq!(
             (h.window, h.block_max, h.content_size, h.checksum),
             (1024, 1024, None, true)
         );
-        // Exponent 13 (window log 23), mantissa 7: 8 MiB + 7 MiB.
         let h = parse(&[0x00, 13 << 3 | 7]).unwrap();
         assert_eq!(h.window, (8 << 20) + 7 * (1 << 20));
-        // Window log 27 is the cap; any mantissa past it is refused.
         assert_eq!(parse(&[0x00, 17 << 3]).unwrap().window, 1 << 27);
         assert_eq!(
             refusal(&[0x00, 17 << 3 | 1]),
@@ -180,9 +167,7 @@ mod tests {
             refusal(&[0x03, 0x00, 1, 0, 0, 0x80]),
             DecodeError::Dictionary(0x8000_0001)
         );
-        // Dictionary ID 0 is no dictionary.
         assert!(parse(&[0x02, 0x00, 0, 0]).is_ok());
-        // The unused bit is ignored.
         assert!(parse(&[0x10, 0x00]).is_ok());
     }
 

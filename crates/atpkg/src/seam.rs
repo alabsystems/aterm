@@ -131,7 +131,7 @@ pub const STOCK_NAMES: &[(&str, &str)] = &[
 ];
 
 /// The directories beside `bin/` a sysroot is read through, cloned into the view
-/// (file by file, not a directory symlink — see the module doc) so a tool run from it
+/// (file by file, not a directory symlink) so a tool run from it
 /// finds its own `lib/rustlib`, `libexec/` helpers and `share/` docs, and reports the
 /// view as its sysroot.
 const VIEW_DIRS: &[&str] = &["lib", "libexec", "share", "etc"];

@@ -3,7 +3,9 @@
 
 //! A durable obligation to activate desktop preferences after their write.
 
-use crate::model::User;
+use crate::items::defaults::{Signalled, Target};
+use crate::model::{PValue, User};
+use crate::plist::Entries;
 use crate::port::{Cmd, System};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,7 @@ pub const CONTAINED_MARKER: &str = "notificationcenter";
 /// The marker of a write to the Window Manager's widget keys (on the desktop and in Stage Manager), whose relaunch is the Dock's.
 pub const WIDGETS_MARKER: &str = "desktopwidgets";
 
-/// The marker an older aterm (0.114.0 and before) wrote before every widgets write, Notification Center's widget list with the Window Manager's keys, and cleared once the Dock and Notification Center were relaunched.
+/// The marker an older aterm (0.116.0 and before) wrote before every widgets write, Notification Center's widget list with the Window Manager's keys, and cleared once the Dock and Notification Center were relaunched.
 pub const LEGACY_WIDGETS_MARKER: &str = "widgets";
 
 fn path(user: &User, family: &str) -> Result<PathBuf, String> {
@@ -155,22 +157,113 @@ enum State<W> {
     },
 }
 
-/// Relaunch each of `processes` that runs, once, in turn, and return once each is up again and past its start or the minute is out: for each, `Ok`, or why not.
+/// Relaunch each of `processes` that runs, once, in turn, and return once each is up again and past its start or the minute is out: for each, `Ok`, or why not, which says the activation remains pending (its durable marker, [`begin`], is cleared only after this).
 pub fn relaunch_settled<W: PartialEq>(
     sys: &dyn System,
     user: &User,
     processes: &[&str],
     look: impl Fn(&str) -> Result<W, String>,
 ) -> Vec<Result<(), String>> {
-    let pending = |why: String| format!("{why}; activation remains pending");
+    relaunched(sys, user, processes, look)
+        .into_iter()
+        .map(|answer| answer.map_err(|why| format!("{why}; activation remains pending")))
+        .collect()
+}
+
+/// Relaunch `user`'s `process` once and return once it is up again and what it reads of
+/// `keys` is still ([`reading`]), for a caller that keeps no durable obligation: a fleet
+/// row's relaunch ([`crate::items::defaults::Relaunch`]) and the doctor's own after it puts
+/// a value back. `Ok` too when the process does not run or `user` has no login session:
+/// nothing then holds what it read before.
+///
+/// # Errors
+/// Why the process was not relaunched, or is not yet up and still a minute after.
+pub fn relaunch_reading(
+    sys: &dyn System,
+    user: &User,
+    process: &str,
+    keys: &[Target],
+) -> Result<(), String> {
+    relaunched(sys, user, &[process], |_| reading(sys, keys))
+        .pop()
+        .unwrap_or(Ok(()))
+}
+
+/// The Dock's keys whose tiles it gives a GUID as it loads them (aterm's own pins carry none).
+const TILE_KEYS: [&str; 2] = ["persistent-apps", "persistent-others"];
+
+/// What the process that reads `keys` holds of them now, each of their domains read once,
+/// a read's failure kept as what it read; `Err` while it is the Dock and has not yet loaded
+/// the tiles it was handed: a Dock gives each tile it loads a GUID, and a write of aterm's
+/// pins carries none.
+///
+/// # Errors
+/// The Dock has not yet loaded a tile of `keys`.
+pub fn reading(sys: &dyn System, keys: &[Target]) -> Result<Vec<Result<Entries, String>>, String> {
+    let mut domains: Vec<&Target> = Vec::new();
+    for key in keys {
+        if !domains
+            .iter()
+            .any(|seen| seen.domain == key.domain && seen.scope == key.scope)
+        {
+            domains.push(key);
+        }
+    }
+    let mut seen = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let entries = domain.entries(sys).map(|entries| -> Entries {
+            entries
+                .into_iter()
+                .filter(|(name, _)| {
+                    keys.iter().any(|key| {
+                        key.domain == domain.domain && key.scope == domain.scope && key.key == *name
+                    })
+                })
+                .collect()
+        });
+        if domain.domain == "com.apple.dock"
+            && let Ok(entries) = &entries
+            && entries.iter().any(|(key, value)| {
+                TILE_KEYS.contains(&key.as_str())
+                    && value.as_ref().is_ok_and(|tiles| !loaded(tiles))
+            })
+        {
+            return Err("the Dock has not yet loaded the tiles it was given".into());
+        }
+        seen.push(entries);
+    }
+    Ok(seen)
+}
+
+/// Whether every tile of `tiles` carries the GUID a Dock gives a tile it loads.
+fn loaded(tiles: &PValue) -> bool {
+    let PValue::Array(tiles) = tiles else {
+        return true;
+    };
+    tiles.iter().all(
+        |tile| matches!(tile, PValue::Dict(fields) if fields.iter().any(|(key, _)| key == "GUID")),
+    )
+}
+
+/// [`relaunch_settled`], each failure saying only why.
+fn relaunched<W: PartialEq>(
+    sys: &dyn System,
+    user: &User,
+    processes: &[&str],
+    look: impl Fn(&str) -> Result<W, String>,
+) -> Vec<Result<(), String>> {
     let mut states: Vec<State<W>> = processes
         .iter()
         .map(|&process| match census(sys, user, process) {
-            Err(why) => State::Done(Err(pending(why))),
+            Err(why) => State::Done(Err(why)),
             Ok(old) if old.is_empty() => State::Done(Ok(())),
             Ok(old) => match crate::items::defaults::relaunch(sys, user, process) {
-                Err(why) => State::Done(Err(pending(why))),
-                Ok(()) => State::Waiting {
+                Err(why) => State::Done(Err(why)),
+                // No login session: nothing was signalled and nothing starts again.
+                Ok(Signalled::NoSession) => State::Done(Ok(())),
+                // A `killall` that signalled not every one (a refused kill, or a census
+                // the process outran) proves nothing: the old processes are waited on.
+                Ok(Signalled::Every | Signalled::NotEvery) => State::Waiting {
                     old,
                     last: None,
                     why: format!("{process} has not been looked at"),
@@ -213,9 +306,9 @@ pub fn relaunch_settled<W: PartialEq>(
         if !sys.run(&sleep).is_ok_and(|ran| ran.success()) {
             for (state, process) in states.iter_mut().zip(processes) {
                 if matches!(state, State::Waiting { .. }) {
-                    *state = State::Done(Err(pending(format!(
+                    *state = State::Done(Err(format!(
                         "the wait for the relaunched {process} was interrupted"
-                    ))));
+                    )));
                 }
             }
             break;
@@ -225,9 +318,7 @@ pub fn relaunch_settled<W: PartialEq>(
         .into_iter()
         .map(|state| match state {
             State::Done(answer) => answer,
-            State::Waiting { why, .. } => {
-                Err(pending(format!("{why} a minute after its relaunch")))
-            }
+            State::Waiting { why, .. } => Err(format!("{why} a minute after its relaunch")),
         })
         .collect()
 }
@@ -503,6 +594,50 @@ mod tests {
         });
         assert_eq!(answers, [Ok(())]);
         assert_eq!(sleeps(&sys), 3);
+    }
+
+    /// A `killall` that exits 1 after the census saw the process (a refused kill, or a
+    /// process that exited on its own first) vouches for nothing: the old process is
+    /// waited on as after any kill, so one that keeps running fails the activation, and one
+    /// that did exit counts only once its successor is up and still. Negative control: an
+    /// answer taken from `killall`'s status alone returns `Ok` with no wait.
+    #[test]
+    fn a_kill_that_signalled_not_every_process_is_waited_on_like_any_other() {
+        let who = user("alice", 501);
+        let census = "alice$ /usr/bin/pgrep -u 501 -x Dock";
+        let script = |sys: &Fake| {
+            sys.on(census, Ran::ok("123\n"));
+            sys.on("/bin/launchctl print gui/501", Ran::ok(""));
+            sys.on(
+                "alice@gui$ /usr/bin/killall -u alice Dock",
+                Ran::exit(1, "kill -TERM 123: Operation not permitted"),
+            );
+            sys.on("alice$ /bin/sleep 1", Ran::ok(""));
+        };
+        let sys = Fake::root();
+        script(&sys);
+        sys.alive(123);
+        let why = relaunch_settled(&sys, &who, &["Dock"], |_| Ok::<_, String>(()))
+            .remove(0)
+            .unwrap_err();
+        assert!(
+            why.contains("the previous Dock process has not exited")
+                && why.ends_with("activation remains pending"),
+            "{why}"
+        );
+        assert_eq!(sleeps(&sys), 59);
+        assert_eq!(kills(&sys), 1);
+
+        let sys = Fake::root();
+        script(&sys);
+        sys.on(census, Ran::ok("124\n"));
+        let reads = std::sync::Mutex::new(vec![1, 2, 2]);
+        let answers = relaunch_settled(&sys, &who, &["Dock"], |_| {
+            Ok::<_, String>(reads.lock().unwrap().remove(0))
+        });
+        assert_eq!(answers, [Ok(())]);
+        assert_eq!(sleeps(&sys), 2);
+        assert!(reads.lock().unwrap().is_empty());
     }
 
     /// Two equal reads count only under the same new processes: a consumer that started

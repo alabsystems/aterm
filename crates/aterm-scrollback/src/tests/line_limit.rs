@@ -8,8 +8,6 @@ use super::*;
 
 #[test]
 fn scrollback_line_limit_default_is_safe_cap() {
-    // The default line limit bounds a runaway stdout; unlimited history is an
-    // explicit opt-in.
     let sb = Scrollback::with_defaults();
     assert_eq!(sb.line_limit(), Some(DEFAULT_LINE_LIMIT));
 }
@@ -24,19 +22,15 @@ fn scrollback_line_limit_zero_disables() {
     }
     assert_eq!(sb.line_count(), 5);
 
-    // Setting to Some(0) clears everything
     sb.set_line_limit(Some(0));
     assert_eq!(sb.line_count(), 0);
 }
 
 #[test]
 fn scrollback_default_caps_runaway_push_from_oldest() {
-    // Pushing far more than the cap keeps `line_count` at it and evicts the
-    // oldest lines first (cold → warm → hot).
     let mut sb = Scrollback::with_defaults();
     assert_eq!(sb.line_limit(), Some(DEFAULT_LINE_LIMIT));
 
-    // 10x a small cap with small tiers: fast, and still drops across tiers.
     let cap = 500usize;
     sb.set_line_limit(Some(cap));
 
@@ -45,11 +39,8 @@ fn scrollback_default_caps_runaway_push_from_oldest() {
         sb.push_str(&format!("Line {i}"));
     }
 
-    // Line count is bounded.
     assert_eq!(sb.line_count(), cap, "line_count must be clamped to limit");
 
-    // Oldest-first eviction preserved: the oldest retained line must be
-    // `push_total - cap` (everything before that was dropped).
     let expected_oldest = format!("Line {}", push_total - cap);
     let oldest = sb
         .get_line(0)
@@ -61,7 +52,6 @@ fn scrollback_default_caps_runaway_push_from_oldest() {
         "expected oldest retained line to contain `{expected_oldest}`, got `{oldest}`",
     );
 
-    // Newest is preserved.
     let newest = sb
         .get_line_rev(0)
         .expect("no error")
@@ -76,15 +66,11 @@ fn scrollback_default_caps_runaway_push_from_oldest() {
 
 #[test]
 fn scrollback_line_limit_evicts_from_oldest_tier_first() {
-    // Populate enough to push lines through every tier (cold + warm + hot),
-    // then set a lower limit and confirm eviction strictly removes from the
-    // oldest tier first (cold before warm before hot).
     let hot_limit = 10;
     let warm_limit = 50;
     let block_size = 5;
     let mut sb = Scrollback::with_block_size(hot_limit, warm_limit, 10_000_000, block_size);
 
-    // Fill enough to force lines into warm and cold.
     for i in 0..200 {
         sb.push_str(&format!("Line {i}"));
     }
@@ -102,14 +88,10 @@ fn scrollback_line_limit_evicts_from_oldest_tier_first() {
     let warm_before = sb.warm_line_count();
     let hot_before = sb.hot_line_count();
 
-    // Trim to just the hot tier's worth of lines.
     sb.set_line_limit(Some(hot_before));
 
-    // All removed lines must come from cold first, then warm; hot survives.
     assert!(sb.cold_line_count() <= cold_before);
     assert!(sb.warm_line_count() <= warm_before);
-    // If we can fit entirely in hot, cold + warm should be drained before hot
-    // loses a single line.
     assert_eq!(sb.cold_line_count(), 0, "cold tier must drain before warm");
     assert_eq!(sb.warm_line_count(), 0, "warm tier must drain before hot");
     assert_eq!(sb.line_count(), hot_before);
@@ -117,8 +99,6 @@ fn scrollback_line_limit_evicts_from_oldest_tier_first() {
 
 #[test]
 fn scrollback_line_limit_bounds_massive_push() {
-    // A runaway stdout stays bounded: pushed far past the cap, the line count
-    // is the cap and the budgeted memory stays small.
     let cap = 200usize;
     let mut sb = Scrollback::new(20, 200, 10_000_000);
     sb.set_line_limit(Some(cap));
@@ -128,8 +108,6 @@ fn scrollback_line_limit_bounds_massive_push() {
     }
 
     assert_eq!(sb.line_count(), cap);
-    // Budgeted memory must be reasonable relative to the cap.
-    // Each "xN" line is ~5 bytes + overhead; 200 lines well under 1 MiB.
     assert!(
         sb.budgeted_memory_used() < 4 * 1024 * 1024,
         "budgeted_memory_used={} exceeded safety headroom",
@@ -137,9 +115,6 @@ fn scrollback_line_limit_bounds_massive_push() {
     );
 }
 
-/// Verify that `binary_search_counted` matches `slice::binary_search` for a
-/// range of inputs, ensuring the hand-rolled implementation used for step
-/// counting is behaviorally equivalent to the stdlib.
 #[test]
 fn binary_search_counted_matches_stdlib() {
     let cumulative: Vec<usize> = vec![3, 7, 12, 20, 25, 30, 44, 50];
@@ -158,7 +133,6 @@ fn binary_search_counted_matches_stdlib() {
         );
     }
 
-    // Empty slice edge case.
     let empty: Vec<usize> = vec![];
     let mut empty_steps = 0usize;
     let result = binary_search_counted(&empty, 5, &mut empty_steps);

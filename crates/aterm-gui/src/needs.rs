@@ -502,7 +502,8 @@ const NOT_ASKS: [&str; 2] = [
 /// less the API's 429, which is an API error).
 const LIMIT_WALLS: [&str; 4] = ["usage-session", "usage-weekly", "model-bucket", "spend"];
 
-/// The classifier: `facts` → [`Verdict`] (the module doc's rule).
+/// The classifier: `facts` → [`Verdict`]; of the needs that apply, the first in [`NeedWord`]'s
+/// order wins.
 #[must_use]
 pub(crate) fn of(facts: &NeedFacts) -> Verdict {
     let wall = facts.agent.as_ref().and_then(|agent| {

@@ -105,7 +105,9 @@ pub fn encode(input: &[u8]) -> Result<String, EncodeError> {
     Ok(out)
 }
 
-/// Length of the padded encoding of `input_len` bytes, `4 * ceil(input_len / 3)`.
+/// Length of the padded encoding of `input_len` bytes, `4 * ceil(input_len / 3)`;
+/// `None` above [`crate::MAX_INPUT_LEN`], exactly the lengths [`encode_into`]
+/// refuses.
 #[must_use]
 #[inline]
 pub const fn encoded_len(input_len: usize) -> Option<usize> {

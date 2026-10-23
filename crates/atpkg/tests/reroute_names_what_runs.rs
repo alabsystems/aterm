@@ -407,7 +407,6 @@ fn a_stock_rustc_a_trust_cargo_spawns_by_name_is_judged_in_a_trust_checkout() {
 
 #[test]
 fn with_no_store_a_stock_rustc_in_a_trust_checkout_is_refused() {
-    // `HOME` unset leaves no home only for an account the passwd file does not list
     if !cfg!(debug_assertions) {
         aterm_spec::host::could_not_run(
             "a build without debug assertions reads no passwd-file seam, so `HOME` unset \

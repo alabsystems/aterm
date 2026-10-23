@@ -6,11 +6,6 @@ use super::{
     display_endpoints_from, linux_trial_start, loop_goes_first,
 };
 
-/// Leave at `path` the socket file of a display server that exited: one nothing answers.
-/// A datagram socket, not a dropped stream listener: macOS sets close-on-exec only after
-/// `socket()` returns, so a concurrent test's `posix_spawn` can inherit the listener and keep it
-/// listening, and a connect then succeeds into its backlog. A stream connect to a datagram
-/// socket's path is refused (`EPROTOTYPE`) whoever holds it.
 fn server_gone_socket(path: &std::path::Path) {
     drop(std::os::unix::net::UnixDatagram::bind(path).unwrap());
 }
@@ -23,9 +18,6 @@ fn only<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> +
     }
 }
 
-/// A `DISPLAY` nothing answers (`:99` with no X server: a stale socket file or none) is no
-/// window start at the boot apply: the launch fails "cannot open a display", so its start is
-/// left for the display's opening. Negative control: a listening socket is a window start.
 #[test]
 fn a_display_variable_nothing_answers_is_no_window_start() {
     let root = crate::test_scratch::short_dir("a display server's socket");
@@ -50,7 +42,6 @@ fn a_display_variable_nothing_answers_is_no_window_start() {
         LinuxTrialStart::Window,
         "no socket at all"
     );
-    // A socket file whose server is gone refuses the connection.
     server_gone_socket(&socket);
     assert!(socket.exists());
     assert_ne!(
@@ -73,8 +64,6 @@ fn a_display_variable_nothing_answers_is_no_window_start() {
     );
 }
 
-/// A Wayland compositor answers at `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY` (or an
-/// absolute `WAYLAND_DISPLAY`); with no runtime directory there is nowhere to ask.
 #[test]
 fn a_wayland_display_is_asked_at_its_socket() {
     let root = crate::test_scratch::short_dir("a display server's socket");
@@ -114,8 +103,6 @@ fn a_wayland_display_is_asked_at_its_socket() {
         display_endpoints_from(only(&[("WAYLAND_SOCKET", "5")])),
         [DisplayEndpoint::Inherited(5)]
     );
-    // `WAYLAND_SOCKET`, present at all, is the connection: libwayland reads it
-    // first and alone, so one that is no number is no connection.
     assert_eq!(
         display_endpoints_from(only(&[
             ("WAYLAND_SOCKET", "7"),
@@ -132,10 +119,6 @@ fn a_wayland_display_is_asked_at_its_socket() {
     );
 }
 
-/// `WAYLAND_SOCKET` names a socket the session handed down by number: it answers when
-/// the number is an open socket, and not when it is open on anything else or not open at
-/// all. Read from the descriptor itself, so every platform's tests read it (a path of
-/// the number, `/proc/self/fd/N`, answered nothing off Linux).
 #[test]
 fn an_inherited_display_socket_answers_and_no_other_descriptor_does() {
     use std::os::fd::AsRawFd as _;
@@ -147,17 +130,12 @@ fn an_inherited_display_socket_answers_and_no_other_descriptor_does() {
     assert!(!answers(-1), "no descriptor");
 }
 
-/// winit's choice of display decides, not any display that answers: winit picks Wayland whenever
-/// a Wayland variable is set and never falls back to X11 (a tmux server from a Wayland session,
-/// attached from X11, refreshes only `DISPLAY`). Negative control: with no Wayland variable the
-/// live X server is a window start, and so is a live compositor.
 #[test]
 fn winits_choice_of_display_decides_whether_a_start_is_counted() {
     let root = crate::test_scratch::short_dir("a display server's socket");
     let runtime = root.path().to_str().unwrap();
     let x_server = root.path().join("X0");
     let _x_server = std::os::unix::net::UnixListener::bind(&x_server).unwrap();
-    // The live X server stands where `:0` names it; every other endpoint is asked.
     let answers = |endpoint: &DisplayEndpoint| match endpoint {
         DisplayEndpoint::Socket(at)
             if at.as_path() == std::path::Path::new("/tmp/.X11-unix/X0") =>
@@ -170,7 +148,6 @@ fn winits_choice_of_display_decides_whether_a_start_is_counted() {
     let start = |vars: &[(&str, &str)]| {
         linux_trial_start(false, a_display_server_answers_from(only(vars), answers))
     };
-    // A compositor socket left by a session that ended.
     let stale = root.path().join("wayland-0");
     server_gone_socket(&stale);
     let attached = [
@@ -211,18 +188,6 @@ fn winits_choice_of_display_decides_whether_a_start_is_counted() {
     );
 }
 
-/// LINUX-6 — A LAUNCH WHOSE DISPLAY ANSWERS FORKS SESSION 0 BEFORE THE EVENT LOOP.
-/// Session 0's shell waited for every free-unix window's event-loop build, which opens
-/// the display (9.3-9.9 ms on X11, 1.6-1.8 ms on Wayland in the Linux lane, 2026-10-20).
-/// Now the build goes first only where no display server answered where winit will
-/// connect, so a launch that cannot open its display still takes nothing single-use and
-/// forks no shell. A build that opens no display (macOS, a headless run with none
-/// named) asks no server; the dev seam puts the loop first everywhere.
-///
-/// FAILS WITHOUT THE FIX: every build that opens a display went first.
-///
-/// NEGATIVE CONTROL: the display named by a socket its server left answers nothing, and
-/// the loop goes first.
 #[test]
 fn a_launch_whose_display_answers_forks_session_zero_before_the_loop() {
     let root = crate::test_scratch::short_dir("a display server's socket");
@@ -230,7 +195,6 @@ fn a_launch_whose_display_answers_forks_session_zero_before_the_loop() {
     let _server = std::os::unix::net::UnixListener::bind(&live).unwrap();
     let gone = root.path().join("X1");
     server_gone_socket(&gone);
-    // `:0`, answered at `at` in place of `/tmp/.X11-unix/X0`.
     let answered_at = |at: &std::path::Path| {
         let at = at.to_path_buf();
         move || {
@@ -263,9 +227,6 @@ fn a_launch_whose_display_answers_forks_session_zero_before_the_loop() {
     );
 }
 
-/// How `DISPLAY` names its server, as libxcb parses it: an empty host or `unix` is
-/// the local server's socket; any other host is over the network, which no launch
-/// can vouch for (`ssh -X`'s `localhost:10.0`); a path is that socket.
 #[test]
 fn display_names_its_server_as_libxcb_reads_it() {
     let x = |display: &str| display_endpoints_from(only(&[("DISPLAY", display)]));

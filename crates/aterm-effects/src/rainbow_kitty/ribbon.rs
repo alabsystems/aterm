@@ -11,7 +11,7 @@ use aterm_render::{
     ribbon_beam,
 };
 
-use crate::color_math::{hsv2rgb, oklab_distance, relative_luminance, rgb2hsv};
+use crate::color_math::{hsv2rgb, oklab, relative_luminance, rgb2hsv};
 use crate::cursor_glow::{InkRole, band_pos, band_row};
 use crate::effect_util::lerp_rgb;
 use crate::spectrum::{spectrum, spectrum_with_min_saturation};
@@ -997,9 +997,12 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
         };
         (ch(16) << 16) | (ch(8) << 8) | ch(0)
     };
+    let bg_lab = oklab(bg);
     let holds = |share: f32| {
         let on_glass = lerp_rgb(bg, full, share * cap);
-        oklab_distance(on_glass, bg) <= weight
+        let lab = oklab(on_glass);
+        let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
+        (dl * dl + da * da + db * db).sqrt() <= weight
             && bar.is_none_or(|bar| {
                 ratio(crate::color_math::relative_luminance_with(
                     table,
@@ -1177,54 +1180,110 @@ const fn cov_cap(cfg: &Config) -> f32 {
     }
 }
 
+#[inline]
+fn walk_arc_at(i: usize) -> u32 {
+    spectrum(walk_pace(i as f32 / (BED_INK_LUT_LEN - 1) as f32))
+}
+
+/// Shared 129-stop hot-edge ink LUT across the ribbon and meteor landing marks.
+#[inline]
+#[must_use]
+pub(crate) fn hot_edge_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    static HOT_EDGE_INK_LUT: std::sync::OnceLock<[u32; BED_INK_LUT_LEN]> =
+        std::sync::OnceLock::new();
+    HOT_EDGE_INK_LUT.get_or_init(|| std::array::from_fn(|i| hot_edge_ink(walk_arc_at(i))))
+}
+
+#[inline]
+fn rail_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    static RAIL_INK_LUT: std::sync::OnceLock<[u32; BED_INK_LUT_LEN]> = std::sync::OnceLock::new();
+    RAIL_INK_LUT.get_or_init(|| std::array::from_fn(|i| rail_ink(walk_arc_at(i))))
+}
+
+#[inline]
+fn dark_bed_max_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    static DARK_BED_MAX_LUT: std::sync::OnceLock<[u32; BED_INK_LUT_LEN]> =
+        std::sync::OnceLock::new();
+    DARK_BED_MAX_LUT.get_or_init(|| std::array::from_fn(|i| bed_ink(walk_arc_at(i), BED_LUMA_MAX)))
+}
+
+#[inline]
+fn dark_seen_common_lut(bg: u32) -> Option<&'static [f32; BED_INK_LUT_LEN]> {
+    static DARK_SEEN_COMMON_LUT: std::sync::OnceLock<[(u32, [f32; BED_INK_LUT_LEN]); 3]> =
+        std::sync::OnceLock::new();
+    let bg = bg & 0x00FF_FFFF;
+    if !matches!(bg, 0x0000_0000 | 0x0016_161C | 0x001A_1B26) {
+        return None;
+    }
+    let table = DARK_SEEN_COMMON_LUT.get_or_init(|| {
+        let beds: [u32; BED_INK_LUT_LEN] =
+            std::array::from_fn(|i| bed_ink(walk_arc_at(i), BED_LUMA_MAX));
+        [0x0000_0000, 0x0016_161C, 0x001A_1B26]
+            .map(|g| (g, std::array::from_fn(|i| seen_floor(beds[i], g))))
+    });
+    table.iter().find(|&&(g, _)| g == bg).map(|(_, lut)| lut)
+}
+
 /// The bed's ink table for one theme, rebuilt only when the theme or spelling changes.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct BedInkLut {
     key: Option<(u32, u32, bool, bool)>,
-    lut: Vec<u32>,
-    hot: Vec<u32>,
-    rail: Vec<u32>,
-    seen: Vec<f32>,
+    lut: [u32; BED_INK_LUT_LEN],
+    seen: [f32; BED_INK_LUT_LEN],
+}
+
+impl Default for BedInkLut {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            key: None,
+            lut: [0; BED_INK_LUT_LEN],
+            seen: [0.0; BED_INK_LUT_LEN],
+        }
+    }
 }
 
 impl BedInkLut {
     fn sync(&mut self, cfg: &Config) {
         let key = (cfg.theme_fg, cfg.theme_bg, cfg.dark_theme, cfg.ribbon_tall);
-        if self.key == Some(key) && self.lut.len() == BED_INK_LUT_LEN {
+        if self.key == Some(key) {
             return;
         }
         let budget = bed_luma_budget(cfg.theme_fg);
         let role = light_role(cfg);
-        self.lut.clear();
-        self.lut.reserve(BED_INK_LUT_LEN);
-        self.hot.clear();
-        self.hot.reserve(BED_INK_LUT_LEN);
-        self.rail.clear();
-        self.rail.reserve(BED_INK_LUT_LEN);
-        self.seen.clear();
-        self.seen.reserve(BED_INK_LUT_LEN);
+        let dark_max =
+            (cfg.dark_theme && (budget - BED_LUMA_MAX).abs() == 0.0).then(dark_bed_max_lut);
+        if let Some(max_lut) = dark_max
+            && let Some(seen_lut) = dark_seen_common_lut(cfg.theme_bg)
+        {
+            self.lut = *max_lut;
+            self.seen = *seen_lut;
+            self.key = Some(key);
+            return;
+        }
         for i in 0..BED_INK_LUT_LEN {
-            let x = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
-            let arc = spectrum(walk_pace(x));
-            let bed = if cfg.dark_theme {
-                bed_ink(arc, budget)
+            let bed = if let Some(max_lut) = dark_max {
+                max_lut[i]
             } else {
-                let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
-                let a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
-                let shows = seen(
-                    over_premul(cfg.theme_bg, premul_rgb(paper, a), a) & 0x00FF_FFFF,
-                    cfg.theme_bg,
-                );
-                if cfg.ribbon_tall && !shows {
-                    crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, a)
+                let arc = walk_arc_at(i);
+                if cfg.dark_theme {
+                    bed_ink(arc, budget)
                 } else {
-                    paper
+                    let paper = paper_ink(arc, cfg.theme_fg, cfg.theme_bg, role);
+                    let a = (cov_cap(cfg) + 16.0).min(255.0) as u8;
+                    let shows = seen(
+                        over_premul(cfg.theme_bg, premul_rgb(paper, a), a) & 0x00FF_FFFF,
+                        cfg.theme_bg,
+                    );
+                    if cfg.ribbon_tall && !shows {
+                        crate::cursor_glow::light_body_ink(arc, cfg.theme_fg, cfg.theme_bg, a)
+                    } else {
+                        paper
+                    }
                 }
             };
-            self.lut.push(bed);
-            self.hot.push(hot_edge_ink(arc));
-            self.rail.push(rail_ink(arc));
-            self.seen.push(seen_floor(bed, cfg.theme_bg));
+            self.lut[i] = bed;
+            self.seen[i] = seen_floor(bed, cfg.theme_bg);
         }
         self.key = Some(key);
     }
@@ -1233,6 +1292,9 @@ impl BedInkLut {
     #[inline]
     #[must_use]
     pub fn at(&self, t: f32) -> u32 {
+        if self.key.is_none() {
+            return 0;
+        }
         Self::sample(&self.lut, t)
     }
 
@@ -1240,21 +1302,27 @@ impl BedInkLut {
     #[inline]
     #[must_use]
     pub fn hot_at(&self, t: f32) -> u32 {
-        Self::sample(&self.hot, t)
+        if self.key.is_none() {
+            return 0;
+        }
+        Self::sample(hot_edge_ink_lut(), t)
     }
 
     /// The vivid rail's ink at walk position `t`.
     #[inline]
     #[must_use]
     pub fn rail_at(&self, t: f32) -> u32 {
-        Self::sample(&self.rail, t)
+        if self.key.is_none() {
+            return 0;
+        }
+        Self::sample(rail_ink_lut(), t)
     }
 
     /// The colour floor at walk position `t`.
     #[inline]
     #[must_use]
     pub fn seen_floor_at(&self, t: f32) -> f32 {
-        if self.seen.is_empty() {
+        if self.key.is_none() {
             return 0.0;
         }
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
@@ -1264,10 +1332,7 @@ impl BedInkLut {
     }
 
     #[inline]
-    fn sample(table: &[u32], t: f32) -> u32 {
-        if table.is_empty() {
-            return 0;
-        }
+    fn sample(table: &[u32; BED_INK_LUT_LEN], t: f32) -> u32 {
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
         let i = (x as usize).min(BED_INK_LUT_LEN - 1);
         let j = (i + 1).min(BED_INK_LUT_LEN - 1);
@@ -4332,8 +4397,13 @@ impl Ribbon {
     }
 
     fn build_runs(&mut self, ctx: &Ctx<'_>, sorted: &[(u16, u16, u32)]) {
-        fn cohort_of(cells: &[Cell], e: &(u16, u16, u32)) -> Option<u32> {
-            cells.get(e.2 as usize).map(|c| c.cohort)
+        const fn cohort_of(cells: &[Cell], e: (u16, u16, u32)) -> Option<u32> {
+            let idx = e.2 as usize;
+            if idx < cells.len() {
+                Some(cells[idx].cohort)
+            } else {
+                None
+            }
         }
         let mut s = 0usize;
         while s < sorted.len() {
@@ -4341,7 +4411,7 @@ impl Ribbon {
             while e + 1 < sorted.len()
                 && sorted[e + 1].0 == sorted[s].0
                 && sorted[e + 1].1 == sorted[e].1 + 1
-                && cohort_of(&self.cells, &sorted[e + 1]) == cohort_of(&self.cells, &sorted[e])
+                && cohort_of(&self.cells, sorted[e + 1]) == cohort_of(&self.cells, sorted[e])
             {
                 e += 1;
             }

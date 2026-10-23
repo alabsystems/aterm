@@ -263,6 +263,7 @@ impl SessionLog {
         let (log, host, stats) = Log::from_carry_built(lines, a, build)?;
         self.epochs.note(log.ep());
         self.replace_log(log);
+        self.carried = true;
         self.origin = Kind::Adopt;
         if host.iter().any(|l| l == JOURNAL_HOST_LINE) {
             self.journal_start = Some(stats.head);

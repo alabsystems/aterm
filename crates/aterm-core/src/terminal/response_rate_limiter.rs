@@ -3,41 +3,22 @@
 // Author: Andrew Yates
 
 //! Token-bucket rate limiter for PTY response sequences.
-//!
-//! A malicious PTY peer can spam queries (DSR, DA, DECRQSS, color queries, XTGETTCAP,
-//! title reports) to force replies. The 1 MiB [`MAX_RESPONSE_BUFFER_SIZE`] bounds memory
-//! but not rate, so [`ResponseRateLimiter`] gates `send_response` and drops the excess, as
-//! a full buffer does. The defaults sit far above the few hundred bytes/s of replies a
-//! shell startup emits.
-//!
-//! [`MAX_RESPONSE_BUFFER_SIZE`]: super::MAX_RESPONSE_BUFFER_SIZE
 
-// aterm_time::Instant: std on native, the JS clock on wasm32 (where std's
-// Instant::now() panics); the engine's other Instant seams use it too.
 use aterm_time::Instant;
 use std::time::Duration;
 
-/// Default refill rate in bytes/sec: far above legitimate traffic (shell-startup probes
-/// are under 1 KiB in all), while still limiting amplification against the 1 MiB cap.
+/// Default refill rate in bytes per second.
 pub(crate) const DEFAULT_REFILL_BYTES_PER_SEC: u64 = 100 * 1024;
 
-/// Default burst capacity in bytes: absorbs startup bursts (DECRQSS batteries,
-/// DA/DA2/XTVERSION, OSC palette probes) and carries the largest response. Sized on the
-/// wire: an OSC 52 query answers in base64, about 1.34x the
-/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`] the handler admits, and `try_consume` refuses
-/// anything above capacity.
-///
-/// [`MAX_OSC52_QUERY_RESPONSE_BYTES`]: super::MAX_OSC52_QUERY_RESPONSE_BYTES
+/// Default burst capacity in bytes, sized above [`super::MAX_OSC52_QUERY_RESPONSE_BYTES`] in base64.
 pub(crate) const DEFAULT_BURST_BYTES: u64 = 96 * 1024;
 
-/// Abstraction over [`Instant::now`] so tests can drive the clock forward
-/// deterministically without sleeping.
+/// Clock source for deterministic rate-limiter tests.
 pub(crate) trait TimeSource {
-    /// Return the current instant.
     fn now(&self) -> Instant;
 }
 
-/// Production time source — delegates to [`Instant::now`].
+/// Production time source backed by [`Instant::now`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SystemTime;
 
@@ -52,10 +33,7 @@ impl TimeSource for SystemTime {
     }
 }
 
-/// Token-bucket rate limiter for PTY response bytes: tokens refill at
-/// `refill_bytes_per_sec` up to `capacity_bytes`, and a response that finds too few is
-/// dropped silently. One larger than the capacity is always dropped, so the capacity is
-/// sized on the largest encoded response ([`DEFAULT_BURST_BYTES`]).
+/// Token-bucket rate limiter for PTY response bytes.
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseRateLimiter {
     /// Current token count. Saturates at `capacity_bytes` after refill.
@@ -70,14 +48,13 @@ pub(crate) struct ResponseRateLimiter {
 }
 
 impl ResponseRateLimiter {
-    /// Create a rate limiter with the default capacity and refill rate.
+    /// Creates a rate limiter with default capacity and refill rate.
     #[inline]
     pub(crate) const fn new() -> Self {
         Self::with_limits(DEFAULT_REFILL_BYTES_PER_SEC, DEFAULT_BURST_BYTES)
     }
 
-    /// A rate limiter with custom limits. `refill_bytes_per_sec = 0` never replenishes the
-    /// initial capacity.
+    /// Creates a rate limiter with custom refill and capacity limits.
     #[inline]
     pub(crate) const fn with_limits(refill_bytes_per_sec: u64, capacity_bytes: u64) -> Self {
         Self {
@@ -92,9 +69,7 @@ impl ResponseRateLimiter {
         }
     }
 
-    /// Deduct `bytes` tokens: `true` if the response may go, `false` if it is dropped.
-    /// `f64` tokens let sub-millisecond refill intervals accumulate (a burst of tiny DSR
-    /// replies back to back).
+    /// Deducts `bytes` tokens, returning `false` when the response must be dropped.
     #[inline]
     pub(crate) fn try_consume<T: TimeSource>(&mut self, bytes: usize, clock: &T) -> bool {
         // Larger than capacity can never fit: drop without deducting, so one pathological
@@ -123,7 +98,6 @@ impl ResponseRateLimiter {
     #[inline]
     fn refill(&mut self, now: Instant) {
         let Some(last) = self.last_refill else {
-            // First call: seed the clock; the bucket already starts full.
             self.last_refill = Some(now);
             return;
         };
@@ -161,7 +135,6 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    /// Advances only when `advance()`d.
     struct FakeClock {
         now: Cell<Instant>,
     }
@@ -186,7 +159,6 @@ mod tests {
 
     #[test]
     fn test_response_rate_above_limit_excess_dropped() {
-        // No time passes: the 200-byte burst admits five 40-byte responses.
         let mut limiter = ResponseRateLimiter::with_limits(100, 200);
         let clock = FakeClock::new();
 
@@ -215,7 +187,6 @@ mod tests {
         assert!(limiter.try_consume(100, &clock));
         assert!(!limiter.try_consume(1, &clock));
 
-        // 50 ms at 1000 bytes/sec earns 50 tokens back.
         clock.advance(Duration::from_millis(50));
         assert!(
             limiter.try_consume(50, &clock),
@@ -231,7 +202,6 @@ mod tests {
 
         assert!(limiter.try_consume(100, &clock));
 
-        // Ten idle seconds would earn 100_000 tokens uncapped.
         clock.advance(Duration::from_secs(10));
         assert!(
             limiter.try_consume(100, &clock),
@@ -252,7 +222,6 @@ mod tests {
             !limiter.try_consume(101, &clock),
             "response larger than capacity must be dropped"
         );
-        // Nor is the bucket drained by it.
         assert!(limiter.try_consume(100, &clock));
     }
 }

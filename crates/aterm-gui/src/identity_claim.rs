@@ -114,8 +114,8 @@ fn successor_marker_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.successor", sid.as_str())))
 }
 
-/// The epoch record beside a claim file: `claims/<sid>.ep` (module doc, "The
-/// epoch record").
+/// The epoch record beside a claim file: `claims/<sid>.ep`, the largest epoch a holder of the
+/// id gave its log.
 fn epoch_record_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
     claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.ep", sid.as_str())))
 }
@@ -537,7 +537,8 @@ fn open_claim(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(unix)]
 fn lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
-    // SAFETY: `file` is a live open file, so its descriptor is valid for the call.
+    // SAFETY: `file` is a live open file, so its descriptor is valid for the call;
+    // `flock` mutates no memory and the descriptor outlives it.
     #[expect(
         clippy::disallowed_methods,
         reason = "the claim's lock: held by a `Claim`, whose Drop releases it by LOCK_UN"

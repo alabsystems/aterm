@@ -55,7 +55,8 @@ fn osc_title(data: &str) -> Option<String> {
     last
 }
 
-/// Every idle spell after a busy state of `cast` as `reader` reads it ([module docs](self)).
+/// Every idle spell after a busy state of `cast` as `reader` reads it, frames left mid-draw
+/// skipped.
 pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Spell> {
     use aterm_core::terminal::{ClockReading, Terminal};
     struct St {

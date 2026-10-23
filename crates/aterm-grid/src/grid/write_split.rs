@@ -408,7 +408,9 @@ impl Grid {
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for i in 0..to_write {
                         let col = cursor_col + (i as u16) * 2;
-                        // SAFETY: (a) `col + 1 < end_col_run <= cells_len()`, checked above.
+                        // SAFETY: (a) `col + 1 < end_col_run <= cells_len()`, checked above;
+                        // (b) `col = cursor_col + 2i` is a wide-cell boundary; (c) the writes are
+                        // sequential and disjoint, each covering `(col, col + 1)`.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + i], colors, flags);
                         }
@@ -503,7 +505,9 @@ impl Grid {
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for j in 0..to_write {
                         let col = cursor_col + (j as u16) * 2;
-                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above.
+                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above;
+                        // (b) `col = cursor_col + 2j` is a wide-cell boundary; (c) the writes are
+                        // sequential and disjoint, each covering `(col, col + 1)`.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + j], colors, flags);
                         }
@@ -610,7 +614,9 @@ impl Grid {
                         } else {
                             bmp_flags
                         };
-                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above.
+                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above;
+                        // (b) `col = cursor_col + 2j` is a wide-cell boundary; (c) the writes are
+                        // sequential and disjoint, each covering `(col, col + 1)`.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, c, bmp_colors, fl);
                         }

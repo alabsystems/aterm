@@ -299,7 +299,7 @@ fn discovery_order_is_store_then_path_and_no_developer_tree() {
     assert_eq!((got.origin, got.path), (TrustBinOrigin::Store, store));
 }
 
-/// Rewrite `p` in place with same-length `body` and restore `mtime` once `ctime` advances.
+/// Rewrite `p` in place with same-length `body`, restoring its `mtime`, until its `ctime` differs.
 #[cfg(unix)]
 fn rewrite_keeping_mtime(p: &Path, body: &str) {
     use std::os::unix::fs::MetadataExt as _;
@@ -739,7 +739,8 @@ fn a_pooled_co_process_ends_before_the_process_that_pooled_it() {
     );
 }
 
-/// `audit_dead_negative_controls` accepts committed-dead mutants caught at `Buggy = 1` and rejects tier drift, unknown actions, or uncommitted dials.
+/// `audit_dead_negative_controls` accepts committed-dead mutants caught at `Buggy = 1` and rejects
+/// an uncommitted dial; `dead_actions_agree` rejects tier drift and unknown actions.
 #[test]
 fn audit_dead_negative_controls_needs_tier_agreement_and_a_committed_dial() {
     let m = config_catalog_snapshot_model();

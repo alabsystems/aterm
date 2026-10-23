@@ -2,13 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Derived from serde_derive 1.0.228 src/internals/case.rs and modified by the
-// aterm project in 2026: only the five rules aterm writes
-// (docs/measured/third-party-2026-10-15/serde-attrs.tsv); `camelCase`,
-// `SCREAMING_SNAKE_CASE` and `SCREAMING-KEBAB-CASE` are refused by name.
-// See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
+// aterm project in 2026. See ../LICENSE-MIT and ../LICENSE-APACHE for the
+// upstream licenses.
 
-//! Code to convert the Rust-styled field/variant (e.g. `my_field`, `MyType`) to the
-//! case of the source (e.g. `my-field`, `MY_FIELD`).
+//! Converts Rust-styled field and variant identifiers to serialized case styles.
 
 use self::RenameRule::*;
 
@@ -21,11 +18,9 @@ pub enum RenameRule {
     LowerCase,
     /// Rename direct children to "UPPERCASE" style.
     UpperCase,
-    /// Rename direct children to "PascalCase" style, as typically used for
-    /// enum variants.
+    /// Rename direct children to "PascalCase" style.
     PascalCase,
-    /// Rename direct children to "snake_case" style, as commonly used for
-    /// fields.
+    /// Rename direct children to "snake_case" style.
     SnakeCase,
     /// Rename direct children to "kebab-case" style.
     KebabCase,
@@ -101,7 +96,6 @@ impl RenameRule {
 mod tests {
     use super::RenameRule::{self, *};
 
-    // Upstream's rename_variants/rename_fields tables, on the five rules kept.
     #[test]
     fn rename_variants() {
         for &(original, lower, upper, snake, kebab) in &[

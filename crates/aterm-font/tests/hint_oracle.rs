@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-font's autohinter (`aterm_font::autohint`, TF.4 of
-//! docs/AUDIT-third-party-2026-10-15.md) held to the TF.1 hinting corpus
-//! (`crates/aterm-render/tests/fixtures/font-oracle/hinting.txt`): what
-//! skrifa 0.46.2, the hinter it was carved from, answered for every hinted
-//! face, instance, mode and size. A line's answer digests every sampled
-//! glyph's grid-fitted outline (each coordinate's f32 bits) and aterm's
-//! coverage mask of it, so a line answers alike only when every outline is
-//! bit-identical and every mask byte-identical.
-//!
-//! The answers are written by `hint_raster.rs` (aterm-render's
-//! `tests/font_oracle/hint_raster.rs`), the code the out-of-workspace
-//! recorder runs on skrifa; here the [`Hinter`] is the carve, the reader
-//! aterm-font. aterm-render compiles the hinter only for Linux and Windows;
-//! aterm-font is platform-neutral, so this replay runs on every host. A
-//! system face this host lacks is skipped, never failed; a committed face
-//! must answer every line.
+//! Autohinter oracle replay against the hinting corpus.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,7 +12,6 @@ use crate::corpus::{self, FACES, Line, Origin};
 use crate::hint_raster::{Hinter, MODES, Mode, PathPen, SIZES, answer};
 use crate::reader_oracle::reader::latin_gids;
 
-/// The carve, over aterm-font's reader.
 struct Carve;
 
 impl Carve {
@@ -40,8 +24,6 @@ impl Carve {
     }
 }
 
-/// An outline sink into the oracle's pen, scaled by `scale` (1.0 for the
-/// hinter, which draws in pixels already).
 struct Pen<'a> {
     pen: &'a mut PathPen,
     scale: f32,
@@ -92,7 +74,6 @@ impl Hinter for Carve {
         gid: u16,
         pen: &mut PathPen,
     ) -> Option<()> {
-        // 1.0 is the identity: multiplying an f32 by it changes no bits.
         hint.draw(bytes, index, gid, &mut Pen { pen, scale: 1.0 })
     }
 
@@ -131,8 +112,6 @@ impl Hinter for Carve {
     }
 }
 
-/// The recorder's glyph sample: the face's printable ASCII and Latin-1
-/// glyphs, plus every `max(glyph_count / 128, 1)`th glyph id from 0.
 fn sample_gids(bytes: &[u8], index: u32) -> Vec<u16> {
     let face = Face::parse(bytes, index).expect("a hinted corpus face parses");
     let n = face.number_of_glyphs();
@@ -144,7 +123,6 @@ fn sample_gids(bytes: &[u8], index: u32) -> Vec<u16> {
     gids
 }
 
-/// A hinted corpus face this host has.
 struct Loaded {
     committed: bool,
     bytes: Vec<u8>,
@@ -190,7 +168,6 @@ fn corpus_lines() -> Vec<Line> {
         .collect()
 }
 
-/// A line's inputs: user-space coords and the size from its `px<size>` case.
 fn inputs(line: &Line) -> (Vec<(u32, f32)>, f32) {
     let coords = corpus::parse_coords(&line.inst)
         .expect("corpus coords")
@@ -205,8 +182,6 @@ fn inputs(line: &Line) -> (Vec<(u32, f32)>, f32) {
     (coords, px)
 }
 
-/// Whether one face has every mode/size case the recorder asks, independently
-/// of the cases that happen to remain in the corpus.
 fn covers_recording_cases<'a>(lines: impl Iterator<Item = &'a Line>, key: &str) -> bool {
     let recorded: BTreeSet<_> = lines
         .filter(|line| line.key == key)
@@ -219,8 +194,6 @@ fn covers_recording_cases<'a>(lines: impl Iterator<Item = &'a Line>, key: &str) 
     recorded == expected
 }
 
-/// Every hinting line answers as skrifa recorded it, on every committed face
-/// and every system face this host has.
 #[test]
 fn hinting_answers_hold() {
     let faces = hinted_faces();
@@ -266,10 +239,6 @@ fn hinting_answers_hold() {
         same + moved.len(),
         moved.join("\n")
     );
-    // Not vacuous: every committed face (a `FACES` row with the HINT role and
-    // a repo path; `hinted_faces` fails on one it cannot read) answered the
-    // recorder's whole mode-by-size matrix, so a face whose lines lost their
-    // key, or a corpus cut to fewer modes or sizes, fails here.
     let committed: Vec<&Loaded> = faces.iter().filter(|f| f.committed).collect();
     let short: Vec<&str> = committed
         .iter()
@@ -285,11 +254,6 @@ fn hinting_answers_hold() {
     );
 }
 
-/// The control: the same replay with the grayscale lines asked of the other
-/// grayscale target (`full` answered by `light` and back) must move every
-/// line whose face fits at all, or `hinting_answers_hold` could not tell the
-/// targets apart and proves nothing about them. Removing every line of any
-/// mode or size must also fail the replay's coverage check.
 #[test]
 fn swapped_targets_move_the_answers() {
     struct Swapped;
@@ -344,7 +308,6 @@ fn swapped_targets_move_the_answers() {
     let faces = hinted_faces();
     let lines = corpus_lines();
     let (mut asked, mut moved) = (0usize, 0usize);
-    // The committed faces' 12 px full and light lines.
     for line in lines
         .iter()
         .filter(|l| (l.feats == "full" || l.feats == "light") && l.case == "px12.0")
@@ -367,7 +330,6 @@ fn swapped_targets_move_the_answers() {
         asked += 1;
         moved += usize::from(now != line.answer);
     }
-    // Each committed face answers 12 px in both grayscale modes.
     let committed = faces.iter().filter(|f| f.committed).count();
     assert!(
         committed > 0 && asked >= 2 * committed,

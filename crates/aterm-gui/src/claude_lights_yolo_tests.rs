@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The mode light names the state as Claude's relabelled pill does (review
-//! C8): under the pill relabel's gate (`claude_footer::relabels_pill`: a
-//! Claude Code pane whose composer border aterm draws) bypass reads `⏵⏵ YOLO
-//! on` and manual `⏸ YOLO off` on the light, its titles with it; outside the
-//! gate, Claude's words.
+//! Mode-light YOLO relabeling tests under the Claude Code footer gate.
 
 use std::time::{Duration, Instant};
 
@@ -22,12 +18,6 @@ use crate::{App, WindowId};
 const MANUAL: &str = "  \u{23F8} manual mode on \u{00B7} ? for shortcuts";
 const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)";
 
-/// A headless App `cols` wide whose one session is Claude Code's, its facts
-/// published, under a harness host (the Autopilot chip beside the light) —
-/// and, where `relabel`, this window's host holding the session's claim:
-/// Cruise's glass is worn, so the composer border is drawn and the pill
-/// relabel's gate is open. Without the claim the border, and the gate, are
-/// shut.
 fn claude_app(
     cols: u16,
     relabel: bool,
@@ -57,14 +47,10 @@ fn claude_app(
     (app, wid, session, reader, hosted)
 }
 
-/// Claude's `mode` row cut to a pane `cols` wide, as a narrow pane cuts its
-/// hint (so the row never wraps the engine's last line).
 fn mode_row_in(mode: &str, cols: u16) -> String {
     mode.chars().take(usize::from(cols) - 1).collect()
 }
 
-/// The light's painted cells this frame: their frame row and columns, and
-/// the glass text under them.
 fn light_cells(app: &App, wid: WindowId) -> (Vec<(usize, usize)>, String) {
     let cells: Vec<(usize, usize)> = app.windows[&wid]
         .claude_lights
@@ -77,24 +63,10 @@ fn light_cells(app: &App, wid: WindowId) -> (Vec<(usize, usize)>, String) {
     (cells, text)
 }
 
-/// Claude's own mode row as the glass shows it (the pane's last row).
 fn pill_glass(app: &App, wid: WindowId) -> String {
     row_text(app, wid, footer_row(app, wid) + 1)
 }
 
-/// THE LIGHT'S WORD FOLLOWS THE PILL, AND KEEPS ITS ROOM (review C8). In
-/// manual mode under the relabel's gate the pill reads `YOLO off` and the
-/// light beside it `⏸ YOLO off` — ten cells for `⏸ manual`'s eight — at
-/// 120, 80, 50 and 33 columns. MEASURED (this test's own setup: the
-/// Autopilot chip `∞`, the light, the owner's facts): every width keeps both
-/// chips and the model (`◆ Opus 5.5 xhigh` from 50 up, `◆ Opus 5.5` at 33),
-/// the two extra cells taken from the rule's run — `─── ∞ ⏸ YOLO off ─────
-/// ◆ Opus 5.5 ─` at 33. Narrower, the ladder gives the LIGHT up first, never
-/// another chip: `⏸ YOLO off` stands down to 31 columns and `⏸ manual` to
-/// 29, while `∞` stands down to 20 under either word. The click target is
-/// the word as drawn: every painted cell of it, its last included, presses
-/// the light. NEGATIVE CONTROL: outside the gate (no claim, no border) the
-/// pill and the light keep Claude's `manual`.
 #[test]
 fn the_mode_light_names_manual_as_the_relabelled_pill_does_in_every_width() {
     for cols in [120_u16, 80, 50, 33] {
@@ -155,13 +127,6 @@ fn the_mode_light_names_manual_as_the_relabelled_pill_does_in_every_width() {
     }
 }
 
-/// THE LIGHT'S TITLES NAME BYPASS AND MANUAL AS THE PILL DOES. Hovered in
-/// manual mode it offers `click for YOLO on or auto`; a press unanswered past
-/// its deadline stops `in YOLO off`; and a return that reaches bypass says
-/// `⏵⏵ YOLO on  Permission mode: YOLO on` on the chip as the pill reads
-/// `YOLO on` under it. NEGATIVE CONTROL: outside the gate each says Claude's
-/// words — `click for bypass or auto`, `stopped in manual mode`, `⏵⏵ bypass
-/// Permission mode: bypass`.
 #[test]
 fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
     for relabel in [true, false] {
@@ -230,13 +195,6 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
     }
 }
 
-/// THE LIGHT NAMES THE PILL AS THE GLASS SHOWS IT, NOT AS THE GATE ALLOWS
-/// (review G2): under the relabel's gate a pill the glass leaves as Claude
-/// drew it — here the cursor on its row, where the relabel would move cells
-/// under the caret — keeps Claude's `⏸ manual mode on`, and the light beside
-/// it says `⏸ manual` too: one state, one name on screen. CONTROL: the
-/// cursor back at the composer, the same frame path relabels the pill and
-/// the light says `⏸ YOLO off`.
 #[test]
 fn the_mode_lights_word_follows_the_relabel_the_glass_takes() {
     let (mut app, wid, session, _reader, _host) = claude_app(120, true);

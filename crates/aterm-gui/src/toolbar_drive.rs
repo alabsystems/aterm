@@ -68,7 +68,8 @@ mod macos {
         _view: Id,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this call).
+        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this call);
+        // `-numberOfItems` is `-(NSInteger)`, sent as that.
         let items = if menu.is_null() {
             0
         } else {
@@ -147,7 +148,8 @@ mod macos {
         }
     }
     unsafe fn s_rect(r: Id, s: Sel) -> CGRect {
-        // SAFETY: as above, for `NSRect (id, SEL)`.
+        // SAFETY: as above, for `NSRect (id, SEL)`. 32 bytes, returned in
+        // registers on both Apple ABIs for this shape.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = checked_msg();
             f(r, s)
@@ -182,7 +184,9 @@ mod macos {
         }
     }
     unsafe fn s_bytes(r: Id, s: Sel) -> *const u8 {
-        // SAFETY: as above, for `unsigned char * (id, SEL)` (`-[NSBitmapImageRep bitmapData]`).
+        // SAFETY: as above, for `unsigned char * (id, SEL)`
+        // (`-[NSBitmapImageRep bitmapData]`). Taken as `Id` and re-cast
+        // because both are one pointer-sized return in the same register.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(r, s).as_ptr().cast_const().cast::<u8>()
@@ -206,7 +210,8 @@ mod macos {
         win: isize,
         clicks: isize,
     ) -> Id {
-        // SAFETY: a class method on `NSEvent` (linked), cast to the exact prototype above.
+        // SAFETY: a class method on `NSEvent` (linked), cast to the exact
+        // prototype above; every argument is a plain scalar or nil.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -297,7 +302,8 @@ mod macos {
         if id.is_null() {
             return "nil".to_owned();
         }
-        // SAFETY: `id` is non-null here.
+        // SAFETY: `id` is non-null here; `class_of` and `class_name` are
+        // read-only runtime queries and the name is immortal.
         unsafe { class_name(class_of(id)) }
             .to_string_lossy()
             .into_owned()
@@ -512,7 +518,8 @@ mod macos {
     /// The strip container, reached the way AppKit reaches it: window ->
     /// toolbar -> items -> item 0 -> view.
     unsafe fn strip_of(ns_window: Id) -> Id {
-        // SAFETY: `ns_window` is a live `NSWindow`.
+        // SAFETY: `ns_window` is a live `NSWindow`; every send is a read-only
+        // accessor at the prototype its helper declares.
         unsafe {
             let tb = s_id(ns_window, sel!(toolbar));
             if tb.is_null() {
@@ -528,7 +535,7 @@ mod macos {
     }
 
     unsafe fn subviews(v: Id) -> Vec<Id> {
-        // SAFETY: `v` is a live `NSView`.
+        // SAFETY: `v` is a live `NSView`; `-subviews` answers a live array.
         unsafe {
             let arr = s_id(v, sel!(subviews));
             if arr.is_null() {
@@ -543,7 +550,7 @@ mod macos {
 
     /// Every tab chip, in x order. The `+` button is excluded by class name.
     unsafe fn chips(strip: Id) -> Vec<Id> {
-        // SAFETY: `strip` is a live `NSView`.
+        // SAFETY: `strip` is a live `NSView`; `-frame` is read-only.
         unsafe {
             let mut v: Vec<(f64, Id)> = subviews(strip)
                 .into_iter()
@@ -566,7 +573,10 @@ mod macos {
     /// `(w, h, bytes)`: what `drawRect:` actually put down, so a class that
     /// registers every encoding correctly yet draws the wrong thing is caught.
     unsafe fn capture(view: Id) -> Option<(usize, usize, Vec<u8>)> {
-        // SAFETY: `view` is a live `NSView` on the main thread.
+        // SAFETY: `view` is a live `NSView` on the main thread; the two sends
+        // are the documented caching pair and the rep's accessors are
+        // read-only. `bitmapData` is valid while `rep` is, which is for the
+        // rest of this autorelease scope.
         unsafe {
             let b = s_rect(view, sel!(bounds));
             if !(b.size.width > 1.0 && b.size.height > 1.0) {
@@ -673,7 +683,8 @@ mod macos {
             return Vec::new();
         }
         let mut count: std::ffi::c_uint = 0;
-        // SAFETY: `proto` is live.
+        // SAFETY: `proto` is live; the runtime writes the count through the pointer and hands back
+        // a malloc'd array this function owns.
         let list = unsafe { protocol_copyProtocolList(proto, &raw mut count) };
         if list.is_null() {
             return Vec::new();
@@ -684,7 +695,8 @@ mod macos {
             let name = unsafe { CStr::from_ptr(protocol_getName(*list.add(i))) };
             names.push(name.to_string_lossy().into_owned());
         }
-        // SAFETY: the array is this function's to free.
+        // SAFETY: the array is this function's to free; the immortal protocol
+        // objects it held are not touched.
         unsafe { free(list.cast()) };
         names
     }
@@ -864,7 +876,8 @@ mod macos {
             crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no content view");
             return NOT_RUN;
         }
-        // SAFETY: `ns_view` is winit's live content view.
+        // SAFETY: `ns_view` is winit's live content view; both accessors are
+        // read-only.
         let ns_window = unsafe { s_id(ns_view, sel!(window)) };
         // SAFETY: as above.
         let win_no = unsafe { s_isize(ns_window, sel!(windowNumber)) };
@@ -962,7 +975,8 @@ mod macos {
         println!("\n-- stage 3: a left click on each hit-tested chip view");
         // SAFETY: `+sharedApplication` on a linked class.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
-        // SAFETY: the live NSApp and the drive's own window.
+        // SAFETY: the live NSApp and the drive's own window; `-isActive` and
+        // `-isKeyWindow` are read-only `B16@0:8` getters.
         let focused =
             || unsafe { s_bool(app, sel!(isActive)) && s_bool(ns_window, sel!(isKeyWindow)) };
         let take_focus = |d: &mut Driver, el: &mut EventLoop<Wake>| {
@@ -986,7 +1000,8 @@ mod macos {
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
             let before = focused();
-            // SAFETY: `c` and `strip` are live views, `ns_window` is live.
+            // SAFETY: `c` and `strip` are live views, `ns_window` is live;
+            // the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
                 let b = s_rect(*c, sel!(bounds));
                 let mid = CGPoint {
@@ -1068,9 +1083,11 @@ mod macos {
         );
 
         println!("\n-- stage 5: the context menu, two ways in");
-        // SAFETY: `NSMenu` is a live, immortal class object.
+        // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it
+        // answers its metaclass.
         let meta = unsafe { aterm_objc::class_of(class(c"NSMenu").as_id()) };
-        // SAFETY: the stub has exactly the row's prototype and cannot unwind.
+        // SAFETY: the stub has exactly the row's prototype and cannot unwind;
+        // NSMenu's metaclass is live and the selector is interned.
         let pop_site_replaced = match unsafe {
             POP_UP_CONTEXT_MENU.install(
                 meta,
@@ -1135,7 +1152,8 @@ mod macos {
             );
         }
         if pop_site_replaced {
-            // SAFETY: live views, NSApp and NSWindow throughout this block.
+            // SAFETY: live views, NSApp and NSWindow throughout this block; every
+            // synthesized event is +0 autoreleased.
             unsafe {
                 let b = s_rect(cs[1], sel!(bounds));
                 let mid = CGPoint {
@@ -1298,7 +1316,7 @@ mod macos {
         let plus_before = unsafe { plus_button(strip).map(|p| s_rect(p, sel!(frame))) };
         // SAFETY: as above.
         let strip_w0 = unsafe { s_rect(strip, sel!(bounds)) }.size.width;
-        // SAFETY: `ns_window` is live.
+        // SAFETY: `ns_window` is live; `-setFrame:display:` is the documented resize.
         unsafe {
             let f = s_rect(ns_window, sel!(frame));
             s_v_rect_bool(
@@ -1424,7 +1442,7 @@ mod macos {
             d.wakes.is_empty(),
             format!("opening the editor posted no outcome; saw {:?}", d.wakes),
         );
-        // SAFETY: `ns_window` is live.
+        // SAFETY: `ns_window` is live; `-firstResponder` is read-only.
         let fr = unsafe { s_id(ns_window, sel!(firstResponder)) };
         println!("  --  firstResponder after begin: {}", name_of(fr));
         cx.check(
@@ -1438,7 +1456,8 @@ mod macos {
                 toolbar::rename_editor_text(&handle)
             ),
         );
-        // SAFETY: `fr` is a live responder while the editor is up.
+        // SAFETY: `fr` is a live responder while the editor is up; both
+        // `-delegate` sends are read-only accessors.
         unsafe {
             let ctl = s_id(fr, sel!(delegate));
             let tgt = if ctl.is_null() {
@@ -1455,7 +1474,7 @@ mod macos {
                 rename_target_cls = class_of(tgt);
             }
         }
-        // SAFETY: `app` is the live NSApp.
+        // SAFETY: `app` is the live NSApp; the events are +0 autoreleased.
         unsafe {
             for (ch, code) in [("Z", 6u16), ("Q", 12u16)] {
                 s_v_id(
@@ -1554,7 +1573,7 @@ mod macos {
         let m4 = model(4);
         apply(&handle, &m3);
         pump(&mut d, &mut el, 100);
-        // SAFETY: `strip` is live.
+        // SAFETY: `strip` is live; every send is a read-only accessor.
         let (rc0, sv0, ta0) = unsafe {
             (
                 s_usize(strip, sel!(retainCount)),
@@ -1721,7 +1740,7 @@ mod macos {
                 ("chip hover", sel!(mouseEntered:)),
                 ("chip hover off", sel!(mouseExited:)),
             ] {
-                // SAFETY: `chip` is a live view.
+                // SAFETY: `chip` is a live view; the event is +0 autoreleased.
                 unsafe {
                     let b = s_rect(chip, sel!(bounds));
                     let wp = s_point_point_id(
@@ -1741,7 +1760,7 @@ mod macos {
             cx.check(false, "a chip is live for the hover rows".to_owned());
         }
         if let Some(p) = plus {
-            // SAFETY: `p` is the live `+` button.
+            // SAFETY: `p` is the live `+` button; the events are +0.
             let wp = unsafe {
                 let b = s_rect(p, sel!(bounds));
                 s_point_point_id(
@@ -1859,7 +1878,8 @@ mod macos {
         }
 
         println!("\n-- stage 10: the four declared classes, off the live objects");
-        // SAFETY: `ns_window` is live.
+        // SAFETY: `ns_window` is live; the toolbar's delegate is the declared
+        // `ATermToolbarDelegate` while the toolbar exists.
         let tb_delegate = unsafe {
             let tb = s_id(ns_window, sel!(toolbar));
             if tb.is_null() {

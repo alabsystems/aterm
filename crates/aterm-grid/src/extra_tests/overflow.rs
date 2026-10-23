@@ -4,7 +4,7 @@
 
 use super::*;
 
-// u16 overflow boundary tests for shift_rows_up_by / shift_region_up_by
+// u16 overflow boundary tests for `shift_rows_up_by` / `shift_region_up_by`
 
 #[test]
 fn shift_rows_up_by_u16_overflow_drops_all() {

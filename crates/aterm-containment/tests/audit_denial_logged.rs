@@ -3,25 +3,19 @@
 // Author: Andrew Yates
 
 //! Integration test: containment gate denials emit audit log events.
-//!
-//! Installs a capturing logger, calls `log_denial()`, and asserts the expected
-//! output arrives with the `containment_audit` target.
 
 use std::sync::{Mutex, OnceLock};
 
 use aterm_containment::ContainmentMode;
 
-/// Mutex to serialize tests that share a process-global logger.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Captured log record.
 struct CapturedRecord {
     target: String,
     level: aterm_log::Level,
     message: String,
 }
 
-/// Test logger that captures records into a global Vec.
 struct TestLogger;
 
 static CAPTURED: OnceLock<Mutex<Vec<CapturedRecord>>> = OnceLock::new();
@@ -51,14 +45,11 @@ static LOGGER: TestLogger = TestLogger;
 #[test]
 fn log_denial_emits_audit_event() {
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // Install test logger (once per binary — may race with other tests in this file).
     let _ = aterm_log::set_logger(&LOGGER);
     aterm_log::set_max_level(aterm_log::LevelFilter::Warn);
 
-    // Clear any records from other tests that ran first.
     captured().lock().unwrap().clear();
 
-    // Emit a denial event.
     aterm_containment::log_denial(
         "process",
         "spawn '/bin/bash'",
@@ -66,7 +57,6 @@ fn log_denial_emits_audit_event() {
         "NoFork",
     );
 
-    // Verify captured record.
     let records = captured().lock().unwrap();
     assert_eq!(records.len(), 1, "expected exactly one log record");
 
@@ -103,15 +93,11 @@ fn log_denial_emits_audit_event() {
 #[test]
 fn log_denial_includes_all_modes() {
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // Install test logger (may already be set by the other test — that's fine,
-    // both tests run in the same binary but the OnceLock captures all).
     let _ = aterm_log::set_logger(&LOGGER);
     aterm_log::set_max_level(aterm_log::LevelFilter::Warn);
 
-    // Clear captured records.
     captured().lock().unwrap().clear();
 
-    // Emit denials for each mode.
     for mode in [
         ContainmentMode::Containment,
         ContainmentMode::Safety,
@@ -123,12 +109,10 @@ fn log_denial_includes_all_modes() {
     let records = captured().lock().unwrap();
     assert_eq!(records.len(), 3, "expected one record per mode");
 
-    // All use the same target.
     for record in records.iter() {
         assert_eq!(record.target, "containment_audit");
     }
 
-    // Each mentions its mode.
     assert!(records[0].message.contains("Containment"));
     assert!(records[1].message.contains("Safety"));
     assert!(records[2].message.contains("User"));
@@ -138,12 +122,10 @@ fn log_denial_includes_all_modes() {
 fn log_posture_is_neutral_not_denial() {
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = aterm_log::set_logger(&LOGGER);
-    // Posture events are Info — below the Warn denials — so capture at Info.
     aterm_log::set_max_level(aterm_log::LevelFilter::Info);
 
     captured().lock().unwrap().clear();
 
-    // A posture/permit event shares the audit target but is not a DENIED line.
     aterm_containment::log_posture(
         "spawn",
         "os-network-sandbox",
@@ -170,14 +152,8 @@ fn log_posture_is_neutral_not_denial() {
 
 #[test]
 fn decide_permit_is_not_logged_as_denied() {
-    // Every spawn goes through `decide`, which records the OS-sandbox posture.
-    // A permitted spawn never appears as `DENIED:` (so `grep DENIED` counts
-    // only denials). The one refused spawn, Containment where the platform has
-    // no OS sandbox, logs exactly one `DENIED:` naming the gap and no posture
-    // line.
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = aterm_log::set_logger(&LOGGER);
-    // Capture both posture (Info) and any denial (Warn) lines.
     aterm_log::set_max_level(aterm_log::LevelFilter::Info);
 
     captured().lock().unwrap().clear();
@@ -199,8 +175,6 @@ fn decide_permit_is_not_logged_as_denied() {
     }
 
     let records = captured().lock().unwrap();
-    // One record per decision either way: a posture line per permitted spawn,
-    // one denial for a refused one.
     assert_eq!(records.len(), 3, "expected one audit record per decision");
     let denied: Vec<&CapturedRecord> = records
         .iter()
@@ -233,9 +207,6 @@ fn decide_permit_is_not_logged_as_denied() {
 
 #[test]
 fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
-    // User gets aterm's own limits (`Limits::inherit`) and Safety the
-    // hardened ones (`Limits::shell_default`), so only Safety's no-sandbox
-    // record may claim resource limits.
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = aterm_log::set_logger(&LOGGER);
     aterm_log::set_max_level(aterm_log::LevelFilter::Info);
@@ -264,7 +235,6 @@ fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
             "{message}"
         );
     }
-    // Containment, where this platform sandboxes it, records the posture it applied.
     if aterm_containment::os_sandbox_actuated() {
         captured().lock().unwrap().clear();
         let decision = aterm_containment::decide_spawn(ContainmentMode::Containment);

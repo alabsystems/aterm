@@ -605,8 +605,8 @@ mod tests {
         Searcher::new(needle).rfind_in(haystack)
     }
 
-    /// The `0x01`-after-`0x00` case from the module doc, where the SWAR test's higher
-    /// lanes lie. Invisible in random data.
+    /// The `0x01`-after-`0x00` case: the borrow from the zero byte flags the `0x01`
+    /// lane too, so the SWAR test's higher lanes lie. Invisible in random data.
     #[test]
     fn a_one_byte_after_a_zero_byte_does_not_shift_the_answer() {
         let haystack = [0x00u8, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01];

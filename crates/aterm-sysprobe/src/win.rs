@@ -30,17 +30,12 @@ type BOOL = i32;
 type HANDLE = isize;
 type NTSTATUS = i32;
 
-/// `SYSTEM_INFORMATION_CLASS` values.
 const SYSTEM_PROCESS_INFORMATION: i32 = 5;
 const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: i32 = 8;
 const SYSTEM_PAGEFILE_INFORMATION: i32 = 18;
-/// `STATUS_INFO_LENGTH_MISMATCH`.
 const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = 0xC000_0004_u32.cast_signed();
-/// `MEMORY_RESOURCE_NOTIFICATION_TYPE::LowMemoryResourceNotification`.
 const LOW_MEMORY_RESOURCE_NOTIFICATION: i32 = 0;
-/// The largest process table read (64 MiB).
 const PROCESS_TABLE_CAP: usize = 64 << 20;
-/// The largest CPU Set table read (1 MiB: some 32,000 CPU Sets).
 const CPU_SET_CAP: u32 = 1 << 20;
 
 #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
@@ -101,14 +96,12 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 }
 
-/// A `u64` buffer (8-byte aligned, as the NT information classes want) seen as its bytes.
 fn as_bytes(words: &[u64]) -> &[u8] {
     // SAFETY: `u8` has alignment 1 and no invalid values; the slice covers exactly the words'
     // bytes, borrowed as long as they are.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
-/// Each active processor group's width (`GetActiveProcessorCount`), in group order.
 fn group_widths() -> Vec<u32> {
     // SAFETY: takes nothing, returns a count.
     let groups = unsafe { GetActiveProcessorGroupCount() };
@@ -133,7 +126,8 @@ impl Ticks {
         }
     }
 
-    /// One reading: each group's processors in turn, padded.
+    /// One reading: each group's processors in turn, padded (or cut) to the
+    /// group's width so the logical ids stay those [`cpu_layout`] uses.
     pub(crate) fn sample(&mut self) -> Option<Vec<CoreTicks>> {
         let mut out = Vec::new();
         let single = self.widths.len() == 1;
@@ -180,7 +174,6 @@ impl Ticks {
     }
 }
 
-/// The CPU Set table's bytes.
 fn cpu_set_bytes() -> Option<Vec<u8>> {
     let mut len = 0u32;
     // SAFETY: a null buffer of length zero asks only for the size.
@@ -200,7 +193,6 @@ fn cpu_set_bytes() -> Option<Vec<u8>> {
     Some(as_bytes(&buf)[..n].to_vec())
 }
 
-/// The layout and the parked cores from the CPU Sets.
 fn layout_and_parked() -> Option<(CpuLayout, Vec<u16>)> {
     layout_from_cpu_sets(&cpu_sets(&cpu_set_bytes()?), &group_widths())
 }
@@ -221,7 +213,6 @@ pub(crate) fn withdrawn() -> Option<Vec<u16>> {
     layout_and_parked().map(|(_, parked)| parked)
 }
 
-/// The page files' `(in use, size)` in pages, `None` when unread.
 fn page_file_pages() -> Option<(u64, u64)> {
     let mut len = 1024usize;
     while len <= 64 * 1024 {
@@ -250,7 +241,6 @@ fn page_file_pages() -> Option<(u64, u64)> {
     None
 }
 
-/// Whether the low-memory resource notification is set.
 fn low_memory() -> bool {
     static NOTE: OnceLock<HANDLE> = OnceLock::new();
     // SAFETY: takes an enum value, returns a handle or 0.
@@ -266,7 +256,6 @@ fn low_memory() -> bool {
     ok != 0 && state != 0
 }
 
-/// One `K32GetPerformanceInfo`, or `None` where it fails.
 fn performance_info() -> Option<PerformanceInformation64> {
     let cb = u32::try_from(size_of::<PerformanceInformation64>()).ok()?;
     let mut perf = PerformanceInformation64 {
@@ -345,7 +334,6 @@ pub(crate) fn processes() -> Option<Sweep> {
     None
 }
 
-/// A NUL-terminated (or full) wide buffer as text.
 fn wide_text(buf: &[u16]) -> String {
     let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])

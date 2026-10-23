@@ -351,7 +351,6 @@ impl CursorGlow {
                 if matches!(cfg.style, GlowStyle::Beam) {
                     beam_power(frac)
                 } else if matches!(cfg.style, GlowStyle::Laser) {
-                    // full-power light over the text.
                     if frac < 0.20 {
                         1.0
                     } else if frac < 0.55 {
@@ -2847,7 +2846,8 @@ impl CursorGlow {
     /// The cue sink v2 is lent ([`rk::Frame::cues`]).
     pub(super) const V2_CUE_SCRATCH: usize = 64;
 
-    /// Size the three pixel streams to their caps once (see the emit arm of seam point 3).
+    /// Size the three pixel streams to their caps once, on the first engaged frame: their peaks
+    /// depend on state, so growing on demand could allocate long after warm-up.
     #[inline]
     pub(super) fn reserve_v2_scratch(
         under: &mut Vec<GlowQuad>,
@@ -4068,7 +4068,7 @@ impl DarkTongues {
     }
 
     #[inline]
-    fn push(&mut self, tongue: DarkTongue) {
+    const fn push(&mut self, tongue: DarkTongue) {
         if self.n < self.buf.len() {
             self.buf[self.n] = tongue;
             self.n += 1;
@@ -4153,7 +4153,7 @@ fn flame_level_of(idx: i32) -> usize {
 }
 
 #[inline]
-fn flame_level_light(level: usize) -> u32 {
+const fn flame_level_light(level: usize) -> u32 {
     if level + 1 >= CursorGlow::FIRE_DARK_HELD_LEVELS {
         return aterm_render::fire_field::FIRE_ADD_HOTTEST;
     }

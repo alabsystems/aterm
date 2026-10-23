@@ -617,7 +617,8 @@ impl Via {
 pub struct Peer {
     /// Its node id; `None` for a peer a person named (or a copy of one).
     pub node: Option<String>,
-    /// The node key the book binds that node id to (the module doc's **Node keys**); `None` for a node an older aterm recorded, bound at its next registration, and for a peer a person named.
+    /// The node key the book binds that node id to; `None` for a node an older aterm recorded,
+    /// bound at its next registration, and for a peer a person named.
     pub key: Option<NodeKey>,
     /// Where a node bound to no key may bind one, when that is not [`Peer::addr`]: the address its entry was recorded from before a registration that proved no key moved it ([`record`]).
     pub key_from: Option<IpAddr>,
@@ -1060,7 +1061,9 @@ pub fn remove(book: &mut Vec<Peer>, copies: &[Peer], what: &str) -> Result<Peer,
     }
 }
 
-/// The node keys this machine binds, node id to key (the module doc's **Node keys**): its book's — on the issuer every member that registered since keys came, on a member its issuer — then a member's copy of its issuer's book's.
+/// The node keys this machine binds, node id to key: its book's — on the issuer every member that
+/// registered since keys came, on a member its issuer — then a member's copy of its issuer's
+/// book's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keyring {
     own: Vec<(String, NodeKey)>,
@@ -1432,7 +1435,7 @@ impl Drop for BookLock {
     }
 }
 
-/// What a member tells the issuer it joins (the module doc's wire).
+/// What a member tells the issuer it joins ([`Registration::line`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Registration {
     /// The member's node id ([`node_id`]).
@@ -2095,7 +2098,9 @@ pub enum Unreached {
         /// The node the book holds there: what `aterm fleet peers rm` takes when that machine left.
         want: String,
     },
-    /// The address claimed this node and proved another key than the one this machine binds it to (the module doc's **Node keys**): not that node, so its survey was never asked; and the peer's name did not answer as that node either.
+    /// The address claimed this node and proved another key than the one this machine binds it to
+    /// ([`Keyring`]): not that node, so its survey was never asked; and the peer's name did not
+    /// answer as that node either.
     Impostor {
         /// The address that answered.
         at: SocketAddr,

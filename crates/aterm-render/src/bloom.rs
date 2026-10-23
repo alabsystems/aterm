@@ -139,7 +139,8 @@ fn screen(dst: u32, src: [f32; 3]) -> u32 {
 
 /// Bloom `frame` (a grid of `rows` rows) with its `glow` stream, as the GPU's post pass does.
 /// # Errors
-/// Invalid frame geometry.
+/// Invalid frame geometry, nonfinite tunables, a negative radius or scratch
+/// reservation failure is reported before any frame pixel changes.
 pub fn apply(
     frame: &mut Frame,
     glow: &[GlowQuad],

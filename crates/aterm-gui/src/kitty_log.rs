@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::native_document_host::HeldAdvisoryLock;
 
-/// The ledger's filename, a sibling of `aterm.toml` (the module doc says why it
-/// never lives inside the user's config file).
+/// The ledger's filename, a sibling of `aterm.toml`, never inside it: the config watcher would
+/// turn every count bump into a reload.
 const KITTY_LOG_FILE: &str = "kitty-log.toml";
 
 /// Authoritative collectible identities and the embedded-replica baseline are
@@ -713,7 +713,7 @@ impl KittyLog {
         self.collectibles.sort_by(collectible_order);
     }
 
-    /// Flush `delta` into the ledger at `path`: read-merge-write under the sibling `.lock` (see the module doc).
+    /// Flush `delta` into the ledger at `path`: read-merge-write under the sibling `.lock`.
     pub(crate) fn flush_merge(path: &Path, delta: &KittyLog) -> bool {
         if delta.is_empty() {
             // no-op skip: never rewrite (or create) the file for nothing

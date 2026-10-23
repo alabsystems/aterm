@@ -188,7 +188,9 @@ fn headers_value(headers: &[(String, String)]) -> Value {
 ///
 /// # Errors
 ///
-/// Usage error for invalid flags/paths/origins or request failure.
+/// Usage for a write method, HEAD or `--include` with `--all`, another origin, a dot-segment, a
+/// bad field, an unroutable path, a `/repositories/{id}` that is not `-R`'s, or object pages
+/// with neither ndjson nor `--jq`; the read's error.
 pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let method = method(inv)?;
     let all = inv.has("--all");

@@ -620,7 +620,10 @@ fn latched_error(path: &Path, why: &str, remedy: Remedy) -> Error {
 impl TapeSink {
     /// Create `path` (`create_new`; mode 0600 on unix) and write `MAGIC` and the header item, each argument of its `argv` through `Redactor::shapes`.
     /// # Errors
-    /// As `Fx::record`.
+    /// As `Fx::record`. A header whose rendered lines the shapes would still change (two
+    /// arguments that read as one shape once joined, `Bearer` then a long word) is CouldNotRun,
+    /// `Sub::Local`, before any file is made. A header that cannot be written removes the file
+    /// it was written to. A header over the tape's size bound fails before any file is made.
     pub fn create(path: &Path, header: &TapeHeader) -> Result<TapeSink> {
         Self::open_within(path, header, TAPE_MAX)
     }
@@ -706,7 +709,15 @@ impl TapeSink {
 
     /// Flush the file, then make it durable (`aterm_durable::durable`).
     /// # Errors
-    /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`: the latched error, or the flush's own.
+    /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be written: {e}`: the latched
+    /// error, or the flush's own. A refusal every run would meet again (a record outside the
+    /// subset, a rendering the shapes would change, a tape over `TAPE_MAX`) first removes the
+    /// file, and its next is `run it without --record: a tape cannot hold this run` (a file it
+    /// cannot remove is kept, with a write error's next); a write error keeps the partial file,
+    /// next `remove {path}, then record again`. A directory that cannot be flushed after the
+    /// file was made durable is why `the tape {path} is whole, but its directory could not be
+    /// flushed: {e}`, next `replay it: agh --replay {path}`: the file is kept. In each next,
+    /// `{path}` is one POSIX shell word.
     pub fn finish(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(e) = &state.failed {

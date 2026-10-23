@@ -7,7 +7,7 @@ use super::connector::Connector;
 use super::facts::{Facts, Kept};
 use super::store::Ended;
 
-/// A use within this long reads `ok`; older, `idle` (accounts v2's `OK_FRESH_S`).
+/// Maximum age in seconds for a recent use to classify as [`State::Ok`].
 pub const OK_FRESH_S: i64 = 6 * 3600;
 
 /// One CLI's state.
@@ -19,7 +19,7 @@ pub enum State {
     Idle,
     /// The usage limit is reached until this time.
     Limited(i64),
-    /// Claude: accounts v2's forecast ends by this time.
+    /// Claude usage forecast ends by this time.
     Due(i64),
     /// It has run here, and nothing says whether a login exists.
     Unproven,
@@ -145,7 +145,6 @@ pub fn when(t: i64) -> String {
     }
 }
 
-/// Whether a login is known to exist (`Some(true)`), known absent (`Some(false)`), or unknown (`None`).
 const fn login_seen(f: &Facts) -> Option<bool> {
     if let Some(a) = &f.accounts
         && a.login.is_some()

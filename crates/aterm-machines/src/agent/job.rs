@@ -454,9 +454,13 @@ fn rekey(sys: &dyn System, layout: &Layout, e: &Envelope) -> Result<ItemReport, 
     Ok(r)
 }
 
-/// The agent executable inside an expanded archive.
+/// The agent executable inside an expanded archive, relative to `dir`: for a bundle,
+/// `<name>.app/Contents/MacOS/aterm`, from `aterm.app` or else the one `.app` at the top
+/// (`ship dev-app`'s `aterm (dev).app`, a renamed copy); else the one regular file at the
+/// top (a dev binary).
 /// # Errors
-/// One line when the archive holds none of these.
+/// One line when `dir` cannot be listed or holds neither one `.app` with `Contents/MacOS/aterm` nor
+/// exactly one regular file.
 pub fn find_executable(sys: &dyn System, dir: &Path) -> Result<(PathBuf, bool), String> {
     let regular = |rel: &Path| sys.stat(&dir.join(rel)).is_ok_and(|s| !s.dir && !s.symlink);
     let inside = |app: &str| Path::new(app).join("Contents/MacOS/aterm");

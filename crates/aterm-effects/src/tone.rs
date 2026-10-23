@@ -126,8 +126,8 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
     #[inline]
-    const fn fold(h: u64, cb: &[u8; 4]) -> u64 {
-        fnv1a_64_extend(h, cb)
+    const fn fold(h: u64, cb: [u8; 4]) -> u64 {
+        fnv1a_64_extend(h, &cb)
     }
     #[inline]
     const fn bucket(h: u64) -> usize {
@@ -157,21 +157,21 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
         };
         let cb = (c as u32).to_le_bytes();
         // 1-gram.
-        f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, &cb)));
+        f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, cb)));
         count += 1;
         // 2-gram ending here.
         if let Some(h2_p1) = prev1_h2 {
-            f(bucket(fold(h2_p1, &cb)));
+            f(bucket(fold(h2_p1, cb)));
             count += 1;
             // 3-gram ending here.
             if let Some(h3_p2_p1) = prev2_h3 {
-                f(bucket(fold(h3_p2_p1, &cb)));
+                f(bucket(fold(h3_p2_p1, cb)));
                 count += 1;
             }
         }
-        prev2_h3 = prev1_h3.map(|h3_p1| fold(h3_p1, &cb));
-        prev1_h3 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3), &cb));
-        prev1_h2 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2), &cb));
+        prev2_h3 = prev1_h3.map(|h3_p1| fold(h3_p1, cb));
+        prev1_h3 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(3), cb));
+        prev1_h2 = Some(fold(FNV64_OFFSET ^ ORDER_SALT.wrapping_mul(2), cb));
     }
     count
 }

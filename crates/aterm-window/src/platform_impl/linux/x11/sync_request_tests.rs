@@ -4,35 +4,8 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! The resize sync protocol (`sync_request.rs`) against a stand-in window manager on its own
-//! connection, which sends a window of the backend a `_NET_WM_SYNC_REQUEST` and resizes it, as
-//! mutter does, while the test pumps the window's event loop and reads the window's counter from
-//! the server.
-//!
-//! [`a_resize_is_answered_by_the_frame_drawn_at_its_size`]: the window names its counter in
-//! `_NET_WM_SYNC_REQUEST_COUNTER` and the protocol in `WM_PROTOCOLS`; a request whose serial's
-//! high half is non-zero (and whose low half has its top bit set) is still unanswered when the
-//! application handles the `Resized` and its redraw, and answered, to the serial, once the
-//! application says it presented a frame (`frame_presented`); the window's drop destroys the
-//! counter. Its negative controls: with `SetCounter` setting 0, the counter reads 0 after the
-//! present; with a configure that changed the size answered at once, it reads the serial at the
-//! `Resized`; without the present's answer, it reads 0 after the present.
-//!
-//! [`a_request_no_frame_follows_is_answered_anyway`]: an application that draws nothing at the
-//! new size still answers, at the end of the event-loop turn that brought the `Resized` (it reads
-//! unanswered while the application handles it); a configure that moved the window without
-//! resizing it answers the request before it with no frame at all; and a request no configure
-//! follows is answered by its deadline. Its negative controls: without the turn's end
-//! (`end_turn_of_sync_requests`), the counter reads below the serial after the `Resized`'s turn;
-//! with no deadline, the wait for the last answer ends the test.
-//!
-//! The window is unmapped and made override-redirect by the stand-in, so a window manager
-//! running on the display (mutter, on `:7`) neither manages it nor sends it requests, and the
-//! stand-in's resize goes to the server rather than to that manager as a `ConfigureRequest` it
-//! would apply later. Round trips of both connections before each pump put what the stand-in
-//! sent in the window's queue first, so a request and a resize sent together arrive together.
-//!
-//! They run where `$DISPLAY` names an X server with SYNC; elsewhere they say SKIP and return.
+//! Tests `_NET_WM_SYNC_REQUEST` resize synchronization against an override-redirect X11 window
+//! driven by a stand-in window manager connection.
 
 use std::cell::Cell;
 use std::sync::{Arc, MutexGuard};
@@ -49,26 +22,21 @@ use crate::event::{Event, WindowEvent};
 use crate::platform_impl::{ActiveEventLoop as PlatformActiveEventLoop, EventLoop};
 use crate::window::WindowAttributes;
 
-/// The hang detector: how long a wait for what must happen may take, which it never needs.
 const HANG: Duration = Duration::from_secs(60);
 
-/// The stand-in window manager, on its own connection.
 struct Manager {
     conn: Connection,
     sync_major: u8,
-    /// SYNC's first error: `Counter` (a counter that does not exist) is its error 0.
     bad_counter: u8,
     wm_protocols: u32,
     wm_delete_window: u32,
     net_wm_ping: u32,
     sync_request: u32,
     sync_request_counter: u32,
-    /// The window's counter, from its `_NET_WM_SYNC_REQUEST_COUNTER`.
     counter: u32,
 }
 
 impl Manager {
-    /// `None`, after saying SKIP, where the server has no SYNC.
     fn new() -> Option<Manager> {
         let (conn, _) =
             Connection::connect(None).expect("DISPLAY is set: the connection must open");
@@ -105,7 +73,6 @@ impl Manager {
         })
     }
 
-    /// `window`'s `property`: its type and 32-bit values.
     fn property32(&self, window: u32, property: u32) -> (u32, Vec<u32>) {
         let reply = self
             .conn
@@ -116,7 +83,6 @@ impl Manager {
         (reply.type_, reply.value32().unwrap_or_default())
     }
 
-    /// The window's counter once the window's own requests have reached the server.
     fn counter(&self, window: &Window) -> i64 {
         window.xconn.sync_with_server().expect("the window's requests reach the server");
         self.conn
@@ -127,9 +93,7 @@ impl Manager {
             .counter_value
     }
 
-    /// Ask `window` to answer `value` before the resize that follows, as mutter does: a
-    /// `WM_PROTOCOLS` client message, the serial's low half in `data.l[2]` and its high half
-    /// in `data.l[3]`.
+    /// Sends a `_NET_WM_SYNC_REQUEST` client message with 64-bit serial `value`.
     fn request(&self, window: u32, value: i64) {
         let bits = value.cast_unsigned();
         let message = ClientMessage::new32(window, self.wm_protocols, [
@@ -147,8 +111,7 @@ impl Manager {
     }
 }
 
-/// A hidden, override-redirect window of the backend, its event loop, and the stand-in manager.
-/// Fields drop in order: the window before its loop.
+/// Override-redirect X11 window, its event loop, and the stand-in window manager (`window` drops before `event_loop`).
 struct Rig {
     window: Window,
     event_loop: EventLoop<()>,
@@ -158,7 +121,6 @@ struct Rig {
 }
 
 impl Rig {
-    /// `None`, after saying SKIP, where no X server with SYNC is named.
     fn new() -> Option<Rig> {
         if std::env::var_os("DISPLAY").is_none() {
             eprintln!("SKIP: no DISPLAY");
@@ -191,16 +153,13 @@ impl Rig {
         Some(Rig { window, event_loop, manager, xwindow, _turn: turn })
     }
 
-    /// Round trips of the stand-in's connection and then the window's: the server has handled
-    /// what the stand-in sent, and the events it made for the window, which reach the window
-    /// before the window's own reply, are in the window's queue.
+    /// Flushes the stand-in manager connection and then the window connection so queued events arrive in order.
     fn settle(&self) {
         let reply = self.manager.conn.send(xproto::get_input_focus()).unwrap().reply();
         reply.expect("GetInputFocus");
         self.window.xconn.sync_with_server().expect("the window's round trip");
     }
 
-    /// Resize the window by `dw` x `dh` from its size now.
     fn grow(&self, dw: u32, dh: u32) {
         let size = self.window.inner_size();
         self.manager.configure(
@@ -211,8 +170,6 @@ impl Rig {
         );
     }
 
-    /// Pump the event loop one turn at a time, handing each window event to `on`, until `done`,
-    /// failing the test after [`HANG`].
     fn until(
         &mut self,
         what: &str,
@@ -271,9 +228,6 @@ fn a_resize_is_answered_by_the_frame_drawn_at_its_size() {
     assert_eq!(before.get(), Some(0), "unanswered until the frame is presented");
     assert_eq!(after.get(), Some(value), "the present answers it, high half and all");
 
-    // The offer can succeed before a later constructor step fails, before any Window
-    // wrapper owns the counter. Exercise that scope with a real offered counter: the
-    // Err drops it, while the display and this unrelated live counter remain alive.
     let failed_counter = Cell::new(None);
     let failed: Result<(), ()> = {
         let _counter = SyncCounter::offer(&rig.window.xconn, rig.xwindow).expect("a counter");

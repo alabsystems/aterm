@@ -361,8 +361,6 @@ pub fn semver_class(version: &str) -> String {
     }
 }
 
-/// The semver class of a plain version or a bare, caret or exact requirement (the forms attest's
-/// `req_satisfied` models), else `None`.
 fn known_semver_class(version: &str) -> Option<String> {
     let version = version.trim();
     let number = version
@@ -435,8 +433,7 @@ impl PatchEntry {
     }
 }
 
-/// Read `[patch.crates-io]` from `<root>/Cargo.toml` and measure each entry
-/// against the vendored manifest and `Cargo.lock`.
+/// Reads `[patch.crates-io]` entries from `<root>/Cargo.toml` and `Cargo.lock`.
 pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     let manifest = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest)
@@ -522,7 +519,6 @@ pub fn patch_entries(root: &Path) -> Result<Vec<PatchEntry>, String> {
     Ok(out)
 }
 
-/// `(name, version, license)` from a patched crate's own manifest.
 fn patched_manifest(
     root: &Path,
     rel: &str,
@@ -648,8 +644,6 @@ census.namespace = "smol_str"
         assert_eq!(ss.census_namespace.as_deref(), Some("smol_str"));
     }
 
-    /// The ledger is fail-closed: each drift a hand edit can introduce is
-    /// refused, never quietly reinterpreted.
     #[test]
     fn a_ledger_that_does_not_parse_cleanly_is_refused() {
         let dup = format!(

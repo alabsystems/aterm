@@ -61,9 +61,6 @@ fn assert_planned_frame_builds_once(mut app: App, expected: crate::VisibleConten
         "route, geometry, preparation, cursor effects, chrome and finalization reuse one plan",
     );
 
-    // Negative control: resolve an outer plan, then invoke a standalone
-    // consumer that owns another; the counter observes both builds for every
-    // route shape.
     reset_visible_leaf_plan_builds();
     let (_, route) = app.active_visible_frame_layout(wid).expect("outer layout");
     let prepared = match route {
@@ -84,27 +81,22 @@ fn assert_planned_frame_builds_once(mut app: App, expected: crate::VisibleConten
     );
 }
 
-/// Every frame route (terminal, native, heterogeneous) threads one visible plan through its
-/// frame.
 #[test]
 fn every_frame_route_threads_one_visible_plan() {
     type Fixture = fn() -> (App, crate::VisibleContentRoute);
     let fixtures: [Fixture; 3] = [
-        // Terminal.
         || {
             (
                 App::headless_for_test(),
                 crate::VisibleContentRoute::Terminal { composed: false },
             )
         },
-        // Native.
         || {
             let mut app = App::headless_for_test();
             assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
             let (instance, view) = app.active_native_view(WindowId(0)).expect("native front");
             (app, crate::VisibleContentRoute::Native { instance, view })
         },
-        // Heterogeneous.
         || {
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
@@ -161,9 +153,6 @@ fn terminal_capture_threads_one_fresh_visible_plan() {
     );
     assert_eq!(visible_leaf_plan_builds(), 1, "single-pane Retain");
 
-    // An all-terminal tab owns a `layouts` entry, so the split goes through the legacy tree
-    // and is mirrored forward, as production's `!canonical_split` arm does.
-    // `split_active_with_stub_terminal` is the canonical arm and would desync the two here.
     app.split_active_stub_tab(wid);
     for (label, clock) in [
         (
@@ -185,8 +174,6 @@ fn terminal_capture_threads_one_fresh_visible_plan() {
         assert_eq!(visible_leaf_plan_builds(), 1, "{label}");
     }
 
-    // Negative control: resolve those three consumers independently at the
-    // same capture boundary.
     reset_visible_leaf_plan_builds();
     let route = app
         .active_visible_content_route(wid)
@@ -210,7 +197,6 @@ fn charge_cursor_body(state: &mut WindowState, now: Instant) {
             enabled: true,
             intensity: 1.0,
             blinking: false,
-            // Only a charged body engine is needed; the base is the scheduler's.
             base: None,
             head_rgb: None,
             paint: None,
@@ -639,9 +625,6 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     app.windows.get_mut(&wid).unwrap().scale = 2.0;
     assert!(!app.prepare_layout_coordinate_space(wid, route));
     let state = app.windows.get_mut(&wid).unwrap();
-    // A re-grid of the same view (DPI, resize, font step) leaves the pet on the same
-    // terminal's cells, so the body stays on glass; only the hit target is withdrawn until the
-    // next frame draws it.
     assert!(
         state.fx.companion_mut().brain().is_active(),
         "a re-grid of the focused view keeps the resident's body"
@@ -668,8 +651,6 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     assert!(state.input_scratch.cursor_fill_override.is_none());
     assert!(state.input_scratch.cursor_effect_style_override.is_none());
 
-    // Control: a layout focusing another view replaced the surface, and the resident leaves
-    // it: dark, no hit target, no frame debt, the same companion.
     app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
     {
         let state = app.windows.get_mut(&wid).unwrap();
@@ -710,9 +691,6 @@ fn layout_coordinate_change_rebases_cursor_kitty_and_pet_placement() {
     );
 }
 
-/// Tier-1 conformance for `layout_coordinate_reset_model`: drive the real
-/// shipping divider/key/reset seam and project each decision onto the
-/// executable semantics generated from the same Rust model that `ty` checks.
 #[test]
 fn shipping_layout_coordinate_reset_conforms_to_derived_model() {
     let model = aterm_models_misc::layout_coordinate_reset_model();
@@ -815,7 +793,6 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
     }
     assert!(app.active_tab_contains_native(wid));
 
-    // The setup seam `redraw_window` calls before its heterogeneous early return.
     assert!(app.prepare_layout_coordinate_space(wid, route));
     let state = &app.windows[&wid];
     assert_eq!(state.last_composed, Some(true));
@@ -833,19 +810,6 @@ fn mixed_split_uses_canonical_root_and_schedules_the_composed_body() {
     );
 }
 
-/// A native frame inherits no companion sprite from the previous terminal frame through the
-/// reused `input_scratch`, through the real native preparation. Native routes tick no word
-/// engine and no `PetBrain`, so anything left would be re-presented at a frozen age.
-///
-/// * The planes: `retire_torn_cursor_fx` → `suppress_torn_cursor_projection` clears the
-///   sprite, glow and cat planes on this edge, and `clear_effect_overlays_for_compose` clears
-///   them again; the latter alone guards `nova_add`.
-/// * The brain: the front-content fence in `sync_window` (`CompanionOwner::retire_owner`)
-///   fires first, backed by `retire_torn_cursor_fx` (`route` is a term of
-///   [`crate::LayoutCoordinateSpaceKey`]); without both, `needs_frames()` stays latched on a
-///   route that never ticks it.
-///
-/// The terminal frame comes first: a cold window has no previous coordinate space to change.
 #[test]
 fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
     let mut app = App::headless_for_test();
@@ -891,13 +855,11 @@ fn fronting_a_native_tab_strips_the_terminal_frames_decoration_and_its_pet() {
                 && ws.fx.companion_mut().brain().needs_frames(),
             "fixture: a pet walking after a moved caret is on glass and owes frames"
         );
-        // ...and the frame it drew: a companion body plus a free-floating mote.
         ws.input_scratch.free_sprites = vec![aterm_core::render::FreeSprite::default(); 2];
         ws.input_scratch.nova_add = vec![aterm_core::render::GlowQuad::default()];
         ws.input_scratch.cursor_glow_add = vec![aterm_core::render::GlowQuad::default()];
     }
 
-    // Front Settings ▸ Packages, the first-run provisioning screen.
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Packages));
     assert!(app.prepare_native_input_scratch(wid));
 

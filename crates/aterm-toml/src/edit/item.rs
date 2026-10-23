@@ -49,8 +49,7 @@ impl Item {
         }
     }
 
-    /// The `[header]` table, if this entry is one. An inline table is not one:
-    /// [`Item::as_table_like`] spans both spellings.
+    /// The `[header]` table, if this entry is one.
     #[inline]
     #[must_use]
     pub const fn as_table(&self) -> Option<&Table> {
@@ -149,8 +148,7 @@ impl Item {
         self.as_value().and_then(Value::as_bool)
     }
 
-    /// The array, if this entry is one. An array of tables is
-    /// [`Item::as_array_of_tables`].
+    /// The array, if this entry is one.
     #[inline]
     #[must_use]
     pub fn as_array(&self) -> Option<&super::Array> {
@@ -409,8 +407,7 @@ impl Table {
         self.items.insert(key, item)
     }
 
-    /// Delete `key` with everything its line holds, the comment lines above it included;
-    /// [`super::DocumentMut::remove_path`] keeps those.
+    /// Delete `key` with everything its line holds, the comment lines above it included.
     pub fn remove(&mut self, key: &str) -> Option<Item> {
         self.items.remove(key)
     }
@@ -468,7 +465,6 @@ pub(crate) fn append_values<'a>(
     }
 }
 
-/// The leaf key of every line [`append_values`] lists, for writing.
 fn line_keys_mut<'a>(items: &'a mut KeyMap, out: &mut Vec<&'a mut Key>) {
     for (key, item) in &mut items.entries {
         match item {

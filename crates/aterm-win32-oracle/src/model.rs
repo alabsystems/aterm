@@ -7,13 +7,8 @@ use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// aterm-win32's hand-written modules (under its `src/`): the COM vocabulary
-/// and the DXGI slice of `windows` 0.62.2, which windows-sys does not carry.
-/// `gen` neither emits nor deletes them, and their `crate::` paths into the
-/// generated tree are harvested like a consumer's.
+/// Hand-written modules under `aterm-win32/src/` harvested alongside consumers.
 pub const HAND_WRITTEN: [&str; 2] = ["com.rs", "dxgi.rs"];
-/// The crate first-party code names directly (`aterm_win32::`), as against
-/// the `windows-sys` facade third-party code reaches.
 const CRATE: &str = "aterm-win32";
 
 pub struct Model {
@@ -115,7 +110,6 @@ impl Model {
                     let (k, v) = entry()?;
                     consumers.insert(k, v);
                 }
-                // The facade itself names aterm-win32 only to re-export it.
                 if !is_target(p) && own.iter().any(|id| names(id.as_str()).unwrap_or(false)) {
                     let (k, v) = entry()?;
                     direct.insert(k, v);
@@ -184,9 +178,6 @@ impl Model {
             }
         }
         let keep = closure(&up, seeds.keys().cloned().collect(), &enabled)?;
-        // aterm-win32 has no features: what a direct consumer or the crate's
-        // hand-written modules name is resolved against every upstream
-        // feature, and enables the features upstream gates it on.
         let every = up.implied(&up.features.keys().cloned().collect())?;
         let mut own = BTreeMap::new();
         let mut sources = vec![];
@@ -261,8 +252,6 @@ pub fn closure(
         )
     })
 }
-/// The closure of `seeds` under `enabled`, or the first item it reaches that
-/// `enabled` gates off.
 fn gated_closure(
     up: &Upstream,
     seeds: BTreeSet<Key>,
@@ -284,9 +273,7 @@ fn gated_closure(
     }
     Ok(Ok(keep))
 }
-/// The closure of the direct seeds, `enabled` grown by the features upstream
-/// gates each reached item on (its modules' and its own) until nothing it
-/// reaches is gated off; an item no feature set reaches is an error.
+/// Grow `enabled` and compute the closure of `seeds` until no reached item is gated off.
 pub fn grown_closure(
     up: &Upstream,
     seeds: BTreeSet<Key>,
@@ -456,10 +443,7 @@ impl Harvest<'_> {
         Ok(i)
     }
 }
-/// Seeds every upstream declaration `file` names through `root`
-/// (`windows_sys` for the facade's consumers, `aterm_win32` for a direct one,
-/// `crate` in aterm-win32's own hand-written modules), whose paths to those
-/// hand-written modules are not upstream's.
+/// Seed every upstream declaration `file` names through `root`.
 pub fn harvest_file(
     up: &Upstream,
     file: &Path,

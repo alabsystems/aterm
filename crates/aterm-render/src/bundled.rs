@@ -485,7 +485,7 @@ fn deepest_latin_letter(ids: &[&str; 4]) -> Option<f32> {
     deepest
 }
 
-/// The DEFAULT primary candidate.
+/// Default primary font candidate identities.
 #[inline]
 #[must_use]
 pub const fn default_primary_candidates() -> &'static [&'static str] {

@@ -379,7 +379,8 @@ pub(crate) fn run_once(prepared: Prepared) -> Result<RunOut> {
     })
 }
 
-/// `jq`'s `@tsv` of `fields`: a string with `\`, tab, newline and carriage return escaped.
+/// `jq`'s `@tsv` of `fields`: a string with `\`, tab, newline and carriage return escaped; a
+/// number in its JSON spelling; a boolean as `true`/`false`; null as nothing.
 #[must_use]
 pub(crate) fn tsv(fields: &[&Value]) -> String {
     fields

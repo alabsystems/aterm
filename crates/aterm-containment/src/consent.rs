@@ -4422,7 +4422,8 @@ mod imp {
             tv_sec: 1,
             tv_nsec: 0,
         };
-        // SAFETY: `id` is the 16 bytes of a `uuid_t` and outlives the call.
+        // SAFETY: `id` is the 16 bytes of a `uuid_t` and outlives the call; `wait` is a
+        // valid `timespec` read during the call only.
         let rc = unsafe { gethostuuid(id.as_mut_ptr(), &raw const wait) };
         (rc == 0).then(|| super::format_uuid(&id))
     }
@@ -4466,7 +4467,8 @@ mod imp {
         let mut flags: u32 = 0;
         // SAFETY: `getpid` has no preconditions.
         let me = unsafe { libc::getpid() };
-        // SAFETY: `flags` is a live, aligned `u32`, and the size passed is its exact size.
+        // SAFETY: `flags` is a live, aligned `u32`, and the size passed is its
+        // exact size; `CS_OPS_STATUS` writes exactly one `uint32_t`.
         let ret = unsafe {
             csops(
                 me,
@@ -4528,7 +4530,8 @@ mod imp {
             return None;
         }
         let mut is_member: libc::c_int = 0;
-        // SAFETY: both are live 16-byte `uuid_t`s.
+        // SAFETY: both are live 16-byte `uuid_t`s, and `is_member` is a live
+        // `int` the call writes once.
         let ret =
             unsafe { mbr_check_membership(user.as_ptr(), group.as_ptr(), &raw mut is_member) };
         (ret == 0).then_some(is_member != 0)
@@ -4546,7 +4549,10 @@ mod imp {
                 gr_mem: std::ptr::null_mut(),
             };
             let mut found: *mut Group = std::ptr::null_mut();
-            // SAFETY: `name` is NUL-terminated.
+            // SAFETY: `name` is NUL-terminated; `record` and `found` are live
+            // out-parameters; `buf` is a live allocation of exactly `size`
+            // bytes that outlives the call and every pointer written into
+            // `record` (only `gr_gid`, a plain integer, is read below).
             let ret = unsafe {
                 getgrnam_r(
                     name.as_ptr(),
@@ -4629,12 +4635,14 @@ mod imp {
             // an errno rather than panicking in a probe.
             return Err(libc::EINVAL);
         };
-        // SAFETY: `path` is a valid NUL-terminated C string that outlives the call.
+        // SAFETY: `path` is a valid NUL-terminated C string that outlives the
+        // call; `O_RDONLY | O_CLOEXEC` takes no third argument.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(errno());
         }
-        // SAFETY: `fd` is a descriptor this call just created, owned by nothing else.
+        // SAFETY: `fd` is a descriptor this call just created, owned by nothing
+        // else; the `OwnedFd` closes it exactly once.
         Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 
@@ -4644,7 +4652,8 @@ mod imp {
     }
 
     fn responsibility_symbol() -> Option<ResponsibilityGetPid> {
-        // SAFETY: `RESPONSIBILITY_SYMBOL` is NUL-terminated.
+        // SAFETY: `RESPONSIBILITY_SYMBOL` is NUL-terminated; `RTLD_DEFAULT` is
+        // the documented pseudo-handle for a global search.
         let sym = unsafe {
             libc::dlsym(
                 libc::RTLD_DEFAULT,
@@ -4664,7 +4673,8 @@ mod imp {
     pub(super) fn responsibility_spi() -> Option<impl FnMut(i32) -> Result<i32, ResponsibleError>> {
         let func = responsibility_symbol()?;
         Some(move |pid: i32| {
-            // SAFETY: `__error()` returns a valid pointer to this thread's errno.
+            // SAFETY: `__error()` returns a valid pointer to this thread's errno;
+            // cleared so a stale value cannot be read back as this call's.
             unsafe {
                 *libc::__error() = 0;
             }
@@ -4708,7 +4718,8 @@ mod imp {
         unsafe {
             *libc::__error() = 0;
         }
-        // SAFETY: `buf` is a live allocation of exactly the length passed.
+        // SAFETY: `buf` is a live allocation of exactly the length passed, and
+        // `proc_pidpath` writes at most that many bytes.
         let written = unsafe {
             proc_pidpath(
                 pid,
@@ -4730,7 +4741,8 @@ mod imp {
         }
         const APPLICATION_NOT_FOUND: isize = -10814;
         let len = isize::try_from(bundle_id.len()).ok()?;
-        // SAFETY: `bundle_id` is a live UTF-8 buffer of exactly `len` bytes.
+        // SAFETY: `bundle_id` is a live UTF-8 buffer of exactly `len` bytes; a
+        // null allocator is the documented default.
         let id =
             unsafe { CFStringCreateWithBytes(std::ptr::null(), bundle_id.as_ptr(), len, UTF8, 0) };
         if id.is_null() {
@@ -4754,7 +4766,8 @@ mod imp {
         let mut out = Vec::new();
         let mut buf = vec![0u8; 4096];
         let max = isize::try_from(buf.len()).unwrap_or(isize::MAX);
-        // SAFETY: `urls` is a valid CFArray of CFURLs we own.
+        // SAFETY: `urls` is a valid CFArray of CFURLs we own; every index is in
+        // range; `buf` holds `max` bytes and the call NUL-terminates within it.
         unsafe {
             for index in 0..CFArrayGetCount(urls) {
                 let url = CFArrayGetValueAtIndex(urls, index);
@@ -4773,7 +4786,8 @@ mod imp {
     pub(super) fn parse_info_plist(bytes: &[u8]) -> Option<super::InfoPlist> {
         const IMMUTABLE: usize = 0;
         let text = |value: CfRef, max: isize| -> Option<String> {
-            // SAFETY: `value` is a live CF object owned by the dictionary the caller holds.
+            // SAFETY: `value` is a live CF object owned by the dictionary the
+            // caller holds; its type is checked before any string call.
             unsafe {
                 if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
                     return None;
@@ -4795,12 +4809,14 @@ mod imp {
             }
         };
         let len = isize::try_from(bytes.len()).ok()?;
-        // SAFETY: `bytes` is a live buffer of exactly `len` bytes, copied by `CFDataCreate`.
+        // SAFETY: `bytes` is a live buffer of exactly `len` bytes, copied by
+        // `CFDataCreate`; a null allocator is the documented default.
         let data = unsafe { CFDataCreate(std::ptr::null(), bytes.as_ptr(), len) };
         if data.is_null() {
             return None;
         }
-        // SAFETY: `data` is a valid CFData we own.
+        // SAFETY: `data` is a valid CFData we own; null format and error slots
+        // are documented as allowed.
         let plist = unsafe {
             CFPropertyListCreateWithData(
                 std::ptr::null(),
@@ -4818,7 +4834,10 @@ mod imp {
         let mut plain_id = None;
         let mut macos_id: Option<Option<String>> = None;
         let mut plain_executables = true;
-        // SAFETY: `plist` is a valid property list we own (Create rule).
+        // SAFETY: `plist` is a valid property list we own (Create rule); the
+        // dictionary calls run only once its type is checked, the key and
+        // value buffers hold exactly `count` slots, and `plist` is released
+        // exactly once, after the last read of anything it owns.
         unsafe {
             if CFGetTypeID(plist) == CFDictionaryGetTypeID() {
                 let count = usize::try_from(CFDictionaryGetCount(plist)).unwrap_or(0);

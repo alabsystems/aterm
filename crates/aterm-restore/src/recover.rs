@@ -714,7 +714,7 @@ fn walk_tail<V: RegionView + ?Sized>(
     walk
 }
 
-/// Read the history ring's run between its words (module doc, step 6).
+/// Read the history ring's run between its words.
 fn read_ring<V: RegionView + ?Sized>(view: &V, geometry: &Geometry) -> RingRun {
     let mut run = RingRun::default();
     let words = (

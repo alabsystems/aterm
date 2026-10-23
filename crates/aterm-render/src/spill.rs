@@ -329,7 +329,8 @@ impl SpillBand {
         self.rects.as_slice()
     }
 
-    /// The straight-alpha RGBA strip buffer (packing in the module docs).
+    /// The straight-alpha RGBA strip buffer: the top (head included), bottom, left and right
+    /// strips, each row-major, concatenated.
     #[inline]
     pub const fn rgba(&self) -> &[u8] {
         self.rgba.as_slice()

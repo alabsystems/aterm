@@ -6,7 +6,6 @@ use crate::supervise::ScratchDir;
 
 const DAY: u64 = 24 * 3_600;
 
-/// The unix second now, the clock file mtimes are set against.
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -14,7 +13,6 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// Writes `<root>/drive/<name>` holding `body`, last written `age` seconds before `now`.
 fn file(root: &Path, name: &str, body: &str, now: u64, age: u64) {
     let drive = root.join("drive");
     std::fs::create_dir_all(&drive).expect("drive");
@@ -28,7 +26,6 @@ fn file(root: &Path, name: &str, body: &str, now: u64, age: u64) {
         .expect("mtime");
 }
 
-/// A tab's group: its ledger and journal (and whatever `extra` names), `age` old.
 fn group(root: &Path, stem: &str, extra: &[(&str, &str)], now: u64, age: u64) {
     file(root, &format!("{stem}.jsonl"), "{}\n", now, age);
     file(root, &format!("{stem}.journal.jsonl"), "{}\n", now, age);
@@ -37,7 +34,6 @@ fn group(root: &Path, stem: &str, extra: &[(&str, &str)], now: u64, age: u64) {
     }
 }
 
-/// The tabs whose ledger is still there.
 fn left(root: &Path) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir(root.join("drive"))
         .expect("drive")
@@ -47,15 +43,6 @@ fn left(root: &Path) -> Vec<String> {
     out
 }
 
-/// A drive directory of seven tabs and three names that are no tab's group:
-/// - `s-a1` live (named), the oldest, its note naming `s-b2`;
-/// - `s-b2`, only that note names it;
-/// - `s-c3` written a day ago;
-/// - `s-d4` (its goal hold), `s-e5`, `s-f6` and `s-0a`, nothing naming them, 20, 15, 10 and 8
-///   days old;
-/// - `self.jsonl`, a cut's `s-0a.jsonl.tmp`, and a DIRECTORY `s-99.jsonl`.
-///
-/// Fifteen group files in all: the directory is no file, counts for nothing and keeps its tab.
 fn drive(name: &str, now: u64) -> ScratchDir {
     let dir = ScratchDir::new("drive-retention", name);
     group(&dir, "s-a1", &[(".earlier-tabs", "s-b2\n")], now, 30 * DAY);
@@ -76,13 +63,6 @@ fn live() -> Option<BTreeSet<String>> {
     Some(["s-a1".to_string()].into())
 }
 
-/// THE DRIVE DIRECTORY KEEPS ITS BUDGET AND EVERY TAB SOMETHING NAMES (relaunch-10 of
-/// , the review's KR-5): over the budget, the oldest groups nothing names go,
-/// oldest first, until the groups are within it — never a named tab, an earlier tab a kept tab's
-/// note names, a group written this week, a name that is no tab's group, or a directory.
-/// NEGATIVE CONTROLS: unnamed, the live tab and the tab its note named go first; with no note,
-/// the noted tab goes; within the budget nothing is read or unlinked; what names tabs unread
-/// unlinks nothing.
 #[test]
 fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     let now = now();
@@ -92,7 +72,6 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     };
     let all = left(&drive("all", now));
 
-    // Over by six: the three oldest unnamed tabs (six files), and no more.
     let dir = drive("over", now);
     assert_eq!(prune(&dir, live, now, budget(10)), ["s-d4", "s-e5", "s-f6"]);
     let kept: Vec<String> = all
@@ -113,7 +92,6 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
         "written this week"
     );
 
-    // Over by everything: what is protected stays, whatever the budget.
     let dir = drive("all-over", now);
     assert_eq!(
         prune(&dir, live, now, budget(0)),
@@ -123,18 +101,15 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     assert!(!after.contains(&"s-0a.jsonl".to_string()), "{after:?}");
     assert!(after.contains(&"s-0a.jsonl.tmp".to_string()), "{after:?}");
 
-    // NEGATIVE CONTROL: nothing names the live tab — it and its noted tab, the oldest, go first.
     let dir = drive("unnamed", now);
     assert_eq!(
         prune(&dir, || Some(BTreeSet::new()), now, budget(10)),
         ["s-a1", "s-b2"]
     );
-    // NEGATIVE CONTROL: no note — the tab only it named goes first.
     let dir = drive("unnoted", now);
     std::fs::remove_file(dir.join("drive/s-a1.earlier-tabs")).expect("the note");
     assert_eq!(prune(&dir, live, now, budget(10)), ["s-b2", "s-d4"]);
 
-    // Within the budget: nothing is asked, nothing goes.
     let dir = drive("within", now);
     let asked = std::cell::Cell::new(false);
     let named = || {
@@ -144,17 +119,14 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     assert!(prune(&dir, named, now, budget(15)).is_empty());
     assert!(!asked.get(), "the usual pass is one listing");
     assert_eq!(left(&dir), all);
-    // What names tabs could not be read: nothing goes.
     assert!(prune(&dir, || None, now, budget(0)).is_empty());
     assert_eq!(left(&dir), all);
 
-    // A complete small listing still prunes through the production collector.
     let dir = drive("bounded-positive", now);
     assert_eq!(
         prune_with_limit(&dir, live, now, budget(10), all.len()),
         ["s-d4", "s-e5", "s-f6"]
     );
-    // A partial group census or naming census proves no group unreferenced.
     let dir = drive("bounded-refusal", now);
     assert!(prune_with_limit(&dir, live, now, budget(0), 1).is_empty());
     assert_eq!(left(&dir), all);
@@ -171,7 +143,6 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     assert_eq!(named(), None);
     assert!(prune(&dir, named, now, budget(0)).is_empty());
     assert_eq!(left(&dir), all, "INCOMPLETE_NAMING_MUST_KEEP_DRIVE_GROUPS");
-    // Oversized naming files and earlier-tab notes are unknown, never prefixes.
     let oversized = std::fs::File::create(naming.join("large")).expect("large record");
     oversized
         .set_len(MAX_NAMING_BYTES + 1)
@@ -182,7 +153,6 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     assert!(prune(&dir, live, now, budget(0)).is_empty());
     assert_eq!(left(&dir), all);
 
-    // THE BYTES COUNT TOO: within the file count, over the bytes, the oldest unnamed goes.
     let dir = drive("bytes", now);
     file(&dir, "s-0a.journal.jsonl", &"x".repeat(4_096), now, 8 * DAY);
     assert_eq!(
@@ -199,9 +169,6 @@ fn the_drive_directory_keeps_its_budget_and_every_tab_something_names() {
     );
 }
 
-/// A TAB ID IS READ WHEREVER IT STANDS ([`tab_ids_in`]): a TOML string, a record key, a JSON
-/// field, a run of hex cut short; `s-` with no hex is none. [`tabs_named_in`] reads the files
-/// whose names it is asked for, and a directory that is not there names none.
 #[test]
 fn every_tab_id_a_record_or_layout_holds_is_read() {
     let mut ids = BTreeSet::new();
@@ -232,8 +199,6 @@ fn every_tab_id_a_record_or_layout_holds_is_read() {
     );
     #[cfg(unix)]
     {
-        // A wanted naming link cannot prove which tabs are unnamed, even if its
-        // target can be read now. Directories above remain deliberately ignored.
         std::os::unix::fs::symlink(dir.join("session.toml"), dir.join("alias.toml"))
             .expect("a layout alias");
         assert_eq!(
@@ -244,15 +209,11 @@ fn every_tab_id_a_record_or_layout_holds_is_read() {
     }
 }
 
-/// One registry listing names its own entries, not every shared-state writer. Captured
-/// pruning below is given this fixture's complete protected set. Empty or missing roster
-/// admission, an unread directory and an overfull listing all refuse that set.
 #[test]
 fn a_registry_lists_its_entries_and_refuses_unknown_or_partial_lists() {
     let dir = ScratchDir::new("drive-retention", "registry");
     let graph = dir.join("graph");
     std::fs::create_dir_all(&graph).expect("graph");
-    // This instance's tab, another instance's, and two names that are no tab.
     for name in ["s-a1", "s-b2", "notes", "s-xyz"] {
         std::fs::write(graph.join(name), "sock = \"/x\"\n").expect("entry");
     }
@@ -280,8 +241,6 @@ fn a_registry_lists_its_entries_and_refuses_unknown_or_partial_lists() {
     );
     assert!(registry_tabs_with_limit(&graph, &ours, 4).is_some());
 
-    // This owned fixture supplies every protected tab explicitly through its listing.
-    // Removing an entry permits that fixture's unreferenced group to go.
     let now = now();
     for stem in ["s-a1", "s-b2", "s-c3"] {
         group(&dir, stem, &[], now, 30 * DAY);

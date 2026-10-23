@@ -3209,7 +3209,7 @@ impl PetBrain {
     /// and flies as it did before them.
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_letters_unseen(&mut self, unseen: bool) {
+    pub const fn set_letters_unseen(&mut self, unseen: bool) {
         self.letters_unseen = unseen;
     }
 
@@ -8640,8 +8640,13 @@ impl PetBrain {
     /// A fresh brain — [`Self::default`].
     #[inline]
     #[must_use]
-    pub(crate) fn reborn(&self) -> Self {
+    pub(crate) fn reborn(&mut self) -> Self {
+        let mut ink_spans = std::mem::take(&mut self.ink_spans);
+        ink_spans.clear();
+        let console = self.console.retired();
         Self {
+            console,
+            ink_spans,
             departure_serial: self.departure_serial,
             ..Self::default()
         }
@@ -21355,5 +21360,35 @@ mod tests {
         pet_vigil.deferred_hidden_landing = Some((12.0, 5.0));
         assert!(pet_vigil.carry_with_regrid(3.0, 24));
         assert_eq!(pet_vigil.deferred_hidden_landing, Some((12.0, 8.0)));
+    }
+
+    #[test]
+    fn retire_unowned_retains_console_world_and_ink_spans_capacity() {
+        use crate::pet_world::{PetPane, PetWorldFacts};
+        use aterm_core::terminal::Terminal;
+
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let _ = awake(&mut pet, start, 5, 10);
+        pet.sense_ink(0, &[(1, 4), (6, 9)], Some(5));
+        let mut term = Terminal::new(24, 80);
+        let input = term.cell_frame(24, 80);
+        let facts = PetWorldFacts::read(&term, 7);
+        pet.observe_console(&input, &facts, PetPane::full(&input));
+        let world_ptr: *const crate::pet_world::PetWorld =
+            pet.console.world.as_deref().expect("world allocated");
+        let spans_cap = pet.ink_spans.capacity();
+        assert!(spans_cap >= 2);
+
+        pet.retire_unowned();
+        assert!(!pet.is_active());
+        assert!(pet.ink_spans.is_empty());
+        assert_eq!(pet.ink_spans.capacity(), spans_cap);
+        let spare = pet
+            .console
+            .spare_world
+            .as_deref()
+            .expect("retired PetWorld should be parked in spare_world");
+        assert_eq!(core::ptr::from_ref(spare), world_ptr);
     }
 }

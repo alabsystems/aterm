@@ -4,6 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/geometry.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's requests, where
+// upstream used x11rb's. `get_frame_extents_heuristic` returns a request's failure, where
+// upstream's `expect`s panicked on a display that had gone.)
+
 use std::cmp;
 
 use aterm_x11::proto::atom;
@@ -193,7 +197,6 @@ impl XConnection {
         let nested = !(window == child || self.is_top_level(child, root) == Some(true));
 
         if let Some(mut frame_extents) = self.get_frame_extents(window) {
-            // Mutter/Muffin/Budgie and Marco preserve their decorated frame extents when
             if !nested {
                 frame_extents = FrameExtents::new(0, 0, 0, 0);
             }

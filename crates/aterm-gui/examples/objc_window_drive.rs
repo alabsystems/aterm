@@ -100,7 +100,7 @@ mod macos {
     /// # Safety
     /// `window` must be a live `NSWindow`.
     unsafe fn window_title(window: Id) -> String {
-        // SAFETY: `-title` is `@16@0:8` on `NSWindow`.
+        // SAFETY: `-title` is `@16@0:8` on `NSWindow` and never answers nil.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             aterm_objc::ns_string_to_rust(f(window, sel!(title)))
@@ -171,7 +171,8 @@ mod macos {
     /// `-[NSScreen backingScaleFactor]` for `+[NSScreen mainScreen]`, read without
     /// the port.
     fn main_screen_backing_scale() -> Option<f64> {
-        // SAFETY: `+mainScreen` is `@16#0:8`.
+        // SAFETY: `+mainScreen` is `@16#0:8` and may answer nil;
+        // `-backingScaleFactor` is `d16@0:8`.
         unsafe {
             let id_of: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let f64_of: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
@@ -903,7 +904,8 @@ mod macos {
                 let memcpyd = WeakSlot::uninit();
                 // SAFETY: `registered` is freshly `uninit()` and pinned in place.
                 unsafe { registered.init(view.id()) };
-                // SAFETY: `WeakSlot` is `#[repr(transparent)]` over one pointer word.
+                // SAFETY: both slots are `#[repr(transparent)]` over one pointer word, live locals
+                // that do not overlap.
                 unsafe { std::ptr::copy_nonoverlapping(registered.addr(), memcpyd.addr(), 1) };
 
                 let moved = weak;
@@ -1034,7 +1036,7 @@ mod macos {
             ];
 
             for (i, (title, separator, action, key, mask)) in expected.iter().enumerate() {
-                // SAFETY: `i < 8 == numberOfItems`.
+                // SAFETY: `i` indexes the eight rows the menu holds (`n == 8` above).
                 let row = unsafe { read_row(menu_item_at(app_menu, i as isize)) };
                 self.report.check(
                     row.separator == *separator,

@@ -48,7 +48,6 @@ fn decode_state(schema: &MomentumSchema, bytes: &[u8]) -> Result<MomentumState, 
     Ok(s)
 }
 
-/// Why `bytes` is not a state, if it is not.
 fn state_fault(schema: &MomentumSchema, bytes: &[u8]) -> Option<WireFault> {
     decode_state(schema, bytes).err()
 }
@@ -59,7 +58,6 @@ fn encode_observation(schema: &MomentumSchema, o: &MomentumObservation) -> Vec<u
     e.finish()
 }
 
-/// A tick at the extremes of every field.
 fn extreme_tick() -> MomentumEvent {
     MomentumEvent::Tick {
         cur: Some((u16::MAX, u16::MAX)),
@@ -91,7 +89,6 @@ fn extreme_tick() -> MomentumEvent {
     }
 }
 
-/// One input of every kind, the shipped host's and the extremes of every field.
 fn inputs() -> Vec<MomentumEvent> {
     let c = cfg(true);
     vec![
@@ -136,10 +133,6 @@ fn inputs() -> Vec<MomentumEvent> {
     ]
 }
 
-/// Every input, the shipped host's and the extremes of every field (offsets at `i128`'s
-/// ends, `usize::MAX` geometry, NaN and negative-zero bits, the widest glyph span,
-/// `Duration::MAX`), decodes to itself and re-encodes to the same bytes; the geometry and
-/// config records carry every field bit for bit.
 #[test]
 fn every_input_round_trips_through_its_encoding_including_extremes() {
     let schema = MomentumSchema::new(Instant::now());
@@ -163,7 +156,6 @@ fn every_input_round_trips_through_its_encoding_including_extremes() {
     }
 }
 
-/// A tag no input encoding writes is `BadTag` on `event.tag`.
 #[test]
 fn an_unknown_input_tag_is_refused_naming_it() {
     let schema = MomentumSchema::new(Instant::now());
@@ -178,8 +170,6 @@ fn an_unknown_input_tag_is_refused_naming_it() {
     }
 }
 
-/// Every proper prefix of every input's encoding is `Truncated`, and one byte past its end
-/// is `Trailing { extra: 1 }`.
 #[test]
 fn every_truncation_of_an_input_is_refused_and_so_is_a_trailing_byte() {
     let schema = MomentumSchema::new(Instant::now());
@@ -204,10 +194,8 @@ fn every_truncation_of_an_input_is_refused_and_so_is_a_trailing_byte() {
     }
 }
 
-/// A change to one config field.
 type Flip = fn(&mut ConfigRecord);
 
-/// The byte where two encodings differ, when they differ in exactly one byte.
 fn sole_difference(a: &[u8], b: &[u8]) -> usize {
     assert_eq!(a.len(), b.len());
     let at: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
@@ -215,9 +203,6 @@ fn sole_difference(a: &[u8], b: &[u8]) -> usize {
     at[0]
 }
 
-/// A bool byte of 2 is `BadTag` on its field (`cfg.enabled`, `cfg.dark_theme`,
-/// `cfg.block`), and an option tag of 2 is `BadTag` on its field (`event.tick.cur`,
-/// `cfg.glyph_span`).
 #[test]
 fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
     let schema = MomentumSchema::new(Instant::now());
@@ -272,8 +257,6 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
     );
 }
 
-/// A frame interval whose nanoseconds reach a second is `NonCanonical` on
-/// `event.query.frame_interval`.
 #[test]
 fn a_frame_interval_with_a_second_of_nanoseconds_is_refused() {
     let schema = MomentumSchema::new(Instant::now());
@@ -294,9 +277,6 @@ fn a_frame_interval_with_a_second_of_nanoseconds_is_refused() {
     );
 }
 
-/// Every state a host reaches on random streams (inside and outside the profile, unattached
-/// engines driven exactly as a host drives them) encodes, decodes and re-encodes to the same
-/// bytes, so its digest survives a checkpoint; the clock round-trips at its extremes.
 #[test]
 fn every_reachable_state_round_trips_byte_for_byte() {
     let t0 = Instant::now();
@@ -325,11 +305,6 @@ fn every_reachable_state_round_trips_byte_for_byte() {
     }
 }
 
-/// A state whose bytes no encoder writes is refused naming the field: a short snapshot is
-/// `Truncated` on `state.snapshot`; another snapshot schema is `NonCanonical` on
-/// `state.snapshot.schema`; a bad offset tag is `BadTag` on `rate_at`; a canonical but
-/// unreachable snapshot (a stamped rate of zero) is `NonCanonical` on `rate_at`; a clock
-/// tag of 2 is `BadTag` on `state.clock`; and a trailing byte is `Trailing`.
 #[test]
 fn a_state_that_is_not_canonical_or_not_reachable_is_refused_naming_its_field() {
     let t0 = Instant::now();
@@ -396,7 +371,6 @@ fn a_state_that_is_not_canonical_or_not_reachable_is_refused_naming_its_field() 
     );
 }
 
-/// Every refusal admission can name.
 fn refusals() -> Vec<AdmitRefusal> {
     vec![
         AdmitRefusal::Tau(1),
@@ -443,9 +417,6 @@ fn quad(row: u16, alpha: u8) -> GlowQuad {
     }
 }
 
-/// Distinct observations encode to distinct bytes (the observation chain tells every pair
-/// apart): each kind, each refusal variant and field, a quad moved from one stream to the
-/// other, and each schedule field.
 #[test]
 fn distinct_observations_encode_distinctly() {
     let schema = MomentumSchema::new(Instant::now());
@@ -518,10 +489,6 @@ fn distinct_observations_encode_distinctly() {
     }
 }
 
-/// The artifacts carry their kinds and names at version 1; the code artifact binds the build
-/// id it names (another build is another artifact), the two codes are distinct artifacts,
-/// the demonstration fault's descriptor declares itself as one, and the identity puts each
-/// artifact in its slot, its digest moving with the code.
 #[test]
 fn the_artifacts_name_their_kinds_and_bind_what_they_declare() {
     let task = task_artifact();
@@ -587,7 +554,6 @@ fn the_artifacts_name_their_kinds_and_bind_what_they_declare() {
     assert_eq!(id.with_code(demo.clone()), demo_id);
 }
 
-/// Each code's short and artifact names name it, and nothing else names a code.
 #[test]
 fn code_names_round_trip_and_other_names_name_nothing() {
     assert_eq!(MomentumCode::ALL.len(), 2);
@@ -601,7 +567,6 @@ fn code_names_round_trip_and_other_names_name_nothing() {
     }
 }
 
-/// While paused, keys and resets queue and ticks and queries are skipped.
 #[test]
 fn keys_and_resets_queue_while_paused_and_ticks_and_queries_are_skipped() {
     let schema = MomentumSchema::new(Instant::now());
@@ -614,8 +579,6 @@ fn keys_and_resets_queue_while_paused_and_ticks_and_queries_are_skipped() {
     }
 }
 
-/// An unattached host's status reads unattached and empty, and an attached one names its
-/// code, build and checkpoint; the status line renders either.
 #[test]
 fn the_status_names_the_mode_code_and_build() {
     let t0 = Instant::now();
@@ -650,7 +613,6 @@ fn the_status_names_the_mode_code_and_build() {
     );
 }
 
-/// The quad encoding as first written: nine field writes, in field order.
 fn quads_field_by_field(e: &mut Enc, quads: &[GlowQuad]) {
     e.u64(quads.len() as u64);
     for q in quads {
@@ -666,7 +628,6 @@ fn quads_field_by_field(e: &mut Enc, quads: &[GlowQuad]) {
     }
 }
 
-/// A quad drawn from `r`, every field over its whole range (the extremes included).
 fn random_quad(r: &mut super::test_fixtures::Rng) -> GlowQuad {
     let mut field = |max: u64| match r.below(4) {
         0 => 0,
@@ -686,10 +647,6 @@ fn random_quad(r: &mut super::test_fixtures::Rng) -> GlowQuad {
     }
 }
 
-/// Each quad is encoded as one 20-byte write; the bytes are the nine field writes' exactly,
-/// for single quads and whole streams of random quads at every field's extremes, and a frame
-/// observation's encoding is the frame encoder's on the same quads. Non-vacuity: a quad
-/// differing in any one field encodes differently.
 #[test]
 fn one_twenty_byte_write_per_quad_appends_what_the_nine_field_writes_append() {
     let schema = MomentumSchema::new(Instant::now());

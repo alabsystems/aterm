@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The whole script, run as a person runs it: the whole-file execution guard
-//! (a truncated `curl … | bash` runs nothing), install-mode `--dry-run`'s
-//! zero-mutation plan, the toolset stand-down, and `--uninstall`'s hand-off to
-//! the installed aterm's own sweep (`aterm pkg self-uninstall`, whose ownership
-//! rules are atpkg's tests now).
-//! Every run has a scratch HOME and TMPDIR and a PATH of the stubs it names;
-//! the network is a logger or a stub that serves one release.
+//! Whole-file execution guard, `--dry-run`, toolset stand-down, and `--uninstall` tests for `tools/install.sh`.
 
 use std::path::Path;
 
@@ -18,19 +12,11 @@ use crate::support::{
     tree, write,
 };
 
-/// curl and gh as loggers: any invocation is recorded, never networked.
 const LOGGER: &str = "#!/bin/sh\necho \"$(basename \"$0\") $*\" >>\"${SHIM_LOG:?}\"\nexit 1\n";
 
-/// `uname` answering Linux, so a run that breached the guard cannot reach the
-/// machine's own /Applications/aterm.app (the macOS lane links it, then runs
-/// its toolset over the network); it still asks the logged curl for the head.
 const LINUX_UNAME: &str = "#!/bin/sh\ncase \"$1\" in -m) echo x86_64 ;; *) echo Linux ;; esac\n";
 
-/// The cut points that matter: each line that starts a top-level construct
-/// and the line before it (bash executes complete top-level statements as
-/// they arrive, so every truncation behaves like one of these), plus the
-/// three classic shapes — everything before `main`, a cut deep inside it, and
-/// a cut that loses only the final call.
+/// Returns truncation line numbers at top-level construct boundaries plus pre-`main`, mid-`main`, and final-line cuts.
 fn cuts(lines: &[&str]) -> Vec<usize> {
     let total = lines.len();
     let main_open = lines
@@ -55,8 +41,6 @@ fn cuts(lines: &[&str]) -> Vec<usize> {
     cuts
 }
 
-/// What a truncated run did: its status and output, and whatever it wrote or
-/// asked of the network.
 struct Truncated {
     cut: usize,
     run: Run,
@@ -70,7 +54,6 @@ fn truncated(scratch: &Scratch, text: &str, cut: usize, shim: &Path) -> Truncate
     let log = scratch.join(&format!("cut/{cut}/calls.log"));
     let prefix: String = text.split_inclusive('\n').take(cut).collect();
     let file = scratch.write(&format!("cut/{cut}/prefix.sh"), prefix);
-    // The prefix arrives on bash's stdin, as `curl … | bash` delivers it.
     let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
     cmd.arg("-c")
         .arg(format!("exec {} <{}", q(s(&bash())), q(s(&file))))
@@ -88,9 +71,6 @@ fn truncated(scratch: &Scratch, text: &str, cut: usize, shim: &Path) -> Truncate
     }
 }
 
-/// The cuts of `text` (from `select`) that executed something: wrote into
-/// HOME or TMPDIR, reached the network, or exited 0 with output (a prefix of
-/// the run).
 fn guard_breaches(
     scratch: &Scratch,
     text: &str,
@@ -123,7 +103,6 @@ fn guard_breaches(
     results
         .into_iter()
         .filter_map(|t| {
-            // Inert: a parse error (bash's status 2), or a silent exit 0.
             let inert = match t.run.code() {
                 0 => t.run.all().is_empty(),
                 code => code == 2,
@@ -145,9 +124,6 @@ fn guard_breaches(
         .collect()
 }
 
-/// A `curl … | bash` cut short anywhere runs nothing: a cut inside `main`'s
-/// body is a parse error, and a cut that keeps every definition but loses the
-/// final `main "$@"` defines everything and calls nothing.
 #[test]
 fn a_truncated_pipe_runs_nothing() {
     let scratch = Scratch::new();
@@ -156,8 +132,6 @@ fn a_truncated_pipe_runs_nothing() {
     assert!(breaches.is_empty(), "{}", breaches.join("\n"));
 }
 
-/// Negative control: with a statement after `main "$@"`, the guard's call is
-/// no longer the last line, and a cut between them runs the installer.
 #[test]
 fn the_guard_property_catches_work_after_the_final_call() {
     let scratch = Scratch::new();
@@ -170,10 +144,6 @@ fn the_guard_property_catches_work_after_the_final_call() {
     );
 }
 
-/// The release download host as one published release, `v9.9.9` of
-/// `$STUB_SLUG`: the latest pointer, the manifest's presence, the manifest's
-/// and the zip's sizes, and the manifest's bytes. Anything else — any other
-/// URL or request shape, any API host — fails the run.
 #[cfg(target_os = "macos")]
 const WEB_STUB: &str = r#"#!/bin/sh
 head=0 follow=0 fmt="" url=""
@@ -218,7 +188,6 @@ fn dry_run(scratch: &Scratch, home: &Home, args: &[&str]) -> DryRun {
     dry_run_with(scratch, home, args, &[])
 }
 
-/// [`dry_run`] with `env` added to the installer's environment.
 #[cfg(target_os = "macos")]
 fn dry_run_with(scratch: &Scratch, home: &Home, args: &[&str], env: &[(&str, &str)]) -> DryRun {
     let web = scratch.mkdir("web");
@@ -250,11 +219,6 @@ fn dry_run_with(scratch: &Scratch, home: &Home, args: &[&str], env: &[(&str, &st
     }
 }
 
-/// The plan's toolset line follows the console's owner through the one step
-/// the install runs too (`elect_install_lane`; docs/DESIGN-init-system-2026-10-20.md
-/// §4.2, "The SSH install"): the installing user at the screen leaves the toolset
-/// to aterm's first launch, and with another login at the screen it installs
-/// here, saying why.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_dry_run_s_toolset_line_follows_the_console_owner() {
@@ -292,11 +256,6 @@ fn a_dry_run_s_toolset_line_follows_the_console_owner() {
     }
 }
 
-/// Install-mode `--dry-run` prints the whole plan — the elected release, the
-/// exact asset and size, every destination — reads the latest pointer exactly
-/// once by a redirect-refusing HEAD, asks nothing of any other host or of gh,
-/// and leaves HOME and TMPDIR untouched. A bundle at the destination that is
-/// not aterm's skips the app half, left in place.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_dry_run_prints_the_plan_and_changes_nothing() {
@@ -365,10 +324,6 @@ fn a_dry_run_prints_the_plan_and_changes_nothing() {
     assert_eq!(tree(&foreign.home), before);
 }
 
-/// The public channel's download host with ONE release, `v9.9.9`, that
-/// publishes no Linux executable: the latest pointer, and a 404 for either
-/// architecture's raw binary. Only alabsystems/aterm is served — any other
-/// repository, URL or request shape fails the run.
 #[cfg(target_os = "linux")]
 const PUBLIC_NO_LINUX_STUB: &str = r#"#!/bin/sh
 head=0 follow=0 fmt="" url=""
@@ -395,19 +350,9 @@ case "$head$follow $url" in
 esac
 "#;
 
-/// `uname` of an aarch64 Linux machine.
 #[cfg(target_os = "linux")]
 const AARCH64_UNAME: &str = "#!/bin/sh\ncase \"$1\" in -m) echo aarch64 ;; *) echo Linux ;; esac\n";
 
-/// `curl … | bash` on an aarch64 Linux machine, as alab.systems hands it out:
-/// with no checkout and no ATERM_REPO_SLUG the script installs from the public
-/// channel (alabsystems/aterm). When the latest release publishes no Linux
-/// executable for the machine, both halves say so in Linux's terms — the one
-/// release inspected publishes none (no `--version` it cannot back), and a
-/// source build needs Trust, which publishes no Linux build, and then a clone
-/// of aterm whose own tools/install.sh builds it — never an aterm.app, a clone
-/// offered before Trust (it cannot build), or a tarball; a real run then says
-/// nothing was installed.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
@@ -462,7 +407,6 @@ fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
         }
         assert!(out.contains(app_skip), "{name}: {out}");
         assert!(out.contains(cargo_skip), "{name}: {out}");
-        // The clone is named only as the step after Trust, never on its own.
         let elsewhere = out.replace(cargo_skip, "");
         assert!(
             !elsewhere.contains("git clone"),
@@ -487,10 +431,6 @@ fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
     }
 }
 
-/// `--uninstall` is the installed aterm's own sweep: install.sh hands it the
-/// run's overrides (the scope, the bin and store dirs, `--dry-run`) and runs
-/// nothing of its own — here a store-placed stand-in that answers as aterm and
-/// knows the verb, and logs what it was asked.
 #[test]
 fn uninstall_runs_the_installed_aterms_own_sweep() {
     let scratch = Scratch::new();
@@ -527,9 +467,6 @@ fn uninstall_runs_the_installed_aterms_own_sweep() {
     );
 }
 
-/// With no runnable aterm there is nothing to sweep with: `--uninstall`
-/// refuses, changes nothing, and lists what install.sh placed that is there —
-/// never a foreign `aterm`, which it does not run.
 #[test]
 fn uninstall_without_an_aterm_refuses_and_lists_what_is_there() {
     let scratch = Scratch::new();
@@ -538,7 +475,6 @@ fn uninstall_without_an_aterm_refuses_and_lists_what_is_there() {
     let profile =
         "# >>> aterm ALab toolset (managed by install.sh) >>>\nx\n# <<< aterm ALab toolset <<<\n";
     write(&rc, profile);
-    // A foreign `aterm` on PATH (the X11 terminal's name): not ours, never run.
     let ran = scratch.join("none/foreign-ran");
     let foreign = home.home.join(".local/bin/aterm");
     write(
@@ -562,10 +498,6 @@ fn uninstall_without_an_aterm_refuses_and_lists_what_is_there() {
     assert_eq!(tree(&home.home), before);
 }
 
-/// A toolchain-only run that stands aside for another atpkg run (`pkg seed`
-/// exits 75 on the store lock) is not a failure: one `pkg seed`, no update
-/// after it, the rerun named, exit 0 — never followed by a failure line, and
-/// never naming the holder, which install.sh cannot see.
 #[test]
 fn a_toolset_stand_down_is_not_a_failure() {
     let scratch = Scratch::new();
@@ -576,7 +508,6 @@ fn a_toolset_stand_down_is_not_a_failure() {
         "#!/bin/sh\necho \"aterm $*\" >>\"${STUB_LOG:?}\"\nif [ \"$1 $2\" = \"pkg seed\" ]; then\n\techo \"atpkg: another atpkg process holds the store lock\" >&2\n\texit 75\nfi\nexit 0\n",
     );
     let home = scratch.home("standdown");
-    // The toolset half on, driving the stub above, never an installed aterm.
     let run = installer(
         &install_sh(),
         &home,
@@ -599,9 +530,6 @@ fn a_toolset_stand_down_is_not_a_failure() {
     assert_eq!(run.code(), 0, "{}", run.all());
 }
 
-/// A store that overlaps a PATH directory is refused before anything is
-/// fetched: ATERM_BIN_DIR itself (through a dir still to be created, a `..`
-/// and a symlink), and a store around ~/.local/bin.
 #[test]
 fn a_store_overlapping_a_path_dir_is_refused_up_front() {
     let scratch = Scratch::new();

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for the `aterm pkg alab` subcommand.
+//! Tests for the `alab` module.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1117,7 +1117,9 @@ fn pack_archive_recording(build: u64, exe: &[u8], record: Option<&[u8]>) -> Vec<
     crate::extract::fixtures::zstd_bytes(&crate::extract::fixtures::tar_bytes(&entries))
 }
 
-/// The bytes every darwin test pack runs: a copy of an Apple binary signed AD HOC.
+/// The bytes every darwin test pack runs: a copy of an Apple binary signed AD HOC, as
+/// `alab/package.sh` signs codex-alab, which `codesign --verify --strict` passes; elsewhere
+/// any bytes (no platform gate there).
 pub(crate) fn signed_exe() -> Vec<u8> {
     if cfg!(target_os = "macos") {
         codesigned(&["--force", "--sign", "-"])

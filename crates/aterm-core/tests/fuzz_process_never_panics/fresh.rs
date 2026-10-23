@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Fresh-terminal batches, which the long-lived terminals of `fuzz_process_never_panics`
-//! never reach: a fresh 24x80 terminal taking one multi-KiB `process()` call, the C1
-//! introducers 0x9b/0x90/0x9c in an escape-weighted soup, 1..=3 x 1..=3 grids, and reads
-//! back through `visible_content()`. Each run draws a fresh seed, printed with the command
-//! that replays it; a failing case prints its index and input length.
-//!
-//! The long-lived fuzz terminals of `fuzz_process_never_panics` never see a
-//! fresh 24x80 terminal take one multi-KiB `process()` call, never feed the C1
-//! introducers 0x9b/0x90/0x9c inside an escape-weighted soup, never build a
-//! 1..=3 x 1..=3 grid, and never read back through `visible_content()`. These
-//! LCG loops cover those angles (400 cases each). Each run prints its seed
-//! (fixed by default, `ATERM_FRESH_FUZZ_SEED` to pick another) with the
-//! command that replays it; a failing case prints its index
-//! and input length. `PROPTEST_CASES` raises the case count. Every soup run
-//! carries dozens of `ESC P [0-9;]* q` sixel hooks, which reach the decoder
-//! and image placement.
+//! Fresh-terminal LCG fuzz tests: single-batch escape soup, chunked escape soup,
+//! tiny `1..=3` grids, and a known adversarial corpus.
 
 use aterm_core::terminal::Terminal;
 
@@ -29,16 +15,9 @@ fn next(state: &mut u64) -> u32 {
     (*state >> 33) as u32
 }
 
-/// The default seed: fixed, so the suite is deterministic. A deep run picks
-/// its own with `ATERM_FRESH_FUZZ_SEED`.
 const FRESH_DEFAULT_SEED: u64 = 0x5eed_a7e2_f2e5_0001;
-
-/// Cases per fresh-terminal property by default.
 const FRESH_CASES: u32 = 400;
 
-/// This run's case count per fresh-terminal property: [`FRESH_CASES`], raised by
-/// `PROPTEST_CASES` for a deep run but never lowered, so a value exported to shorten some
-/// other suite cannot cut these. A value that is not a count is reported and ignored.
 fn fresh_cases() -> u32 {
     let Ok(v) = std::env::var("PROPTEST_CASES") else {
         return FRESH_CASES;
@@ -55,18 +34,7 @@ fn fresh_cases() -> u32 {
     }
 }
 
-/// This run's seed and case count for the fresh-terminal property `test` (its
-/// function name). The seed is `ATERM_FRESH_FUZZ_SEED` (hex with `0x`, or
-/// decimal) when set, else [`FRESH_DEFAULT_SEED`] mixed with `lane` (so the
-/// four properties differ), the same on every run so a commit turns red only
-/// on its own change. Both are printed with the exact
-/// replay command for this binary, which selects the test by libtest's name
-/// with `--exact` — so that name must be the running test's, or the replay
-/// runs 0 tests and exits 0, and a failing seed looks fixed.
 fn fresh_run(test: &str, lane: u64) -> (u64, u32) {
-    // libtest names a test by its path below the crate root, and names the
-    // test's thread after it (the main thread runs it only when the harness
-    // cannot spawn one).
     let name = match module_path!().split_once("::") {
         Some((_, module)) => format!("{module}::{test}"),
         None => test.to_string(),
@@ -106,8 +74,6 @@ fn fresh_run(test: &str, lane: u64) -> (u64, u32) {
     (seed, cases)
 }
 
-/// Names the failing case while a fresh-terminal property unwinds: its index
-/// in this seed's stream and its input length. Silent for a passing case.
 struct FailingCase<'a> {
     test: &'a str,
     case: u32,
@@ -125,9 +91,6 @@ impl Drop for FailingCase<'_> {
     }
 }
 
-/// A byte biased toward escape-sequence machinery, weighted 2 ESC, 2 introducer/param
-/// punctuation, 2 digits, 2 final bytes, 1 C0/C1 control (incl. 0x9b CSI, 0x90 DCS,
-/// 0x9c ST), 1 arbitrary byte.
 fn escapey_byte(s: &mut u64) -> u8 {
     fn pick(s: &mut u64, from: &[u8]) -> u8 {
         from[(next(s) as usize) % from.len()]
@@ -142,13 +105,11 @@ fn escapey_byte(s: &mut u64) -> u8 {
     }
 }
 
-/// `len` in `0..max_len`, filled by `byte`.
 fn fresh_input(s: &mut u64, max_len: u32, byte: fn(&mut u64) -> u8) -> Vec<u8> {
     let len = next(s) % max_len;
     (0..len).map(|_| byte(s)).collect()
 }
 
-/// No panic on up to 4 KiB of escape-dense soup in one `process()` call.
 #[test]
 fn fresh_terminal_single_batch_escape_soup_never_panics() {
     const TEST: &str = "fresh_terminal_single_batch_escape_soup_never_panics";
@@ -166,9 +127,6 @@ fn fresh_terminal_single_batch_escape_soup_never_panics() {
     }
 }
 
-/// Up to 2 KiB of soup split across `process()` calls at up to 64 random
-/// 1..64-byte boundaries (then 7-byte chunks): a sequence straddling a chunk
-/// boundary is a classic parser bug class.
 #[test]
 fn fresh_terminal_chunked_escape_soup_never_panics() {
     const TEST: &str = "fresh_terminal_chunked_escape_soup_never_panics";
@@ -198,8 +156,6 @@ fn fresh_terminal_chunked_escape_soup_never_panics() {
     }
 }
 
-/// Fresh 1..=3 x 1..=3 grids fed up to 1 KiB of soup: boundary arithmetic on
-/// cursor and scroll with almost no room.
 #[test]
 fn fresh_tiny_grid_escape_soup_never_panics() {
     const TEST: &str = "fresh_tiny_grid_escape_soup_never_panics";
@@ -219,7 +175,6 @@ fn fresh_tiny_grid_escape_soup_never_panics() {
     }
 }
 
-/// A corpus of hand-picked nasties that must each be survived.
 #[test]
 fn known_adversarial_corpus_is_survived() {
     let corpus: &[&[u8]] = &[

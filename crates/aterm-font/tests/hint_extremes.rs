@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The autohinter at the edges of its input: outlines whose points sit at the
-//! ends of the 16-bit range, on faces with the fewest units per em the `head`
-//! table allows, at sizes up to the scale the hinter fits at.
-//!
-//! The Trust lane refutes hundreds of the hinter's `i32` additions and
-//! subtractions (TRUST-QUIET, `docs/measured/trust-quiet-2026-10-20.md`). Each
-//! function is verified alone, so the bound on a 26.6 coordinate (at most
-//! 32768 font units times the scale) is no fact the solver has. These tests
-//! hold that bound where it matters: past 512 pixels per font unit the 16.16
-//! scale wrapped and the fitting overflowed (a panic with overflow checks on,
-//! a wrong outline without), so `HintingInstance::new` and `draw` refuse a
-//! scale past 128 pixels per unit, and up to it every outline fits.
+//! Autohinter scale bounds and extreme 16-bit outline coordinate tests.
 
 use aterm_font::OutlineSink;
 use aterm_font::autohint::{HintingInstance, Target};
@@ -42,8 +31,6 @@ fn be16(v: i32) -> [u8; 2] {
     (v as u16).to_be_bytes()
 }
 
-/// A simple `glyf` glyph from absolute on-curve contours, every delta a long
-/// one (each must fit an `i16`).
 fn simple_glyph(contours: &[Vec<(i32, i32)>]) -> Vec<u8> {
     let pts: Vec<(i32, i32)> = contours.iter().flatten().copied().collect();
     let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
@@ -81,11 +68,9 @@ fn simple_glyph(contours: &[Vec<(i32, i32)>]) -> Vec<u8> {
     g
 }
 
-/// `cmap` format 4 (3, 1) mapping `ch` to glyph 1.
 fn cmap_for(ch: char) -> Vec<u8> {
     let c = ch as i32;
     let mut sub = Vec::new();
-    // Format, length (set below), language, segCountX2, then the search fields.
     for v in [4, 0, 0, 4, 4, 1, 0] {
         sub.extend(be16(v));
     }
@@ -103,9 +88,6 @@ fn cmap_for(ch: char) -> Vec<u8> {
     t
 }
 
-/// A two-glyph TrueType face: glyph 0 empty, glyph 1 `contours`, mapped from
-/// `ch` when there is one (Latin `H` and CJK each pick their writing system;
-/// an unmapped glyph takes the default style).
 fn face(upem: i32, contours: &[Vec<(i32, i32)>], ch: Option<char>) -> Vec<u8> {
     let glyf = simple_glyph(contours);
     let mut loca = Vec::new();
@@ -156,7 +138,6 @@ fn face(upem: i32, contours: &[Vec<(i32, i32)>], ch: Option<char>) -> Vec<u8> {
 const STYLES: [Option<char>; 3] = [Some('H'), None, Some('\u{4E00}')];
 const TARGETS: [Target; 3] = [Target::Normal, Target::Light, Target::Lcd];
 
-/// Fits glyph 1 of `bytes`; `None` when the instance or the draw is refused.
 fn fit(bytes: &[u8], px: f32, target: Target) -> Option<u64> {
     let hint = HintingInstance::new(bytes, 0, px, &[], target)?;
     let mut sink = Count::default();
@@ -164,9 +145,6 @@ fn fit(bytes: &[u8], px: f32, target: Target) -> Option<u64> {
     Some(sink.0)
 }
 
-/// A stem of a rectilinear contour from the left edge of the 16-bit range to
-/// the right one, which overflowed the fitting at 9000 pixels per em on a
-/// 16-unit face (562.5 pixels per unit, a wrapped 16.16 scale).
 fn wide_stem() -> Vec<Vec<(i32, i32)>> {
     vec![vec![
         (4, -32740),
@@ -185,9 +163,6 @@ fn wide_stem() -> Vec<Vec<(i32, i32)>> {
     ]]
 }
 
-/// Past 128 pixels per font unit the hinter refuses the size: at 9000 px on a
-/// 16-unit face, where the fitting overflowed, and at 10^9 px on a 1000-unit
-/// one. One pixel under the bound it fits the same outline.
 #[test]
 fn a_scale_past_the_bound_is_refused() {
     let stem = wide_stem();
@@ -206,9 +181,6 @@ fn a_scale_past_the_bound_is_refused() {
     }
 }
 
-/// An instance built for a face with many units per em, drawn with the data of
-/// one with few (the caller's mistake, and the one way the size reaches the
-/// fitting unchecked by `new`), refuses the draw rather than wrapping.
 #[test]
 fn a_draw_holds_the_bound_for_the_face_it_is_given() {
     let stem = wide_stem();
@@ -236,8 +208,6 @@ impl Lcg {
         self.next() as usize % n
     }
 
-    /// A coordinate at either end of the 16-bit range, anywhere in it, or near
-    /// the origin.
     fn coord(&mut self) -> i32 {
         match self.next() % 4 {
             0 => 32767 - (self.next() % 64) as i32,
@@ -248,9 +218,6 @@ impl Lcg {
     }
 }
 
-/// One to four contours, most of them rectilinear (alternating horizontal and
-/// vertical runs, so the hinter finds segments, edges, stems and serifs); a
-/// run too long for one `glyf` delta goes through its midpoint.
 fn contours(rng: &mut Lcg) -> Vec<Vec<(i32, i32)>> {
     (0..1 + rng.below(4))
         .map(|_| {
@@ -283,17 +250,6 @@ fn deltas_fit(contours: &[Vec<(i32, i32)>]) -> bool {
     })
 }
 
-/// Outlines at the ends of the 16-bit range, at the bound (128 pixels per
-/// unit) and at half of it, on faces of 16 to 2048 units, in every target and
-/// writing system: the hinter fits them all (the test profile keeps overflow
-/// checks on, so an overflow here is a panic). Before the bound, 300000 such
-/// outlines at sizes from 300 px to 10^9 px overflowed the fitting 983 times:
-/// 977 at 9000 and 12000 px on 16-unit faces, 6 at 10^9 px on 1000-unit ones.
-///
-/// It drives sizes at or under the bound only, so it has no negative control
-/// of its own: with the bound removed it still passes. The refusal tests
-/// above are the control; they fail when `scale_fits` lets a size past 128
-/// pixels per unit through. The bound sits 4x under the wrap at 512.
 #[test]
 fn outlines_at_the_edge_of_the_range_fit_up_to_the_bound() {
     let mut rng = Lcg(7);
@@ -313,7 +269,6 @@ fn outlines_at_the_edge_of_the_range_fit_up_to_the_bound() {
             drawn += n;
         }
     }
-    // Not vacuous: most outlines are fitted and drawn.
     assert!(fitted > tried / 2, "{fitted} of {tried} fitted");
     assert!(drawn > u64::from(fitted), "{drawn} path elements");
 }

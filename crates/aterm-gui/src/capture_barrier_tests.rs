@@ -669,7 +669,8 @@ fn image_source_policy_table() {
     );
 }
 
-/// Destination-copying captures (`image` and `Snapshot`) arm the client tap while `image plain` does not.
+/// Destination-copying captures (`image` and `Snapshot`) take the armed client tap while waiting;
+/// `image plain` does not.
 #[test]
 fn image_requests_own_the_tap_while_waiting() {
     let image = |clean: bool| {

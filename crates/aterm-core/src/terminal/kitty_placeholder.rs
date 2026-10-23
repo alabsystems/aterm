@@ -3,28 +3,18 @@
 // Author: Andrew Yates
 
 //! Kitty graphics Unicode placeholder decoding.
-//!
-//! A virtual Kitty placement is drawn as [`PLACEHOLDER`] (U+10EEEE) text cells, so an image can
-//! flow through a pager or multiplexer as text. Up to three combining diacritics encode the
-//! image row, column and the id's high byte; the foreground colour carries the id's low 24 bits
-//! and the underline colour the placement id (`p=`; `0` lets the terminal pick). [`decode_cell`]
-//! serves the renderer (`render_cells::images_row_into`) and the handler, which damages the
-//! cells an image change repaints.
 
 use aterm_grid::{CellExtra, Grid, PackedColors};
 
 /// The Kitty Unicode placeholder base character.
 pub(crate) const PLACEHOLDER: char = '\u{10EEEE}';
 
-/// One Unicode placeholder cell, decoded: the image and virtual placement it
-/// names, and the tile of that placement it draws.
+/// Decoded Kitty Unicode placeholder cell coordinates and ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlaceholderCell {
-    /// The image id: the foreground colour's 24 bits, under the third
-    /// diacritic's byte.
+    /// Image id (24-bit foreground color plus high byte from the third diacritic).
     pub(crate) image_id: u32,
-    /// The virtual placement id: the underline colour's 24 bits (an indexed
-    /// underline colour is its palette index), `0` without one.
+    /// Virtual placement id from the underline color (`0` when absent).
     pub(crate) placement_id: u32,
     /// The tile's row within the placement (the first diacritic).
     pub(crate) row: u16,
@@ -32,15 +22,7 @@ pub(crate) struct PlaceholderCell {
     pub(crate) col: u16,
 }
 
-/// Decode the cell at live screen (`row`, `col`) of `grid`, whose extra is
-/// `extra`, if it is a Kitty Unicode placeholder; `None` for any other cell. A
-/// missing diacritic decodes as `0`.
-///
-/// The coordinates are the extras map's, which name the live screen whatever
-/// the viewport shows, so the cell is read off the live row
-/// ([`Grid::row_at_screen`]), not through the display offset `Grid::cell`
-/// applies, which while scrolled back pairs another row's text with this
-/// cell's extras.
+/// Decodes a Kitty Unicode placeholder cell at live screen `(row, col)` of `grid`.
 pub(crate) fn decode_cell(
     grid: &Grid,
     row: u16,
@@ -48,8 +30,6 @@ pub(crate) fn decode_cell(
     extra: &CellExtra,
 ) -> Option<PlaceholderCell> {
     let cell = grid.row_at_screen(row)?.get(col)?;
-    // The placeholder is non-BMP, so it is always a complex cell, resolved via
-    // the overflow table.
     if !cell.is_complex() || grid.complex_char_at(row, col) != Some(PLACEHOLDER) {
         return None;
     }
@@ -89,8 +69,7 @@ const fn rgb_id([r, g, b]: [u8; 3]) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
-/// The encoded value of a row/column/high diacritic (its index in `DIACRITICS`), or `None` for
-/// any other codepoint.
+/// Returns the encoded value of a Kitty row/column/high diacritic, or `None`.
 #[inline]
 pub(crate) fn diacritic_value(c: char) -> Option<u32> {
     DIACRITICS
@@ -100,8 +79,6 @@ pub(crate) fn diacritic_value(c: char) -> Option<u32> {
 }
 
 /// Canonical Kitty rowcolumn diacritics (297, sorted; index = encoded value).
-/// Independently reproduced from UnicodeData 6.0 for compatibility with the
-/// placeholder protocol. See the repository's `UNICODE-LICENSE.txt`.
 #[rustfmt::skip]
 const DIACRITICS: [char; 297] = [
     '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
@@ -159,12 +136,10 @@ mod tests {
 
     #[test]
     fn known_diacritic_values() {
-        // Index == encoded value; spot-check the ends + a few interior points.
         assert_eq!(diacritic_value('\u{0305}'), Some(0));
         assert_eq!(diacritic_value('\u{030D}'), Some(1));
         assert_eq!(diacritic_value('\u{030E}'), Some(2));
         assert_eq!(diacritic_value('\u{1D244}'), Some(296));
-        // A non-diacritic codepoint decodes to None.
         assert_eq!(diacritic_value('A'), None);
         assert_eq!(diacritic_value(PLACEHOLDER), None);
     }

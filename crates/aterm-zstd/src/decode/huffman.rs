@@ -5,17 +5,11 @@
 // project in 2026. See ../../LICENSE-MIT for the upstream MIT license.
 
 //! Huffman decoding of compressed literals (RFC 8878 §4.2).
-//!
-//! The tree is described by weights, stored directly or FSE-compressed; the
-//! last symbol's weight is implied. The decoding table has
-//! `1 << max_num_bits` entries, and a state is always masked to that size, so
-//! a lookup never leaves it.
 
 use super::bits::BitReaderReversed;
 use super::error::DecodeError;
 use super::fse::{FseDecoder, FseTable, highest_bit_set};
 
-/// The format's longest Huffman code.
 const MAX_MAX_NUM_BITS: u8 = 11;
 
 /// One state of a decoding table.
@@ -25,19 +19,14 @@ struct Entry {
     num_bits: u8,
 }
 
-/// A literals Huffman table, kept across the blocks of a frame for the
-/// Treeless literals type.
+/// A literals Huffman table, kept across blocks of a frame for Treeless literals.
 pub(crate) struct HuffmanTable {
     decode: Vec<Entry>,
-    /// Weights read from the description (the last symbol's is implied).
     weights: Vec<u8>,
-    /// The longest code; 0 means no table yet.
     max_num_bits: u8,
-    /// Scratch while building.
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
     rank_indexes: Vec<usize>,
-    /// For FSE-compressed weights.
     fse_table: FseTable,
 }
 
@@ -62,8 +51,7 @@ impl HuffmanTable {
         self.fse_table.reset();
     }
 
-    /// Reads a tree description from the front of `source` and builds the
-    /// table. Returns the bytes read.
+    /// Reads a tree description from the front of `source` and builds the table, returning the bytes read.
     pub(crate) fn build_decoder(&mut self, source: &[u8]) -> Result<usize, DecodeError> {
         self.decode.clear();
         self.max_num_bits = 0;
@@ -72,7 +60,6 @@ impl HuffmanTable {
         Ok(bytes_used)
     }
 
-    /// Reads the weights (RFC 8878 §4.2.1.2). Returns the bytes read.
     fn read_weights(&mut self, source: &[u8]) -> Result<usize, DecodeError> {
         let Some((&header, rest)) = source.split_first() else {
             return Err(DecodeError::Corrupt("Huffman tree description is empty"));
@@ -80,8 +67,6 @@ impl HuffmanTable {
         self.weights.clear();
 
         if header < 128 {
-            // `header` bytes of FSE-compressed weights, two interleaved states
-            // over one table.
             let Some(fse_stream) = rest.get(..usize::from(header)) else {
                 return Err(DecodeError::Corrupt("Huffman weights run past the block"));
             };
@@ -99,8 +84,6 @@ impl HuffmanTable {
             dec1.init_state(&mut br)?;
             dec2.init_state(&mut br)?;
 
-            // The decoders take turns until the stream runs out; the one
-            // that did not read last contributes its final state's symbol.
             loop {
                 self.weights.push(dec1.symbol());
                 dec1.update_state(&mut br);
@@ -114,15 +97,12 @@ impl HuffmanTable {
                     self.weights.push(dec1.symbol());
                     break;
                 }
-                // 255 explicit weights at most: symbols are bytes and the
-                // last weight is implied.
                 if self.weights.len() > 255 {
                     return Err(DecodeError::Corrupt("too many Huffman weights"));
                 }
             }
             Ok(1 + usize::from(header))
         } else {
-            // `header - 127` weights stored directly, 4 bits each.
             let num_weights = usize::from(header - 127);
             let bytes_needed = num_weights.div_ceil(2);
             let Some(raw) = rest.get(..bytes_needed) else {
@@ -137,7 +117,6 @@ impl HuffmanTable {
         }
     }
 
-    /// Builds the decoding table from the weights (RFC 8878 §4.2.1).
     fn build_table_from_weights(&mut self) -> Result<(), DecodeError> {
         if self.weights.len() > 255 {
             return Err(DecodeError::Corrupt("too many Huffman weights"));
@@ -154,7 +133,6 @@ impl HuffmanTable {
         if weight_sum == 0 {
             return Err(DecodeError::Corrupt("Huffman tree has no weights"));
         }
-        // The implied last weight completes the sum to a power of two.
         let max_bits = highest_bit_set(weight_sum);
         let left_over = (1u32 << max_bits) - weight_sum;
         if !left_over.is_power_of_two() {
@@ -165,11 +143,9 @@ impl HuffmanTable {
         if max_bits > u32::from(MAX_MAX_NUM_BITS) {
             return Err(DecodeError::Corrupt("Huffman code longer than 11 bits"));
         }
-        // Both fit a u8: max_bits <= 11, and the last weight <= max_bits.
         let max_bits = max_bits as u8;
         let last_weight = highest_bit_set(left_over) as u8;
 
-        // Code lengths: weight w is max_bits + 1 - w bits; weight 0 unused.
         self.bits.clear();
         for &w in &self.weights {
             self.bits.push(if w > 0 { max_bits + 1 - w } else { 0 });
@@ -183,8 +159,6 @@ impl HuffmanTable {
                 *rank += 1;
             }
         }
-        // A complete tree has an even number (at least two) of the longest
-        // codes; libzstd refuses anything else, and so does this.
         let longest = self
             .bit_ranks
             .get(usize::from(max_bits))
@@ -196,7 +170,6 @@ impl HuffmanTable {
             ));
         }
 
-        // First table index per code length, longest codes first.
         self.rank_indexes.clear();
         self.rank_indexes.resize(usize::from(max_bits) + 1, 0);
         for nb in (1..=usize::from(max_bits)).rev() {
@@ -217,7 +190,6 @@ impl HuffmanTable {
                 num_bits: 0,
             },
         );
-        // A code of `nb` bits owns `1 << (max_bits - nb)` consecutive entries.
         for (symbol, &nb) in self.bits.iter().enumerate() {
             if nb == 0 {
                 continue;
@@ -231,7 +203,6 @@ impl HuffmanTable {
             };
             for entry in run {
                 *entry = Entry {
-                    // At most 256 symbols, checked above.
                     symbol: symbol as u8,
                     num_bits: nb,
                 };
@@ -242,10 +213,7 @@ impl HuffmanTable {
         Ok(())
     }
 
-    /// Decodes literals from Huffman streams into `dsts`, each filled
-    /// exactly from the stream beside it, and each stream spent exactly
-    /// (RFC 8878 §4.2.2). The streams are independent, so up to four decode
-    /// in step, which overlaps their table lookups.
+    /// Decodes literals from Huffman `streams` into `dsts` (RFC 8878 §4.2.2).
     pub(crate) fn decode_streams<const N: usize>(
         &self,
         streams: [&[u8]; N],
@@ -293,7 +261,6 @@ struct Lane<'s> {
 }
 
 impl<'s> Lane<'s> {
-    /// Skips the stream's padding and reads the first state.
     fn start(stream: &'s [u8], max_bits: u8) -> Result<Self, DecodeError> {
         let mut bits = BitReaderReversed::new(stream);
         bits.skip_padding()?;
@@ -327,12 +294,9 @@ impl<'s> Lane<'s> {
 mod tests {
     use super::HuffmanTable;
 
-    /// Direct weights [1, 1]: three symbols, with the implied one weight 2.
-    /// Symbol 2 gets the 1-bit code, symbols 0 and 1 the 2-bit codes.
     #[test]
     fn direct_weights_build_the_canonical_table() {
         let mut t = HuffmanTable::new();
-        // Header 129: two 4-bit weights.
         let used = t.build_decoder(&[129, 0x11]).unwrap();
         assert_eq!(used, 2);
         assert_eq!(t.max_num_bits, 2);
@@ -343,15 +307,10 @@ mod tests {
     #[test]
     fn weights_that_complete_no_tree_are_refused() {
         let mut t = HuffmanTable::new();
-        // Weights [2, 2]: the implied last weight is 3, so no symbol has
-        // weight 1 (the longest code), which a complete tree pairs up.
         assert!(t.build_decoder(&[129, 0x22]).is_err());
-        // One direct weight announced, its byte missing; no description.
         assert!(t.build_decoder(&[128]).is_err());
         assert!(t.build_decoder(&[]).is_err());
-        // All weights zero.
         assert!(t.build_decoder(&[129, 0x00]).is_err());
-        // Weight 12 is past the longest code.
         assert!(t.build_decoder(&[128, 0xC0]).is_err());
     }
 }

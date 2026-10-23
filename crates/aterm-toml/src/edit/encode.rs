@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Rendering a document back to text.
-//!
-//! For a parsed, unmodified document this is `concat` over the stored source fragments:
-//! every input byte landed in some node's repr, decor, preamble or trailing, or is the
-//! byte-order mark the document records. `tests/roundtrip.rs` asserts it over every `.toml`
-//! file in the repository. Built nodes have no stored text and use the `DEFAULT_*` spacing.
 
 use core::fmt::{self, Write as _};
 
@@ -14,22 +9,15 @@ use super::item::{ArrayOfTables, Item, Table};
 use super::value::{Array, InlineTable, Value};
 use super::{DocumentMut, Key};
 
-/// Around a key on its own line: nothing before, one space before the `=`.
 const DEFAULT_KEY_DECOR: (&str, &str) = ("", " ");
-/// Around an intermediate segment of a dotted key: nothing on either side.
 const DEFAULT_PATH_DECOR: (&str, &str) = ("", "");
-/// Around a value on a key-value line: one space after `=`, then the newline.
 const DEFAULT_VALUE_DECOR: (&str, &str) = (" ", "\n");
-/// Around a table header that is not the first thing in the document: a blank
-/// line before it, the newline after it.
 const DEFAULT_TABLE_DECOR: (&str, &str) = ("\n", "\n");
 
 impl fmt::Display for DocumentMut {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         encode_document(&mut out, self.as_table(), self.trailing.as_str());
-        // Outside `out`: the encoder reads an empty `out` as the start of the
-        // file (no line to end, no blank line above the first header).
         if self.bom {
             f.write_char('\u{feff}')?;
         }
@@ -38,8 +26,6 @@ impl fmt::Display for DocumentMut {
 }
 
 impl fmt::Display for Table {
-    /// The table's contents (its key-value lines and the sub-tables beneath it), with no
-    /// header: a `Table` does not know its own path.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         encode_document(&mut out, self, "");
@@ -69,8 +55,6 @@ impl fmt::Display for Item {
 }
 
 impl fmt::Display for Value {
-    /// The value alone, without its decor (which, on a key-value line, carries the line's
-    /// trailing comment and newline).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::new();
         encode_value_body(&mut out, self);
@@ -94,8 +78,6 @@ impl fmt::Display for InlineTable {
     }
 }
 
-/// Render a table as a whole document: its own lines, then every table beneath
-/// it, in the order their headers were authored.
 fn encode_document(out: &mut String, root: &Table, trailing: &str) {
     let mut tables: Vec<(Option<usize>, &Table, Vec<&Key>, bool)> = Vec::new();
     let mut last_position = None;
@@ -106,8 +88,6 @@ fn encode_document(out: &mut String, root: &Table, trailing: &str) {
         }
         tables.push((last_position, table, path.to_vec(), is_array));
     });
-    // Stable, so tables sharing an inherited position keep document order; the sort is
-    // what prints `[a.b]` written before `[a]` back in that order.
     tables.sort_by_key(|(position, ..)| *position);
 
     for (_, table, table_path, is_array) in tables {
@@ -116,11 +96,6 @@ fn encode_document(out: &mut String, root: &Table, trailing: &str) {
     out.push_str(trailing);
 }
 
-/// Depth-first walk over the header-bearing tables under `table`.
-///
-/// A dotted table is not visited (its lines print among its parent's) but is descended
-/// into: a `[header]` may add a sub-table beneath a dotted key (`apple.color = "red"` then
-/// `[fruit.apple.texture]`), and skipping the subtree would drop it.
 fn visit_nested_tables<'t>(
     table: &'t Table,
     path: &mut Vec<&'t Key>,
@@ -153,8 +128,6 @@ fn encode_table(out: &mut String, table: &Table, path: &[&Key], is_array: bool) 
     let children = table.get_values();
     if !path.is_empty() && (is_array || !(table.implicit && children.is_empty())) {
         end_line(out);
-        // The first header in a document gets no leading blank line; every
-        // later one does. Authored decor overrides both.
         let default_prefix = if out.is_empty() {
             ""
         } else {
@@ -179,18 +152,12 @@ fn encode_table(out: &mut String, table: &Table, path: &[&Key], is_array: bool) 
             DEFAULT_VALUE_DECOR,
         );
     }
-    // The comment lines a removed last line was written under (`Table::trailing`).
     if !table.trailing.as_str().is_empty() {
         end_line(out);
         out.push_str(table.trailing.as_str());
     }
 }
 
-/// Terminate the line `out` ends on, if it is unterminated, so the next header or key-value
-/// line starts a line of its own. A file's final line has no terminator when the file ends
-/// without one (its suffix is `""` or ` # comment`), and a line added after it would
-/// otherwise be glued on: `a = 1b = 2`, or `a = 1 # noteb = 2` with `b` inside the comment.
-/// Inline-table entries never come through here; they share one line.
 fn end_line(out: &mut String) {
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
@@ -215,8 +182,6 @@ fn encode_key_value(
 ) {
     let leaf = path.last().expect("a key path has at least one segment");
     match &leaf.path_repr {
-        // Authored: the head is literally the source bytes from the start of
-        // the line to this key, so nothing about the line can be lost.
         Some(repr) => {
             out.push_str(repr.head.as_str());
             out.push_str(&leaf.display_repr());
@@ -319,7 +284,6 @@ pub(crate) fn encode_basic_string(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\u{c}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
-            // `basic-unescaped` stops at %x7E, so DEL is escaped too.
             c if c < ' ' || c == '\u{7f}' => {
                 let _ = write!(out, "\\u{:04X}", c as u32);
             }

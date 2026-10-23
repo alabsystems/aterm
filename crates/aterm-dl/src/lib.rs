@@ -198,14 +198,17 @@ mod sys {
 
     /// dlopen(3) one name.
     pub(crate) fn open(soname: &CStr) -> Result<NonNull<c_void>, String> {
-        // SAFETY: a NUL-terminated name; RTLD_LAZY with no RTLD_GLOBAL is local scope.
+        // SAFETY: a NUL-terminated name; RTLD_LAZY with no RTLD_GLOBAL is local scope. Loading runs
+        // the library's constructors, which is what opening it means.
         let handle = unsafe { libc::dlopen(soname.as_ptr(), libc::RTLD_LAZY) };
         NonNull::new(handle).ok_or_else(last_error)
     }
 
     /// dlsym(3) one name on a live handle.
     pub(crate) fn symbol(handle: NonNull<c_void>, symbol: &CStr) -> Option<NonNull<c_void>> {
-        // SAFETY: a handle dlopen returned and never closed, and a NUL-terminated name.
+        // SAFETY: a handle dlopen returned and never closed, and a
+        // NUL-terminated name. A null answer is absence: none of the symbols
+        // aterm reads can legitimately sit at address zero.
         NonNull::new(unsafe { libc::dlsym(handle.as_ptr(), symbol.as_ptr()) })
     }
 

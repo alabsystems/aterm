@@ -427,6 +427,15 @@ fn relaunch_held(
         Err(NoPlan::Wait(why)) => return said(r, format!("wait:{why}")),
         Err(NoPlan::Refused { why, detail, .. }) => return fail(opts, r, st, &why, &detail),
     };
+    if let Some(layout) = atpkg::store::resolve_configured()
+        && let Some(exe) = st.resume_argv.first()
+        && let Err(error) = atpkg::managed_launch::prepare_resume(&layout, Path::new(exe))
+    {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return said(r, "wait:managed-resume-writer");
+        }
+        return fail(opts, r, st, "managed-resume", &error.to_string());
+    }
     st.line.clone_from(&line);
     save(opts, &key(&tab), st);
     match type_relaunch_line_with(

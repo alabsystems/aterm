@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A child's output, read until the child has exited and its pipes are empty, never until
-//! end-of-file.
-//!
-//! A pipe reads end-of-file only once every copy of its write end is closed, and a sibling
-//! thread's spawn can take a copy: on macOS std marks a new pipe close-on-exec in a second
-//! step (there is no `pipe2`), and a child forked between the two keeps the write end for its
-//! whole life. Once the child has exited, everything it wrote is already in the pipe, so this
-//! reads what is there and stops.
+//! Non-blocking child output collection bounded by child exit rather than pipe EOF.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read};
@@ -16,9 +9,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::{Child, Output};
 use std::time::{Duration, Instant};
 
-/// Wait for `child` and collect what it wrote to its piped stdout and stderr
-/// (an unpiped stream reads empty). `None` when it has not exited by
-/// `deadline`: it is then killed and reaped, and the caller says what hung.
+/// Wait for `child` up to `deadline` and collect its piped stdout and stderr.
 #[allow(dead_code)]
 pub fn wait_and_read(mut child: Child, deadline: Instant) -> Option<Output> {
     let mut pipes = [
@@ -27,8 +18,6 @@ pub fn wait_and_read(mut child: Child, deadline: Instant) -> Option<Output> {
     ];
     let mut read = [Vec::new(), Vec::new()];
     loop {
-        // Exit first, then the reads: what the child wrote before it exited is
-        // in the pipe by the time its exit can be seen.
         let status = child.try_wait().expect("poll the child");
         for (pipe, buf) in pipes.iter_mut().zip(read.iter_mut()) {
             read_available(pipe, buf);
@@ -53,15 +42,7 @@ pub fn wait_and_read(mut child: Child, deadline: Instant) -> Option<Output> {
 /// The maximum raw bytes retained from either stream before an acknowledgement.
 pub const ACK_OUTPUT_LIMIT: usize = 64 * 1024;
 
-/// Wait until `child`'s piped stderr carries a whole line `wanted` accepts —
-/// a client's acknowledgement, written before what it goes on to do — reading
-/// one byte at a time, so nothing past that line is taken from the pipe, which
-/// is handed back to `child` (non-blocking) for whoever reads it next.
-///
-/// [`NoLine::Exited`] when the child exits first; [`NoLine::Hung`] when
-/// `deadline` passes first, the child then killed and reaped. Diagnostics from
-/// either stream stop at [`ACK_OUTPUT_LIMIT`]; excess output is a named failure,
-/// with the still-running owned child killed and reaped.
+/// Wait until `child`'s piped stderr emits a line accepted by `wanted` before `deadline`.
 #[allow(dead_code)]
 pub fn await_stderr_line(
     child: &mut Child,
@@ -72,7 +53,6 @@ pub fn await_stderr_line(
     let mut said = Vec::new();
     let mut line_from = 0;
     loop {
-        // Exit first, then the read, as in [`wait_and_read`].
         let status = child.try_wait().expect("poll the child");
         let mut byte = [0u8; 1];
         while let Some(file) = stderr.as_mut() {
@@ -134,8 +114,6 @@ pub fn await_stderr_line(
                     Err(e) => panic!("read the child's stdout: {e}"),
                 }
             }
-            // The stderr loop already drained through EOF or WouldBlock;
-            // another drain could follow a sibling writer indefinitely.
             return Err(NoLine::Exited(Output {
                 status,
                 stdout: out,
@@ -156,11 +134,9 @@ pub fn await_stderr_line(
 pub enum NoLine {
     /// The child exited first: reaped, with bounded output available now.
     Exited(Output),
-    /// The deadline passed first: the child was killed and reaped, having
-    /// written this much to stderr.
+    /// The deadline passed first, with the child killed and reaped.
     Hung(String),
-    /// The child's pre-acknowledgement output reached [`ACK_OUTPUT_LIMIT`].
-    /// A still-running owned child was killed and reaped.
+    /// Pre-acknowledgement output reached [`ACK_OUTPUT_LIMIT`].
     OutputLimit {
         stream: &'static str,
         captured: String,
@@ -181,7 +157,6 @@ fn nonblocking(fd: OwnedFd) -> File {
     File::from(fd)
 }
 
-/// Read what `pipe` holds now; at end-of-file it is dropped.
 fn read_available(pipe: &mut Option<File>, buf: &mut Vec<u8>) {
     let Some(file) = pipe else { return };
     let mut chunk = [0u8; 8192];

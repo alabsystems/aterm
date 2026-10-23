@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The input legs the typing audit named as unmeasured
-//! (docs/AUDIT-typing-to-pixels-2026-08-26.md, P1): the output → redraw-request
-//! span and the IME preedit → commit clock. The third, a key deferred behind a
-//! paste arming the echo clock, is pinned in `egress_contract_tests`.
+//! Tests for the output-to-redraw-request span and IME preedit-to-commit clock.
 
 use crate::WindowId;
 use std::sync::atomic::Ordering;
@@ -17,15 +14,9 @@ fn close_pipe(pipe: [i32; 2]) {
     }
 }
 
-/// The output → redraw-request span (a burst's leading edge to the turn that
-/// admits its redraw) is booked once per burst: a second wake for the same
-/// unpresented burst books nothing, a new burst books again, and a stamp older
-/// than the honesty cap is never booked.
 #[test]
 fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
     let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
-    // An epoch old enough to date a stamp past the honesty cap (a fresh
-    // App's clock started microseconds ago).
     app.lat_epoch = Instant::now()
         .checked_sub(Duration::from_secs(10))
         .expect("an epoch ten seconds back");
@@ -60,7 +51,6 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
         "the next burst books its own span"
     );
     assert!(requests() >= before + 2);
-    // The negative control: a stamp that aged past the cap is discarded.
     let cap_ms = crate::metrics::OUTPUT_REDRAW_REQUEST_CAP_NS / 1_000_000;
     stamp_ms_ago(cap_ms + 5);
     assert_eq!(
@@ -72,10 +62,6 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
     close_pipe(pipe);
 }
 
-/// A composition is timed from its first marked character to its commit,
-/// through the cleared preedit platforms send just before committing; one
-/// cleared and replaced by a new one without a commit counts as cancelled; an
-/// empty commit books no duration.
 #[test]
 fn the_ime_clock_times_preedit_to_commit_and_counts_cancels() {
     let (mut app, _sink, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
@@ -102,7 +88,6 @@ fn the_ime_clock_times_preedit_to_commit_and_counts_cancels() {
         "the committed composition booked its duration"
     );
 
-    // A cleared composition replaced by a new one never committed: cancelled.
     let now = Instant::now();
     let open = super::ime_compose_on_preedit(None, true, now);
     let cleared = super::ime_compose_on_preedit(open, false, now);

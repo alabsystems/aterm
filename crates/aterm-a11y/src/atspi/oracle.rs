@@ -1,29 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The semantics oracle's replay: the AT-SPI semantics the publisher serves
-//! from, held to what registry accesskit_atspi_common 0.19.0 answered.
-//!
-//! `tests/recorder`, outside the workspace, played the corpus of
-//! `tests/oracle/corpus.rs` on the registry crates and wrote
-//! `tests/recorded/accesskit-0.24.1-transcript.txt`; this module plays the
-//! same corpus through the same transcript code on the semantics compiled
-//! here and compares, scenario by scenario (docs/AUDIT-third-party-2026-10-15.md,
-//! unit a11y, A11Y.5). A difference names the scenario, the first line that
-//! differs, and the scenario's full text up to it.
-//!
-//! The blank-line table, `tests/recorded/accesskit-0.24.1-blank-lines.txt`,
-//! holds the text navigation the scenarios cannot: documents with empty runs
-//! anywhere, on which the registry crates' paragraph search could loop
-//! forever. Where they answered, the answer must be the same; where they
-//! hung, there must be an answer, holding the offset.
+//! Replays the AT-SPI semantics oracle corpus against the recorded transcripts.
 
-/// The model the corpus builds.
 mod model {
     pub(crate) use crate::model::*;
 }
 
-/// The semantics the transcript plays: this crate's.
 mod sem {
     pub(crate) use crate::atspi::semantics::NodeIdentity as NodeId;
     pub(crate) use crate::atspi::semantics::*;
@@ -46,7 +29,6 @@ use sem::Granularity;
 const RECORDING: &str = include_str!("../../tests/recorded/accesskit-0.24.1-transcript.txt");
 const BLANK_LINES: &str = include_str!("../../tests/recorded/accesskit-0.24.1-blank-lines.txt");
 
-/// The recording's scenarios: each `scenario` line and what follows it.
 fn recorded() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in RECORDING.lines().filter(|l| !l.starts_with('#')) {
@@ -61,7 +43,6 @@ fn recorded() -> Vec<String> {
     out
 }
 
-/// The first line where `got` and `want` differ, with its number.
 fn first_difference(got: &str, want: &str) -> Option<(usize, String, String)> {
     let mut got_lines = got.lines();
     let mut want_lines = want.lines();
@@ -81,8 +62,6 @@ fn first_difference(got: &str, want: &str) -> Option<(usize, String, String)> {
     None
 }
 
-/// The transcript of every scenario, compared with the recording; the
-/// failures, each a report.
 fn compare(scenarios: Vec<corpus::Scenario>) -> Vec<String> {
     let want = recorded();
     let mut failures = Vec::new();
@@ -93,8 +72,6 @@ fn compare(scenarios: Vec<corpus::Scenario>) -> Vec<String> {
             want.len()
         ));
     }
-    // Each scenario plays on its own player, so they play on every core; the
-    // reports keep the recording's order.
     let jobs = std::sync::Mutex::new(scenarios.into_iter().zip(&want).enumerate());
     let found = std::sync::Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
@@ -127,12 +104,9 @@ fn compare(scenarios: Vec<corpus::Scenario>) -> Vec<String> {
     failures
 }
 
-/// How scenario `index` plays against `want`, its recording: `None` when they
-/// agree, else the report.
 fn difference(index: usize, scenario: corpus::Scenario, want: &str) -> Option<String> {
     let got = transcript::play(scenario, false);
     let (line, g, w) = first_difference(&got, want)?;
-    // Replay that scenario in full, for the text behind the digest.
     let full = corpus::scenarios()
         .into_iter()
         .nth(index)
@@ -171,9 +145,6 @@ fn the_semantics_answer_as_the_registry_crates_did() {
     );
 }
 
-/// The negative control: the recording is no rubber stamp. A changed word
-/// boundary in one row of the first fixture, and a changed name in its tab
-/// strip, each make that scenario, and only it, differ.
 #[test]
 fn a_changed_tree_is_caught() {
     let want = recorded();
@@ -212,8 +183,6 @@ fn a_changed_tree_is_caught() {
     }
 }
 
-/// `f`'s result, on its own thread: the wait is a one-minute hang detector,
-/// so a question that never returns fails the test.
 fn within_a_minute<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -223,8 +192,6 @@ fn within_a_minute<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) ->
         .expect("every blank-line question is answered")
 }
 
-/// The offsets a `GetStringAtOffset` answer, as the table writes it
-/// (`("text", start, end)`), spans.
 fn answered_range(answer: &str) -> Option<(i32, i32)> {
     let inner = answer.strip_prefix('(')?.strip_suffix(')')?;
     let mut tail = inner.rsplitn(3, ", ");
@@ -233,9 +200,6 @@ fn answered_range(answer: &str) -> Option<(i32, i32)> {
     Some((start, end))
 }
 
-/// The blank-line table asked of `answer`: each recorded answer must come
-/// back the same, and where the registry crates hung, `answer` must give a
-/// range that holds the offset. The failures, a row each.
 fn compare_blank_lines(
     answer: impl Fn(&corpus::Document, i32, Granularity) -> String,
 ) -> Vec<String> {
@@ -285,10 +249,6 @@ fn blank_lines_answer_as_the_registry_crates_did_and_where_they_hung() {
     );
 }
 
-/// The blank-line table's negative control: it holds both kinds of row. A
-/// changed answer where the registry crates answered is caught, and so is the
-/// answer the first carve gave where they hung (the paragraph before a blank
-/// line, which does not hold the offset).
 #[test]
 fn a_changed_blank_line_answer_is_caught() {
     let hung = BLANK_LINES.lines().filter(|l| l.ends_with(" hang")).count();

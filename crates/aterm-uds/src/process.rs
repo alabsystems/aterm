@@ -156,6 +156,10 @@ pub const END_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 const END_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Terminates `token`'s process, re-proving identity and `still_proven` before each signal.
+///
+/// # Errors
+/// [`EndRefusal`]: stale or not proven before the `SIGTERM`, or a `SIGTERM` the kernel refused
+/// while the process still reads. Once a `SIGTERM` went out the answer is `Ok`.
 pub fn end_proven(
     token: Identity,
     grace: std::time::Duration,
@@ -257,7 +261,8 @@ impl EndControl for EndControlLive {
             unsafe extern "C" {
                 fn kill(pid: i32, sig: i32) -> i32;
             }
-            // SAFETY: two integer arguments.
+            // SAFETY: two integer arguments; `end_proven` re-read `pid`'s identity just before
+            // this and signals one pid, never a group.
             if unsafe { kill(pid, sig) } == 0 {
                 Ok(())
             } else {
@@ -280,10 +285,12 @@ impl EndControl for EndControlLive {
 
 #[path = "process_kin.rs"]
 mod kin;
+#[cfg(any(unix, windows))]
+pub use kin::held_among;
 pub use kin::{
-    GroupMembers, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, VERIFY_RUN_VAR, at_program_check,
-    boot_id, group_members, launchd_idversion, launched_before, read_identity, read_lineage,
-    read_process_markers,
+    GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, VERIFY_RUN_VAR,
+    at_program_check, boot_id, group_members, held_programs, launchd_idversion, launched_before,
+    read_identity, read_lineage, read_process_markers, thread_ran,
 };
 
 #[cfg(target_vendor = "apple")]
@@ -332,7 +339,8 @@ pub fn read_process_path(pid: i32) -> Option<std::path::PathBuf> {
     }
     read_bsdinfo(pid)?;
     let mut buf = [0u8; MAX];
-    // SAFETY: `buf` is MAX writable bytes; libproc writes at most that many.
+    // SAFETY: `buf` is MAX writable bytes; libproc writes at most that many and returns the path's
+    // length, or <= 0 on failure.
     let len = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), MAX as u32) };
     let len = usize::try_from(len).ok().filter(|&n| n > 0 && n <= MAX)?;
     Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
@@ -397,7 +405,8 @@ pub fn read_short_info(pid: i32) -> Option<BsdShortInfo> {
         return None;
     }
     let mut info = std::mem::MaybeUninit::<BsdShortInfo>::zeroed();
-    // SAFETY: `info` is SIZE writable bytes matching the structure this flavor fills.
+    // SAFETY: `info` is SIZE writable bytes of exactly the structure this flavor fills (size
+    // asserted above); libproc returns the number of bytes it wrote.
     let read = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -431,7 +440,8 @@ pub const CHILD_PIDS_MAX: usize = 64;
 pub fn child_pids(pid: i32) -> Option<Vec<i32>> {
     let mut pids = [0i32; CHILD_PIDS_MAX];
     let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is `bytes` writable bytes of pid slots.
+    // SAFETY: `pids` is `bytes` writable bytes of pid slots; libproc writes at most that many and
+    // answers how many pids it wrote, or -1.
     let found = unsafe { proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
     let found = usize::try_from(found).ok()?.min(CHILD_PIDS_MAX);
     Some(pids[..found].iter().copied().filter(|p| *p > 0).collect())
@@ -527,7 +537,8 @@ fn read_bsdinfo(pid: i32) -> Option<BsdInfo> {
         return None;
     }
     let mut info = [0u8; SIZE];
-    // SAFETY: `info` is SIZE writable bytes matching the structure this flavor fills.
+    // SAFETY: `info` is SIZE writable bytes, exactly the structure this flavor fills; libproc
+    // returns the number of bytes it wrote.
     let read = unsafe {
         proc_pidinfo(
             pid,
@@ -591,7 +602,8 @@ pub fn read_creation_filetime(pid: i32) -> Option<u64> {
     }
     let mut times = [ffi::FileTime::default(); 4];
     let [created, exited, kernel, user] = &mut times;
-    // SAFETY: `handle` is live and the four out-params are distinct writable `FILETIME`s.
+    // SAFETY: `handle` is the live process handle opened above, and the four out-params are
+    // distinct writable `FILETIME`s that outlive the call.
     let read = unsafe { ffi::WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT
         && unsafe { ffi::GetProcessTimes(handle, created, exited, kernel, user) } != 0;
     // SAFETY: closes the one handle this function opened.
@@ -648,7 +660,8 @@ pub fn translation() -> Translation {
     const ENOENT: i32 = 2;
     let mut value: i32 = 0;
     let mut len = core::mem::size_of::<i32>();
-    // SAFETY: a NUL-terminated name, one writable `int` and its length, all live for the call.
+    // SAFETY: a NUL-terminated name, one writable `int` and its length, all
+    // live for the call; nothing is written to the kernel (`newp` null).
     let rc = unsafe {
         sysctlbyname(
             c"sysctl.proc_translated".as_ptr(),
@@ -955,7 +968,9 @@ fn sysctl_timeval_ms(name: &core::ffi::CStr) -> Option<i64> {
         tv_usec: 0,
     };
     let mut len = core::mem::size_of::<libc::timeval>();
-    // SAFETY: `name` is NUL-terminated and outlives the call.
+    // SAFETY: `name` is NUL-terminated and outlives the call; `tv` and `len`
+    // are live locals, `len` the buffer's real size; nothing is written to the
+    // kernel (`newp` null).
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -1010,7 +1025,8 @@ fn start_abstime(pid: i32) -> Option<BootClock> {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut core::ffi::c_void) -> i32;
     }
     let mut info = [0u64; 12];
-    // SAFETY: `info` is 96 writable, aligned bytes matching the structure this flavor fills.
+    // SAFETY: `info` is 96 writable, aligned bytes, the size of the structure this flavor fills,
+    // and outlives the call.
     if unsafe { proc_pid_rusage(pid, RUSAGE_INFO_V0, info.as_mut_ptr().cast()) } != 0 {
         return None;
     }
@@ -1197,7 +1213,7 @@ fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
     argv_from_cmdline(&read_cmdline(u32::try_from(pid).ok()?)?)
 }
 
-/// `pid`'s `/proc/<pid>/cmdline`, at most 8 MiB.
+/// `pid`'s `/proc/<pid>/cmdline`, at most 8 MiB: a longer read is unknown, never a prefix.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn read_cmdline(pid: u32) -> Option<Vec<u8>> {
@@ -1426,7 +1442,9 @@ mod sc {
     #[cfg_attr(trust_verify, trust::skip)]
     pub(super) unsafe fn text(string: CFTypeRef) -> Option<String> {
         let mut buf = [0u8; 256];
-        // SAFETY: `string` is a live CFString (the caller's promise).
+        // SAFETY: `string` is a live CFString (the caller's promise); `buf`
+        // is `buf.len()` writable bytes, which the call fills with the name
+        // and its NUL, or leaves unread.
         let ok = unsafe {
             CFStringGetCString(string, buf.as_mut_ptr().cast(), buf.len() as isize, UTF8)
         };
@@ -1453,14 +1471,17 @@ fn setup_system(key_name: sc::CFTypeRef) -> Option<String> {
     if key.is_null() {
         return None;
     }
-    // SAFETY: a NULL store asks with a temporary session; `key` is live.
+    // SAFETY: a NULL store asks with a temporary session; `key` is live. The
+    // result is a new reference this frame owns, or NULL.
     let setup = unsafe { sc::SCDynamicStoreCopyValue(std::ptr::null(), key) };
     // SAFETY: this frame owns exactly the one reference the create returned.
     unsafe { sc::CFRelease(key) };
     if setup.is_null() {
         return None;
     }
-    // SAFETY: `setup` is live until it is released below.
+    // SAFETY: `setup` is live until it is released below; a type id is a
+    // plain query, and the value is read only once it is known to be a
+    // CFString, borrowed from the dictionary (the Get rule) while it lives.
     let name = unsafe {
         if sc::CFGetTypeID(setup) == sc::CFDictionaryGetTypeID() {
             let value = sc::CFDictionaryGetValue(setup, key_name);
@@ -1486,7 +1507,8 @@ fn configured_host_name() -> Option<String> {
 #[cfg(target_os = "macos")]
 #[cfg_attr(trust_verify, trust::skip)]
 fn bonjour_host_name() -> Option<String> {
-    // SAFETY: a NULL store asks with a temporary session; this frame owns the returned ref.
+    // SAFETY: a NULL store asks with a temporary session; the result is a new CFString reference
+    // this frame owns, or NULL.
     let name = unsafe { sc::SCDynamicStoreCopyLocalHostName(std::ptr::null()) };
     if name.is_null() {
         return None;
@@ -1510,7 +1532,8 @@ fn os_host_name() -> Option<String> {
         fn gethostname(name: *mut core::ffi::c_char, len: usize) -> i32;
     }
     let mut buf = [0u8; 256];
-    // SAFETY: `buf` is `buf.len()` writable bytes that outlive the call.
+    // SAFETY: `buf` is `buf.len()` writable bytes that outlive the call; the
+    // call writes at most that many and a NUL within them on success.
     let rc = unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     if rc != 0 {
         return None;
@@ -1545,7 +1568,9 @@ fn computer_name(format: u32) -> Option<String> {
     const CAPACITY: usize = 256;
     let mut buf = [0u16; CAPACITY];
     let mut len = CAPACITY as u32;
-    // SAFETY: `buf` is `len` writable UTF-16 units and outlives the call.
+    // SAFETY: `buf` is `len` writable UTF-16 units and outlives the call. On
+    // success the API writes the name and its NUL inside them and sets `len` to
+    // the name's length without the NUL; on failure nothing written is read.
     let ok = unsafe { crate::win::ffi::GetComputerNameExW(format, buf.as_mut_ptr(), &mut len) };
     (ok != 0)
         .then(|| buf.get(..len as usize).map(String::from_utf16_lossy))

@@ -3,15 +3,6 @@
 // Author: Andrew Yates
 
 //! Kitty placements relative to a virtual placement ("floating" placements).
-//!
-//! A virtual placement (`U=1`) shows wherever the client prints Unicode
-//! placeholders naming it. A placement relative to one takes the minimum x and
-//! minimum y of all those placeholders (per the protocol), possibly through a
-//! chain of such placements. It cannot be stamped into cells, so it is kept
-//! beside the grid (`TransientState::kitty_floating`) and placed each frame:
-//! [`floating_tiles`] finds its tiles and `Terminal::images_frame_into` lays
-//! them. One whose virtual ancestor shows nowhere is kept and drawn nowhere,
-//! as kitty does.
 
 use std::num::NonZeroU32;
 
@@ -145,8 +136,6 @@ pub(super) fn floating_origins(grid: &Grid, transient: &TransientState) -> Vec<O
     if transient.kitty_floating.is_empty() {
         return Vec::new();
     }
-    // Where each virtual placement shows: the top row and the leftmost
-    // column of the placeholders showing it.
     let mut shown: Vec<(NonZeroU32, i32, i32)> = Vec::new();
     let (rows, cols) = (grid.rows(), grid.cols());
     for (at, extra) in grid.extras().iter() {
@@ -176,8 +165,6 @@ pub(super) fn floating_origins(grid: &Grid, transient: &TransientState) -> Vec<O
         .collect()
 }
 
-/// [`floating_origins`] for one placement, through at most
-/// `MAX_KITTY_RELATIVE_DEPTH` parents.
 fn origin(
     transient: &TransientState,
     shown: &[(NonZeroU32, i32, i32)],

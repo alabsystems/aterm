@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Builds `MTLRenderPipelineState`s from [`crate::pipeline_table`], the same
-//! rows `renderer.rs` builds its wgpu pipelines from.
-//!
-//! The mappings off the table's neutral enums are total, so a variant added to
-//! the table fails to compile here until Metal spells it. Metal expresses
-//! REPLACE (`(One, Zero)` on both halves) as blending disabled, so
-//! [`metal_blend`] maps a REPLACE row to `None`, decided by
-//! [`crate::pipeline_table::Blend::is_replace`], not by name.
+//! Builds `MTLRenderPipelineState`s from [`crate::pipeline_table`].
 
 use super::ffi::{
     self, BlendFactor, BlendOperation, BlendState, ColorWriteMask, Device, Library, Obj,
@@ -33,10 +26,7 @@ const fn metal_factor(f: Factor) -> BlendFactor {
     }
 }
 
-/// The Metal blend state for
-/// [`RenderPipelineDescriptor::set_color_attachment`], or `None` for no
-/// blending: a row with `blend: None` or a row whose blend is REPLACE
-/// ([`Blend::is_replace`]).
+/// The Metal blend state for `blend`, or `None` when blending is disabled or [`Blend::is_replace`].
 #[inline]
 pub(crate) const fn metal_blend(blend: Option<Blend>) -> Option<BlendState> {
     let Some(b) = blend else {
@@ -86,13 +76,7 @@ const fn metal_attr_format(f: AttrFormat) -> VertexFormat {
     }
 }
 
-/// The colour-attachment format for a row's [`TargetRole`]. The offscreen pair
-/// is `format_plan`'s native choice (`Rgba8Unorm` with an `Rgba8UnormSrgb`
-/// alias view), view-compatible in Metal as in wgpu. `present` is the live
-/// swapchain format (`Bgra8Unorm` or `Rgba8Unorm` from `pick_surface_format`).
-///
-/// Hand-written because no wgpu type may enter this module; the Metal-vs-wgpu
-/// byte differentials in `metal::tests` catch a role it resolves differently.
+/// The colour-attachment format for `role`, using `present` for [`TargetRole::Present`].
 #[inline]
 pub(crate) const fn metal_format(role: TargetRole, present: PixelFormat) -> PixelFormat {
     match role {
@@ -103,13 +87,7 @@ pub(crate) const fn metal_format(role: TargetRole, present: PixelFormat) -> Pixe
     }
 }
 
-/// The `MTLVertexDescriptor` for a row's instance stream, or `None` for a
-/// `[[vertex_id]]`-only pass. Attributes and stride come from the table's
-/// [`crate::pipeline_table::VertexLayoutSpec`].
-///
-/// The stream lives at [`ffi::INSTANCE_STREAM_SLOT`], never 0: vertex functions
-/// taking `[[stage_in]]` declare uniforms at `[[buffer(0)]]` in the same
-/// argument table.
+/// The `MTLVertexDescriptor` for `layout` at [`ffi::INSTANCE_STREAM_SLOT`], or `None` for a `[[vertex_id]]`-only pass.
 pub(crate) fn metal_vertex_descriptor(layout: VertexLayout) -> Option<VertexDescriptor> {
     let spec = layout.spec()?;
     let vd = VertexDescriptor::new()?;
@@ -125,10 +103,7 @@ pub(crate) fn metal_vertex_descriptor(layout: VertexLayout) -> Option<VertexDesc
     Some(vd)
 }
 
-/// The `MTLPrimitiveType` for a row's [`Topology`]. Topology is pipeline state
-/// in wgpu but a `drawPrimitives:` argument in Metal; [`ffi::DrawCall`] takes
-/// its `primitive` from here. The tray's 4-vertex strip drawn as a list would
-/// cover half the card.
+/// The `MTLPrimitiveType` for `t`.
 #[cfg(test)]
 pub(crate) const fn metal_primitive_type(t: Topology) -> ffi::PrimitiveType {
     match t {
@@ -137,10 +112,7 @@ pub(crate) const fn metal_primitive_type(t: Topology) -> ffi::PrimitiveType {
     }
 }
 
-/// Build the real `MTLRenderPipelineState` for one table row.
-///
-/// `library` must be the compiled MSL for `spec.library`; `present` is the
-/// swapchain format for a [`TargetRole::Present`] row and is ignored otherwise.
+/// Builds the `MTLRenderPipelineState` for `spec`.
 pub(crate) fn build(
     device: &Device,
     library: &Library,
@@ -169,16 +141,14 @@ pub(crate) fn build(
     device.new_render_pipeline(&desc)
 }
 
-/// One MSL library, compiled with the shipped [`ffi::CompileOptions`]
-/// (`preserveInvariance`, MSL 2.3 pinned at the macOS 11 floor).
+/// Compiles `library` with [`ffi::CompileOptions::aterm_default`].
 pub(crate) fn compile_library(device: &Device, library: ShaderLibrary) -> Result<Library, String> {
     let opts = ffi::CompileOptions::aterm_default()
         .ok_or_else(|| "MTLCompileOptions allocation failed".to_owned())?;
     device.new_library_with_options(super::shaders::source(library), &opts)
 }
 
-/// [`compile_library`] for the library one row names. Sweeps compile per
-/// library and share the result.
+/// Compiles the shader library named by `spec`.
 #[cfg(test)]
 pub(crate) fn compile(device: &Device, spec: &PipelineSpec) -> Result<Library, String> {
     compile_library(device, spec.library)
@@ -191,13 +161,9 @@ mod tests {
     use crate::pipeline_table::ALL_PIPELINES;
     use std::collections::HashMap;
 
-    /// Every table row builds a real `MTLRenderPipelineState` with the
-    /// renderer's own entry points, blend, write mask, formats and vertex
-    /// layouts, for both swapchain formats `pick_surface_format` can choose.
     #[test]
     fn every_table_row_builds_a_metal_pipeline() {
         let dev = device();
-        // Six libraries serve twenty rows: compile each once.
         let libs: HashMap<ShaderLibrary, Library> = ShaderLibrary::ALL
             .into_iter()
             .map(|lib| {
@@ -221,12 +187,6 @@ mod tests {
         }
     }
 
-    /// The FFI constants, pinned against the SDK headers
-    /// (`MTLVertexDescriptor.h`, `MTLRenderCommandEncoder.h`,
-    /// `MTLRenderPipeline.h`). A wrong value still builds a pipeline:
-    /// `UChar4 == 3` in place of `UChar4Normalized == 9` turns `Unorm8x4`
-    /// colours from 0..1 into 0..255, and a transposed blend factor swaps the
-    /// blend equation.
     #[test]
     fn metal_constants_match_the_sdk_headers() {
         for (f, raw, name) in [
@@ -261,8 +221,6 @@ mod tests {
         }
     }
 
-    /// REPLACE, however the table spells it, reaches Metal as blending
-    /// disabled, and nothing else does.
     #[test]
     fn only_replace_rows_disable_blending() {
         for row in ALL_PIPELINES {

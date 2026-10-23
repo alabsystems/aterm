@@ -6,7 +6,9 @@
 //! break, and if so what holds it. Pure and clockless: every instant is the caller's milliseconds
 //! (the loop's hold clock), and every input is a value the caller already holds — the hold, the
 //! board's [`OccupancyReading`], the [`Books`] of what was told, and the [`Guards`] it judged
-//! from its own state. [`decide`] reads nothing and types nothing.
+//! from its own state, and the nudge's wait (the session's setup holds it, from
+//! [`wait_nudge_after_ms`], so a tape replays under the wait it was recorded under). [`decide`]
+//! reads nothing and types nothing.
 //!
 //! Each rule's verdict, checked in this order:
 //!
@@ -40,6 +42,28 @@ pub const HOLD_ROOM_MACHINE: &str = "sys avail>=8GiB and mem<critical";
 
 /// `wait-nudge` holds from a hold this old.
 pub const WAIT_NUDGE_AFTER_MS: i64 = 30 * 60_000;
+
+/// THE DEVELOPMENT SEAM that shortens [`WAIT_NUDGE_AFTER_MS`] to its whole seconds (the lab's
+/// `occupancy-break-claude` sets 60), read through [`aterm_types::dev_seam!`]: a shipped binary
+/// never reads it and nudges at 30 min.
+pub const NUDGE_SEAM: &str = "ATERM_OCCUPANCY_NUDGE_S";
+
+/// How old a hold `wait-nudge` holds from in this process: [`WAIT_NUDGE_AFTER_MS`], or
+/// [`NUDGE_SEAM`]'s seconds in a build that reads seams, read once. A session's setup takes it
+/// when the session is made; [`decide`] takes the setup's.
+#[must_use]
+pub fn wait_nudge_after_ms() -> i64 {
+    static AFTER: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| nudge_after_ms_of(aterm_types::dev_seam!(NUDGE_SEAM).as_deref()))
+}
+
+/// [`wait_nudge_after_ms`] of the seam's value `seam`: a whole count of seconds from 1 to the
+/// shipped wait's, so the seam only shortens it; anything else is the shipped wait.
+fn nudge_after_ms_of(seam: Option<&std::ffi::OsStr>) -> i64 {
+    seam.and_then(|v| v.to_str()?.trim().parse::<i64>().ok())
+        .filter(|s| (1..=WAIT_NUDGE_AFTER_MS / 1000).contains(s))
+        .map_or(WAIT_NUDGE_AFTER_MS, |s| s * 1000)
+}
 
 /// `hold-room` holds from a hold this old.
 pub const HOLD_ROOM_AFTER_MS: i64 = 2 * 60 * 60_000;
@@ -103,6 +127,17 @@ impl RuleId {
         match self {
             RuleId::WaitNudge => 0,
             RuleId::HoldRoom => 1,
+        }
+    }
+
+    /// Whether its line needs a free build slot and types the board's figures: its pace
+    /// reserves the slot, and the host re-reads the board for the write
+    /// ([`super::PaceGrant::Room`]).
+    #[must_use]
+    pub const fn slot(self) -> bool {
+        match self {
+            RuleId::WaitNudge => false,
+            RuleId::HoldRoom => true,
         }
     }
 }
@@ -299,8 +334,7 @@ pub enum Verdict {
 #[must_use]
 pub fn wants_reading(hold: Option<HoldSeen>, books: &Books, now_ms: i64) -> bool {
     hold.is_some_and(|hold| {
-        holds_but_machine(RuleId::HoldRoom, hold, books, now_ms)
-            && !spent(RuleId::HoldRoom, books, now_ms)
+        room_holds(hold, books, now_ms) && !spent(RuleId::HoldRoom, books, now_ms)
     })
 }
 
@@ -317,28 +351,50 @@ pub fn ready(r: &OccupancyReading, hold: Option<HoldSeen>, now_ms: i64) -> bool 
 }
 
 /// `rule`'s terms but the machine's, with its own cadence: for `wait-nudge` the hold
-/// [`WAIT_NUDGE_AFTER_MS`] old, undeclared and not nudged yet; for `hold-room` the hold
-/// [`HOLD_ROOM_AFTER_MS`] old and its last line [`HOLD_ROOM_APART_MS`] back.
-fn holds_but_machine(rule: RuleId, hold: HoldSeen, books: &Books, now_ms: i64) -> bool {
-    let held_ms = now_ms.saturating_sub(hold.since_ms);
+/// `nudge_after_ms` old, undeclared and not nudged yet; for `hold-room` [`room_holds`].
+fn holds_but_machine(
+    rule: RuleId,
+    hold: HoldSeen,
+    books: &Books,
+    nudge_after_ms: i64,
+    now_ms: i64,
+) -> bool {
     match rule {
-        RuleId::WaitNudge => held_ms >= WAIT_NUDGE_AFTER_MS && !hold.declared && !books.nudged,
-        RuleId::HoldRoom => {
-            held_ms >= HOLD_ROOM_AFTER_MS
-                && books
-                    .rooms
-                    .last()
-                    .is_none_or(|last| now_ms.saturating_sub(*last) >= HOLD_ROOM_APART_MS)
+        RuleId::WaitNudge => {
+            now_ms.saturating_sub(hold.since_ms) >= nudge_after_ms
+                && !hold.declared
+                && !books.nudged
         }
+        RuleId::HoldRoom => room_holds(hold, books, now_ms),
     }
 }
 
+/// `hold-room`'s terms but the machine's: the hold [`HOLD_ROOM_AFTER_MS`] old and its last line
+/// [`HOLD_ROOM_APART_MS`] back ([`room_due_ms`]).
+fn room_holds(hold: HoldSeen, books: &Books, now_ms: i64) -> bool {
+    now_ms >= room_due_ms(hold.since_ms, books.rooms.last().copied())
+}
+
+/// WHEN `hold-room`'S CADENCE NEXT LETS ITS LINE GO, on the clock `since_ms` is on: on a hold
+/// begun at `since_ms` whose last line went at `last_ms` (none yet: `None`), the hold
+/// [`HOLD_ROOM_AFTER_MS`] old and that line [`HOLD_ROOM_APART_MS`] back: the term [`decide`]
+/// judges the rule's cadence by, which a host that samples its board for the rule's slot term
+/// from that term's `for=` before then reads too.
+#[must_use]
+pub fn room_due_ms(since_ms: i64, last_ms: Option<i64>) -> i64 {
+    let after = since_ms.saturating_add(HOLD_ROOM_AFTER_MS);
+    last_ms.map_or(after, |last| {
+        after.max(last.saturating_add(HOLD_ROOM_APART_MS))
+    })
+}
+
 /// THE DECISION AT A BREAK at `now_ms` ([module docs](self)): each rule's verdict, in
-/// [`RuleId::ALL`]'s order. `books` must be of `hold` ([`Books::hold`]). A cap is judged before
-/// the machine: a spent `hold-room` needs no reading to be said spent. `OccupancyDoor`'s
-/// `Intend` is enabled where this says [`Verdict::Due`] (the anchor binds that verdict; the
-/// intent row itself is the typing path's), and its `Lapse` is a due rule whose condition no
-/// longer holds ([`Verdict::Quiet`]: dropped, never told late).
+/// [`RuleId::ALL`]'s order, `wait-nudge` holding from a hold `nudge_after_ms` old (the
+/// session's setup's; [`wait_nudge_after_ms`]). `books` must be of `hold` ([`Books::hold`]). A
+/// cap is judged before the machine: a spent `hold-room` needs no reading to be said spent.
+/// `OccupancyDoor`'s `Intend` is enabled where this says [`Verdict::Due`] (the anchor binds that
+/// verdict; the intent row itself is the typing path's), and its `Lapse` is a due rule whose
+/// condition no longer holds ([`Verdict::Quiet`]: dropped, never told late).
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -361,11 +417,14 @@ pub fn decide(
     hold: Option<HoldSeen>,
     books: &Books,
     g: &Guards,
+    nudge_after_ms: i64,
     now_ms: i64,
 ) -> [(RuleId, Verdict); 2] {
     let mut due_seen = false;
     RuleId::ALL.map(|rule| {
-        let verdict = match hold.filter(|hold| holds_but_machine(rule, *hold, books, now_ms)) {
+        let verdict = match hold
+            .filter(|hold| holds_but_machine(rule, *hold, books, nudge_after_ms, now_ms))
+        {
             None => Verdict::Quiet,
             Some(_) if spent(rule, books, now_ms) => Verdict::Spent,
             Some(hold) => match line(rule, r, hold, now_ms) {
@@ -387,8 +446,10 @@ pub fn decide(
 /// `rule`'s line on `hold` at `now_ms`, where the machine lets it go (`hold-room`'s terms on the
 /// board, [`HOLD_ROOM_SLOTS`], [`HOLD_ROOM_MACHINE`] and `disk=ok`, in a session whose jobs held
 /// a build slot during the hold), else `None`. The caller judged the rest
-/// ([`holds_but_machine`]).
-fn line(rule: RuleId, r: &OccupancyReading, hold: HoldSeen, now_ms: i64) -> Option<FactLine> {
+/// ([`holds_but_machine`]): [`decide`] on the board's look, and the door's write again on the
+/// board its host re-read for it, whose figures the line then types.
+#[must_use]
+pub fn line(rule: RuleId, r: &OccupancyReading, hold: HoldSeen, now_ms: i64) -> Option<FactLine> {
     let held_ms = now_ms.saturating_sub(hold.since_ms);
     match rule {
         RuleId::WaitNudge => Some(templates::wait_nudge(held_ms)),
@@ -440,6 +501,90 @@ pub fn would_reason(rule: RuleId, episode: u64, held_ms: i64, declared: bool) ->
 
 /// The ledger rule a would-be line is booked under.
 pub const WOULD_RULE: &str = "fact-would@v1";
+
+/// The ledger rule a held verdict is booked under (design §6): `waiting`, on a transition only,
+/// once an episode a guard ([`held_reason`]).
+pub const HELD_RULE: &str = "fact-held@v1";
+
+/// The reason a `fact-held@v1` row carries: the episode's words ([`would_reason`]), its
+/// ordinal in the hold (`ordinal=<n>`, [`Books::this_hold`]) and `guard=<word>`, the guard that
+/// held it.
+#[must_use]
+pub fn held_reason(
+    rule: RuleId,
+    episode: u64,
+    ordinal: usize,
+    held_ms: i64,
+    declared: bool,
+    guard: Guard,
+) -> String {
+    format!(
+        "{} ordinal={ordinal} guard={}",
+        would_reason(rule, episode, held_ms, declared),
+        guard.word()
+    )
+}
+
+/// A `fact-held@v1` row read back ([`held_rows_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldRow {
+    /// The rule held.
+    pub rule: RuleId,
+    /// The episode's ordinal in its hold: which of the rule's lines in the hold was held.
+    pub ordinal: usize,
+    /// The guard that held it.
+    pub guard: Guard,
+    /// The row's stamp, unix ms.
+    pub row_ms: i64,
+}
+
+/// THE HELD VERDICTS A LOOP BEFORE THIS ONE BOOKED for session `sid` in the ledger text `body`,
+/// oldest first: each `fact-held@v1` row's rule, ordinal, guard and stamp, so a successor that
+/// carries the hold books none of its rows again. A row this build cannot read is passed over.
+#[must_use]
+pub fn held_rows_in(body: &str, sid: Option<&str>) -> Vec<HeldRow> {
+    let want = sid.map(|s| s.trim_start_matches('@').to_string());
+    let mut rows = Vec::new();
+    for line in body.lines() {
+        if !line.contains(HELD_RULE) || want.as_deref().is_some_and(|sid| !line.contains(sid)) {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid").map(str::to_string) != want || text("rule_id") != Some(HELD_RULE) {
+            continue;
+        }
+        let (Some(row_ms), Some(reason)) = (
+            v.get("ts").and_then(aterm_json::Value::as_i64),
+            text("reason"),
+        ) else {
+            continue;
+        };
+        let mut rule = None;
+        let mut ordinal = None;
+        let mut guard = None;
+        for word in reason.split(' ') {
+            if let Some(name) = word.strip_prefix("rule=") {
+                rule = RuleId::of_name(name);
+            } else if let Some(n) = word.strip_prefix("ordinal=") {
+                ordinal = n.parse::<usize>().ok();
+            } else if let Some(word) = word.strip_prefix("guard=") {
+                guard = Guard::from_word(word);
+            }
+        }
+        if let (Some(rule), Some(ordinal), Some(guard)) = (rule, ordinal, guard) {
+            rows.push(HeldRow {
+                rule,
+                ordinal,
+                guard,
+                row_ms,
+            });
+        }
+    }
+    rows
+}
 
 /// A `fact-would@v1` row read back ([`would_rows_in`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

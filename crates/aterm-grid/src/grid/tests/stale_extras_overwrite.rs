@@ -2,14 +2,11 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Overwriting an extras-bearing cell (hyperlink, combining marks, RGB) removes
-//! its `CellExtras` entry on every grid write path, so no stale entry leaks or
-//! merges into a later styled write at the same coordinate.
+//! Tests for clearing `CellExtras` entries when overwriting cells.
 
 use super::*;
 use std::sync::Arc;
 
-/// Plant a hyperlink-bearing extras entry at (row, col) and verify it.
 fn plant_hyperlink(grid: &mut Grid, row: u16, col: u16) {
     grid.cell_extra_mut(row, col)
         .set_hyperlink(Some(Arc::from("https://example.com")));
@@ -153,7 +150,6 @@ fn write_wide_run_autowrap_clears_stale_extras_entries() {
 
 #[test]
 fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
-    // The bulk run's one pre-run fixup clears the base of the pair it starts on.
     let mut grid = Grid::new(5, 10);
     grid.set_cursor(0, 0);
     assert!(grid.write_wide_autowrap_fast('中', PackedColors::new(), CellFlags::empty()));
@@ -165,7 +161,6 @@ fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
             .contains(CellFlags::WIDE_CONTINUATION)
     );
 
-    // CUP onto the continuation half, then a bulk wide run.
     grid.set_cursor(0, 1);
     grid.write_mixed_wide_run_autowrap(
         &['🚀', '🚀'],
@@ -182,8 +177,6 @@ fn wide_run_autowrap_clears_orphaned_wide_half_at_run_start() {
 
 #[test]
 fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
-    // A new extras-bearing write on an old hyperlink cell does not inherit the
-    // stale hyperlink.
     let mut grid = Grid::new(5, 10);
     plant_hyperlink(&mut grid, 0, 0);
 
@@ -212,14 +205,9 @@ fn write_ascii_run_with_extras_does_not_merge_stale_hyperlink() {
     );
 }
 
-/// An extras run that creates map entries (an underline colour, OSC 8) starts
-/// each cell's entry fresh, so it never adopts an entry its cells did not claim
-/// (planted straight into the map here). A truecolor-only run writes the ring,
-/// not the map, and relies on orphans being closed where they are made.
 #[test]
 fn an_extras_run_never_adopts_an_orphaned_entry() {
     let url: Arc<str> = Arc::from("https://example.com/new");
-    // (pen, underline colour, link)
     let pens = [
         ("underline colour", Some(0x01_FF_00_00), None),
         ("hyperlink", None, Some(&url)),
@@ -267,12 +255,9 @@ fn an_extras_run_never_adopts_an_orphaned_entry() {
 
 #[test]
 fn failed_wide_write_does_not_drop_live_extras() {
-    // A wide char that cannot fit must leave the existing extras alone —
-    // removal is gated on the write actually landing.
     let mut grid = Grid::new(5, 10);
     plant_hyperlink(&mut grid, 0, 9); // last column
     grid.set_cursor(0, 9);
-    // Width-2 write at the last column cannot fit (effective_cols = 10).
     let ok = grid.write_wide_char_at_cursor_packed('中', PackedColors::new(), CellFlags::empty());
     assert!(!ok, "wide char must not fit at the last column");
     assert_eq!(
@@ -282,10 +267,6 @@ fn failed_wide_write_does_not_drop_live_extras() {
     );
 }
 
-/// The bulk wide-run lane tightens `len` like the single-glyph writer and
-/// `fill_cell_run`: a run starting on a continuation orphans that char's base,
-/// and its tail can orphan the continuation just past its end; when that orphan
-/// was the row's last content, `len` shrinks (`Row::update_len` only grows).
 #[test]
 fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
     let mut grid = Grid::new(2, 80);
@@ -297,9 +278,6 @@ fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
         "three wide chars occupy cols 0..6"
     );
 
-    // Cursor on col 1 (the continuation of `日`), then a two-glyph run: it
-    // orphans `日`'s base at col 0 and `語`'s continuation at col 5, the last
-    // content.
     grid.set_cursor(0, 1);
     grid.write_wide_run_autowrap(&['あ', 'い'], PackedColors::new(), CellFlags::empty());
 

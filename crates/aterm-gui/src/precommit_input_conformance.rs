@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance of the successor's pre-Commit input queue to
-//! `aterm_models_update::native_update_precommit_input_model`
-//! (`NativeUpdatePreCommitInput`, gap #33).
-//!
-//! Every model schedule up to four steps (enough to reach every model state, which the test
-//! checks) is replayed on a headless App with its incoming handoff pending, through the
-//! production seams: `queue_pre_commit_input` (input deferred before Commit), `on_focus`
-//! (`LoseFocus`) and `settle_replayed_handoff_input` (the Commit arm, run with ⌘ left armed, as a
-//! replayed stream whose release was lost would leave it). Every real step must be a transition
-//! the model admits (interpreter, and `ty` wherever installed), and every reached state
-//! satisfies every invariant.
-//!
-//! Negative control: `Buggy = 1` (every focus loss marks the queue; an overflow marks nothing)
-//! must reject the real steps at the first focus loss with nothing queued and at the overflow.
+//! Tier-1 conformance of the pre-Commit input queue against `native_update_precommit_input_model`.
 
 use std::collections::BTreeMap;
 
@@ -36,7 +23,6 @@ struct Settled {
     repaired: bool,
 }
 
-/// One replay: the App, and what the user and the platform did to it.
 struct Rig {
     app: crate::App,
     winit: aterm_window::window::WindowId,
@@ -54,7 +40,6 @@ impl Rig {
         let winit = aterm_window::window::WindowId::from(0u64);
         let window = WindowId(0);
         app.winit_to_window.insert(winit, window);
-        // The successor, revealed and waiting for Commit.
         app.incoming_handoff_pending = true;
         Rig {
             app,
@@ -66,7 +51,6 @@ impl Rig {
         }
     }
 
-    /// The window's input, queued the way `window_event` queues it.
     fn type_one(&mut self) {
         self.app.queue_pre_commit_input(
             self.winit,
@@ -91,9 +75,6 @@ impl Rig {
             "Settle" => {
                 let incoherent = self.app.handoff_deferred_input_incoherent;
                 let dropped = self.app.handoff_deferred_input_dropped > 0;
-                // The Commit arm: committed, the queue taken and replayed — and
-                // the replay left ⌘ armed, which the settle must disarm exactly
-                // when the stream was not coherent.
                 self.app.incoming_handoff_pending = false;
                 let replayed = std::mem::take(&mut self.app.handoff_deferred_input);
                 assert_eq!(
@@ -118,8 +99,6 @@ impl Rig {
         }
     }
 
-    /// The model's state, read off the App (and, once settled, off what the
-    /// Commit arm consumed) and the replay's truth.
     fn project(&self) -> State {
         let queued_for_window = self
             .app
@@ -155,11 +134,8 @@ impl Rig {
 
 const ACTIONS: &[&str] = &["Type", "LoseFocus", "Drop", "Settle"];
 
-/// One real step, projected: `(before, action, after)`.
 type Step = (State, &'static str, State);
 
-/// Replay `schedule` on the real App: the projected initial state and every
-/// projected step.
 fn replay(schedule: &[&'static str]) -> (State, Vec<Step>) {
     let mut rig = Rig::new();
     let initial = rig.project();
@@ -174,8 +150,6 @@ fn replay(schedule: &[&'static str]) -> (State, Vec<Step>) {
     (initial, steps)
 }
 
-/// `(label, conforms)` per step of `schedule` against `model`, both tiers (interpreter, and
-/// `ty` wherever installed).
 fn verdicts(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String, bool)> {
     let (initial, steps) = replay(schedule);
     let mut out = vec![(
@@ -191,15 +165,8 @@ fn verdicts(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String,
     out
 }
 
-/// The shipping queue, focus arm and settle refine `NativeUpdatePreCommitInput` on every
-/// schedule up to four steps, every state they reach satisfies every invariant, and together
-/// they reach every state the model can reach. Each step is admitted by the interpreter; each
-/// distinct real transition is then validated once on both tiers (`ty` is a process per call).
 #[test]
 fn the_real_pre_commit_queue_conforms_to_the_model() {
-    // Hold the counters' lock for the whole replay: every `Drop` step refuses a real event
-    // (`input_dropped=` + 1) and every incoherent `Settle` repairs one (`input_incoherent=` + 1),
-    // process-wide counters the focus and metrics tests pin exactly.
     let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -248,7 +215,6 @@ fn the_real_pre_commit_queue_conforms_to_the_model() {
             "{label} does not conform to NativeUpdatePreCommitInput"
         );
     }
-    // The schedules the model exists for are among them.
     for owners in [
         vec!["LoseFocus", "LoseFocus", "Settle"],
         vec!["LoseFocus", "Type", "Settle"],
@@ -262,13 +228,8 @@ fn the_real_pre_commit_queue_conforms_to_the_model() {
     }
 }
 
-/// Negative control: the latch (`Buggy = 1`: every focus loss marks the queue) rejects the real
-/// steps at the first focus loss with nothing queued (winit's startup event for a new window),
-/// where the real code leaves the queue coherent; the silent drop (`Buggy = 1`: an overflow
-/// marks nothing) rejects them at the overflow, which the real queue marks.
 #[test]
 fn the_old_latch_rejects_the_real_steps() {
-    // Its overflow schedule moves the process-wide counters too.
     let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -282,10 +243,8 @@ fn the_old_latch_rejects_the_real_steps() {
     assert!(rejected(&startup, "LoseFocus"), "{startup:?}");
     let typed_after = verdicts(&buggy, &["LoseFocus", "Type", "Settle"], "buggy-typed");
     assert!(rejected(&typed_after, "LoseFocus"), "{typed_after:?}");
-    // …and a loss after typing is where the buggy latch is right: both machines agree there.
     let tabbed = verdicts(&buggy, &["Type", "LoseFocus", "Settle"], "buggy-tabbed");
     assert!(tabbed.iter().all(|(_, ok)| *ok), "{tabbed:?}");
-    // The silent drop: the real queue marks the overflow the buggy one ignores.
     let overflowed = verdicts(&buggy, &["Type", "Drop", "Settle"], "buggy-overflow");
     assert!(rejected(&overflowed, "Drop"), "{overflowed:?}");
 }

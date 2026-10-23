@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The lineage receipt switch: whether a compiler with no LINEAGE or SEED-MINT receipt may
-//! still be admitted (recorded `lineage = "unproven"`), read from the trust repo's live
-//! origin main.
-//!
-//! Dormant only when the seed ledger ([`LEDGER`]) at the live main is readable and has no
-//! `[release.mint]`; anything unknown is not dormant. A mint on the local origin/main is
-//! live with no network; otherwise `git ls-remote` names the live main, fetched if absent
-//! into a quarantine object dir that moves no ref. Every network step is bounded by
-//! [`super::tools::HANG`].
-//!
-//! Read by every pack (and again before an `unproven` row is signed), `sign`, the group
-//! publish and the Linux lane.
+//! Reads the lineage receipt switch from the trust repository's live `origin/main`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -23,19 +12,16 @@ use crate::error::Result;
 /// What the switch reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Switch {
-    /// No minted re-pin on the trust repo's live main: an unproven compiler is admitted
-    /// (and recorded so).
+    /// No minted re-pin on live `main`; unproven compilers are admitted.
     Dormant,
-    /// A minted re-pin is there: every compiler needs its receipt.
+    /// A minted re-pin is present; every compiler requires its receipt.
     Live,
-    /// Nothing shows either (no checkout, no answer, no readable ledger): required. The
-    /// string says why, and what to fetch where a fetch is the remedy.
+    /// Switch state could not be determined; treated as required.
     Unknown(String),
 }
 
 impl Switch {
-    /// The client checker's policy this reading is: dormant admits an unproven compiler;
-    /// live and unknown both require the receipt.
+    /// Returns the [`atpkg::lineage::LineagePolicy`] for this switch state.
     #[must_use]
     pub const fn policy(&self) -> atpkg::lineage::LineagePolicy {
         match self {
@@ -45,8 +31,7 @@ impl Switch {
     }
 }
 
-/// The trust checkout the switch is read from: [`Ctx::trust_repo`] (`$HOME/trust` unless the
-/// verb's `--trust-repo` names another).
+/// Returns the trust checkout path from `ctx`.
 #[must_use]
 pub fn default_trust_repo(ctx: &Ctx) -> PathBuf {
     ctx.trust_repo.clone()
@@ -55,13 +40,8 @@ pub fn default_trust_repo(ctx: &Ctx) -> PathBuf {
 /// Where the ledger lives in the trust repo.
 pub const LEDGER: &str = "bootstrap/trust-stage0/seed-ledger.toml";
 
-/// The bound on every network step (a hang detector).
 const NETWORK_BOUND: Duration = super::tools::HANG;
-
-/// A quarantine left by a run killed outright is swept once it is this old: no live
-/// fetch outlasts its [`NETWORK_BOUND`].
 const QUARANTINE_STALE: Duration = Duration::from_secs(3600);
-
 const QUARANTINE_PREFIX: &str = "atpkg-lineage-fetch.";
 
 /// Read the switch from `trust_repo`'s live origin main.
@@ -188,7 +168,6 @@ fn has_commit(repo: &Path, sha: &str) -> bool {
     git_ok(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some()
 }
 
-/// A local git question: its stdout when it succeeds.
 fn git_ok(repo: &Path, args: &[&str]) -> Option<String> {
     crate::git::run(repo, args).ok()
 }
@@ -221,15 +200,12 @@ fn bounded_git(repo: &Path, env: &[(&str, &std::ffi::OsStr)], args: &[&str]) -> 
     }
 }
 
-/// `<git-dir>/atpkg-lineage-live`: the last live main a check fetched — a plain file, not
-/// a ref (no ref moves), offered as the next fetch's negotiation tip.
 fn note_path(repo: &Path) -> Option<PathBuf> {
     let p = git_ok(repo, &["rev-parse", "--git-path", "atpkg-lineage-live"])?;
     let p = PathBuf::from(p);
     Some(if p.is_absolute() { p } else { repo.join(p) })
 }
 
-/// Best effort: a note that cannot be written only costs the next check a larger fetch.
 fn note_live(repo: &Path, live: &str) {
     if !has_commit(repo, live) {
         return;
@@ -250,7 +226,6 @@ fn is_sha(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// A quarantine directory removed however the fetch ends.
 struct Quarantine(PathBuf);
 
 impl Drop for Quarantine {
@@ -259,8 +234,6 @@ impl Drop for Quarantine {
     }
 }
 
-/// Fetch origin's main into `repo`'s object store and nothing else: the objects land in a
-/// quarantine (the store its alternate) and move in only once the fetch finished.
 fn quarantined_fetch(repo: &Path) -> std::result::Result<(), Bounded> {
     let fail = |why: &str| Bounded::Failed(why.to_string());
     let od = git_ok(repo, &["rev-parse", "--git-path", "objects"])
@@ -321,8 +294,6 @@ fn quarantined_fetch(repo: &Path) -> std::result::Result<(), Bounded> {
     }
 }
 
-/// Remove quarantines a killed run left, once they are an hour old. The store's own
-/// `pack/` is never swept: a partial pack cannot be told from a concurrent fetch's.
 fn sweep_quarantines(od: &Path) {
     let Ok(entries) = std::fs::read_dir(od) else {
         return;
@@ -343,9 +314,6 @@ fn sweep_quarantines(od: &Path) {
     }
 }
 
-/// Move what the quarantine stored into the store the way git's own tmp-objdir migrates:
-/// each pack's other files before its `.idx` (no reader ever sees an index whose pack is
-/// not there yet), loose objects by rename, nothing already in the store replaced.
 fn adopt(q: &Path, od: &Path) -> std::io::Result<()> {
     let qpack = q.join("pack");
     if qpack.is_dir() {

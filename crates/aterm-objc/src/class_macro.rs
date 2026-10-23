@@ -343,7 +343,13 @@ macro_rules! declare_class {
                         ) $(-> $ret)? {
                             let __guard = ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(move || {
-                                    // SAFETY: the runtime delivers a message only to a live instance of the declaring class or a subclass (nil short-circuits before any IMP), and subclassing does not move this class's ivar offset.
+                                    // SAFETY: the runtime delivers a message
+                                    // only to a live instance of the declaring
+                                    // class or a subclass (nil short-circuits
+                                    // before any IMP), and subclassing does not
+                                    // move this class's ivar offset. `$name` is
+                                    // zero-sized, so the reference borrows no
+                                    // bytes of its own.
                                     let __self: &$name =
                                         unsafe { &*__this.cast::<$name>().cast_const() };
                                     $crate::__aterm_objc_method_call!(
@@ -389,7 +395,9 @@ macro_rules! declare_class {
             #[inline]
             #[allow(dead_code, reason = "generated for every declared class; each class calls a subset")]
             $vis fn super_receiver(&self) -> $crate::ObjcSuper {
-                // SAFETY: `self` borrows a live instance and `Self::meta()` is the registered class declaring this method.
+                // SAFETY: `self` borrows a live instance and `Self::meta()` is
+                // the registered class declaring this method: the right pair
+                // for a `[super …]` send from here.
                 unsafe { $crate::super_of(self.as_id(), Self::meta().class()) }
             }
 
@@ -403,7 +411,9 @@ macro_rules! declare_class {
                         .expose_provenance()
                         .wrapping_add_signed(__meta.ivar_offset()),
                 );
-                // SAFETY: `self` borrows a live instance, so the slot at the registered offset is aligned, readable and live for the borrow.
+                // SAFETY: `self` borrows a live instance, so the slot at the
+                // registered offset is aligned, readable and live for the
+                // borrow. `IvarSlot::get` checks it was written, in release too.
                 unsafe { $crate::IvarSlot::get(__slot) }
             }
 
@@ -449,7 +459,11 @@ macro_rules! declare_class {
                 mtm: $crate::MainThread,
                 ivars: $ivars,
             ) -> ::core::option::Option<$crate::Retained<Self>> {
-                // SAFETY: `alloc_ivars` returns a +1 instance owing one designated initializer, and `-init` is NSObject's, right for any class whose chain does not require a stricter one.
+                // SAFETY: `alloc_ivars` returns a +1 instance owing one
+                // designated initializer, and `-init` is NSObject's, right for
+                // any class whose chain does not require a stricter one. It
+                // consumes the +1 and returns +1 or nil (having released it,
+                // so `dealloc` already dropped the ivars).
                 unsafe {
                     let __raw = Self::alloc_ivars(mtm, ivars);
                     if __raw.is_null() {

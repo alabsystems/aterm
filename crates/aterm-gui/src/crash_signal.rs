@@ -151,7 +151,9 @@ pub(crate) fn adopt_app_identity() -> bool {
 pub(crate) fn clean_exit_now(code: i32) -> ! {
     let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
     release_own_marker();
-    // SAFETY: async-signal-safe immediate exit of the calling process.
+    // SAFETY: async-signal-safe immediate exit of the calling process. It ends
+    // this process and nothing else, runs no handler and no destructor, and
+    // cannot return.
     unsafe { libc::_exit(code) }
 }
 
@@ -582,7 +584,8 @@ mod imp {
             return None;
         }
         use std::os::unix::ffi::OsStrExt as _;
-        // SAFETY: a non-null MARKER_PATH is a leaked, never-freed CString.
+        // SAFETY: a non-null MARKER_PATH is a leaked, never-freed CString
+        // (`publish_marker_path`).
         let current = unsafe { std::ffi::CStr::from_ptr(current) };
         let path = std::path::Path::new(std::ffi::OsStr::from_bytes(current.to_bytes()));
         Some((path.parent()?.to_path_buf(), nanos))
@@ -690,7 +693,9 @@ mod imp {
                 continue;
             }
             if n < 0 {
-                // SAFETY: `errno_location()` returns a valid thread-local `*mut c_int`.
+                // SAFETY: `errno_location()` returns a valid, thread-local
+                // `*mut c_int`; reading it on this thread is sound and
+                // async-signal-safe.
                 let err = unsafe { *errno_location() };
                 if err == libc::EINTR {
                     continue;
@@ -1288,7 +1293,8 @@ mod imp_windows {
         while off < bytes.len() {
             let mut written = 0u32;
             let len = u32::try_from(bytes.len() - off).unwrap_or(u32::MAX);
-            // SAFETY: `bytes[off..]` is live and `written` is a valid out-param.
+            // SAFETY: `bytes[off..]` is live and `written` is a valid out-param; `WriteFile`
+            // allocates nothing on our side, so a possibly corrupt heap does not matter.
             let ok = unsafe {
                 WriteFile(
                     handle,
@@ -1311,7 +1317,9 @@ mod imp_windows {
         let mut code = 0u32;
         let mut address = 0u64;
         let mut av: Option<(&[u8], u64)> = None;
-        // SAFETY: `info` is a valid `EXCEPTION_POINTERS` from the OS with guarded pointers and fixed layout.
+        // SAFETY: `info` is a valid `EXCEPTION_POINTERS` from the OS with guarded pointers; the
+        // record's fixed `#[repr(C)]` layout and the `number_parameters` check keep the
+        // `exception_information` reads in bounds.
         unsafe {
             if !info.is_null() {
                 let rec = (*info).exception_record;
@@ -1337,7 +1345,7 @@ mod imp_windows {
         let mut av_digits = [0u8; 16];
         let av_hex = av.map(|(_, addr)| fmt_u64_hex(addr, &mut av_digits));
 
-        // SAFETY: `GetStdHandle` is a plain handle query.
+        // SAFETY: `GetStdHandle` is a plain handle query, callable anywhere.
         let stderr = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
         let marker = MARKER_HANDLE.load(Ordering::Relaxed);
         for h in [stderr, marker] {

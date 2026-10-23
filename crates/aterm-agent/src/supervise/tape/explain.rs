@@ -563,8 +563,8 @@ fn screen_of(item: &Item) -> Option<Screen> {
     parse_text_json(&reply.stdout).ok()
 }
 
-/// An approval's or a question's decision made again from its mark's facts
-/// ([module docs](self)), into `why`.
+/// An approval's or a question's decision made again from its mark's facts,
+/// into `why`.
 fn box_trace(
     why: &mut Why,
     header: &Header,
@@ -882,7 +882,7 @@ fn head_of(
 }
 
 /// A turn end's trace, from a strict replay of the tape to its mark on the
-/// build that recorded it ([module docs](self)), into `why`.
+/// build that recorded it, into `why`.
 fn turn_end_trace(why: &mut Why, bytes: &[u8], header: &Header) {
     if header.build != why.explained_by {
         why.trace_note = Some(format!(

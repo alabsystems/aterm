@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Progress words: a percent row says how long is left, a count that stops
-//! says it stalled, a script's finished words read as every reporter's do,
-//! work about to end at its grace never flashes, and a withdrawn row's record
-//! reads as ended.
+//! Progress ETA, stall detection, custom ending words, and reveal-grace deferral tests.
 
 use crate::animate::Look;
 use crate::center::{EchoKind, MessageCenter};
@@ -29,20 +26,16 @@ fn notice(c: &mut MessageCenter, g: &mut WireGate, line: &str, now: Instant) -> 
     apply(c, g, req, WallStamp { unix_ms: 1_000 }, now)
 }
 
-/// Settle and commit, as the host's sweep does.
 fn sweep(c: &mut MessageCenter, now: Instant) {
     c.settle(now, true);
     c.commit_rows(now, 3);
 }
 
-/// The ETA slot's words on the first row at `now`.
 fn eta_words(c: &MessageCenter, now: Instant) -> Option<String> {
     let p = present(c, 120);
     c.motion(&p, now, Look::MOVING).rows.first()?.eta.clone()
 }
 
-/// A script that says only its percent (`pct=`) at a steady 5 %/s gets an
-/// ETA slot and an estimate, as a `done=` script does.
 #[test]
 fn a_percent_row_says_how_long_is_left() {
     let t0 = Instant::now();
@@ -63,13 +56,9 @@ fn a_percent_row_says_how_long_is_left() {
     assert!(p.rows[0].eta.is_some(), "a percent row has an ETA slot");
     let words = eta_words(&c, now).expect("an estimate at 60 % of a steady job");
     assert!(words.ends_with(" left"), "{words}");
-    // 40 % left at 5 %/s: eight seconds, said in fives.
     assert_eq!(words, "10 s left");
 }
 
-/// A count that stops says so: a `done=` steps job that stops reporting at 11
-/// of 40 does not count down to `<5 s left` and go blank; it says `stalled`
-/// four of its own gaps (never under ten seconds) after its last step.
 #[test]
 fn a_count_that_stops_says_stalled_not_less_than_five_seconds() {
     let t0 = Instant::now();
@@ -110,9 +99,6 @@ fn a_count_that_stops_says_stalled_not_less_than_five_seconds() {
     );
 }
 
-/// A script's own ending words stand: `done <key> withdraw <words>` and
-/// `done <key> warn <words>` are the record's title, never `Indexing ended` /
-/// `Indexing stopped` over them; the mark still says how it ended.
 #[test]
 fn a_scripts_own_ending_words_are_its_record() {
     let t0 = Instant::now();
@@ -144,7 +130,6 @@ fn a_scripts_own_ending_words_are_its_record() {
         assert!(rec.detail.is_empty(), "{rec:?}");
         assert_eq!(rec.severity, sev, "{rec:?}");
     }
-    // Without words the table still speaks.
     notice(
         &mut c,
         &mut g,
@@ -156,7 +141,6 @@ fn a_scripts_own_ending_words_are_its_record() {
     assert_eq!(c.log().get(id).unwrap().title, "Indexing stopped");
 }
 
-/// A live row whose work is almost done at the end of its grace.
 fn rewrap(total: u64) -> Message {
     Message::new(tags::SESSION, Severity::Info, "Rewrapping 2.0M lines")
         .hold(Hold::Live {
@@ -189,15 +173,10 @@ fn restate(c: &mut MessageCenter, id: crate::model::MessageId, done: u64, total:
     );
 }
 
-/// No flash at the grace's end: a row whose work projects to end within
-/// REVEAL_MIN_LEFT when its grace runs out is held back and, if the work then
-/// ends, never reaches the glass (no row, no echo). A projection that keeps
-/// promising and is wrong still reaches the glass by the cap.
 #[test]
 fn work_about_to_end_at_its_grace_never_flashes() {
     let t0 = Instant::now();
     let total = 2_000_000;
-    // A 2.6 s job: 75 % done at the grace's end.
     let mut c = MessageCenter::new(MessageLog::empty(), t0);
     let id = c.post(rewrap(total), WallStamp { unix_ms: 1 }, t0).id;
     let mut now = t0;
@@ -212,7 +191,6 @@ fn work_about_to_end_at_its_grace_never_flashes() {
     assert!(c.withdraw_with(id, EchoKind::Complete, now + ms(100)));
     assert!(c.echoes().is_empty(), "never shown, so no echo");
 
-    // A job that stalls at 90 % right at its grace: shown by the cap.
     let mut c = MessageCenter::new(MessageLog::empty(), t0);
     let id = c.post(rewrap(total), WallStamp { unix_ms: 1 }, t0).id;
     for k in 1..=8u64 {
@@ -234,9 +212,6 @@ fn work_about_to_end_at_its_grace_never_flashes() {
     assert!(c.on_glass().next().is_some(), "revealed by the cap");
 }
 
-/// The session wait holds its row back the same way: a rewrap asked after at
-/// 2.9 s, three quarters done, is not posted, is sampled at the row's pace
-/// and ends silently; one asked early with most of it ahead is posted at once.
 #[test]
 fn a_session_wait_about_to_end_is_not_posted() {
     let sample = |done: u64, ms_: u64, end| WaitSample {
@@ -251,7 +226,6 @@ fn a_session_wait_about_to_end_is_not_posted() {
         ..sample(done, ms_, None)
     };
     let mut w = SessionWait::rewrap(1);
-    // Seen first unasked (its pace's base), then asked with a second left.
     assert_eq!(w.step(&unasked(500_000, 1_000)), WaitStep::Idle);
     assert_eq!(w.step(&sample(1_480_000, 2_900, None)), WaitStep::Idle);
     assert!(!w.posted());
@@ -265,21 +239,17 @@ fn a_session_wait_about_to_end_is_not_posted() {
         WaitStep::Idle,
         "ends silently"
     );
-    // Asked at its first sample: no pace yet, so it is posted (the engine's
-    // reveal looks again when the grace ends).
     let mut early = SessionWait::rewrap(1);
     assert!(matches!(
         early.step(&sample(1_200_000, 0, None)),
         WaitStep::Post(_)
     ));
-    // Most of it ahead: posted.
     let mut slow = SessionWait::rewrap(1);
     assert_eq!(slow.step(&unasked(100_000, 500)), WaitStep::Idle);
     assert!(matches!(
         slow.step(&sample(200_000, 1_000, None)),
         WaitStep::Post(_)
     ));
-    // Past the cap it is posted whatever the projection says.
     let mut late = SessionWait::rewrap(1);
     assert_eq!(late.step(&unasked(1_900_000, 3_900)), WaitStep::Idle);
     assert!(matches!(

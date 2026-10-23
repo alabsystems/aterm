@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typed-word dog cameo. A canine word (`dog`, `perro`, `子犬`, …) past
-//! [`crate::kitty_summon`]'s keystroke gate pops a dog up next to the cursor, rolling a breed
-//! from [`crate::dog_glyphs_gen::DOG_HEADS`] and a coat; a re-summon while a dog is on screen
-//! rolls a different breed.
-//!
-//! Pure lifecycle (envelope, seeded roll, entry bounce): the host reads `alpha`/`bob`/`look`
-//! each frame and hands them to `word_decorations::dog_cameo`, which bakes through
-//! [`crate::dog_baker::DogBaker`].
+//! Typed-word dog cameo lifecycle, seeded breed/coat roll, and entry bounce.
 
 use std::time::Duration;
 
@@ -17,24 +10,18 @@ use aterm_time::Instant;
 use crate::dog_glyphs_gen::{DOG_HEADS, DogGlyphId};
 use crate::genome::mix;
 
-/// Entry fade.
 const FADE_IN: Duration = Duration::from_millis(140);
-/// How long the dog stays at full presence after its entry.
 const HOLD: Duration = Duration::from_millis(2600);
-/// Exit fade.
 const FADE_OUT: Duration = Duration::from_millis(420);
 const FADE_IN_HOLD: Duration = Duration::from_millis(140 + 2600);
 const VISIT_LIFE: Duration = Duration::from_millis(140 + 2600 + 420);
 const _: () = assert!(FADE_IN_HOLD.as_nanos() == FADE_IN.as_nanos() + HOLD.as_nanos());
 const _: () = assert!(VISIT_LIFE.as_nanos() == FADE_IN_HOLD.as_nanos() + FADE_OUT.as_nanos());
 
-/// Entry bounce: two equal-length hops, the second half as high, finished inside the hold.
 const HOP_MS: u64 = 420;
 const HOPS: u64 = 2;
-/// First hop's peak lift, as a fraction of a cell (negative = up at draw time).
 const HOP_LIFT: f32 = 0.22;
 
-/// Distinct seed salts so the breed and coat rolls are independent.
 const BREED_SALT: u64 = 0x646f_6721_6272_6564; // b"dog!bred"
 const COAT_SALT: u64 = 0x646f_6721_636f_6174; // b"dog!coat"
 
@@ -45,8 +32,7 @@ const fn scale(entropy: u64, upper: usize) -> usize {
     ((entropy as u128 * upper as u128) >> 64) as usize
 }
 
-/// One visit's rolled identity: which authored breed, wearing which
-/// [`COAT_RAMP`](crate::cat_baker::COAT_RAMP) stop.
+/// One visit's rolled identity: breed head and coat ramp index.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DogLook {
     /// The authored breed head.
@@ -66,9 +52,7 @@ pub struct DogCameo {
 }
 
 impl DogCameo {
-    /// Summon a dog: roll a breed + coat from `seed` and restart the envelope.
-    /// While a dog is visible the roll excludes the resident breed. A no-op on
-    /// an empty roster.
+    /// Summon a dog by rolling a breed and coat from `seed` and restarting the envelope.
     #[inline]
     pub fn on_summon(&mut self, now: Instant, seed: u64) {
         if DOG_HEADS.is_empty() {
@@ -77,8 +61,6 @@ impl DogCameo {
         let resident = self.active(now).then_some(self.look).flatten();
         let breed = match resident {
             Some(prev) if DOG_HEADS.len() > 1 => {
-                // Uniform over the roster minus the resident breed: draw from
-                // `len - 1` tickets and skip over the resident's index.
                 let prev_ix = DOG_HEADS.iter().position(|&b| b == prev.breed).unwrap_or(0);
                 let draw = scale(mix(seed ^ BREED_SALT), DOG_HEADS.len() - 1);
                 DOG_HEADS[if draw >= prev_ix { draw + 1 } else { draw }]
@@ -98,8 +80,7 @@ impl DogCameo {
             .is_some_and(|at| now.saturating_duration_since(at) < VISIT_LIFE)
     }
 
-    /// The visit's presence envelope at `now`: `0..=255` through fade-in →
-    /// hold → fade-out, `0` before the first summon and after expiry.
+    /// The visit's presence envelope (`0..=255`) at `now`.
     #[inline]
     #[must_use]
     pub fn alpha(&self, now: Instant) -> u8 {
@@ -120,8 +101,7 @@ impl DogCameo {
         }
     }
 
-    /// The entry bounce at `now`, in cell fractions (`<= 0`: up): two damped
-    /// hops, then flat. Under reduced motion the host does not call this.
+    /// The entry bounce at `now` in cell fractions (`<= 0` is up).
     #[inline]
     #[must_use]
     pub fn bob(&self, now: Instant) -> f32 {
@@ -134,13 +114,11 @@ impl DogCameo {
         }
         let hop = ms / HOP_MS;
         let phase = (ms % HOP_MS) as f32 / HOP_MS as f32;
-        // Each hop is a half-sine arc at half the previous hop's height.
         let lift = HOP_LIFT / (1 << hop) as f32;
         -lift * (phase * std::f32::consts::PI).sin()
     }
 
     /// The current visit's rolled identity (`None` before the first summon).
-    /// Stays set through the fade-out so a mid-fade frame keeps its sprite.
     #[inline]
     #[must_use]
     pub const fn look(&self) -> Option<DogLook> {
@@ -156,7 +134,6 @@ mod tests {
         Instant::now()
     }
 
-    /// The envelope rises, holds and expires, and `active` agrees with `alpha` at every edge.
     #[test]
     fn envelope_rises_holds_and_expires() {
         let mut d = DogCameo::default();
@@ -176,7 +153,6 @@ mod tests {
         );
     }
 
-    /// A re-summon while the dog is visible rolls a different breed; many seeds reach many.
     #[test]
     fn resummons_parade_distinct_breeds() {
         let t = t0();
@@ -207,7 +183,6 @@ mod tests {
         );
     }
 
-    /// The bounce lifts inside the hop window, the second hop lower, then settles to exactly 0.
     #[test]
     fn entry_bounce_hops_then_settles() {
         let mut d = DogCameo::default();

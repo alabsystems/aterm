@@ -158,8 +158,6 @@ impl TerminalHandler<'_> {
 mod tests {
     use crate::terminal::Terminal;
 
-    /// The handback's `CAN` ends a query its holder left torn. Answering it
-    /// would type the reply into the next holder's input (the shell's).
     #[test]
     fn a_handback_does_not_answer_a_torn_query() {
         let mut t = Terminal::new(24, 80);
@@ -174,7 +172,6 @@ mod tests {
         assert_eq!(t.take_response(), None);
     }
 
-    /// `bytes` fed in two reads cut at `cut`.
     fn fed(bytes: &[u8], cut: usize) -> Terminal {
         let mut t = Terminal::new(24, 80);
         let (head, tail) = bytes.split_at(cut);
@@ -183,11 +180,6 @@ mod tests {
         t
     }
 
-    /// A DCS is answered or applied only at ST, as xterm answers it. An ESC that
-    /// does not begin ST breaks the string off and cancels it, as CAN and SUB do,
-    /// so a DECRQSS or XTGETTCAP query is not answered (`ESC P $ q m ESC [ 0 m`
-    /// replied `ESC P 1 $ r 0 m ESC \`), and what the ESC begins runs as
-    /// anywhere. The ESC and the byte after it in two reads decide the same way.
     #[test]
     fn a_query_broken_off_by_an_escape_is_not_answered() {
         for query in [&b"\x1bP$qm"[..], b"\x1bP+q544E"] {
@@ -208,7 +200,6 @@ mod tests {
         }
     }
 
-    /// Wraps `payload` in a tmux passthrough sequence with doubled ESC bytes.
     fn tmux_wrapped(payload: &[u8]) -> Vec<u8> {
         let mut out = b"\x1bPtmux;".to_vec();
         for &byte in payload {
@@ -221,12 +212,6 @@ mod tests {
         out
     }
 
-    /// A DECRQSS or XTGETTCAP wrapped in a tmux passthrough that reached aterm
-    /// itself (a tab that inherited `TMUX` with no tmux in it) is answered as
-    /// the bare query is, however the bytes are cut: tmux 3.5a hands its own
-    /// terminal the bare query for that wrapper (measured 2026-10-19), and the
-    /// parser unwraps it the same way. RED before: the wrapper doubled the
-    /// query's ST into `ESC ESC \`, which broke it off unanswered.
     #[test]
     fn a_query_wrapped_for_tmux_is_answered_as_the_bare_one() {
         for query in [&b"\x1bP$qm\x1b\\"[..], b"\x1bP+q544E\x1b\\"] {
@@ -244,8 +229,6 @@ mod tests {
         }
     }
 
-    /// Negative control: ST ends a query complete however it is cut, the ESC in
-    /// one read and the `\` in the next included, and so does the 8-bit ST.
     #[test]
     fn a_query_ended_at_st_is_answered_however_it_is_cut() {
         for (query, reply) in [
@@ -266,11 +249,6 @@ mod tests {
         }
     }
 
-    /// The strings the engine consumes and ignores (tmux control mode, the SSH
-    /// conductor, DECDLD, a kitty remote-control command, the DCS
-    /// synchronized-update pair) end with nothing at ST or broken off alike, and
-    /// what breaks one off runs. A tmux passthrough wrapper, unwrapped, runs
-    /// its payload (an OSC here) and ends at its own `ESC \`.
     #[test]
     fn a_consumed_string_broken_off_runs_what_breaks_it_off() {
         let heads: [&[u8]; 6] = [
@@ -297,12 +275,6 @@ mod tests {
         }
     }
 
-    /// A wrapper head with no wrapper after it (a program that wrote `ESC P tmux;`
-    /// and doubled nothing, a stray head in a file `cat` prints) leaves the shell's
-    /// and the next program's sequences working: an ST-ended title is set and the
-    /// text after it prints, a RIS ends the wrapper whole, and a query after BEL-ended
-    /// prompts is answered. RED before: the head's wrapper stayed open past RIS, and
-    /// its `ESC \` ended the wrapper instead of the title, which swallowed the text.
     #[test]
     fn a_stray_wrapper_head_breaks_no_sequence_after_it() {
         let head = b"\x1bPtmux;";
@@ -336,8 +308,6 @@ mod tests {
         assert!(t.parser_is_ground());
     }
 
-    /// A query torn at the ESC that may begin its ST is still open: the handback's
-    /// `CAN` ends it, and it is not answered.
     #[test]
     fn a_handback_does_not_answer_a_query_torn_at_its_escape() {
         for query in [&b"\x1b[1m\x1bP$qm\x1b"[..], b"\x1bP+q544E\x1b"] {
@@ -348,7 +318,6 @@ mod tests {
         }
     }
 
-    /// The cells carrying an inline image.
     fn image_cells(t: &Terminal) -> usize {
         let grid = t.grid();
         (0..grid.rows())
@@ -357,9 +326,6 @@ mod tests {
             .count()
     }
 
-    /// A sixel wrapped in a tmux passthrough that reached aterm itself is placed
-    /// as the bare one is, however the bytes are cut. RED before: its doubled
-    /// ST broke it off.
     #[test]
     fn a_sixel_wrapped_for_tmux_is_placed() {
         let sixel = b"\x1bPq#0;2;100;0;0#0~~~~~~-~~~~~~\x1b\\";
@@ -371,8 +337,6 @@ mod tests {
         }
     }
 
-    /// A sixel is placed only at ST: one broken off by an ESC is dropped, as one
-    /// CAN or SUB cancels is. Negative control: ST places it, however it is cut.
     #[test]
     fn a_sixel_broken_off_by_an_escape_is_not_placed() {
         let sixel = b"\x1bPq#0;2;100;0;0#0~~~~~~-~~~~~~";

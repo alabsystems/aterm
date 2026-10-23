@@ -1,18 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shared vocabulary: a package identity, a resolved graph, a target cell, and the
-//! per-package facts every verb reports on.
-//!
-//! A package is `(name, version)`, never a bare name: `cargo pkgid -p <name>` errors as ambiguous
-//! once a second major version is in the graph. Cost is a dominator, not a subtree, since
-//! subtrees double-bill shared dependencies; [`crate::dominator`] computes it.
+//! Package identity, resolved dependency graph, target cell, and per-package facts.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A resolved package identity. Ordering is (name, version) so reports are stable and two
-/// versions of one crate sort adjacently. `Default` exists only so [`Graph`] can derive it; an
-/// empty `PkgId` is never a legal package.
+/// A resolved `(name, version)` package identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PkgId {
     pub name: String,
@@ -39,8 +32,7 @@ impl std::fmt::Display for PkgId {
     }
 }
 
-/// One (triple, root package) measurement cell. Resolution is offline and needs no installed
-/// std; a cell that cannot resolve is named, never passed.
+/// One `(triple, root package)` measurement cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     /// Short handle used in reports and policy (`mac-arm`, `linux`, …).
@@ -50,8 +42,7 @@ pub struct Cell {
     pub package: String,
 }
 
-/// A resolved dependency graph for one cell: normal edges only, rooted at
-/// [`Cell::package`].
+/// A resolved normal-edge dependency graph rooted at [`Cell::package`].
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     pub root: PkgId,
@@ -60,8 +51,7 @@ pub struct Graph {
 }
 
 impl Graph {
-    /// Packages reachable from the root, optionally with one node blocked (the counterfactual
-    /// [`crate::dominator`] needs).
+    /// Packages reachable from the root, optionally with `blocked` excluded.
     pub fn reach(&self, blocked: Option<&PkgId>) -> BTreeSet<PkgId> {
         let mut seen = BTreeSet::new();
         if Some(&self.root) == blocked {
@@ -88,19 +78,15 @@ impl Graph {
 /// Per-package facts, measured once and reused by every verb.
 #[derive(Clone, Debug, Default)]
 pub struct PkgFacts {
-    /// Physical lines across every `*.rs` under the package root
-    /// (`loc_method = "rs-physical-all-files-v1"`).
+    /// Physical lines across every `*.rs` under the package root.
     pub loc: u64,
-    /// `\bunsafe\b` tokens, not `unsafe {` blocks: macro-generated FFI emits
-    /// `unsafe` without blocks.
+    /// Count of `\bunsafe\b` tokens across package sources.
     pub unsafe_tokens: u64,
-    /// A build script is code the compiler executes, and `targo trust` marks every one
-    /// `-Ztrust-verify=off`, so it is a budget row of its own.
+    /// Whether the package has a build script.
     pub has_build_rs: bool,
     pub is_proc_macro: bool,
     pub license: String,
-    /// `false` for aterm's own code ([`crate::provenance::is_first_party`]); `[patch.crates-io]`
-    /// path forks count as third-party.
+    /// `false` for aterm's own crates ([`crate::provenance::is_first_party`]).
     pub is_third_party: bool,
     /// Absolute path to the package's manifest directory, when known.
     pub root_dir: Option<std::path::PathBuf>,
@@ -141,8 +127,7 @@ impl CellSurvey {
             .count()
     }
 
-    /// Names appearing at two or more versions in this cell: the dedup
-    /// opportunity, reported apart from removals.
+    /// Third-party package names appearing at two or more versions in this cell.
     pub fn duplicate_names(&self) -> BTreeMap<String, Vec<String>> {
         let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in self.third_party() {

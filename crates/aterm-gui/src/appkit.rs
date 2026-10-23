@@ -190,7 +190,8 @@ unsafe extern "C" {
 /// The already-created application, borrowed, or `None` before its creation.
 #[must_use]
 pub(crate) fn existing_application(_main_thread: MainThread) -> Option<Id> {
-    // SAFETY: NSApp is AppKit's exported, nullable application pointer.
+    // SAFETY: NSApp is AppKit's exported, nullable application pointer. AppKit
+    // initializes it on the main thread; the witness keeps this load on that thread.
     let app = unsafe { NS_APP };
     (!app.is_null()).then_some(app)
 }
@@ -204,7 +205,8 @@ pub(crate) fn beep() {
 /// The `NSAppearanceName` for the light or dark system appearance, +0: AppKit's own global, never released or retained.
 #[must_use]
 pub(crate) fn appearance_name(dark: bool) -> Id {
-    // SAFETY: both symbols are AppKit globals that live for the whole process.
+    // SAFETY: both symbols are AppKit globals that live for the whole process; reading one
+    // is a plain load of an initialised `NSString *`.
     unsafe {
         if dark {
             NS_APPEARANCE_NAME_DARK_AQUA

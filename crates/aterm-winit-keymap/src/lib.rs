@@ -10,7 +10,7 @@ use aterm_window::keyboard::{
 
 use aterm_types::keyboard::{Key, NamedKey};
 
-/// Map a winit logical [`WinitKey`] (e.g. `ev.logical_key` or `key_without_modifiers()`).
+/// Maps a winit logical [`WinitKey`] to the engine's [`Key`].
 #[inline]
 #[must_use]
 pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
@@ -19,7 +19,6 @@ pub fn map_logical_key(key: &WinitKey) -> Option<Key> {
             let mut chars = s.chars();
             let c = chars.next()?;
             if chars.next().is_some() {
-                // Not a single-codepoint key press (IME / composed text).
                 return None;
             }
             Some(Key::Character(c))
@@ -166,7 +165,6 @@ pub fn map_numpad_key(
             let mut chars = s.chars();
             let c = chars.next()?;
             if chars.next().is_some() {
-                // Not a single-codepoint key press (IME / composed text).
                 return None;
             }
             match c {
@@ -323,8 +321,7 @@ const fn is_unicode_scalar(v: u32) -> bool {
     v <= 0xD7FF || (v >= 0xE000 && v <= 0x10_FFFF)
 }
 
-/// Encode a Kitty key event descriptor `(unicode_key, shifted_key, base_layout_key,
-/// modifiers_mask, event_type)` into a 14-byte little-endian wire frame.
+/// Encodes a Kitty key event descriptor into a 14-byte little-endian wire frame.
 #[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_le(
@@ -360,8 +357,7 @@ pub const fn encode_kitty_key_wire_le(
     ])
 }
 
-/// Decode a 14-byte little-endian Kitty key event wire frame produced by
-/// [`encode_kitty_key_wire_le`].
+/// Decodes a 14-byte little-endian Kitty key event wire frame.
 #[inline]
 #[must_use]
 pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, char, u8, u8)> {
@@ -394,8 +390,7 @@ pub const fn decode_kitty_key_wire_le(wire: &[u8; 14]) -> Option<(char, char, ch
     Some((u, s, b, modifiers_mask, event_type))
 }
 
-/// Encode a Kitty key event descriptor `(unicode_key, shifted_key, base_layout_key,
-/// modifiers_mask, event_type)` into a 14-byte big-endian wire frame.
+/// Encodes a Kitty key event descriptor into a 14-byte big-endian wire frame.
 #[inline]
 #[must_use]
 pub const fn encode_kitty_key_wire_be(
@@ -476,7 +471,6 @@ mod tests {
     use super::*;
     use aterm_window::keyboard::SmolStr;
 
-    /// Verify F13–F35 and media/audio keys map to their engine `NamedKey` variants.
     #[test]
     fn maps_function_keys_past_f12_and_media_keys() {
         for (winit, want) in [
@@ -498,9 +492,6 @@ mod tests {
         WinitKey::Unidentified(aterm_window::keyboard::NativeKey::Unidentified)
     }
 
-    /// A digit at the keypad location is the keypad digit — the engine key
-    /// that reaches DECKPAM's SS3 and kitty's KP codes — not the main row's
-    /// `Character('5')` that the logical key alone would give.
     #[test]
     fn numpad_location_promotes_digit_to_numpad_key() {
         assert_eq!(
@@ -521,8 +512,6 @@ mod tests {
         );
     }
 
-    /// KP_Enter arrives from every platform as the main block's `Enter`; on
-    /// the keypad it is NumpadEnter (CR / SS3 M / `CSI 57414 u`).
     #[test]
     fn numpad_enter_is_not_main_enter() {
         assert_eq!(
@@ -535,10 +524,6 @@ mod tests {
         );
     }
 
-    /// NumLock off: the navigation keysym is the keypad twin of the main-block
-    /// key, and the centre key — which winit names on no platform — is
-    /// NumpadBegin by its physical code, whether xkb reports `Unidentified` or
-    /// Windows reports `Clear`.
     #[test]
     fn numlock_off_navigation_gets_numpad_twin() {
         assert_eq!(
@@ -579,9 +564,6 @@ mod tests {
         );
     }
 
-    /// The identity is the glyph the LAYOUT typed, not the scancode: the same
-    /// physical decimal key is KP_Decimal on a US layout and KP_Separator on a
-    /// de-DE `keypad(comma)` layout, and must type `,` there — never `.`.
     #[test]
     fn keypad_identity_is_the_glyph_not_the_scancode() {
         assert_eq!(
@@ -602,8 +584,6 @@ mod tests {
         );
     }
 
-    /// A keypad key with no keypad identity — KP_Tab, or a keypad key the user
-    /// remapped to a letter — is left to the logical route.
     #[test]
     fn keypad_key_without_keypad_identity_takes_the_logical_route() {
         assert_eq!(
@@ -624,9 +604,6 @@ mod tests {
         );
     }
 
-    /// The negative control: the main block is untouched. `5` above `R` and
-    /// the main Return are not keypad keys, and the LOCATION — not the
-    /// scancode — is what says a key is on the keypad.
     #[test]
     fn standard_location_is_untouched() {
         assert_eq!(
@@ -711,9 +688,6 @@ mod tests {
         );
     }
 
-    /// A right-side modifier press is the engine's *Right key (kitty's
-    /// `RIGHT_SHIFT` 57447, not `LEFT_SHIFT` 57441); a left or standard one,
-    /// and every non-modifier key, is unchanged.
     #[test]
     fn a_right_side_modifier_press_maps_to_its_right_variant() {
         for (winit, left, right) in [
@@ -742,9 +716,6 @@ mod tests {
         assert_eq!(sided_modifier(a.clone(), KeyLocation::Right), a);
     }
 
-    /// Each sided modifier's physical twin is the other side of the SAME
-    /// modifier (the pairing a release's kitty bit is decided by), the map is
-    /// its own inverse, and no other key has one.
     #[test]
     fn a_sided_modifier_has_its_other_side_as_twin() {
         for (l, r) in [

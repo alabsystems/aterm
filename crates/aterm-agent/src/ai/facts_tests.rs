@@ -263,4 +263,35 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
     assert_eq!(view_after.limited_until, None);
     assert_eq!(view_after.next_sign_in, None);
     assert!(view_after.made);
+
+    // Also verify when all rows have explicit `dir` and the serving row is SignedOut.
+    let m27_3_dir = store.login_dir("m27-3").expect("m27-3 dir");
+    std::fs::create_dir_all(&m27_3_dir).expect("mkdir m27-3");
+    let all_dirs_toml = format!(
+        "[[account]]\nlabel = \"m27\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"m27@example.test\"\n\n\
+         [[account]]\nlabel = \"m27-3\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"m27-3@example.test\"\n",
+        m27_dir.display().to_string(),
+        m27_3_dir.display().to_string()
+    );
+    std::fs::write(&roster_path, &all_dirs_toml).expect("all-dirs roster");
+    store
+        .transact_logins(now + 10, &mut note, |state, _| {
+            Ok(accounts::note_auth(
+                state,
+                "m27",
+                accounts::Auth::SignedOut,
+                now + 10,
+            ))
+        })
+        .expect("mark m27 signed out");
+    let f_signed_out = gather(&m, &CLAUDE);
+    let view_signed_out = f_signed_out
+        .accounts
+        .expect("accounts view with all explicit dirs");
+    assert_eq!(view_signed_out.label, "m27");
+    assert_eq!(
+        view_signed_out.next_sign_in.as_deref(),
+        Some("m27"),
+        "when m27 is signed out and m27-3 is limited, next_sign_in falls back to m27 itself"
+    );
 }

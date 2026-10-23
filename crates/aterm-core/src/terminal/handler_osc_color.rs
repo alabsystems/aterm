@@ -7,8 +7,7 @@
 use super::handler::TerminalHandler;
 use aterm_types::{ColorPalette, Rgb};
 
-/// Per-sequence response cap for OSC 4 / OSC 21 palette queries when no
-/// [`PolicyEngine`](aterm_policy::engine::PolicyEngine) is installed.
+/// Per-sequence response cap for OSC 4 / OSC 21 palette queries when the policy sets none.
 pub(super) const LEGACY_PALETTE_PER_SEQUENCE_MAX: usize = 16;
 
 /// The three dynamic colors addressable via OSC 10/11/12.
@@ -57,7 +56,7 @@ impl DynamicColorSlot {
     }
 }
 
-/// OSC 21 queries distinguish a concrete color.
+/// An OSC 21 query's value: a concrete color, a known field with no value, or an unknown field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Osc21QueryValue {
     Color(Rgb),
@@ -65,7 +64,6 @@ enum Osc21QueryValue {
     Unknown,
 }
 
-/// Longest unknown OSC 21 key echoed back.
 const MAX_OSC21_ECHO_KEY_BYTES: usize = 64;
 
 /// Whether an unrecognised OSC 21 key may be echoed in a `key=?` reply.
@@ -128,7 +126,6 @@ impl TerminalHandler<'_> {
             };
 
             if spec == "?" {
-                // Drop queries past the per-sequence cap, but keep scanning so
                 if responses_emitted >= per_seq_cap {
                     i += 2;
                     continue;
@@ -152,7 +149,7 @@ impl TerminalHandler<'_> {
                 self.send_response(cap, response.as_bytes());
                 responses_emitted += 1;
             } else {
-                // Set: gated by `modes.allow_palette_reconfigure` (default off);
+                // Set palette entry.
                 if let Some(color) = ColorPalette::parse_color_spec(spec) {
                     if self.modes.allow_palette_reconfigure {
                         self.color.palette_mut().set(index, color);
@@ -319,7 +316,6 @@ impl TerminalHandler<'_> {
 
     fn osc_21_query_color(&mut self, key: &str) -> Osc21QueryValue {
         if let Some(slot) = DynamicColorSlot::from_name(key) {
-            // Unlike OSC 12's legacy single-color query, OSC 21 can faithfully
             if slot == DynamicColorSlot::Cursor && self.color.cursor_color.is_none() {
                 return Osc21QueryValue::Undefined;
             }
@@ -343,7 +339,6 @@ impl TerminalHandler<'_> {
         Osc21QueryValue::Color(self.color.palette().get(index))
     }
 
-    /// Select a dynamic/undefined value for the OSC 21 fields that support it.
     fn osc_21_set_dynamic_color(&mut self, key: &str) {
         if key.eq_ignore_ascii_case("cursor") {
             self.color.cursor_color = None;
@@ -361,8 +356,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Reset a bare OSC 21 key to the same host-configured baseline as its dedicated reset
-    /// sequence.
     fn osc_21_reset_color(&mut self, key: &str) {
         if let Some(slot) = DynamicColorSlot::from_name(key) {
             self.reset_dynamic_color_slot(slot);
@@ -404,7 +397,6 @@ impl TerminalHandler<'_> {
             return;
         }
         if let Ok(index) = key.parse::<u8>() {
-            // A palette slot: gated by allow_palette_reconfigure (fail-closed).
             if !self.modes.allow_palette_reconfigure {
                 self.note_palette_set_refused();
                 return;
@@ -460,8 +452,7 @@ impl TerminalHandler<'_> {
         self.color.stack.push_back(entry);
     }
 
-    /// Handle OSC 30101: pop the kitty color stack and restore all dynamic colors to the baseline
-    /// plus the popped diff.
+    /// Handle OSC 30101: pop the kitty color stack.
     pub(super) fn handle_osc_30101(&mut self) {
         if let Some(entry) = self.color.stack.pop_back() {
             let palette = self.modes.allow_palette_reconfigure;
@@ -571,7 +562,7 @@ impl TerminalHandler<'_> {
         self.note_color_change(slot.color_target());
     }
 
-    /// Record a palette set.
+    /// Record a palette set refused by the `allow_palette_reconfigure` gate.
     #[inline]
     fn note_palette_set_refused(&mut self) {
         if self.color.palette_set_refused {
@@ -611,7 +602,6 @@ mod osc_color_response_cap_tests {
     use crate::terminal::Terminal;
     use crate::terminal::response_capability::ResponseCapability;
 
-    /// Count OSC-response frames in a raw response buffer.
     fn count_osc_frames(bytes: &[u8]) -> usize {
         let mut count = 0;
         let mut i = 0;
@@ -626,7 +616,6 @@ mod osc_color_response_cap_tests {
         count
     }
 
-    /// Build OSC 4 params with `n` query pairs, as owned byte vectors callers borrow as `&[&[u8]]`.
     fn build_osc_4_query_params(n: usize) -> Vec<Vec<u8>> {
         let mut params: Vec<Vec<u8>> = Vec::with_capacity(1 + n * 2);
         params.push(b"4".to_vec());

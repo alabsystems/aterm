@@ -2,44 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The in-flight output state of a [`TerminalCheckpoint`](super::TerminalCheckpoint):
-//! what a finished sequence left in the engine (not the parser) that output still
-//! queued on the PTY at a seamless-update park relies on. The parser carry
-//! (`checkpoint_parser`) continues a sequence split at the park; this carries:
-//!
-//! * the REP (`CSI b`) character, raw, so `X` then `CSI 40 b` repeats wherever
-//!   the park falls;
-//! * an SGR 58 underline colour, raw (`0x01_RRGGBB` or `0x02_0000NN`), which the
-//!   pen ([`StyleRepr`](super::StyleRepr)) does not hold;
-//! * an open OSC 8 link and its `id=`, so the rest of the link's text is linked;
-//! * a VT52 `ESC Y` waiting for its row and column bytes, which would otherwise
-//!   print as text;
-//! * a just-written ZWJ (U+200D), so the emoji after it joins the previous cell;
-//! * the XTPUSHSGR stack (`CSI # {`), so a later XTPOPSGR restores the pushed pen;
-//! * the XTSAVE'd DEC private modes (`CSI ? Ps s`), so a later XTRESTORE restores
-//!   them.
-//!
-//! [`OutputStateRepr`] crosses as one additive `CheckpointMeta` key, absent when
-//! none of it is set. A consumer that predates it ignores the key, so a hop to an
-//! older build still re-parks over queued output for an open link or a VT52 address
-//! ([`Terminal::output_state_in_flight`]) and loses the rest.
-//!
-//! The PTY keeper's META (`aterm-gui`'s `seamless::keeper_meta`) carries none of
-//! it: that META is resent only when the modes change, so its in-flight state may
-//! be hours stale at a crash.
+//! In-flight terminal output state carried across a [`TerminalCheckpoint`](super::TerminalCheckpoint):
+//! REP (`CSI b`), SGR 58 underline colour, open OSC 8 hyperlink, pending VT52 `ESC Y` address,
+//! pending ZWJ (U+200D), XTPUSHSGR stack (`CSI # {`), and XTSAVE'd DEC private modes (`CSI ? Ps s`).
+//! [`OutputStateRepr`] crosses as one optional `CheckpointMeta` key, omitted when default.
 
 use super::transient_state::Vt52CursorState;
 use super::{SGR_STACK_MAX_DEPTH, SgrPushMask, SgrStackEntry, Terminal};
 use crate::grid::{CellFlags, CurrentStyle, PackedColor};
 
-/// An OSC 8 link still open at the checkpoint: the URI and its `id=`, as the
-/// OSC 8 handler stored them.
+/// An OSC 8 hyperlink still open at the checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HyperlinkRepr {
     /// The link's URI.
     pub uri: String,
-    /// The `id=` parameter that groups the link's cells, when it had one.
+    /// Optional `id=` parameter grouping the link's cells.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -47,13 +25,11 @@ pub struct HyperlinkRepr {
     pub id: Option<String>,
 }
 
-/// A VT52 `ESC Y` (direct cursor address) whose address bytes have not all
-/// arrived.
+/// A VT52 `ESC Y` direct cursor address whose address bytes have not all arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Vt52AddressRepr {
-    /// The row already read (the address byte less 32), the column still to
-    /// come; `None` while both are still to come.
+    /// Decoded row (address byte minus 32) when waiting for column, or `None` when waiting for both.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -61,84 +37,77 @@ pub struct Vt52AddressRepr {
     pub row: Option<u8>,
 }
 
-/// One XTPUSHSGR (`CSI # {`) entry still on the stack: the pen as pushed,
-/// raw as the carried pen is (`CheckpointMeta`'s `style_*` bits), its SGR 58
-/// underline colour, and which attribute groups the push named (all of them
-/// for a bare push).
+/// One XTPUSHSGR (`CSI # {`) entry on the SGR stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SgrPushRepr {
-    /// The pushed foreground, `PackedColor` bits.
+    /// Pushed foreground (`PackedColor` bits).
     pub fg: u32,
-    /// The pushed background, `PackedColor` bits.
+    /// Pushed background (`PackedColor` bits).
     pub bg: u32,
-    /// The pushed SGR cell flags, `CellFlags` bits.
+    /// Pushed SGR cell flags (`CellFlags` bits).
     pub flags: u16,
-    /// The pushed DECSCA protection (XTPOPSGR keeps the current one).
+    /// Pushed DECSCA protection flag.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub protected: bool,
-    /// The pushed SGR 58 underline colour, raw.
+    /// Pushed SGR 58 underline colour, raw.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub underline_color: Option<u32>,
-    /// The attribute groups the push named (`SgrPushMask` bits).
+    /// Attribute groups named by the push (`SgrPushMask` bits).
     pub mask: u16,
 }
 
-/// One XTSAVE'd (`CSI ? Ps s`) DEC private mode and the value it was saved
-/// with.
+/// One XTSAVE'd (`CSI ? Ps s`) DEC private mode and its saved state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SavedModeRepr {
-    /// The DEC private mode number.
+    /// DEC private mode number.
     pub mode: u16,
-    /// Whether it was set when saved.
+    /// Whether the mode was set when saved.
     pub set: bool,
 }
 
-/// The engine's in-flight output state (see the module docs). `Default` is none of
-/// it set: a fresh engine, or a producer that predates the key.
+/// In-flight terminal output state carried across a checkpoint (`Default` when none is active).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OutputStateRepr {
-    /// The character REP (`CSI b`) repeats, raw (before charset translation,
-    /// which REP applies at the repeat).
+    /// Raw character repeated by REP (`CSI b`) before charset translation.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub rep: Option<char>,
-    /// The SGR 58 underline colour, raw.
+    /// SGR 58 underline colour, raw.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub underline_color: Option<u32>,
-    /// The open OSC 8 link.
+    /// Open OSC 8 hyperlink.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub hyperlink: Option<HyperlinkRepr>,
-    /// The VT52 `ESC Y` waiting for its address.
+    /// Pending VT52 `ESC Y` cursor address.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub vt52_address: Option<Vt52AddressRepr>,
-    /// The last zero-width character written was a ZWJ (U+200D): an emoji
-    /// written next joins the previous cell when that cell ends with it.
+    /// Whether the last zero-width character written was a ZWJ (U+200D).
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_false"))]
     pub zwj_pending: bool,
-    /// The XTPUSHSGR stack, oldest first.
+    /// XTPUSHSGR stack, oldest first.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub sgr_stack: Vec<SgrPushRepr>,
-    /// The XTSAVE'd DEC private modes, by mode number.
+    /// XTSAVE'd DEC private modes sorted by mode number.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
@@ -147,7 +116,7 @@ pub struct OutputStateRepr {
 }
 
 impl OutputStateRepr {
-    /// Whether none of it is set (the wire omits the whole projection).
+    /// Returns whether no in-flight output state is set.
     #[inline]
     #[must_use]
     pub fn is_default(&self) -> bool {
@@ -165,9 +134,7 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Read a carried [`OutputStateRepr`], or the default when the value is not one:
-/// `CheckpointMeta` is parsed whole (as with `lenient_title`), and state a successor
-/// can live without must not cost the screen.
+/// Deserializes a carried [`OutputStateRepr`], falling back to `Default` if unreadable.
 #[cfg(feature = "serde")]
 pub(super) fn lenient_output_state<'de, D>(deserializer: D) -> Result<OutputStateRepr, D::Error>
 where
@@ -222,21 +189,13 @@ impl Terminal {
                     .iter()
                     .map(|(&mode, &set)| SavedModeRepr { mode, set })
                     .collect();
-                // The map's order is arbitrary and the meta bytes are digested as
-                // sent, so sort.
                 saved.sort_unstable_by_key(|saved| saved.mode);
                 saved
             },
         }
     }
 
-    /// Install a carried [`OutputStateRepr`], replacing this engine's (what the
-    /// checkpoint does not hold is cleared). Each value goes through the engine's own
-    /// door: the link through the OSC 8 handler, which refuses what it would refuse from
-    /// a program (a refused link costs only its continuation); a control REP character
-    /// is dropped, as the engine never records one; the SGR stack keeps its newest
-    /// `SGR_STACK_MAX_DEPTH` entries, as XTPUSHSGR evicts the oldest; a saved mode
-    /// `query_dec_mode` does not know is dropped, which also bounds the map.
+    /// Installs a carried [`OutputStateRepr`], sanitizing each field through the engine's bounds and handlers.
     pub(super) fn apply_output_state_repr(&mut self, repr: &OutputStateRepr) {
         self.transient.last_graphic_char = repr.rep.filter(|c| !c.is_control());
         self.transient.current_underline_color = repr.underline_color;
@@ -261,9 +220,6 @@ impl Terminal {
                 mask: SgrPushMask::from_bits(pushed.mask),
             })
             .collect();
-        // Closed first: the handler ignores a URI it refuses, which would leave
-        // this engine's own link open. An `id=` cannot hold `:` or `;` (the handler
-        // splits on both), so a carried id rebuilds its parameter exactly.
         self.transient.current_hyperlink = None;
         self.transient.current_hyperlink_id = None;
         let known: Vec<SavedModeRepr> = {

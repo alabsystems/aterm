@@ -25,7 +25,7 @@ fn create_marker(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn child(root: &Path) {
     TERM_SEEN.store(false, AtomicOrdering::SeqCst);
     // SAFETY: the handler lives for this re-executed test process and only stores a lock-free
-    // atomic.
+    // atomic; this child runs one exact test, then exits.
     let previous = unsafe { libc::signal(libc::SIGTERM, term_seen as extern "C" fn(i32) as usize) };
     assert_ne!(previous, libc::SIG_ERR, "install TERM handler");
     create_marker(&root.join("ready"), b"ready\n").expect("ready marker");

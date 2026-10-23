@@ -26,7 +26,7 @@ pub enum Progress {
     /// atomic stage publish — seconds each, one phase.
     Verifying { version: String },
     /// Verified and published: the in-session apply lane applies it in place (automatic by default,
-    /// landing within `aterm-gui`'s `LANDS_WITHIN`, 15 minutes; on a press while `[update]
+    /// landing within `aterm-gui`'s `LANDS_WITHIN`, 55 seconds; on a press while `[update]
     /// auto_apply` is off).
     Staged { version: String, build: u64 },
     /// The download was cut short by something that will heal on its own (the download host

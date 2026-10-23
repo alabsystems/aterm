@@ -498,7 +498,6 @@ pub fn relay_cmd(paths: &Paths, target: &Target) -> Result<Cmd, String> {
 /// What Screen Sharing.app opens: the admin at the relay's local end.
 #[must_use]
 pub fn vnc_url(admin: &str, local_port: u16) -> String {
-    // {admin}@127.0.0.1:{local_port}")
     format!("vnc://{admin}@127.0.0.1:{local_port}")
 }
 

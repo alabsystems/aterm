@@ -11,7 +11,11 @@ use crate::Id;
 /// A value that owns or borrows an AppKit `NSView`.
 ///
 /// # Safety
-/// [`ns_view`](Self::ns_view) returns [`Id::NIL`] or an `NSView` live for as long as `self`.
+///
+/// [`ns_view`](Self::ns_view) answers [`Id::NIL`] or an `NSView` that stays
+/// live for as long as `self` does. The answer is borrowed (+0): a caller that
+/// keeps the view past `self` retains it. AppKit objects are main-thread-only,
+/// so callers message the view on the main thread alone.
 pub unsafe trait HasNsView {
     /// The view, or nil when there is none.
     fn ns_view(&self) -> Id;

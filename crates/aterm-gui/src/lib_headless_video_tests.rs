@@ -53,7 +53,9 @@ fn controller_key(key: Key, event_type: KeyEventType) -> InputEvent {
     controller_key_with_mods(key, Modifiers::empty(), event_type)
 }
 
-/// Bounded bookkeeping for pre-routing controller character attempts: press/repeat adds one sample.
+/// Bounded bookkeeping for pre-routing controller character attempts: press/repeat adds
+/// one sample, release none, never past the cap; an attempt past the cap is counted as
+/// dropped, so logged plus dropped is every attempt.
 fn video_controller_attempt_ledger_model() -> aterm_spec::derive::Model {
     use aterm_spec::ty_model;
     ty_model! {

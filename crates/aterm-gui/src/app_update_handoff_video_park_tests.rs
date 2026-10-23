@@ -251,7 +251,8 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
         .session
         .master = master;
     let pending = b"still printing\r\n";
-    // SAFETY: `slave` is the open slave end of the pair above.
+    // SAFETY: `slave` is the open slave end of the pair above; the buffer is
+    // a live byte slice of the length passed.
     let wrote = unsafe { libc::write(slave, pending.as_ptr().cast(), pending.len()) };
     assert_eq!(
         usize::try_from(wrote).ok(),

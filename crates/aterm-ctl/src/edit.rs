@@ -1,47 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Client `edit` and `await edit` exchanges ([`edit`], [`await_edit`],
-//! [`EditErr::falls_back_to_terminal`], [`crate::resolve_sock_for`],
-//! [`crate::redial::SUCCESSOR_BOUND`], [`AwaitErr::Replaced`], [`crate::EXIT_REPLACED`],
-//! [`Wire`]).
+//! Client `edit` and `await edit` exchanges.
 
 use std::io;
 use std::time::{Duration, Instant};
 
 pub use amacs::protocol::edit::{AwaitEdit, AwaitKey, EditOk, EditOutcome, EditRequest, Ticket};
 
-/// The connect phase of either exchange: a running aterm answers at once.
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
 
-/// How long `edit` waits for its answer once sent.
 const EDIT_REPLY_WAIT: Duration = Duration::from_secs(45);
 
-/// What one `await edit` leg asks for: the server's bound.
 const LEG: Duration = crate::await_task::LEG_MAX;
 
-/// Between two looks for a successor after a leg was cut.
 const REDIAL_POLL: Duration = Duration::from_millis(250);
 
 /// Why `edit` opened no view.
 #[derive(Debug)]
 pub enum EditErr {
-    /// The window answered `ERR …` (the whole line): the request was refused and nothing opened.
+    /// The window answered `ERR …` and opened nothing.
     Refused(String),
     /// The window answered `ERR timeout ticket=<t>`.
     TimedOut(String),
-    /// No window could be asked (no instance, a dead socket, a connect phase nobody served).
+    /// No window could be asked.
     Unreachable(io::Error),
-    /// Request delivery began but its outcome is unknown (a failed send or a missing reply).
+    /// Request delivery began, but its outcome is unknown.
     NoAnswer(io::Error),
-    /// The window answered a line this client cannot read: it may have opened the view.
+    /// The window answered an unreadable line.
     Unreadable(String),
-    /// The request cannot be formatted as a single wire line; nothing was sent.
+    /// The request cannot be formatted as a single wire line.
     Unsendable(String),
 }
 
 impl EditErr {
-    /// Whether the client edits in its own terminal instead .
+    /// Whether the client edits in its own terminal instead.
     #[must_use]
     pub const fn falls_back_to_terminal(&self) -> bool {
         match self {
@@ -68,13 +61,13 @@ impl std::error::Error for EditErr {}
 /// Why `await edit` ended without the edit's outcome.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AwaitErr {
-    /// The window answered `ERR …` (the whole line).
+    /// The window answered `ERR …`.
     Refused(String),
-    /// The window answered a line this client cannot read.
+    /// The window answered an unreadable line.
     Unreadable(String),
     /// The server disconnected and no successor resumed within [`crate::redial::SUCCESSOR_BOUND`].
     Replaced(String),
-    /// The session cannot be framed as one stable selector; no resolution or request was attempted.
+    /// The session cannot be framed as a stable selector.
     Unsendable(String),
 }
 
@@ -96,18 +89,13 @@ impl std::fmt::Display for AwaitErr {
 
 impl std::error::Error for AwaitErr {}
 
-/// One exchange's transport and the clock a re-dial is timed on.
 trait Wire {
-    /// The socket of the instance hosting the session, resolved now.
     fn resolve(&mut self) -> io::Result<String>;
-    /// Send a framed `request` line to `sock` and read the status line within `reply`.
     fn send(&mut self, sock: &str, request: &str, reply: Duration) -> io::Result<String>;
-    /// Wait between two looks for a successor.
     fn pause(&mut self, wait: Duration);
     fn now(&mut self) -> Instant;
 }
 
-/// The control socket of the instance hosting session `sid`.
 struct SocketWire<'a> {
     sid: &'a str,
 }
@@ -152,7 +140,6 @@ fn edit_over(wire: &mut dyn Wire, sid: &str, request: &EditRequest) -> Result<Ed
     }
 }
 
-/// Frame only the stable session selector the resolver and redial follow.
 fn edit_selector(sid: &str) -> Result<String, String> {
     let selector = format!("@{sid}");
     if crate::redial::target_sid(&selector).is_some_and(|named| named.as_str() == sid) {
@@ -162,7 +149,6 @@ fn edit_selector(sid: &str) -> Result<String, String> {
     }
 }
 
-/// What an `edit` answer means.
 fn edit_reply(reply: &str) -> Result<EditOk, EditErr> {
     if reply.starts_with("OK edit ") {
         return EditOk::parse(reply).map_err(|_| EditErr::Unreadable(reply.to_string()));
@@ -176,7 +162,7 @@ fn edit_reply(reply: &str) -> Result<EditOk, EditErr> {
     Err(EditErr::Unreadable(reply.to_string()))
 }
 
-/// `@<sid> await edit <key>`, re-armed until the edit's outcome ([the module](self)).
+/// Run `@<sid> await edit <key>`, re-armed until the edit's outcome.
 /// # Errors
 ///
 /// [`AwaitErr`]: an unframeable session, a refusal, an unreadable answer, or
@@ -185,7 +171,6 @@ pub fn await_edit(sid: &str, key: AwaitKey, uri: &str) -> Result<EditOutcome, Aw
     await_over(&mut SocketWire { sid }, sid, key, uri)
 }
 
-/// How one `await edit` leg ended.
 enum Leg {
     /// The edit's outcome.
     Done(EditOutcome),
@@ -247,7 +232,6 @@ fn await_over(
     }
 }
 
-/// What one `await edit` answer means for the wait on `key`.
 fn await_reply(line: &str, key: &AwaitKey) -> Leg {
     if crate::reply_is_timeout(line) {
         return Leg::TimedOut;

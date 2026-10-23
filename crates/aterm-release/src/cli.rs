@@ -53,7 +53,8 @@ USAGE
                            finishes it after re-checking the prover, the
                            provisioning, the tag, the ledger tail and the engine
                            (a mismatch refuses before the claim); --prepare again
-                           redoes a stale prepare. With --dry-run: both halves
+                           redoes a stale prepare. With --dry-run: the plan of
+                           both halves
         --forget           drop this clone's release journal, withdraw its open
                            asks, and exit; nothing public changes. Takes no flag
                            of a run
@@ -61,6 +62,7 @@ USAGE
                            vX.Y.Z (its draft or uploads, its origin tag, its
                            journal; the claim commit stays). Run it from the
                            release's clone: only the claim's own cutter can
+                           abandon its cut
 
   targo --unverified ship build
       The one build of a release bundle: both slices at once from a snapshot of

@@ -53,7 +53,7 @@ pub struct MessageAsKeyEvent {
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
-    /// Local PATCH (aterm): the Alt code being typed, and the character the last one composed.
+    /// LOCAL PATCH (aterm): the Alt code being typed, and the character the last one composed.
     alt_code: Mutex<AltCode>,
     alt_code_commit: Mutex<Option<String>>,
 }
@@ -68,7 +68,9 @@ impl Default for KeyEventBuilder {
     }
 }
 impl KeyEventBuilder {
-    /// Local PATCH (aterm): the character the last Alt code composed.
+    /// LOCAL PATCH (aterm): the character the last Alt code composed, once. Windows posts it as a
+    /// WM_CHAR with no key-down after Alt is released, which upstream dropped as "probably IME";
+    /// the event loop sends it on as `Ime::Commit`.
     pub(crate) fn take_alt_code_commit(&self) -> Option<String> {
         self.alt_code_commit.lock().unwrap().take()
     }
@@ -704,7 +706,8 @@ fn ex_scancode_from_lparam(lparam: LPARAM) -> ExScancode {
     new_ex_scancode(lparam.scancode, lparam.extended)
 }
 
-/// Local PATCH (aterm): what the key path reads from Windows.
+/// LOCAL PATCH (aterm): what the key path reads from Windows, answered from a recorded message
+/// sequence while one is replayed on this thread (`super::recorded`). Tests and debug builds only.
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod replay {
     use std::cell::RefCell;
@@ -755,7 +758,7 @@ pub(crate) mod replay {
     }
 }
 
-/// Local PATCH (aterm): `GetKeyState(vk)`.
+/// LOCAL PATCH (aterm): `GetKeyState(vk)` (the replay's recorded state while one runs).
 pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     #[cfg(any(test, debug_assertions))]
     if let Some(keys) = replay::keys() {
@@ -765,7 +768,8 @@ pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     unsafe { GetKeyState(vk as i32) }
 }
 
-/// Local PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code through.
+/// LOCAL PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code through; a replay maps with
+/// the thread's own, since a recorded layout is none Windows loaded.
 pub(crate) fn mapping_layout(hkl: HKL) -> HKL {
     #[cfg(any(test, debug_assertions))]
     if replay::layout().is_some() {

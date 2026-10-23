@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `ActiveHandle` (`aterm_models_gui::active_handle_model`):
-//! the process-wide control `ActiveHandle` always names the front window's
-//! active tab's focused pane.
-//!
-//! A headless `App` is driven through the seams that move that session (tab
-//! append/switch/cycle/move, split, pane focus and collapse, tab close, a
-//! background pane EOF, window open/close, background tab churn), and each step
-//! projects the real state onto the model's `<<truth, handle, next>>`. The seams
-//! that spawn a PTY are driven from their post-spawn half (`install_new_tab`,
-//! `install_split_pane`, `insert_logical_window`; the first two wrap what a tab or
-//! split spawned off the loop lands through) with a stub session; that half
-//! moves the front and re-points the handle.
-//!
-//! Projection:
-//!
-//! * `truth` comes from the canonical tab model (`tab_set` → focused view →
-//!   terminal session), not a mirror;
-//! * `handle` is the real `active_handle`'s session;
-//! * each front change takes the fresh id `next`; `handle` projects to it when
-//!   the real handle followed, to the previous id when it stayed (the stale
-//!   shape `Buggy = 1` allows), and to an unreachable id otherwise.
-//!
-//! A step that does not move the front session must also leave the handle on
-//! the truth. Negative control: a real front move with the handle left behind is
-//! rejected by the model and admitted by `Buggy = 1`'s `CloseOrNewFront`.
+//! Conformance tests binding `ActiveHandle` to `aterm_models_gui::active_handle_model`.
 
 use std::collections::BTreeMap;
 
@@ -36,10 +12,8 @@ use crate::{App, WindowId, stub_session};
 
 type State = BTreeMap<&'static str, i64>;
 
-/// `MaxId` lifted past every real run.
 const OVERRIDES: &[(&str, i64)] = &[("MaxId", 1_000_000)];
 
-/// The session the user is looking at, from the canonical tab model.
 fn truth(app: &App) -> Option<u64> {
     let front = app.frontmost_window?;
     let tab = app.windows.get(&front)?.tab_set.active()?;
@@ -49,7 +23,6 @@ fn truth(app: &App) -> Option<u64> {
         .and_then(crate::tab_model::View::terminal_session)
 }
 
-/// The session the control socket's global handle names.
 fn handle(app: &App) -> Option<u64> {
     app.active_handle
         .lock()
@@ -58,8 +31,6 @@ fn handle(app: &App) -> Option<u64> {
         .map(|active| active.id)
 }
 
-/// The relabelling projection (see the module docs), carrying the real
-/// sessions the current model ids stand for.
 struct Projection {
     real_truth: Option<u64>,
     real_handle: Option<u64>,
@@ -81,8 +52,6 @@ impl Projection {
         }
     }
 
-    /// Project the App after a step. `None` when the front session did not move
-    /// (no model step), else the model state the real step reached.
     fn after(&mut self, app: &App) -> Option<State> {
         let (t, h) = (truth(app), handle(app));
         if t == self.real_truth {
@@ -107,8 +76,6 @@ impl Projection {
     }
 }
 
-/// Drive one real step and, when it moved the front session, validate it as
-/// `action`. Returns whether it was a model step.
 fn step(
     app: &mut App,
     p: &mut Projection,
@@ -141,13 +108,9 @@ fn step(
     true
 }
 
-/// One real step: the model action it is (when it moves the front session),
-/// what it is, and the shipping seam that performs it.
 type Step = (&'static str, &'static str, fn(&mut App));
 
-/// Every real step the run drives.
 const STEPS: &[Step] = &[
-    // Tab churn in the front window: the always-lockstep path.
     ("SwitchActive", "append tab", |a| {
         let sid = a.next_session_id;
         a.install_new_tab(WindowId(0), stub_session(sid));
@@ -163,8 +126,6 @@ const STEPS: &[Step] = &[
     ("SwitchActive", "move a tab", |a| {
         a.move_tab(WindowId(0), 0, 2)
     }),
-    // Pane paths: these re-mirror only per-window state, so they are the
-    // swallow-prone family.
     ("CloseOrNewFront", "split", |a| {
         let sid = a.next_session_id;
         a.install_split_pane(
@@ -190,8 +151,6 @@ const STEPS: &[Step] = &[
         let sid = truth(a).expect("front terminal");
         assert!(!a.close_session(WindowId(0), sid), "not the last pane");
     }),
-    // A new window becomes the front; a background window's churn moves
-    // nothing; closing the front window hands the front back.
     ("CloseOrNewFront", "new window", |a| {
         let sid = a.next_session_id;
         a.insert_logical_window(stub_session(sid), 24, 80);
@@ -224,7 +183,6 @@ fn real_front_session_moves_keep_the_handle_conforming() {
     assert!(app.structural_invariants_ok());
 }
 
-/// The swallow from a real state: the front session moves, the handle stays.
 #[test]
 fn a_front_move_that_leaves_the_handle_behind_is_the_buggy_step() {
     let mut app = App::headless_for_test();

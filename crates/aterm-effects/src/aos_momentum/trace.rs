@@ -180,7 +180,7 @@ impl fmt::Display for TraceFault {
 impl std::error::Error for TraceFault {}
 
 impl MomentumTrace {
-    /// The trace as one file (the module docs' layout).
+    /// The trace as one file.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::with_capacity(

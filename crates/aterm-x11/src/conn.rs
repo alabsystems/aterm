@@ -18,7 +18,7 @@ use crate::sys::{self, Iovec, ProtocolRequest, REQUEST_CHECKED, REQUEST_RAW, Xcb
 /// Why a request, reply or connection failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// libxcb or libX11-xcb is not on this machine (or this platform has no loader).
+    /// libxcb or libX11-xcb is unavailable.
     Load(aterm_dl::Error),
     /// The connection is broken: libxcb's `XCB_CONN_*` code.
     Connection(c_int),
@@ -151,20 +151,27 @@ impl Connection {
 
     /// Wrap a raw `xcb_connection_t *`.
     /// # Safety
-    /// `raw` is a live connection that outlives the value.
+    /// `raw` is a live connection that outlives the value; with `owned`,
+    /// nothing else may disconnect it once adoption begins. If loading
+    /// libxcb fails, the caller retains ownership. Once libxcb is loaded,
+    /// `owned` transfers ownership even if reading the setup returns an
+    /// error: that error disconnects it, as a successful value does on drop.
     pub unsafe fn from_raw(raw: NonNull<c_void>, owned: bool) -> Result<Connection, Error> {
         let xcb = sys::xcb().map_err(Error::Load)?;
         // SAFETY: the caller's contract.
         unsafe { Connection::adopt(xcb, raw, owned) }
     }
 
+    /// # Safety
+    /// As [`Connection::from_raw`].
     unsafe fn adopt(
         xcb: &'static Xcb,
         raw: NonNull<c_void>,
         owned: bool,
     ) -> Result<Connection, Error> {
         let setup = (|| -> Result<Setup, Error> {
-            // SAFETY: a live connection; the setup lives as long as it does and starts with its length.
+            // SAFETY: the caller's live connection and libxcb's complete setup; the setup lives as
+            // long as the connection does and starts with its length.
             unsafe {
                 let p = (xcb.get_setup)(raw.as_ptr());
                 if p.is_null() {
@@ -179,7 +186,8 @@ impl Connection {
             Ok(setup) => setup,
             Err(error) => {
                 if owned {
-                    // SAFETY: ownership was admitted at entry and no Connection was constructed.
+                    // SAFETY: ownership was admitted at entry; no Connection was constructed, so
+                    // this is its sole disconnect.
                     unsafe { (xcb.disconnect)(raw.as_ptr()) };
                 }
                 return Err(error);
@@ -312,12 +320,14 @@ impl Connection {
         };
         let flags = REQUEST_RAW | REQUEST_CHECKED;
         let sequence = if fds.is_empty() {
-            // SAFETY: a live connection; `iov[2]` and `request` outlive the call.
+            // SAFETY: a live connection; `iov[2]` and `request` outlive the call, and libxcb only
+            // reads the bytes (RAW: it writes no field).
             unsafe { (self.xcb.send_request64)(self.raw.as_ptr(), flags, &mut iov[2], &request) }
         } else {
             let mut raw: Vec<c_int> = fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
             let n = c_uint::try_from(raw.len()).map_err(|_| Error::RequestTooLarge)?;
-            // SAFETY: as above, plus descriptors handed to libxcb, which closes them.
+            // SAFETY: as above, plus descriptors this call hands to libxcb, which closes them (also
+            // on failure).
             unsafe {
                 (self.xcb.send_request_with_fds64)(
                     self.raw.as_ptr(),
@@ -434,7 +444,7 @@ impl Connection {
 }
 
 impl Connection {
-    /// Intern every name in one round trip (all requests first, then the replies), in order.
+    /// Intern every name in one round trip, in order.
     pub fn intern_atoms(&self, names: &[&[u8]]) -> Result<Vec<crate::proto::Atom>, Error> {
         let cookies = names
             .iter()
@@ -456,6 +466,8 @@ impl Drop for Connection {
     }
 }
 
+/// # Safety
+/// `p` is a malloc'd buffer of at least `len` bytes, which this frees.
 unsafe fn take_packet(p: NonNull<u8>, len: usize) -> Vec<u8> {
     // SAFETY: the caller's contract.
     let out = unsafe { std::slice::from_raw_parts(p.as_ptr(), len) }.to_vec();
@@ -464,6 +476,8 @@ unsafe fn take_packet(p: NonNull<u8>, len: usize) -> Vec<u8> {
     out
 }
 
+/// # Safety
+/// `p` is an event libxcb returned (36 bytes, plus a GenericEvent's tail), which this frees.
 unsafe fn take_event(p: NonNull<u8>) -> Vec<u8> {
     // SAFETY: at least `xcb_generic_event_t` (36 bytes).
     let head = unsafe { std::slice::from_raw_parts(p.as_ptr(), 36) };

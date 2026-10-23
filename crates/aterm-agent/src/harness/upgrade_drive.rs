@@ -2158,9 +2158,12 @@ pub(super) fn held_by_status(line: &str, grace_s: u32) -> bool {
         || super::relaunch::person_present(line, grace_s)
 }
 
-pub(super) const HAND_TTL_MS: u64 = 60_000;
+/// How long a hand lasts unless renewed (`lease acquire ttl=`).
+pub(crate) const HAND_TTL_MS: u64 = 60_000;
 
-const HAND_RENEW: Duration = Duration::from_secs(20);
+/// How often a holder renews its hand: well inside [`HAND_TTL_MS`], so a
+/// renewal a starved holder makes late still lands before the hand lapses.
+pub(crate) const HAND_RENEW: Duration = Duration::from_secs(20);
 
 /// The holder name of this process's hand ([`Hand`]).
 #[must_use]

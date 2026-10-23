@@ -90,7 +90,7 @@ struct InputStream {
     /// Where the bytes written so far end.
     tail: InputTail,
     /// A win32-input-mode record (a CSI whose final byte is `_`) has been
-    /// written, so conhost's parser has thrown THE SWITCH (module docs) and
+    /// written, so conhost's parser has thrown its one-way switch to win32-input-mode and
     /// holds a trailing lone ESC.
     switched: bool,
 }
@@ -137,7 +137,7 @@ impl HandshakeScan {
     }
 }
 
-/// Who a write is from (module docs, REPLIES).
+/// Who a write is from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Writer {
     /// Input a person or a program drove into the tab: keys, pastes, reports.
@@ -156,9 +156,9 @@ fn unpack(size: u32) -> (i16, i16) {
     ((size >> 16) as u16 as i16, size as u16 as i16)
 }
 
-/// The win32-input-mode records of one character beyond U+FFFF (module docs,
-/// ASTRAL CHARACTERS): its high and low surrogates' key-downs, then their
-/// key-ups, with no virtual key, scan code or control-key state.
+/// The win32-input-mode records of one character beyond U+FFFF: its high and
+/// low surrogates' key-downs, then their key-ups, with no virtual key, scan
+/// code or control-key state.
 fn push_astral_records(wire: &mut Vec<u8>, c: char) {
     let mut units = [0u16; 2];
     let pair = c.encode_utf16(&mut units);
@@ -229,8 +229,8 @@ pub(super) struct ResizeGuard {
     /// How many size changes have armed the guard: [`Self::nudge`] acts only
     /// for the latest.
     armings: AtomicU64,
-    /// An OpenConsole session's next write first runs the guard's client
-    /// (module docs, ONLY CONHOST DELIVERS IT).
+    /// An OpenConsole session's next write first runs the guard's client: only
+    /// conhost delivers the inline record.
     client_owed: AtomicBool,
     /// The input writes' turn at the client ([`Self::settle`]): held while the
     /// client runs, so an input write that comes meanwhile waits for its record

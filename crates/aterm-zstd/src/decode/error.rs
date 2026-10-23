@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Why the decoder refused a stream. Every refusal reaches the reader as an
-//! [`io::Error`] of kind [`io::ErrorKind::InvalidData`] carrying a
-//! [`DecodeError`]; a stream that ends early is [`io::ErrorKind::UnexpectedEof`].
+//! Zstandard stream decoding error types.
 
 use std::fmt;
 use std::io;
@@ -12,8 +10,7 @@ use std::io;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DecodeError {
-    /// The four bytes where a frame starts are neither the zstd magic number
-    /// nor a skippable frame's.
+    /// The frame starts with neither the zstd magic number nor a skippable frame's.
     BadMagic(u32),
     /// `Frame_Header_Descriptor` sets its reserved bit.
     ReservedBit,
@@ -35,8 +32,7 @@ pub enum DecodeError {
         /// The low 32 bits of XXH64 over what decoded.
         computed: u32,
     },
-    /// The frame carries no content checksum, and the reader required one
-    /// ([`crate::Decoder::require_checksum`]).
+    /// The frame carries no content checksum and [`crate::Decoder::require_checksum`] is set.
     NoChecksum,
     /// A block breaks a rule of the format; the text names the rule.
     Corrupt(&'static str),

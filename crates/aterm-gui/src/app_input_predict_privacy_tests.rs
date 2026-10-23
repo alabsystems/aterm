@@ -342,7 +342,8 @@ fn a_typed_ahead_word_outlives_only_a_line_terminator() {
 /// Set the slave's local modes, as the program reading it would.
 #[cfg(unix)]
 fn set_lflag(slave: i32, edit: impl FnOnce(&mut libc::tcflag_t)) {
-    // SAFETY: `libc::termios` is plain integer fields plus a byte array; zeroed is a valid value.
+    // SAFETY: `libc::termios` is plain integer fields plus a byte array;
+    // zeroed is a valid value, and `tcgetattr` fills it on the open slave.
     let mut t: libc::termios = unsafe { std::mem::zeroed() };
     // SAFETY: `slave` is an open tty descriptor this test owns.
     assert_eq!(unsafe { libc::tcgetattr(slave, &mut t) }, 0, "tcgetattr");

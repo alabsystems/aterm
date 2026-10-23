@@ -59,7 +59,9 @@ pub struct Table {
 /// Expands `table` into `homebrew.pkg`, `homebrew.ruby`, and formula/cask items.
 ///
 /// # Errors
-/// Returns an error if the owner, package pin, or any formula/cask name is invalid.
+/// One line naming what cannot be expanded: no owner, an owner this Mac does not have or
+/// root, a malformed pkg pin, a formula or cask name `brew` could read as an option or a
+/// path.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let owner_name = table
         .owner

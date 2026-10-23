@@ -27,7 +27,8 @@ impl MachineKey {
     ///
     /// # Errors
     ///
-    /// Returns an error when the key file is missing or is not a PKCS#8 Ed25519 key.
+    /// A refusal when the key file cannot be read, naming the provisioning verbs that mint
+    /// one, or when it is not a pkcs8 Ed25519 key.
     pub fn load(ctx: &Ctx, path: &Path) -> Result<Self> {
         let pkcs8 = std::fs::read(path).map_err(|e| {
             Error::refused(format!(
@@ -104,7 +105,9 @@ pub struct Signer {
 ///
 /// # Errors
 ///
-/// Returns an error if the key or record is missing, mismatched, revoked, unlisted, or expired.
+/// A refusal for a missing or malformed key or record, a key the record does not name, a
+/// revoked id, a key the roster does not list, a roster that lists it under another id, or
+/// an entry past its horizon.
 pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signer> {
     let key = MachineKey::load(ctx, &ctx.identity.key)?;
     let key_pub = key.pubkey_b64()?;

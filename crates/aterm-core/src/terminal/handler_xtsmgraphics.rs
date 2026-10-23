@@ -2,33 +2,15 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`), the graphics-capability query image
-//! tools use to discover sixel limits
-//! (<https://invisible-island.net/xterm/ctlseqs/ctlseqs.txt>).
-//!
-//! - `Pi` item: 1 color registers, 2 sixel geometry, 3 ReGIS geometry
-//!   (unsupported).
-//! - `Pa` action: 1 read, 4 read the maximum; 2 reset and 3 set fail
-//!   (read-only).
-//!
-//! The reply is `CSI ? Pi ; Ps ; Pv S`: `Ps` 0 success, 1 bad Pi, 2 bad Pa, 3
-//! failure; `Pv` the count (Pi 1) or `width ; height` (Pi 2).
+//! XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`) graphics-capability query handler.
 
 use super::handler::TerminalHandler;
 
 use crate::sixel::{MAX_COLOR_REGISTERS, SIXEL_MAX_DIMENSION};
 
-/// The largest sixel geometry XTSMGRAPHICS advertises on either axis: xterm's
-/// default `maxGraphicSize` (1000x1000), and an image the DCS path places
-/// whatever the encoder. Larger ones are dropped, not clipped: the decoder
-/// charges 4 bytes per pixel of its raster stride (which a column-at-a-time
-/// paint grows to the next power of two) against the DCS budget, beside the
-/// stream's own bytes, and refuses more than `SIXEL_MAX_PIXELS`. So the per-axis
-/// [`SIXEL_MAX_DIMENSION`] (4096) is a decoder clamp, not a size that places.
+/// Maximum sixel dimension advertised by XTSMGRAPHICS (`1000x1000`).
 const SIXEL_ADVERTISED_MAX: u16 = 1000;
 
-// The advertised square's raster fits in half the DCS budget, leaving the other
-// half for the stream's bytes, and under the decoder's per-axis clamp.
 const _: () = {
     let side = SIXEL_ADVERTISED_MAX as usize;
     assert!(4 * side.next_power_of_two() * side <= crate::terminal::MAX_DCS_GLOBAL_BUDGET / 2);
@@ -90,8 +72,7 @@ impl XtsmgraphicsAction {
 }
 
 impl TerminalHandler<'_> {
-    /// Handle XTSMGRAPHICS `CSI ? Pi ; Pa ; Pv S`. Read-only: set and reset
-    /// answer Failure.
+    /// Handle XTSMGRAPHICS `CSI ? Pi ; Pa ; Pv S`.
     pub(super) fn handle_xtsmgraphics(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -111,7 +92,6 @@ impl TerminalHandler<'_> {
         };
 
         match (item, action) {
-            // The palette is always its maximum size: current == max.
             (
                 XtsmgraphicsItem::ColorRegisters,
                 XtsmgraphicsAction::Read | XtsmgraphicsAction::ReadMax,
@@ -121,11 +101,6 @@ impl TerminalHandler<'_> {
             }
 
             (XtsmgraphicsItem::SixelGeometry, XtsmgraphicsAction::Read) => {
-                // Read answers the current text area in pixels, not the maximum
-                // (xterm; lsix and img2sixel size output from it). That is CSI
-                // 14 t's fact, so it takes the same window-ops capability and
-                // answer; without one, or before a host reports a cell box, it
-                // answers the maximum. Either way capped at what places.
                 let max_dim = SIXEL_ADVERTISED_MAX;
                 let window_cap = super::window_auth::WindowMintAuthority::new()
                     .try_mint_with_engine(
@@ -145,7 +120,6 @@ impl TerminalHandler<'_> {
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[dim, dim]);
             }
 
-            // ReGIS is not supported.
             (XtsmgraphicsItem::RegisGeometry, _) => {
                 self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Failure, &[0]);
             }
@@ -156,7 +130,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Send XTSMGRAPHICS response: `CSI ? Pi ; Ps ; Pv... S`
+    /// Send XTSMGRAPHICS response `CSI ? Pi ; Ps ; Pv... S`.
     fn send_xtsmgraphics_response(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -187,19 +161,14 @@ mod tests {
             .expect("ASCII")
     }
 
-    /// With window ops granted, the sixel-geometry read answers the real text
-    /// area (the same in-core product CSI 14 t reports), width first.
     #[test]
     fn sixel_geometry_read_reports_the_text_area_with_window_ops() {
         let mut term = Terminal::new(24, 80);
         term.modes_mut().allow_window_ops = true;
         term.set_cell_pixel_size(9, 19);
-        // 80 cols x 9 px = 720 wide; 24 rows x 19 px = 456 tall.
         assert_eq!(geometry_read(&mut term), "\x1b[?2;0;720;456S");
     }
 
-    /// Without window ops the read never reaches the host: a callback that
-    /// would answer is not consulted, and the reply is the maximum dimension.
     #[test]
     fn sixel_geometry_read_does_not_reach_the_host_without_window_ops() {
         let mut term = Terminal::new(24, 80);
@@ -213,15 +182,10 @@ mod tests {
         });
         assert_eq!(geometry_read(&mut term), "\x1b[?2;0;1000;1000S");
 
-        // Negative control: the same host is consulted once window ops are on.
         term.modes_mut().allow_window_ops = true;
         assert_eq!(geometry_read(&mut term), "\x1b[?2;0;222;111S");
     }
 
-    /// Every geometry XTSMGRAPHICS advertises is one the DCS path places, whatever
-    /// the encoder: a solid image of the advertised maximum as one run per band
-    /// under a raster declaration, painted a column at a time with none, and as
-    /// sixteen colour passes per band.
     #[test]
     fn the_advertised_sixel_maximum_is_placed() {
         let mut term = Terminal::new(24, 80);
@@ -257,8 +221,6 @@ mod tests {
         }
     }
 
-    /// Window ops alone, before any host has reported a cell box, still
-    /// answers the maximum rather than a guess.
     #[test]
     fn sixel_geometry_read_falls_back_without_a_cell_box() {
         let mut term = Terminal::new(24, 80);

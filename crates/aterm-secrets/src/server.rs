@@ -30,7 +30,7 @@ pub struct Options {
     pub listen: SocketAddr,
     /// The store directory (made 0700).
     pub store: PathBuf,
-    /// Optional `<name>.local` mDNS registration on the primary IPv4 address.
+    /// Optional `<name>.local` mDNS registration on the LAN's IPv4 address (macOS only).
     pub advertise: Option<String>,
     /// Pins for names the store holds nothing for: name → signing key.
     pub pins: Vec<(String, [u8; 32])>,
@@ -297,7 +297,8 @@ struct Tuning {
     linger: Duration,
     /// The wall clock the join queue is kept by, in unix seconds ([`now`]).
     now: fn() -> u64,
-    /// Whether a connection from a peer address, arriving on one of this machine's addresses.
+    /// Whether a connection from a peer address, arriving on one of this machine's addresses
+    /// (`None`: unknown), comes from this machine.
     is_local: fn(IpAddr, Option<IpAddr>) -> bool,
     /// The keys no PUT is taken signed by, and the key a held signer among them gives way to.
     retired: fn() -> envelope::Retired,
@@ -498,7 +499,8 @@ fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
     ))
 }
 
-/// Read the store: every `<name>.vault` that parses and verifies.
+/// Read the store: every `<name>.vault` that parses and verifies, and every `<name>.joins` line
+/// that parses and has not expired.
 fn load(store: &Path, now: u64) -> crate::Result<State> {
     let mut state = State::default();
     let entries =
@@ -1609,7 +1611,6 @@ fn decide_join(
             && asked.proof == request.proof
     };
     if let Some(at) = queue.iter().position(same) {
-        // A machine asking again for exactly what it asked (the subscriber re-asks hourly,
         if now.saturating_sub(queue[at].request.time.unwrap_or(0)) < JOIN_REFRESH_EVERY_SECS {
             if let Some(held) = state
                 .joins
@@ -1738,7 +1739,8 @@ pub fn caffeinate_args(pid: u32) -> Vec<String> {
     vec!["-i".to_owned(), "-w".to_owned(), pid.to_string()]
 }
 
-/// The addresses this Mac's traffic leaves by: the default route's over IPv4, the LAN's.
+/// The addresses this Mac's traffic leaves by: the default route's over IPv4, the LAN's and the
+/// default route's over IPv6, each `None` without a route.
 pub fn route_sources() -> [Option<IpAddr>; 3] {
     [
         primary_ipv4().map(IpAddr::V4),
@@ -2953,7 +2955,6 @@ mod tests {
             body_deadline: 2 * HANG_DETECTOR,
             ..Tuning::default()
         };
-        // The trickling client keeps the linger's drain going until it ends.
         let deadline = Tuning {
             body_stall: 2 * HANG_DETECTOR,
             body_deadline: Duration::from_millis(200),
@@ -3637,7 +3638,6 @@ mod tests {
     #[test]
     fn a_client_that_never_finishes_its_head_is_cut_at_the_deadline() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        // The trickling client below keeps the linger's drain going until it ends.
         let tuning = Tuning {
             head_deadline: Duration::from_millis(100),
             linger: Duration::from_millis(100),

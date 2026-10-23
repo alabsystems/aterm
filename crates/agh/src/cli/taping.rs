@@ -45,7 +45,12 @@ pub(crate) fn read_taped(global: &Global) -> Result<(TapeHeader, Vec<EffectRecor
 ///
 /// # Errors
 ///
-/// Returns an error if the tape cannot be read/created or `argv` does not match or redacts.
+/// Returns an error if the tape cannot be read/created or `argv` does not match or redacts:
+/// under `--replay`, `Replay::Argv` unless the header's `argv` equals `argv`, each argument
+/// through `Redactor::shapes` as the tape holds it; under `--record` alone, a usage error for
+/// an argument the shapes would change, or a command line whose taped `argv` line they would
+/// change once its arguments are joined (`tape::head_redacts`). Each check comes before any
+/// file is created.
 pub(crate) fn begin_with(
     ctx: &mut Ctx,
     inv: &Invocation,

@@ -3,11 +3,6 @@
 
 use crate::native_updater_service::ApplyMode;
 
-/// A fresh cached pass declaring the chunked grant lets the lane admit more
-/// sessions than one descriptor message carries and lets the worker skip its own
-/// verification (`verify_staged_candidate: false`). The worker's job must carry
-/// the same fact, or the launch omits `ATERM_HANDOFF_GRANT_CAPS`, the successor
-/// claims `ATRZ1C`, and `transfer` refuses the desk.
 #[test]
 fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -32,9 +27,7 @@ fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
             same_image: None,
             target_build: ticket.target_build(),
             target_commit: String::new(),
-            // std on purpose: the shipped `PrelaunchArgs::command` is a std one.
             command: std::process::Command::new("/usr/bin/true"),
-            // A fresh cached pass: the worker does not verify again.
             verify_staged_candidate: false,
             grant_chunks,
             installed_activation: false,
@@ -56,9 +49,6 @@ fn a_worker_that_skips_verification_offers_the_grant_the_lane_admitted() {
     }
 }
 
-/// A fresh cached pass does not outlive a raised operator floor: the worker that skips its
-/// full verification still asks the floor for the target build and refuses before any reader
-/// parks.
 #[test]
 fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -83,7 +73,6 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         target_build: ticket.target_build(),
         target_commit: String::new(),
         command: std::process::Command::new("/usr/bin/true"),
-        // A fresh cached pass: the worker does not verify again.
         verify_staged_candidate: false,
         grant_chunks: false,
         installed_activation: false,
@@ -99,8 +88,6 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
     assert!(!job.verify_staged_candidate, "PRECONDITION");
     let floor = job.target_build.saturating_add(1);
     let asked = std::cell::Cell::new(None);
-    // The worker's own check, as `run_handoff_worker` calls it: the full verification is
-    // skipped and the floor still refuses.
     let refusal = super::worker_pre_park_check(
         &mut job,
         |_| panic!("a fresh cached pass skips the full verification"),
@@ -128,7 +115,6 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         ),
         "a raised floor refuses before anything is launched: {refusal:?}"
     );
-    // At the floor, nothing is refused.
     assert_eq!(
         super::worker_pre_park_check(
             &mut job,
@@ -137,9 +123,6 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         ),
         Ok(())
     );
-    // A stage the check retired is refused: the staged candidate is asked under its commit.
-    // The stage's state is a moment, as the full check files it, so the refusal is transient:
-    // nothing is launched or booked against the build. An activation has no stage to ask about.
     let gone = super::worker_pre_park_check(
         &mut job,
         |_| panic!("a fresh cached pass skips the full verification"),
@@ -177,8 +160,6 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
         Ok(())
     );
     job.installed_activation = false;
-    // Negative control: a worker that verifies never asks the floor separately (the full check
-    // reads it), and files the verifier's word.
     job.verify_staged_candidate = true;
     let verified = super::worker_pre_park_check(
         &mut job,
@@ -197,10 +178,6 @@ fn a_worker_that_skips_verification_still_refuses_a_raised_floor() {
     app.update_handoff_prelaunch = None;
 }
 
-/// A worker that verifies (the attempt outran the arm-time read) publishes a refusal that is a
-/// verdict to the attempt's cache entry, so the attempt is booked by the verifier's word (an
-/// unwritable folder is the person's, never a structural failure of the build). Negative
-/// control: a passing moment (the apply lock held) is no verdict and is not kept.
 #[test]
 fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -225,7 +202,6 @@ fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
         target_build: ticket.target_build(),
         target_commit: String::new(),
         command: std::process::Command::new("/usr/bin/true"),
-        // No verdict cached: the worker verifies.
         verify_staged_candidate: true,
         grant_chunks: false,
         installed_activation: false,
@@ -244,14 +220,12 @@ fn a_worker_that_verifies_keeps_its_verdict_for_the_booking() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     };
-    // A passing moment: refused, transient, and nothing kept.
     let moment = format!(
         "lock: could not take the apply lock within 10s ({})",
         aterm_update::PASSING_REFUSAL_KEY
     );
     assert!(super::worker_pre_park_check(&mut job, |_| Err(moment.clone()), |_, _| None).is_err());
     assert!(kept().is_none(), "NEGATIVE: a moment is no verdict");
-    // The folder's refusal: a verdict, kept for this artifact.
     let folder = format!(
         "{}: /Applications/aterm.app; this install cannot update itself",
         aterm_update::INSTALL_LOCATION_REFUSAL_KEY

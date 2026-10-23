@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance tests for [`Log`] against `SessionLogRing`
-//! ([`Log::after_handoff`], [`Log::carry`], [`Log::from_carry`], [`Log::class_of`],
-//! [`the_over_half_rule_is_the_models_where_it_decides`]).
+//! Tier-1 conformance tests for [`Log`] against `SessionLogRing`.
 
 use aterm_models_session::session_log_ring_model;
 use aterm_slog::{
@@ -17,10 +15,8 @@ use aterm_spec::verify;
 
 use crate::support::at;
 
-/// The real ring's record bound: the model's `Cap`.
 const CAP: usize = 3;
 
-/// The model's eviction actions, in no order.
 const EVICTS: &[&str] = &[
     "EvictOldDetail",
     "EvictTurnDetail",
@@ -33,13 +29,10 @@ const EVICTS: &[&str] = &[
     "CarryDone",
 ];
 
-/// The host's overlap reserve in the walk: the model's `Reserve`.
 const RESERVE: u64 = 2;
 
-/// The carry's record bound in the walk: the model's `CarryCap`.
 const CARRY_CAP: usize = 2;
 
-/// The model at the real ring's bound, with `MaxSeq` and `After` out of the walk's way.
 fn model() -> Model {
     with_consts(
         &session_log_ring_model(),
@@ -57,7 +50,6 @@ fn limits() -> Limits {
     Limits::new(CAP, 1 << 20).expect("a three-record ring")
 }
 
-/// The real system under test plus the history the projection needs.
 struct World {
     log: Log,
     /// The ring's bounds (the model's `Cap`).
@@ -89,7 +81,6 @@ impl World {
         World::with_limits(limits())
     }
 
-    /// A world whose ring has `limits` (a model instantiated at its `Cap`).
     fn with_limits(limits: Limits) -> World {
         World {
             log: Log::with_limits(0, limits),
@@ -126,7 +117,6 @@ impl World {
     }
 }
 
-/// Whether `r`'s node lies at or under `root`, by the log's index.
 fn under(log: &Log, r: &Rec, root: Node) -> bool {
     let mut at = r.node;
     for _ in 0..80 {
@@ -141,7 +131,6 @@ fn under(log: &Log, r: &Rec, root: Node) -> bool {
     false
 }
 
-/// The projection onto the model's variables.
 fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
     let log = &w.log;
     let open = |lvl: Lvl| {
@@ -241,10 +230,8 @@ fn project_with(w: &World, fold_turn: bool, fold_turns: u32) -> State {
     .collect()
 }
 
-/// The eviction actions some path of the model's took, by name.
 type Used = std::collections::BTreeSet<&'static str>;
 
-/// Merge state `s` and its `used` eviction actions into `into`.
 fn merge(into: &mut Vec<(State, Used)>, s: State, used: Used) {
     match into.iter_mut().find(|(t, _)| *t == s) {
         Some((_, u)) => u.extend(used),
@@ -252,7 +239,6 @@ fn merge(into: &mut Vec<(State, Used)>, s: State, used: Used) {
     }
 }
 
-/// Reachable states from `prev` via `action` and its eviction batch, with actions taken.
 fn after_batch_paths(m: &Model, action: &str, prev: &State) -> Vec<(State, Used)> {
     let mut done: Vec<(State, Used)> = Vec::new();
     let mut frontier: Vec<(State, Used)> = m
@@ -297,7 +283,6 @@ fn after_batch_paths(m: &Model, action: &str, prev: &State) -> Vec<(State, Used)
     panic!("a batch that never ends from {prev:?} by `{action}`");
 }
 
-/// Reachable states from `prev` via `action` and its eviction batch.
 fn after_batch(m: &Model, action: &str, prev: &State) -> Vec<State> {
     after_batch_paths(m, action, prev)
         .into_iter()
@@ -305,7 +290,6 @@ fn after_batch(m: &Model, action: &str, prev: &State) -> Vec<State> {
         .collect()
 }
 
-/// Assert that the step from `prev` to `next` under `action` is admitted by the model.
 fn admitted(m: &Model, action: &str, prev: &State, next: &State) -> Used {
     let reach = after_batch_paths(m, action, prev);
     match reach.iter().find(|(s, _)| s == next) {
@@ -317,7 +301,6 @@ fn admitted(m: &Model, action: &str, prev: &State, next: &State) -> Used {
     }
 }
 
-/// Perform the real counterpart of the model's correct `action`.
 fn perform(w: &mut World, action: &'static str) {
     let stamp = w.tick();
     if action.starts_with("Open") || action.starts_with("Close") {
@@ -529,7 +512,6 @@ fn perform(w: &mut World, action: &'static str) {
     }
 }
 
-/// The model action a real action is.
 fn model_action(real: &'static str) -> &'static str {
     match real {
         "Amend" => "Mark",
@@ -538,7 +520,6 @@ fn model_action(real: &'static str) -> &'static str {
     }
 }
 
-/// The model's correct appends, with their real variants.
 const ACTIONS: &[&str] = &[
     "OpenRun",
     "OpenTurn",
@@ -561,7 +542,6 @@ const ACTIONS: &[&str] = &[
     "Crash",
 ];
 
-/// One seeded walk of `len` actions; returns how often each ran.
 fn walk(m: &Model, seed: u64, len: usize) -> std::collections::BTreeMap<&'static str, usize> {
     let mut rng = XorShift::new(seed);
     let mut w = World::new();
@@ -664,10 +644,6 @@ fn slog_ring_conforms_to_derived_model() {
     }
 }
 
-/// THE POLICY FUNCTIONS, by name: a batch starts where the model's append
-/// arms one (`over_limits`, the ring past `Cap`) and stops at the model's
-/// `Low` (`low_water`), and closes go before current detail exactly when
-/// the model's `Hf` says they pass half (`closes_over_half`).
 #[test]
 fn eviction_policy_is_the_models() {
     let low = aterm_slog::low_water(limits());
@@ -685,16 +661,6 @@ fn eviction_policy_is_the_models() {
     }
 }
 
-/// THE OVER-HALF RULE IS THE MODEL'S, WHERE IT DECIDES: a three-record ring
-/// evicts two records a batch from at most three candidates, so closes and
-/// current detail are taken alike whichever goes first, and the rule never
-/// shows in the walk above. At the model's `Cap = 6` (`Low = 5`), five runs
-/// opened and closed, then session marks: a batch faces four closes (past
-/// half) and two current marks, and takes one close, then (the closes no
-/// longer past half) one mark. The real ring's step is the model's, by
-/// `EvictClose` then `EvictCurrentOut`. NEGATIVE CONTROL: the ring a rule
-/// without the half guard leaves (both marks taken, every close kept) is
-/// one the model never reaches, and so is the one that takes two closes.
 #[test]
 fn the_over_half_rule_is_the_models_where_it_decides() {
     const CAP6: usize = 6;
@@ -748,7 +714,6 @@ fn the_over_half_rule_is_the_models_where_it_decides() {
     assert!(!reach.contains(&closes_only));
 }
 
-/// NEGATIVE CONTROLS: the projection is load-bearing.
 #[test]
 fn slog_ring_conformance_rejects_what_the_ring_never_does() {
     let m = model();

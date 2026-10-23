@@ -3,21 +3,9 @@
 
 use super::CandidateExitWatch;
 
-/// The orphan's gate: the write end of a pipe the orphan blocks on before its script, so a
-/// caller can attach its [`CandidateExitWatch`] to a process provably still there (a timed
-/// sleep would race launchd's reap under load).
-///
-/// On Darwin [`make_cloexec_pipe`](super::make_cloexec_pipe) sets CLOEXEC after `pipe()`, so
-/// a sibling test's fork can carry a copy of either end; hence [`OrphanGate::release`] writes
-/// a newline rather than closing to EOF. The orphan reads descriptor 3 (`read -r go <&3`),
-/// which bash, dash and zsh leave alone, because a non-interactive shell points a background
-/// job's stdin at `/dev/null`.
 struct OrphanGate(std::os::fd::OwnedFd);
 
 impl OrphanGate {
-    /// Lets the orphan run its script. One newline satisfies `read` whether or
-    /// not another holder of the read end is alive; a broken pipe means the
-    /// orphan is already gone.
     fn release(self) {
         use std::io::Write as _;
         let mut writer = std::fs::File::from(self.0);
@@ -25,16 +13,8 @@ impl OrphanGate {
     }
 }
 
-/// Makes a process that is not our child: fork a middle process that forks the
-/// orphan, then reap the middle so the orphan reparents to launchd. Returns the
-/// orphan's pid (`waitid` answers `ECHILD` about it) and the [`OrphanGate`]
-/// holding it before `script`.
 fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
     let (gate_read, gate_write) = super::make_cloexec_pipe().expect("a pipe for the orphan's gate");
-    // The orphan's standard streams go to `/dev/null`, not this pipe: an
-    // inherited write end would make `read_to_string` wait for the orphan to
-    // exit. The gate's read end arrives as the middle's stdin and is moved to
-    // descriptor 3 before the job is forked.
     let mut middle = aterm_uds::spawnfd::command("/bin/sh")
         .arg("-c")
         .arg(format!(
@@ -58,9 +38,7 @@ fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
     (pid.trim().parse().expect("a pid"), OrphanGate(gate_write))
 }
 
-/// The launched lane's liveness probe leaves the witness alone: the ready wait
-/// asks `candidate_gone` every slice, and reading the kqueue would consume the one
-/// exit event, turning every death on that lane into `Unobserved`.
+/// Probing `candidate_gone` on the launched lane preserves the queued exit status.
 #[test]
 fn asking_whether_a_launched_candidate_is_gone_keeps_its_exit_status() {
     let (orphan, gate) = spawn_orphan("exit 7");
@@ -91,21 +69,16 @@ fn asking_whether_a_launched_candidate_is_gone_keeps_its_exit_status() {
     );
 }
 
-/// The macOS lane end to end: a LaunchServices successor is launchd's child, so
-/// `waitid` answers `ECHILD`. Drives the real [`super::observe_candidate_death`]
-/// against an orphan ended by an external `SIGKILL` (the jetsam shape) and
-/// asserts the death is read as the machine's and the automatic lane retries.
+/// An orphan candidate killed by `SIGKILL` on the launched lane is classified as retryable.
 #[test]
 fn a_starved_candidate_on_the_launched_lane_takes_the_retry_lane() {
     use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
     use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
 
     let (starved, gate) = spawn_orphan("sleep 30");
-    // Registered while it is alive, exactly as the rendezvous accept does.
     let watch = CandidateExitWatch::watch(starved).expect("the candidate is alive");
     gate.release();
     let pid = libc::pid_t::try_from(starved).expect("pid fits");
-    // Someone else's SIGKILL, indistinguishable from this lane's own rejection.
     // SAFETY: `pid` is a positive pid we created and can still see.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
@@ -144,20 +117,15 @@ fn a_starved_candidate_on_the_launched_lane_takes_the_retry_lane() {
     );
 }
 
-/// An exit not witnessed before the lane acted is recovered once the candidate is provably
-/// gone: an `Unwitnessed` candidate (no birth stamp) is signalled nothing, the termination
-/// proof waits it out, and the witness is read after. Sound for an exit code, since SIGKILL
-/// never yields `WIFEXITED`.
+/// An unwitnessed exit is recovered from kqueue after termination is proven.
 #[test]
 fn an_exit_the_parent_did_not_see_coming_is_still_recovered_after_the_wait() {
     use super::{HandoffCandidate, HandoffCandidateHandle, observe_candidate_death};
 
     let (refusing, gate) = spawn_orphan("exit 0");
     let watch = CandidateExitWatch::watch(refusing).expect("the candidate is alive");
-    // A bare pid has no birth stamp, so nothing is signalled.
     let candidate = HandoffCandidate::from_bare_pid(refusing);
     let mut handle = HandoffCandidateHandle::Launched(Some(watch));
-    // The gate is still shut, so the orphan cannot have reached its `exit`.
     assert!(
         handle.witnessed_exit_status().is_none(),
         "it is alive right now: the pre-kill read must claim nothing"
@@ -176,8 +144,7 @@ fn an_exit_the_parent_did_not_see_coming_is_still_recovered_after_the_wait() {
     );
 }
 
-/// The failing direction costs only evidence: a pid naming nothing cannot be
-/// attached to, and the answer is `None`, not an error.
+/// Watching a candidate that has already exited returns `None`.
 #[test]
 fn watching_a_candidate_that_is_already_gone_answers_none() {
     let (gone, gate) = spawn_orphan("exit 0");

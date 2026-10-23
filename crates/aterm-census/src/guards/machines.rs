@@ -1,34 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `machines-root-door`: the root tools `aterm machines` runs on a managed Mac stay inside
-//! its crate (docs/DESIGN-machines-2026-10-16.md §3.6).
-//!
-//! Root actions are authorized for the `aterm machines agent` lane alone;
-//! aterm's install path keeps "no admin prompt, no privileged helper". A line of shipped code
-//! elsewhere that names one of these tools, or reaches the agent past the one door
-//! (`aterm_machines::cli::main_entry`, whose `agent` arm is the only caller of
-//! `agent::main`), would be root work outside that lane. `scutil --set` and system-domain
-//! `launchctl` writes have no literal a line rule can tell from their read-only uses, so the
-//! crate's own review keeps them.
-//!
-//! One spelling is not root work, and is admitted (docs/DESIGN-machines-2026-10-16.md §3.6):
-//! atpkg's Rosetta 2 install, `softwareupdate --install-rosetta
-//! --agree-to-license`, which installs as the user who runs it, with no administrator.
-//! It passes only as that whole argv array, in the one
-//! atpkg file that holds it ([`ROSETTA_INSTALL`]); `softwareupdate` with any other words, in
-//! any other shape or file, is still a finding.
+//! `machines-root-door`: root tools `aterm machines` runs stay inside its crate.
 
 use super::rules::{CENSUS_CRATE, PRODUCT, test_path};
 use super::{Bound, Finding, Line, Rule, SourceFile, Tree, has};
 
-/// The one crate that may name them.
 const MACHINES_CRATE: &str = "crates/aterm-machines/";
 
-/// The tools, by the literal a call would spell: the path for the ones whose bare name is
-/// an ordinary word in this tree (`installer`, `softwareupdate` in prose and manifest
-/// strategies, `pmset -g` read by the perf lanes), the bare name for the two nothing else
-/// has a use for.
 const ROOT_TOOLS: &[&str] = &[
     "/usr/sbin/installer",
     "/usr/sbin/softwareupdate",
@@ -39,12 +18,8 @@ const ROOT_TOOLS: &[&str] = &[
     "systemsetup",
 ];
 
-/// The agent's module, named by path.
 const AGENT_PATH: &str = "aterm_machines::agent";
 
-/// The one admitted spelling: the file, the tool, and the whole argv the
-/// tool may appear in there, as the array literal's text with the whitespace between its
-/// tokens removed (a trailing comma before `]` is rustfmt's, and allowed).
 const ROSETTA_INSTALL: (&str, &str, &str) = (
     "crates/atpkg/src/platform/unix.rs",
     "/usr/sbin/softwareupdate",
@@ -100,9 +75,6 @@ fn machines_root_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Whether `line`'s one root tool is the admitted Rosetta 2 install: in its one file, the
-/// line names no root tool but `softwareupdate`, once, as the first element of an array
-/// literal that is exactly [`ROSETTA_INSTALL`]'s argv, however rustfmt wraps it.
 fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
     let (rel, admitted, argv) = ROSETTA_INSTALL;
     if file.rel != rel
@@ -120,7 +92,6 @@ fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
     };
     let lines: Vec<&str> = file.lines().map(|l| l.text).collect();
     let here = line.no - 1;
-    // The literal opens the array: the text before it, back over blank lines, ends in `[`.
     let before = std::iter::once(&line.text[..at])
         .chain(lines[..here].iter().rev().copied())
         .map(str::trim_end)
@@ -128,7 +99,6 @@ fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
     if before.is_none_or(|t| !t.ends_with('[')) {
         return false;
     }
-    // And the array, from its first element to its `]`, is the argv and nothing more.
     let rest = std::iter::once(&line.text[at..])
         .chain(lines[here + 1..].iter().take(8).copied())
         .collect::<Vec<_>>()
@@ -139,8 +109,6 @@ fn is_rosetta_install(file: &SourceFile, line: &Line<'_>, tool: &str) -> bool {
         .is_some_and(|tail| tail.starts_with(']') || tail.starts_with(",]"))
 }
 
-/// `text` with the whitespace outside string literals removed, so a statement reads the
-/// same however it is wrapped.
 fn squeeze(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut quoted = false;
@@ -164,15 +132,12 @@ fn squeeze(text: &str) -> String {
     out
 }
 
-/// Product source this crate does not own (the census spells every name it bans).
 fn product<'a>(tree: &Tree<'a>) -> impl Iterator<Item = &'a SourceFile> {
     tree.corpus
         .under(PRODUCT)
         .filter(|f| !f.rel.starts_with(CENSUS_CRATE))
 }
 
-/// A line of code naming the agent module: `aterm_machines::agent…`, or a
-/// `use aterm_machines::{…agent…}` group.
 fn reaches_agent(code: &str) -> bool {
     has(code, AGENT_PATH, Bound::Word)
         || (code.contains("aterm_machines::{") && has(code, "agent", Bound::Word))
@@ -233,11 +198,6 @@ mod tests {
         );
     }
 
-    /// The one admitted Rosetta 2 install spelling, and every near miss of it. Positive: the whole
-    /// argv array in atpkg's platform file, as rustfmt wraps it and on one line. Negative:
-    /// the same array in another file; in that file, `softwareupdate` with other words, an
-    /// extra word, a word missing, `sudo` before it, outside an array, a second tool on the
-    /// line, or a bare `command(...)` of it.
     #[test]
     fn only_the_rosetta_install_argv_in_atpkgs_platform_file_names_softwareupdate() {
         let rel = ROSETTA_INSTALL.0;
@@ -258,7 +218,6 @@ mod tests {
                            const TWO: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"]; const I: &str = \"/usr/sbin/installer\";\n\
                            const TWICE: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta\", \"--agree-to-license\"]; const S: &str = \"/usr/sbin/softwareupdate\";\n\
                            const SPACED: [&str; 3] = [\"/usr/sbin/softwareupdate\", \"--install-rosetta \", \"--agree-to-license\"];\n";
-        // The admitted text alone: nothing.
         assert!(
             run(&MACHINES_ROOT_DOOR, &[(rel, admitted)]).is_empty(),
             "the admitted argv, wrapped and on one line"

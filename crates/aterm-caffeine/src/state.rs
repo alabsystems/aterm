@@ -1,42 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The mode on disk: `<state dir>/caffeine.state`, written by the mug on every change and by
-//! `aterm caffeine on|off`, read when the mug starts and when a writer's notification arrives.
-//!
-//! The text is `key=value` lines:
-//!
-//! ```text
-//! mode=until
-//! deadline=1790003600
-//! span=3600
-//! boot=4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9
-//! ```
-//!
-//! `mode` is `off`, `forever` or `until` (with `deadline` and `span`, seconds). `boot` is the
-//! boot of the Mac the file was written in (`kern.bootsessionuuid`,
-//! [`crate::instance::boot_id`]): a mode saved in an earlier boot is off ([`restore`]), so a
-//! restart of the Mac never comes back keeping it awake. Unknown keys are ignored; a file that
-//! does not parse is off.
+//! On-disk caffeine state (`<state dir>/caffeine.state`), encoded as `key=value`
+//! lines (`mode=off|forever|until`, `deadline=<s?>`, `span=<s?>`, `boot=<uuid>`).
+//! A mode saved in an earlier boot or an unparseable file restores to [`Mode::Off`].
 
 use std::io;
 use std::path::Path;
 
 use crate::model::Mode;
 
-/// The largest state file read: anything longer is not one this crate wrote.
+/// Maximum state file byte size.
 pub const READ_CAP: u64 = 4096;
 
-/// What the state file holds.
+/// Persisted caffeine state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Saved {
     /// The mode.
     pub mode: Mode,
-    /// The boot of the Mac it was written in ([`crate::instance::boot_id`]), if known.
+    /// Boot UUID (`kern.bootsessionuuid`, [`crate::instance::boot_id`]), if known.
     pub boot: Option<u128>,
 }
 
-/// A boot id as the file and `kern.bootsessionuuid` spell it: a UUID, upper-case hex.
+/// Formats `boot` as an upper-case UUID string matching `kern.bootsessionuuid`.
 #[must_use]
 pub fn boot_text(boot: u128) -> String {
     let hex = format!("{boot:032X}");
@@ -50,18 +36,13 @@ pub fn boot_text(boot: u128) -> String {
     )
 }
 
-/// The boot id `text` spells, by astream's reader of the kernel's boot id text
-/// (`astream_sys::parse_boot_id`, the one aterm-link's broker reads its boot with): the UUID
-/// [`boot_text`] writes, in either case. `None` for an older stamp (the boot time in seconds),
-/// for the all-zero id, which names no boot, and for anything else astream refuses — so a file
-/// whose `boot` line holds one does not parse ([`decode`]) and [`restore`] turns the mode off:
-/// the safe direction.
+/// Parses a non-zero boot UUID string via `astream_sys::parse_boot_id`.
 #[must_use]
 pub fn parse_boot(text: &str) -> Option<u128> {
     astream_sys::parse_boot_id(text.as_bytes()).map(u128::from_be_bytes)
 }
 
-/// The file's text for `saved`.
+/// Encodes `saved` as `key=value` lines.
 #[must_use]
 pub fn encode(saved: &Saved) -> String {
     let mut text = match saved.mode {
@@ -75,7 +56,7 @@ pub fn encode(saved: &Saved) -> String {
     text
 }
 
-/// The state `text` says; `None` when it is not one [`encode`] could have written.
+/// Decodes state text written by [`encode`].
 #[must_use]
 pub fn decode(text: &str) -> Option<Saved> {
     let (mut mode, mut deadline, mut span, mut boot) = (None, None, None, None);
@@ -106,9 +87,7 @@ pub fn decode(text: &str) -> Option<Saved> {
     Some(Saved { mode, boot })
 }
 
-/// The mode to start in at `now` from what was `saved`, in the boot `boot_now`: off when
-/// nothing was saved, when it was saved in another boot (or either boot is unknown), or when
-/// its deadline has passed.
+/// Restores `saved` at `now` if its boot matches `boot_now` and its deadline has not passed.
 #[inline]
 #[must_use]
 pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: u64) -> Mode {
@@ -124,8 +103,7 @@ pub const fn restore(saved: Option<Saved>, boot_now: Option<u128>, now: u64) -> 
     }
 }
 
-/// Read the state file at `path`; `None` when it is missing, not regular, too long, not
-/// UTF-8 or does not parse. On Unix a final link is refused and a FIFO is never waited on.
+/// Reads and decodes the regular state file at `path` (up to [`READ_CAP`] bytes, `O_NOFOLLOW | O_NONBLOCK` on Unix).
 #[must_use]
 pub fn read(path: &Path) -> Option<Saved> {
     use std::io::Read as _;
@@ -148,8 +126,7 @@ pub fn read(path: &Path) -> Option<Saved> {
     decode(&text)
 }
 
-/// Write `saved` to `path` whole: a private temporary file beside it, renamed over it, so a
-/// reader never sees half a file.
+/// Atomically writes `saved` to `path` via a sibling temporary file.
 ///
 /// # Errors
 ///
@@ -177,9 +154,6 @@ pub fn write(path: &Path, saved: &Saved) -> io::Result<()> {
         #[cfg(unix)]
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         file.write_all(encode(saved).as_bytes())?;
-        // Ordered: the bytes land before the rename, so the name never holds a part. Nothing
-        // needs them durable: a power loss is a new boot, which `restore` reads as off
-        // whatever survived, and a file that does not parse is off too.
         aterm_durable::ordered(&file)?;
         std::fs::rename(&tmp, path)
     })();
@@ -189,7 +163,7 @@ pub fn write(path: &Path, saved: &Saved) -> io::Result<()> {
     written
 }
 
-/// Save `mode` to `path`, stamped with this boot ([`crate::instance::boot_id`]).
+/// Saves `mode` to `path`, stamped with this boot ([`crate::instance::boot_id`]).
 ///
 /// # Errors
 ///
@@ -204,7 +178,7 @@ pub fn save(path: &Path, mode: Mode) -> io::Result<()> {
     )
 }
 
-/// The mode at `now` the file at `path` restores to ([`restore`] against this boot).
+/// Loads and restores the mode at `now` from `path`.
 #[must_use]
 pub fn load(path: &Path, now: u64) -> Mode {
     restore(read(path), crate::instance::boot_id(), now)
@@ -250,10 +224,6 @@ mod tests {
         );
     }
 
-    /// A boot is a UUID, read by astream's reader of the kernel's boot id text in either
-    /// case. Nothing else is a boot — and the all-zero id is none either: a file stamped with
-    /// it does not parse, so [`restore`] turns the mode off, the safe direction. NEGATIVE
-    /// CONTROL: the same file stamped with this boot restores its mode.
     #[test]
     fn a_boot_is_a_uuid_and_nothing_else() {
         assert_eq!(boot_text(BOOT), "4D5A1B2C-3E4F-5061-7283-94A5B6C7D8E9");
@@ -277,10 +247,7 @@ mod tests {
         ] {
             assert_eq!(parse_boot(bad), None, "{bad:?}");
         }
-        // A stamp of an older build (the boot time in seconds) is not this boot's.
         assert_eq!(decode("mode=forever\nboot=1789990000\n"), None);
-        // The all-zero id names no boot: the file does not parse, and the mode is off even
-        // where this boot read as the all-zero id too.
         let zero = format!("mode=forever\nboot={}\n", boot_text(0));
         assert_eq!(decode(&zero), None);
         assert_eq!(restore(decode(&zero), Some(0), NOW), Mode::Off);
@@ -305,7 +272,6 @@ mod tests {
         ] {
             assert_eq!(decode(text), None, "{text:?}");
         }
-        // Comments, blank lines and keys from a later build are fine.
         assert_eq!(
             decode("# note\n\nmode=forever\nflavour=mocha\n"),
             Some(Saved {

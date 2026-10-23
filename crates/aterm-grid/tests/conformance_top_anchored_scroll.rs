@@ -14,9 +14,6 @@ use aterm_spec::verify;
 const ROWS: u16 = 5;
 const COLS: u16 = 5;
 
-/// A lettered grid (row r = letter A+r) at an explicit height, tall enough for
-/// an interior scroll region that does not overlap the fixture selection at
-/// rows 2..4.
 fn seeded_grid_rows(history_enabled: bool, rows: u16) -> Grid {
     let mut grid = Grid::with_scrollback(rows, COLS, usize::from(history_enabled) * 10);
     for row in 0..rows {
@@ -50,8 +47,6 @@ fn real_scroll_transition(
     real_scroll_transition_in_region(choice, top, 2 + top, full_width, history_enabled, ROWS)
 }
 
-/// [`real_scroll_transition`] with an explicit region bottom and grid height, for regions
-/// disjoint from the fixture selection (rows 2..4).
 fn real_scroll_transition_in_region(
     choice: &'static str,
     top: u16,
@@ -70,7 +65,6 @@ fn real_scroll_transition_in_region(
     if full_width {
         grid.scroll_region_up(1);
     } else {
-        // DECLRMM-style rectangle: top-anchored vertically, but not full-width.
         grid.scroll_region_up_margined(1, 1, COLS - 2);
     }
 
@@ -112,24 +106,17 @@ fn real_scroll_transition_in_region(
         }
         (Some(_), _) => selection.clear(),
     }
-    // Mirror `Terminal::post_process`'s selection damage test, which runs after
-    // the geometric transform above.
     let damage = grid.take_selection_damage();
     if damage != aterm_grid::SelectionDamage::None {
         let live_top_abs = grid
             .absolute_row_counter()
             .saturating_sub(u64::from(grid.rows()));
-        // Through `clears_selection`, as `post_process` asks it: a match on `Band` alone
-        // cannot see the gap between two disjoint bands.
         if damage.clears_selection(|lo_abs, hi_abs| {
             selection.intersects_absolute_band(live_top_abs, lo_abs, hi_abs)
         }) {
             selection.clear();
         }
     }
-    // Then its eviction step: a top-anchored archival scroll can push an endpoint past the
-    // retention floor. A no-op in every regime here (the anchors are live-screen rows),
-    // pinning that the re-floor does not perturb the model's `selection_*` variables.
     selection.truncate_to_floor(
         grid.oldest_absolute_row(),
         grid.absolute_row_counter()
@@ -168,8 +155,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
         );
     }
 
-    // Negative controls: the model rejects a dropped history line and a corrupted row below
-    // the scrolling margin.
     let (prev, next) = real_scroll_transition("ChooseArchivalOverlapping", 0, true, true);
     let mut dropped = next.clone();
     dropped.insert("history_len", 0);
@@ -179,9 +164,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
     footer_corrupted.insert("footer", 0);
     assert!(!validate_scroll(&model, &prev, &footer_corrupted).0);
 
-    // `Buggy=1` scrolls to the screen bottom instead of the DECSTBM bottom
-    // margin, replayed on a real grid whose `footer` row is lost. The healthy
-    // model rejects it; the `Buggy=1` model's Scroll is exactly it.
     let (prev, slipped) = real_scroll_transition_in_region(
         "ChooseInteriorOverlapping",
         1,
@@ -221,8 +203,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
     footer_shifted.insert("selection_footer_row", 3);
     assert!(!validate_scroll(&model, &prev, &footer_shifted).0);
 
-    // The disjoint interior regime: a region at rows 6..=8 of a 10-row grid scrolls and the
-    // selection at rows 2..4 survives, since the damage band is the region.
     let (prev, next) =
         real_scroll_transition_in_region("ChooseInteriorDisjoint", 6, 8, true, true, 10);
     assert_eq!(
@@ -236,7 +216,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
         "model rejected the real disjoint interior transition\nprev={prev:?}\nnext={next:?}\n{diagnostic}"
     );
 
-    // Negative control: an over-clear (killing a selection the damage never reached).
     let (prev, mut over_cleared) =
         real_scroll_transition_in_region("ChooseInteriorDisjoint", 6, 8, true, true, 10);
     over_cleared.insert("selection_alive", 0);
@@ -245,10 +224,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
         "negative control: clearing a disjoint selection must be rejected"
     );
 
-    // The other three disjoint regimes, each with a region at rows 0..=1 of a 10-row grid,
-    // above the selection. Margined: the damage records whole rows, so "disjoint ⇒
-    // survives" is about rows. Ephemeral: zero scrollback, where `truncate_to_floor`'s floor
-    // is the live top (`min_row == 0`).
     for (choice, full_width, history_enabled, expected_history) in [
         ("ChooseArchivalDisjoint", true, true, 1),
         ("ChooseMarginedDisjoint", false, true, 0),
@@ -272,7 +247,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
             "model rejected the real {choice} transition\nprev={prev:?}\nnext={next:?}\n{diagnostic}"
         );
 
-        // Negative control: an over-clear in this regime is rejected.
         let (prev, mut over_cleared) =
             real_scroll_transition_in_region(choice, 0, 1, full_width, history_enabled, 10);
         over_cleared.insert("selection_alive", 0);
@@ -282,8 +256,6 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
         );
     }
 
-    // The same archival scroll with a region covering the selection remaps it by one row,
-    // so labelling it `ChooseArchivalDisjoint` is rejected.
     let (prev, next) =
         real_scroll_transition_in_region("ChooseArchivalDisjoint", 0, 2, true, true, 5);
     assert_eq!(

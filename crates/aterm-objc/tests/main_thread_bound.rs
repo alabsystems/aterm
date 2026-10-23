@@ -3,21 +3,12 @@
 
 //! `MainThreadBound<T>`: the half of the contract libtest can hold.
 //!
-//! # WHAT THIS FILE MUST NOT DO, AND WHY IT IS THE FIRST THING WRITTEN HERE
-//!
-//! **Dropping a `MainThreadBound<T>` where `T` needs a destructor, on a libtest
-//! worker thread, HANGS THE WHOLE TEST BINARY.** That is not a defect in the
-//! type; it is [`aterm_objc::run_on_main`]'s documented first hang arriving
-//! through `Drop`. A libtest binary's main thread is parked joining workers, so
-//! it never services its main queue, and the reschedule waits for ever.
-//!
-//! So every test below either holds a `T` with no destructor, or consumes the
-//! container with `into_inner` before it can be dropped. A future test that
-//! forgets this will not fail — it will hang.
-//!
-//! The half that CANNOT be held here — that the destructor really does run on
-//! the main thread — is in `tests/main_thread_bound_drive.rs`, a
-//! `harness = false` test that owns `fn main` and can drive a run loop.
+//! Dropping a `MainThreadBound<T>` whose `T` needs a destructor on a libtest worker HANGS THE
+//! WHOLE TEST BINARY: `Drop` reschedules onto the main queue ([`aterm_objc::run_on_main`]'s first
+//! hang), and libtest's main thread is parked joining workers. So every test here holds a `T` with
+//! no destructor or consumes the container with `into_inner` before it can drop; a test that
+//! forgets this hangs instead of failing. That the destructor runs on the main thread is held by
+//! `tests/main_thread_bound_drive.rs`, a `harness = false` test that drives a run loop.
 
 #![cfg(target_os = "macos")]
 
@@ -25,14 +16,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_objc::{MainThread, MainThreadBound};
 
-/// A witness for values with no main-thread affinity.
-///
-/// # Safety
-/// Every `T` here is a plain Rust value that touches no AppKit state and whose destructor (if
-/// any) increments a counter, so it may be dropped on whatever thread performs the last release
-/// (`MainThread::new_unchecked`'s second form).
 fn witness() -> MainThread {
-    // SAFETY: as documented above.
+    // SAFETY: Every `T` here is a plain Rust value with no AppKit state, droppable on any thread.
     unsafe { MainThread::new_unchecked() }
 }
 
@@ -55,7 +40,6 @@ fn into_inner_hands_the_value_back_and_does_not_run_the_containers_drop() {
         "extracting must not run the destructor — and must not reschedule one either, which on \
          this thread would hang"
     );
-    // Out of the container the value has no affinity: dropped here, on this worker.
     drop(value);
     assert_eq!(1, DROPS.load(Ordering::Relaxed), "exactly once");
 }

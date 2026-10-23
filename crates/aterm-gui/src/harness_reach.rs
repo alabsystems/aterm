@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HARNESS HOST'S REACH (`docs/DESIGN-owner-surfaces-2026-10-16.md` §9 S2):
-//! which sessions the in-GUI supervisor host answers for — the one fact the
-//! need classifier ([`crate::needs`]) reads to tell a box a harness presses
-//! from one nobody does. Read once per refresh, before the registry lock.
+//! Session reach of the in-GUI supervisor host for need classification.
 
 use crate::App;
 
@@ -75,13 +72,6 @@ impl App {
 mod tests {
     use super::*;
 
-    /// A SESSION HELD OFF FOR ITS CLAIM GRACE IS NOBODY'S YET (the round-four
-    /// plan, item 9): while the supervisor host waits for an external
-    /// supervisor to claim an adopted session again, it answers nothing there,
-    /// so the menu-bar rows treat that session as unsupervised — its agent's
-    /// own box is raised rather than left to a host that is not answering it.
-    /// Every other session stays the host's; a host that supervises nothing
-    /// hosts nothing.
     #[test]
     fn a_session_held_off_for_its_claim_grace_is_not_the_hosts() {
         let hosting = HarnessHosting {
@@ -96,13 +86,6 @@ mod tests {
         assert!(!HarnessHosting::default().hosts("s-other", None, aterm_phase::Program::Claude));
     }
 
-    /// AN OFF SESSION IS NOBODY'S (the Autopilot design, §2.2): the host stops
-    /// its worker and starts none, so the menu-bar rows treat it as
-    /// unsupervised and raise its agent's own box — its word `off`, or no word
-    /// under a default of `off`. NEGATIVE CONTROLS: `cruise` and `land` are the
-    /// host's, a word `cruise` opts one session in under a default of `off`,
-    /// no word ever lifts a host that supervises nothing, and no word
-    /// admits an agent its own switch holds off (`agents`).
     #[test]
     fn an_off_session_is_not_the_hosts() {
         use aterm_agent::supervise::Autopilot;

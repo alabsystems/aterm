@@ -48,9 +48,11 @@ pub(super) trait LaneService: Send + Sync {
         let _ = request;
         None
     }
-    /// Whether `request` belongs on a wait lane (see the module doc).
+    /// Whether `request` belongs on a wait lane: its time goes to waiting on an event (`await`,
+    /// `turn`, …) or to relaying to a session this instance does not host.
     fn is_wait(&self, request: &Request, scope: Scope) -> bool;
-    /// Serve a connection that flipped to push until its stream ends, on the subscription lane that took it (see the module doc), with the request that flipped it.
+    /// Serve a connection that flipped to push until its stream ends, on the subscription lane that
+    /// took it, with the request that flipped it.
     fn subscribe(&self, request: Request, scope: Scope, stream: CtlStream);
     /// Release every claim bound to connection `id`: it ended.
     fn release(&self, id: u64);
@@ -78,7 +80,7 @@ pub(super) struct LaneLimits {
 const SUBSCRIPTION_BUSY_LINE: &[u8] = b"ERR subscription capacity busy; retry\n";
 
 /// How many times in a row the parker's loop may panic, with no pass completed
-/// between them, before it stops (see the module doc).
+/// between them, before it stops: it closes every connection it holds, and none parks after.
 #[cfg(unix)]
 const PARKER_PANICS_IN_A_ROW: usize = 3;
 
@@ -1767,6 +1769,7 @@ impl Lanes {
             reply,
             header_done,
             expires,
+            stirred,
             ..
         } = conn;
         let stream: &CtlStream = stream;
@@ -1893,6 +1896,9 @@ impl Lanes {
                 .or_else(|| service.owed_input_reply(&request));
             let disposition = service.serve_line(request, scope, stream, &mut reader, reply);
             mode.forget();
+            // Served: stamped before its answer goes out, not as the lane parks it, which a
+            // lane descheduled after the answer would make later than a peer served since.
+            *stirred = Instant::now();
             if reply.owed() {
                 reply.final_reply = final_reply;
             }
@@ -2011,7 +2017,6 @@ impl Lanes {
             return Err(Box::new(conn));
         }
         conn.parked = Some(slot);
-        conn.stirred = Instant::now();
         waiting.parked.push(conn);
         drop(inbox);
         let _ = (&parker.bell).write(&[1]);

@@ -41,7 +41,11 @@ enum State {
 
 /// Decodes a stream of Zstandard frames read from `R`: the shape of `zstd::Decoder` (a [`Read`] adapter), for what atpkg's installer reads.
 /// # Errors
-/// Nothing in the input panics the decoder.
+///
+/// Nothing in the input panics the decoder. A frame breaking a rule is an
+/// [`io::ErrorKind::InvalidData`] error carrying a [`DecodeError`]; input
+/// ending inside a frame is [`io::ErrorKind::UnexpectedEof`]; errors from
+/// `R` pass through. After any error every later read fails.
 ///
 /// ```
 /// use std::io::Read;

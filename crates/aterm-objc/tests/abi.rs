@@ -23,7 +23,7 @@ unsafe extern "C" {
 /// Seventeen bytes.
 #[repr(C)]
 struct B17([u8; 17]);
-// SAFETY: `#[repr(C)]` over a 17-byte array of `signed char`.
+// SAFETY: `#[repr(C)]` over a 17-byte char array; nothing is misaligned.
 unsafe impl Encode for B17 {
     const ENCODING: &'static str = "{B17=[17c]}";
 }
@@ -50,7 +50,8 @@ struct PackedCharLong {
     c: i8,
     q: i64,
 }
-// SAFETY: the layout is `{PackedCharLong=cq}`.
+// SAFETY: the layout is `{PackedCharLong=cq}`, and the `q` at offset 1 is below
+// its own 8-byte alignment, which is the whole reason this impl exists.
 unsafe impl Encode for PackedCharLong {
     const ENCODING: &'static str = "{PackedCharLong=cq}";
     const HAS_UNALIGNED_FIELDS: bool = true;
@@ -61,7 +62,9 @@ unsafe impl Encode for PackedCharLong {
 struct WrapPacked {
     inner: PackedCharLong,
 }
-// SAFETY: `#[repr(C)]` around one `{PackedCharLong=cq}`.
+// SAFETY: `#[repr(C)]` around one `{PackedCharLong=cq}`; the misalignment is
+// the field's and `WrapPacked` inherits it, which is what the transitive rule
+// says and what clang's classification does.
 unsafe impl Encode for WrapPacked {
     const ENCODING: &'static str = "{WrapPacked={PackedCharLong=cq}}";
     const HAS_UNALIGNED_FIELDS: bool = <PackedCharLong as Encode>::HAS_UNALIGNED_FIELDS;
@@ -151,7 +154,8 @@ fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
 fn platform_encoding(cls: &'static CStr, name: &'static CStr) -> Option<String> {
     let cls = class(cls);
     assert!(!cls.is_null(), "{cls:?} is not linked into this binary");
-    // SAFETY: `cls` is a live.
+    // SAFETY: `cls` is a live class object; the runtime owns the returned encoding string, which
+    // outlives the read.
     unsafe {
         let m = class_getInstanceMethod(cls, aterm_objc::sel_uncached(name));
         if m.is_null() {

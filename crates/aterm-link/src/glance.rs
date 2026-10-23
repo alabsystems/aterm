@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Reader and parser for fleet presence rows (`Last{/f/<F>/pub/*/*/presence}`).
-//!
-//! Keeps verbatim `key=value` body tokens bounded by [`MAX_ROWS`], [`FIELD_CAP`],
-//! and [`FIELDS_MAX`], while reserving [`RESERVED`] subject fields and guaranteeing
-//! `attention=` and `fabric=`.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -24,10 +20,9 @@ pub const ATTENTION_CAP: usize = FIELD_CAP;
 /// Maximum `key=value` tokens kept per row.
 pub const FIELDS_MAX: usize = 64;
 
-/// Two tokens every row carries whether or not the publisher wrote them.
 const GUARANTEED: [&str; 2] = ["attention", "fabric"];
 
-/// Row keys filled from the subject; matching body tokens are dropped by [`fields_of`].
+/// Row keys filled from the subject; matching body tokens are dropped.
 pub const RESERVED: [&str; 4] = ["subject", "offset", "node", "owner"];
 
 /// Placeholder value for a missing token.
@@ -53,7 +48,7 @@ pub struct Row {
     pub node: String,
     /// The face the row describes: a literal `node`, or a hosted `s-<hex>`.
     pub owner: String,
-    /// Verbatim pct-encoded `key=value` body tokens plus the [`GUARANTEED`] keys.
+    /// Verbatim pct-encoded `key=value` body tokens plus guaranteed keys.
     pub fields: BTreeMap<String, String>,
 }
 
@@ -91,7 +86,6 @@ impl Row {
     }
 }
 
-/// Extracts bounded `key=value` tokens from the first line of `body`, dropping [`RESERVED`] keys.
 fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
     let line = String::from_utf8_lossy(body);
     let line = line.split('\n').next().unwrap_or("");
@@ -120,7 +114,6 @@ fn fields_of(body: &[u8]) -> BTreeMap<String, String> {
     out
 }
 
-/// Truncates `v` to at most `cap` bytes on a UTF-8 char boundary, appending `…` when cut.
 fn truncate(v: &str, cap: usize) -> String {
     if v.len() <= cap {
         return v.to_string();
@@ -204,8 +197,6 @@ mod tests {
         Row::parse("f1", 7, subject, body.as_bytes()).expect("a presence row")
     }
 
-    /// Every token survives, unknown ones included, and the two guaranteed
-    /// tokens are present even when the publisher omitted them.
     #[test]
     fn a_row_carries_every_token_and_always_the_two_that_matter() {
         let r = row(
@@ -224,7 +215,6 @@ mod tests {
         assert_eq!(bare.field("attention"), ABSENT);
     }
 
-    /// Only a valid presence subject of `fleet` parses into a [`Row`].
     #[test]
     fn only_a_presence_subject_of_this_fleet_becomes_a_row() {
         for bad in [
@@ -241,7 +231,6 @@ mod tests {
         }
     }
 
-    /// `attention=` is capped on a char boundary, mark included.
     #[test]
     fn attention_is_capped_on_a_char_boundary() {
         let long = format!("attention={}", "é".repeat(400));
@@ -253,7 +242,6 @@ mod tests {
         assert_eq!(short.field("attention"), "needs%20you");
     }
 
-    /// Every key, value and the token count are bounded.
     #[test]
     fn no_publisher_chooses_how_big_a_row_is() {
         let huge = "z".repeat(100_000);
@@ -280,7 +268,6 @@ mod tests {
         assert_eq!(r.field("fabric"), ABSENT);
     }
 
-    /// A body token cannot shadow a cap-forced row fact ([`RESERVED`]).
     #[test]
     fn no_body_token_can_shadow_a_cap_forced_row_fact() {
         let r = row(

@@ -8,7 +8,7 @@ use aterm_json::Value;
 
 use super::machine::Machine;
 
-/// A formula as abrew needs it.
+/// A formula parsed from formulae.brew.sh JSON.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Formula {
     pub name: String,
@@ -75,7 +75,6 @@ fn empty_metadata(value: Option<&Value>) -> bool {
     }
 }
 
-/// A present array must retain every supplied string.
 fn plain_strings(value: Option<&Value>) -> Option<Vec<String>> {
     match value {
         None | Some(Value::Null) => Some(Vec::new()),
@@ -107,7 +106,6 @@ pub(super) fn numeric_macos_version(version: &str) -> bool {
         })
 }
 
-/// A cask artifact source as brew loads it from the API.
 fn appdir_source(source: &str) -> String {
     match source.strip_prefix("$APPDIR/") {
         Some(rest) => format!("/Applications/{rest}"),
@@ -223,7 +221,6 @@ pub enum Requirement {
     XcodeMin(Option<String>),
 }
 
-/// Parse the API `requirements` list.
 fn parse_requirements(v: Option<&Value>) -> Result<Vec<Requirement>, ()> {
     let mut out = Vec::new();
     let Some(items) = v.and_then(Value::as_array) else {
@@ -401,7 +398,6 @@ impl Formula {
         self.resolve_variations_for_keys(&keys)
     }
 
-    /// Apply already-classified system keys.
     fn resolve_variations_for_keys(&mut self, keys: &[String]) -> bool {
         if self
             .variations
@@ -440,14 +436,14 @@ impl Formula {
         true
     }
 
-    /// `name`'s short form without a tap prefix.
+    /// Returns `full` without its tap prefix.
     #[must_use]
     pub fn short_name(full: &str) -> &str {
         full.rsplit('/').next().unwrap_or(full)
     }
 }
 
-/// A cask as abrew needs it.
+/// A cask parsed from formulae.brew.sh JSON.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cask {
     pub token: String,
@@ -484,7 +480,7 @@ pub struct Cask {
     pub nested: Option<String>,
 }
 
-/// One admitted `variations` entry.
+/// One cask `variations` entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Variation {
     /// This entry uses fields/shapes abrew cannot evaluate.
@@ -498,7 +494,9 @@ pub struct Variation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Artifact {
-    /// Source path as brew spells it.
+    /// Source path as brew spells it (payload-relative, or where brew
+    /// installed it: `cask::payload_source`) and the installed name the
+    /// cask's `target:` rename asks for, when it names a plain file name.
     App(String, Option<String>),
     Binary(String, Option<String>),
     Font(String, Option<String>),
@@ -511,7 +509,8 @@ pub enum Artifact {
     Service(String, Option<String>),
     /// Generic `artifact` with its full stated target.
     Generic(String, Option<String>),
-    /// `command_wrapper`.
+    /// `command_wrapper`: wrapper name, the program it runs (a payload source
+    /// or a bare command name), fixed leading args, installed-name rename.
     Wrapper(String, String, Vec<String>, Option<String>),
     /// A plugin/completion artifact linked into a fixed prefix-relative directory.
     Library(String, Option<String>, String),
@@ -528,7 +527,6 @@ struct Depends {
     cask: Vec<String>,
 }
 
-/// The admitted `depends_on` shapes.
 fn parse_depends(v: Option<&Value>) -> Option<Depends> {
     let Value::Object(map) = v? else {
         return None;
@@ -609,7 +607,6 @@ fn parse_depends(v: Option<&Value>) -> Option<Depends> {
     Some(out)
 }
 
-/// The admitted `conflicts_with` shape.
 fn parse_conflicts(v: Option<&Value>) -> Option<Vec<String>> {
     let Value::Object(map) = v? else {
         return None;
@@ -635,7 +632,6 @@ fn parse_conflicts(v: Option<&Value>) -> Option<Vec<String>> {
     Some(names)
 }
 
-/// Parse one API `artifacts` array (shared by casks and their variations).
 fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
     let mut artifacts = Vec::new();
     if let Some(arr) = v.and_then(Value::as_array) {

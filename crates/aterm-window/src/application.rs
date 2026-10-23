@@ -34,6 +34,9 @@ pub trait ApplicationHandler<T: 'static = ()> {
     );
 
     /// Emitted when the OS sends an event to a device.
+    ///
+    /// LOCAL PATCH (aterm): only the Windows backend emits it; the macOS `sendEvent:` override and
+    /// the X11 backend no longer read device events.
     fn device_event(
         &mut self,
         event_loop: &ActiveEventLoop,

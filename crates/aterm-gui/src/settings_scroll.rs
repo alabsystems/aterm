@@ -566,7 +566,10 @@ impl ScrollPlan {
         top
     }
 
-    /// Whether the screen whose first stop is `top`.
+    /// Whether the screen whose first stop is `top`, drawn as the list's
+    /// last screen, shows `top` and every stop after it ([`Self::limit`]),
+    /// the caption of the run it starts in kept as that stop's own seat
+    /// keeps it ([`Self::starts_bare`]).
     pub(super) fn ends_on(&self, top: usize) -> bool {
         let n = self.len();
         if self.foot == ListFoot::Whole {
@@ -817,7 +820,10 @@ impl ScrollPlan {
         first.min(limit)
     }
 
-    /// Whether the screen whose first stop is `top`.
+    /// Whether the screen whose first stop is `top`, as it draws
+    /// ([`Self::screen`], nudged where the render seated it so), shows the
+    /// part of stop `index` from `span.0` to `span.1` under its top whole in
+    /// its room.
     pub(super) fn shows_span(&self, index: usize, top: usize, span: (f32, f32)) -> bool {
         self.shows_span_on(&self.screen(top.min(self.limit())), index, span)
     }
@@ -868,18 +874,20 @@ impl ScrollPlan {
         if headed { lead } else { 0.0 }
     }
 
-    /// Whether the screen whose first stop is `top`.
+    /// Whether the screen whose first stop is `top` shows stop `index` as the keyboard's landing
+    /// reveals it.
     pub(super) fn shows_landing(&self, index: usize, top: usize) -> bool {
         self.shows_revealed(index, top, Reveal::Keep)
     }
 
-    /// Whether the screen whose first stop is `top`.
+    /// Whether the screen whose first stop is `top` shows stop `index`'s controls whole.
     #[cfg(test)]
     pub(super) fn shows_controls(&self, index: usize, top: usize) -> bool {
         self.shows_span(index, top, self.controls_of(index))
     }
 
-    /// Whether the screen whose first stop is `top` ([`Reveal::Keep`]).
+    /// Whether the screen whose first stop is `top` shows stop `index` as the keyboard reads it
+    /// ([`Reveal::Keep`]).
     #[cfg(test)]
     pub(super) fn shows_for_keyboard(&self, index: usize, top: usize) -> bool {
         self.shows_revealed(index, top, Reveal::Keep)
@@ -897,7 +905,7 @@ impl ScrollPlan {
         }
     }
 
-    /// Whether the screen whose first stop is `top`.
+    /// Whether the screen whose first stop is `top` draws some of stop `index`'s controls live.
     pub(super) fn draws_controls_live(&self, index: usize, top: usize) -> bool {
         let Some(rows) = self.control_rows.get(index) else {
             return false;
@@ -909,7 +917,9 @@ impl ScrollPlan {
         )
     }
 
-    /// Whether the screen whose first stop is `top`.
+    /// Whether the screen whose first stop is `top`, as it draws, draws some
+    /// of control `key` of stop `index` live ([`Self::draws_controls_live`]
+    /// for that one control, where the stop says where it sits).
     pub(super) fn draws_control_live(&self, index: usize, key: &UiKey, top: usize) -> bool {
         let span = self
             .control_span(index, key)
@@ -1673,7 +1683,10 @@ impl ScrollRecord {
             && self.top == state.scroll_now().min(self.plan.limit())
     }
 
-    /// What the person was left with of `key`, the keyboard's control ([`Self::left`]).
+    /// What the person was left with of `key`, the keyboard's control
+    /// ([`Self::left`]); for a control this screen was not drawn to keep (the
+    /// keyboard moved since), or once the person scrolled it (a page turned,
+    /// a nudge dropped), what it shows of it.
     fn left_of(&self, key: &UiKey) -> Left {
         self.left
             .clone()
@@ -2062,7 +2075,7 @@ impl SettingsViewState {
         }
     }
 
-    /// Where the screen that put the list where the last render held it ([`ScrollRecord::place`]).
+    /// Where on `plan` the list sits as the last render held it ([`ScrollRecord::place`]).
     fn held_place(
         &self,
         plan: &ScrollPlan,
@@ -2329,7 +2342,8 @@ impl SettingsViewState {
         true
     }
 
-    /// Whether the stop holding the control the list keeps in view ([`Self::page_reveal`]).
+    /// Whether the stop holding the control the list keeps in view ([`Self::page_reveal`]) fits the
+    /// list's room.
     pub(super) fn revealed_stop_fits(&self) -> bool {
         let Some(key) = self.page_reveal.as_ref() else {
             return true;
@@ -2383,7 +2397,8 @@ impl SettingsViewState {
         }
     }
 
-    /// Records status-bar slack so a status bar does not cover the active control ([`ListFoot::Whole`]).
+    /// Records how far the status bar must shorten so it does not cover the active control
+    /// ([`ListFoot::Whole`]).
     pub(super) fn note_status_room(&self, plan: &ScrollPlan, room: f32) {
         let slack = self.status_slack.get();
         let (given, room) = (plan.given + slack, room + slack);
@@ -2638,7 +2653,7 @@ fn keys_within(node: &UiNode, out: &mut Vec<UiKey>) {
     }
 }
 
-/// Each control `node`.
+/// Each control under `node`, with `node` laid out `height` tall: its key, top and height.
 pub(super) fn control_spans_in(node: &UiNode, height: f32) -> Vec<(UiKey, f32, f32)> {
     fn walk(node: &UiNode, top: f32, height: f32, out: &mut Vec<(UiKey, f32, f32)>) {
         if node.paint_only {
@@ -2836,7 +2851,8 @@ fn caption_extent(node: &UiNode) -> Option<CardCaption> {
     })
 }
 
-/// Every control under `node` a person can focus.
+/// Every control under `node` a person can focus (or will, once it is done saving), in authoring
+/// order.
 pub(super) fn focus_keys(node: &UiNode) -> Vec<UiKey> {
     fn walk(node: &UiNode, out: &mut Vec<UiKey>) {
         if node.paint_only {
@@ -3356,7 +3372,8 @@ impl SplitCard {
         stops
     }
 
-    /// Whether every one of `rows` is A NOTE ON THE ROWS OVER IT ([`notes_rows_over`]).
+    /// Whether every one of `rows` is A NOTE ON THE ROWS OVER IT ([`notes_rows_over`]), with a
+    /// control over it in the card.
     pub(super) fn notes_only(&self, rows: Range<usize>) -> bool {
         !rows.is_empty()
             && rows.clone().all(|row| {

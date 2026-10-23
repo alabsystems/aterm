@@ -153,7 +153,9 @@ fn segment_heads_must_be_known_reads() {
     assert!(ro("git tag -l 'v*'"));
     assert!(ro("git tag --contains abc"));
     assert!(!ro("git remote add x url"));
-    assert!(ro("git remote -v; git remote show origin"));
+    // `git remote show <remote>` (without -n) contacts the remote.
+    assert!(!ro("git remote -v; git remote show origin"));
+    assert!(ro("git remote -v; git remote show -n origin"));
     assert!(!ro("git config user.name Bob"));
     assert!(!ro("git config --unset user.name"));
     assert!(ro("git config --get user.name; git config --list"));
@@ -495,6 +497,241 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
         sed_script_writes("k").is_some(),
         "an unknown command is unparsed"
     );
+}
+
+/// `sed`'s script options hide a write in every spelling sed reads: a script
+/// file (`-f`) attached, clustered or abbreviated; an attached or clustered
+/// `-e`; a `--expression=`/abbreviation; and macOS's valueless `-l` (the next
+/// word is the real script, not the flag's value). The file operand is
+/// `input.txt` because classify-v6 read a skipped option's next word as the
+/// script, and `input.txt` parses as an `i` command, so v6 called each of
+/// these read-only (MEASURED 2026-10-23 with the pre-audit `aterm drive
+/// classify`); macOS `/usr/bin/sed` wrote `out` for `-fs.sed`, `-nfs.sed`,
+/// `-ew out`, `-e 'w out'` and `-l 'w out'` in a scratch directory. The
+/// `--fi`/`--file=`/`--e=`/`--expr=`/`--in` spellings are GNU's (`getopt_long`
+/// takes any unambiguous prefix); macOS sed rejects every long option, so they
+/// are REASONED, not measured.
+///
+/// NEGATIVE CONTROLS: the same options carrying a read script, and `-l` whose
+/// following positional script is a read (a mutant that made short `-l` eat the
+/// next word would refuse the real script's filename as unparsed here).
+#[test]
+fn sed_script_options_cannot_hide_a_write() {
+    for cmd in [
+        "sed -fs.sed input.txt",          // -f attached
+        "sed -nfs.sed input.txt",         // -f clustered behind -n
+        "sed -f- input.txt",              // -f reading the script from stdin
+        "sed --fi s.sed input.txt",       // --file by getopt_long abbreviation
+        "sed --fi=s.sed input.txt",       // --file abbreviated, glued
+        "sed --file=s.sed input.txt",     // --file glued
+        "sed -e'w out' input.txt",        // -e attached, a w that writes
+        "sed -ew\\ out input.txt",        // -e attached, an escaped blank
+        "sed --e='w out' input.txt",      // --expression abbreviation, glued
+        "sed --expr='w out' input.txt",   // --expression abbreviation, glued
+        "sed -ne 'w out' input.txt",      // -e clustered, script in the next word
+        "sed -l 'w out' input.txt",       // -l takes no value; the next word writes
+        "sed --in s/a/b/ input.txt",      // --in-place by abbreviation
+        "sed ':x;s/a/b/w out' input.txt", // GNU ends the label at `;`
+    ] {
+        assert!(!ro(cmd), "{cmd:?} writes but was called read-only");
+    }
+    assert_eq!(
+        classify_command("sed -fs.sed input.txt").reason,
+        "sed -f (a script file)"
+    );
+    for cmd in [
+        "sed -n 's/a/b/p' f",
+        "sed -e 's/a/b/g' -e '/^$/d' f",
+        "sed -ne 's/a/b/p' f",
+        "sed --expression='s/x/y/g' f",
+        "sed -l 's/a/b/p' f",
+    ] {
+        assert!(ro(cmd), "{cmd:?} is a read but was refused");
+    }
+    // GNU ends a label at `;`, so a `w` after a `;` on a `:label` line writes;
+    // BSD reads the label to the line end, so refusing only rejects a line BSD
+    // itself rejects.
+    assert_eq!(
+        sed_script_writes(":x;s/a/b/w out").as_deref(),
+        Some("sed s///w (writes a file)")
+    );
+    assert_eq!(sed_script_writes(":a;N;$!ba"), None);
+}
+
+/// A `sed` regex delimiter inside a `[…]` bracket expression is literal (BSD
+/// and GNU), so the regex does not end at it: `s/[/]/g;/w d/p` is one `s`
+/// command and a `/w d/p` that writes `d/p` (MEASURED 2026-10-23, macOS
+/// `/usr/bin/sed` wrote `d/p` in a scratch directory), which classify-v6
+/// misread as `s/[/` and a `]/g` replacement and called read-only; `s/[/]/x/w
+/// f` writes through the `w` after the real close (v6 refused that one only as
+/// unparsed). `skip_regex` makes the address and the `s` pattern bracket-aware
+/// (`[^…]`, a leading `]`, `[:class:]`), while the replacement stays a plain
+/// delimited field.
+///
+/// NEGATIVE CONTROLS: ordinary bracket expressions in a read script, including
+/// a negated class and a class that holds the delimiter, stay read-only (a
+/// mutant that dropped the bracket awareness would misread the `w`/`p` flag and
+/// flip these).
+#[test]
+fn a_sed_bracket_delimiter_does_not_end_the_regex_early() {
+    for cmd in [
+        "sed 's/[/]/g;/w d/p' input.txt",
+        "sed 's/[/]/x/w out' f",
+        "sed '/[/]/w out' f",
+    ] {
+        assert!(!ro(cmd), "{cmd:?} writes but was called read-only");
+    }
+    for cmd in [
+        "sed 's/[0-9]/x/g' f",
+        "sed '/[abc]/d' f",
+        "sed 's/[[:digit:]]/N/g' f",
+        "sed 's/[]]/x/g' f",
+        "sed 's/[^/]/x/p' f",
+    ] {
+        assert!(ro(cmd), "{cmd:?} is a read but was refused");
+    }
+    assert_eq!(
+        sed_script_writes("s/[/]/x/w f").as_deref(),
+        Some("sed s///w (writes a file)")
+    );
+    assert_eq!(sed_script_writes("s/[0-9]/x/g"), None);
+    assert_eq!(sed_script_writes("s/[^/]/x/p"), None);
+    assert_eq!(sed_script_writes("/[/]/d"), None);
+}
+
+/// `sysctl` sets the kernel from a FILE of `name=value` pairs whose values
+/// never reach argv: macOS `-f FILE`/`--file`, Linux procps `-p`/`--system`.
+/// The `sysctl` arm refuses the flag directly, spelled whole, glued or
+/// clustered, alongside the `=`/`-w` write forms.
+///
+/// NEGATIVE CONTROLS: a bare OID read, `-n OID`, `-a`, and several OIDs stay
+/// read-only (a mutant that only checked for `=`/`-w` would approve `-f`/`-p`).
+#[test]
+fn sysctl_sets_the_kernel_from_a_file() {
+    for cmd in [
+        "sysctl -f /tmp/conf",
+        "sysctl --file /tmp/conf",
+        "sysctl --file=/tmp/conf",
+        "sysctl -nf /tmp/conf",
+        "sysctl -p",
+        "sysctl --system",
+    ] {
+        assert!(!ro(cmd), "{cmd:?} sets the kernel but was called read-only");
+        assert!(
+            classify_command(cmd).reason.contains("sysctl"),
+            "{cmd:?}: {}",
+            classify_command(cmd).reason
+        );
+    }
+    for cmd in [
+        "sysctl -n hw.ncpu",
+        "sysctl kern.maxfiles",
+        "sysctl -a",
+        "sysctl hw.ncpu vm.swapusage",
+    ] {
+        assert!(ro(cmd), "{cmd:?} is a read but was refused");
+    }
+}
+
+/// A bare INPUT redirection with no command is not a no-op under zsh: `< file`
+/// runs `$READNULLCMD` (default `more`, not a read), whose value the classifier
+/// does not read, so it cannot be approved. `bare_redirection` refuses a
+/// segment that resolves to no command and holds an input redirect with a
+/// target, in any segment of the line.
+///
+/// A bare OUTPUT redirection runs `$NULLCMD` (default `cat`, a read); a bare
+/// write to a real file is a write `danger_scan` already names, and `>
+/// /dev/null` discards through `cat` — so output-only bare redirects stay
+/// read-only, which also keeps `<(…)` process substitution (a lone `<`
+/// `split_segments` artifact with no target) and a redirect trailing a `)`
+/// group (`find … \( … \) 2>/dev/null`) read-only.
+///
+/// NEGATIVE CONTROLS: the same input redirect with a command keeps that command
+/// (a mutant dropping the no-command guard would refuse `cat < f`); output
+/// redirects and process substitution stay reads (a mutant widening to every
+/// redirect would refuse them).
+#[test]
+fn a_bare_redirection_with_no_command_is_not_read_only() {
+    for cmd in ["< f", "<f", "< /dev/null", "cat x; < f"] {
+        assert!(!ro(cmd), "{cmd:?} runs $READNULLCMD but was read-only");
+    }
+    assert!(
+        classify_command("< f")
+            .reason
+            .contains("bare input redirection"),
+        "{}",
+        classify_command("< f").reason
+    );
+    for cmd in [
+        "cat < f",
+        "> /dev/null",
+        "2> /dev/null",
+        "cat > /dev/null",
+        "ls > /dev/null 2>&1",
+        "diff <(ls a) <(ls b)",
+    ] {
+        assert!(ro(cmd), "{cmd:?} is a read but was refused");
+    }
+    // The rm breaker's classifier (`classify_except_rm`) refuses it too.
+    for cmd in ["< f", "rm -f /tmp/x; < f"] {
+        let v = classify_except_rm(cmd, DEFAULT_PYTHON_ALLOW);
+        assert!(
+            !v.read_only,
+            "{cmd:?} runs $READNULLCMD but was read-only: {v:?}"
+        );
+    }
+}
+
+/// A FILE READ BY SUBSTITUTION AND A SUBSHELL'S REDIRECT RUN NO NULL COMMAND.
+/// MEASURED 2026-10-23 under zsh 5.9 and bash 3.2.57 with `$READNULLCMD` and
+/// `$NULLCMD` set to marker scripts (`docs/measured/classifier-audit-2-2026-10-22.md`):
+/// `$(< f)`, `$(<f)`, `$( < f )`, `` `<f` ``, `$(0<f)` and `(cat) < f` printed
+/// `f` and ran neither marker, as did `(cat; ls f) < f`; `< f`, `(< f)`, `$(<
+/// f; true)`, `$(true; < f)`, `$(3<f)`, `(cat); < f` and `(cat) | < f` ran
+/// `$READNULLCMD` under zsh and `$(<f <f)` ran `$NULLCMD`. So the
+/// bare-redirection refusal leaves the substitution that is one input redirect
+/// from fd 0 and the redirect right after a subshell's `)`, in both
+/// classifiers.
+///
+/// NEGATIVE CONTROLS: the spellings that ran a marker stay refused (a mutant
+/// that skipped every substitution body or every segment after a `)` would
+/// approve `$(< f; true)` or `(cat); < f`), and so does `$(<f &)`, a zsh
+/// parse error kept on the refusing side.
+#[test]
+fn a_file_read_by_substitution_or_a_subshell_redirect_is_read_only() {
+    for cmd in [
+        "echo \"$(< VERSION)\"",
+        "cat $(<files.txt)",
+        "wc -l $(<files.txt)",
+        "cat $(< list.txt) | wc -l",
+        "echo $( < f )",
+        "echo `<f`",
+        "echo \"`< f`\"",
+        "echo $(0<f)",
+        "(cat) < in.txt",
+        "(cat) <in.txt",
+        "(cat; ls in.txt) < in.txt",
+    ] {
+        assert!(
+            ro(cmd),
+            "{cmd:?} reads a file but was refused: {:?}",
+            classify_command(cmd)
+        );
+        let v = classify_except_rm(cmd, DEFAULT_PYTHON_ALLOW);
+        assert!(v.read_only, "{cmd:?} (rm breaker) was refused: {v:?}");
+    }
+    for cmd in [
+        "(< f)",
+        "echo $(< f; true)",
+        "echo $(true; < f)",
+        "echo $(<f <f)",
+        "echo $(<f &)",
+        "echo $(3<f)",
+        "(cat); < f",
+        "(cat) | < f",
+    ] {
+        assert!(!ro(cmd), "{cmd:?} runs a null command but was read-only");
+    }
 }
 
 /// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS. MEASURED
@@ -1600,7 +1837,7 @@ fn a_git_argument_this_check_cannot_read_is_refused_before_the_double_dash() {
         "git log --oneline -- \"$f\"",
         "git diff --stat -- \"$(git ls-files | head -1)\"",
         "git config --get user.name; git config --list",
-        "git remote -v; git remote show origin",
+        "git remote -v; git remote show -n origin",
         "git log --oneline -5",
     ] {
         let v = classify_command(cmd);
@@ -1726,6 +1963,84 @@ fn an_extended_glob_word_may_become_a_flag_or_a_name() {
     }
 }
 
+/// `GIT REMOTE SHOW NAME` CONTACTS THE REMOTE IN EVERY SPELLING; WITH NO NAME
+/// IT LISTS THE REMOTES. MEASURED 2026-10-22 against an `ssh://127.0.0.1:1`
+/// remote with `GIT_SSH_COMMAND` a marker script: `git remote show origin`,
+/// `git remote -v show origin` and `git remote --verbose show origin` called
+/// ssh (the `-v` spellings were approved under classify-v6's box, since its
+/// `git_reads_clear` read only a first-word `show`); `git remote show`, `git
+/// remote -v show` and `git remote show -n origin` did not.
+///
+/// NEGATIVE CONTROLS: the forms that contact nothing stay read-only (a mutant
+/// that dropped the remote-name requirement would refuse `git remote show`).
+#[test]
+fn git_remote_show_contacts_the_remote_only_when_it_names_one() {
+    for cmd in [
+        "git remote show origin",
+        "git remote -v show origin",
+        "git remote --verbose show origin",
+        "git -C repo remote show upstream",
+    ] {
+        assert_eq!(
+            classify_command(cmd).reason,
+            "git remote show (contacts a remote)",
+            "{cmd:?}"
+        );
+    }
+    for cmd in [
+        "git remote show",
+        "git remote -v show",
+        "git remote show -n origin",
+        "git remote -v",
+    ] {
+        assert!(
+            ro(cmd),
+            "{cmd:?} contacts nothing but was refused: {:?}",
+            classify_command(cmd)
+        );
+    }
+}
+
+/// THE SPELLINGS A CLASSIFY-V6 READ-ONLY CALL LET THROUGH, EACH PINNED: the
+/// sed script options by attachment, cluster and GNU abbreviation, the git
+/// cat-file driver abbreviations, and the hazard variables classify-v7 adds.
+/// Each was read-only under the guard's surviving mutant in the review of
+/// c1a32598c2 (`--expr=`, `--fi=`, `--in`, an attached `-e` whose script
+/// holds an escaped blank, `--t`, `--fil`, `PYTHONHOME=`, `FPATH=`).
+///
+/// NEGATIVE CONTROLS: the same options carrying a read script, and an
+/// assignment to an unlisted variable, stay read-only.
+#[test]
+fn the_v6_spellings_of_a_write_or_a_hazard_are_each_refused() {
+    for cmd in [
+        "sed -ew\\ out input.txt",
+        "sed --expr='w out' input.txt",
+        "sed --fi=script.sed input.txt",
+        "sed --in s/a/b/ input.txt",
+        "git cat-file --t HEAD:f",
+        "git cat-file --fil HEAD:f",
+        "PYTHONHOME=/tmp ls",
+        "FPATH=/tmp/x ls",
+    ] {
+        assert!(
+            !ro(cmd),
+            "{cmd:?} writes, runs or sets a hazard but was read-only"
+        );
+    }
+    for cmd in [
+        "sed -es/a/b/ input.txt",
+        "sed --expr='s/a/b/' input.txt",
+        "git cat-file -t HEAD:f",
+        "PYTHONPATHS=/tmp ls",
+    ] {
+        assert!(
+            ro(cmd),
+            "{cmd:?} is a read but was refused: {:?}",
+            classify_command(cmd)
+        );
+    }
+}
+
 /// zsh ties arrays to scalars, so `path=DIR ls`, `for path in DIR; do ls`
 /// run `DIR/ls` and `module_path=DIR; echo $terminfo` loads from `DIR`.
 #[test]
@@ -1738,6 +2053,10 @@ fn a_tied_array_is_assigned_as_its_scalar() {
         "path=/bin:/tmp/x ls",
         "module_path=/tmp/x; echo $terminfo",
         "for module_path in /tmp/x; do echo $terminfo; done",
+        // `cdpath`/`CDPATH` ties to `CDPATH`, a hazard since classifier audit 2:
+        // it moves where a following `cd` lands.
+        "cdpath=/tmp/x; cd x",
+        "CDPATH=/tmp/x cd x",
     ] {
         let v = classify_command(cmd);
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
@@ -1749,7 +2068,6 @@ fn a_tied_array_is_assigned_as_its_scalar() {
     for cmd in [
         "path=/bin ls",
         "path=/bin:/usr/bin ls",
-        "cdpath=/tmp/x; cd x",
         "for p in /tmp/x; do ls; done",
         "paths=/tmp/x; ls",
     ] {
@@ -1793,7 +2111,7 @@ fn a_parameter_zsh_runs_is_a_hazard() {
         let v = classify_except_rm(cmd, &[] as &[&str]);
         assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
     }
-    for cmd in ["cat f", "> /dev/null", "echo $terminfo", "ls"] {
+    for cmd in ["cat f", "cat > /dev/null", "echo $terminfo", "ls"] {
         assert!(classify_command(cmd).read_only, "{cmd:?}");
     }
     for cmd in [
@@ -2551,7 +2869,7 @@ fn a_quoted_git_verb_or_flag_is_still_a_write() {
     }
     for cmd in [
         "git remote -v",
-        "git remote show origin",
+        "git remote show -n origin",
         "git -C 'my dir' remote -v",
         "git branch -a",
         "git branch --list 'feat*'",

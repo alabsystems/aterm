@@ -90,9 +90,8 @@ fn screen_with(inst: &headless_boot::Instance, sid: &str, needle: &str) -> Strin
 }
 
 /// Boot with the event loop's build held, `display` named (`DISPLAY`) or none, and
-/// hold the boot to what the module doc says: the boot shell ran while the build was
-/// held, its first line is on the boot session's screen once and whole, and its pid is
-/// the boot session's shell.
+/// check that the boot shell ran while the build was held, its first line is on the boot
+/// session's screen once and whole, and its pid is the boot session's shell.
 fn forks_before_the_held_build(prefix: &str, display: Option<&str>) {
     let mut watcher = None;
     let booted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -222,7 +222,8 @@ fn frames(
     out
 }
 
-/// Render `inputs` alternately.
+/// Render `inputs` alternately, warm, then count the allocations of 32 more
+/// frames and check each took the damage path `want`.
 fn steady_allocs(
     renderer: &mut Renderer,
     window: &mut WindowCpu,

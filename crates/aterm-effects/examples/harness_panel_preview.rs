@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `harness_panel_preview`.
+//! `harness_panel_preview`: pictures of Claude Code's agents panel as the
+//! harness wears it (`aterm_effects::harness_panel`,
+//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.6.13) for visual
+//! iteration and the owner's eye — pictures to look at, not checks.
 
 use std::path::Path;
 use std::process::ExitCode;

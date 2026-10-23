@@ -376,6 +376,12 @@ fn node_line(me: Option<&NodeIdentity>, end: Signer, exporter: &[u8]) -> String 
     }
 }
 
+/// Read `end`'s node line on this channel and check its signature: the proof, or `None` for
+/// `node -`.
+///
+/// # Errors
+/// [`FleetError::NodeProof`] for a signature that does not verify, [`FleetError::Malformed`] for a
+/// line that is no node line, or the read's own error.
 fn read_node_proof<S: Read>(
     stream: &mut S,
     end: Signer,
@@ -620,7 +626,10 @@ fn server_handshake_armed(
 
 /// Dialer handshake without local node identity (delegates to [`client_handshake_as`]).
 /// # Errors
-/// A [`FleetError`] naming what failed.
+/// A [`FleetError`] naming what failed. On
+/// [`ListenerWrongSecret`](FleetError::ListenerWrongSecret),
+/// [`Reflection`](FleetError::Reflection) and every earlier failure, this end sent no byte of
+/// its own proof.
 pub fn client_handshake(
     tcp: TcpStream,
     secret: &FleetSecret,
@@ -692,8 +701,7 @@ pub const fn drive_per_source(slots: usize) -> usize {
 }
 
 /// How long a connection that has proved nothing keeps its slot against a newcomer from an address
-/// holding no more unproved connections than its own ([`serve`]'s rule 2, the slots' grace for the
-/// fleet's deadline).
+/// holding no more unproved connections than its own (the slots' grace for the fleet's deadline).
 pub(crate) const PREAUTH_GRACE: Duration = Duration::from_secs(1);
 
 /// Return `true` if `ip` (after canonicalising IPv4-mapped IPv6) is loopback, private, or
@@ -934,7 +942,7 @@ pub fn serve<H, E>(
         let (tcp, peer) = match listener.accept() {
             Ok(accepted) => accepted,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // A readiness error backs off like an accept error below, so
+                // A readiness error backs off like an accept error below, so neither busy-loops.
                 if wait_listener_readable(listener, ACCEPT_POLL).is_err()
                     && running.load(Ordering::Acquire)
                 {

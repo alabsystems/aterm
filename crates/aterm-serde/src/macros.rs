@@ -5,36 +5,12 @@
 // aterm project in 2026.
 // See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
-// Super explicit first paragraph because this shows up at the top level and
-// trips up people who are just looking for basic Serialize / Deserialize
-// documentation.
-/// Helper macro when implementing the `Deserializer` part of a new data format
-/// for Serde.
-///
-/// Some [`Deserializer`] implementations for self-describing formats do not
-/// care what hint the [`Visitor`] gives them, they just want to blindly call
-/// the [`Visitor`] method corresponding to the data they can tell is in the
-/// input. This requires repetitive implementations of all the [`Deserializer`]
-/// trait methods.
-///
-/// The `forward_to_deserialize_any!` macro implements these simple forwarding
-/// methods so that they forward directly to [`Deserializer::deserialize_any`].
-/// You can choose which methods to forward.
-///
-/// The macro assumes the convention that your `Deserializer` lifetime parameter
-/// is called `'de` and that the `Visitor` type parameters on each method are
-/// called `V`. A different type parameter and a different lifetime can be
-/// specified explicitly if necessary.
-///
-/// [`Deserializer`]: crate::Deserializer
-/// [`Visitor`]: crate::de::Visitor
-/// [`Deserializer::deserialize_any`]: crate::Deserializer::deserialize_any
+/// Helper macro when implementing the `Deserializer` part of a new data format for Serde.
 #[macro_export(local_inner_macros)]
 macro_rules! forward_to_deserialize_any {
     (<$visitor:ident: Visitor<$lifetime:tt>> $($func:ident)*) => {
         $(forward_to_deserialize_any_helper!{$func<$lifetime, $visitor>})*
     };
-    // This case must be after the previous one.
     ($($func:ident)*) => {
         $(forward_to_deserialize_any_helper!{$func<'de, V>})*
     };

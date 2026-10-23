@@ -1,23 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! Replay / lash-mirror reattach: a viewer that hydrates from a host's
-//! checkpoint mid-stream and is fed the rest of the ordered output-byte log
-//! lands on the live host's state, bit-exact. The log is fed through the
-//! injected-clock seam ([`Terminal::process_at`] + a fixed [`ClockReading`]) so
-//! wall-clock pacing cannot matter. (Chunk-boundary independence and fold
-//! stability are pinned over the adversarial corpora in
-//! `replay_corpus_probe.rs`.)
+//! Checkpoint hydration and log-tail replay determinism test.
 
 use aterm_core::terminal::{ClockReading, Terminal};
 
 const ROWS: u16 = 12;
 const COLS: u16 = 40;
 
-/// A recorded output-byte log covering the determinism hazards (SGR, cursor moves, scroll
-/// region, wide CJK, a combining mark, alt-screen round-trip, autowrap toggle, OSC title, tab
-/// stops). The concatenation ends at parser ground, as `checkpoint()` requires.
 const SESSION: &[&[u8]] = &[
     b"\x1b[1;38;5;202mboot\x1b[0m\r\n",
     b"plain line one\r\nplain line two\r\n",
@@ -51,7 +41,6 @@ fn fresh() -> Terminal {
     Terminal::new(ROWS, COLS)
 }
 
-/// Feed a sequence of byte chunks through the fixed-clock seam.
 fn feed(term: &mut Terminal, chunks: &[&[u8]], clock: ClockReading) {
     for c in chunks {
         term.process_at(c, clock);
@@ -60,8 +49,6 @@ fn feed(term: &mut Terminal, chunks: &[&[u8]], clock: ClockReading) {
 
 #[test]
 fn from_checkpoint_hydration_continues_the_mirror() {
-    // A viewer reattaching mid-stream (snapshot at an offset, hydrate, feed the tail) lands
-    // where the live host did.
     let clock = fixed_clock();
     const AT: usize = 8; // reattach after the alt-screen enter
 
@@ -75,9 +62,6 @@ fn from_checkpoint_hydration_continues_the_mirror() {
     let mut viewer = Terminal::from_checkpoint(&snapshot);
     feed(&mut viewer, &SESSION[AT..], clock);
 
-    // The viewer is a restore the tail reached before any host adopted it: its
-    // checkpoint carries that lineage's seed uncertainty
-    // (`HolderRepr::seed_untrusted`), which the live host never has.
     let reattached = viewer.checkpoint();
     assert!(
         reattached.holder.seed_untrusted,

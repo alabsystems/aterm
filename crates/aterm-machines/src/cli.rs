@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm machines <verb>`: argument parsing and dispatch.
-//!
-//! The front door (`crates/aterm/src/main.rs`) hands every argument after `machines` here.
-//! A flag this does not know is refused with the usage, the same at a terminal and through
-//! a pipe (`crates/aterm/tests/front_door_verbs.rs`).
 
 use crate::controller::commands::{self, Env};
 use crate::controller::discover;
@@ -167,7 +163,6 @@ At each Mac, once (the visit no software replaces):
 `aterm machines person` counts these steps later, so a skipped one is never silent.
 ";
 
-/// Every verb the usage names.
 const VERBS: &[&str] = &[
     "init",
     "scan",
@@ -191,15 +186,10 @@ const VERBS: &[&str] = &[
     "agent",
 ];
 
-/// The `launchd` label of the LaunchAgent builds of `main` from 17 October 2026 installed in
-/// each account that ran them (design §14.2).
 const RETIRED_AGENT: &str = "systems.alab.aterm-machines";
 
-/// Where that LaunchAgent kept its copy of aterm and its log, under `$HOME`.
 const RETIRED_AGENT_DIR: &str = ".local/share/aterm-machines";
 
-/// The files that job made, under [`RETIRED_AGENT_DIR`]: its Spotlight marker, the copy of
-/// aterm it ran, its log and its socket.
 const RETIRED_FILES: &[&str] = &[
     ".metadata_never_index",
     "bin/aterm",
@@ -207,35 +197,26 @@ const RETIRED_FILES: &[&str] = &[
     "state/daemon.sock",
 ];
 
-/// The directories it made, deepest first.
 const RETIRED_DIRS: &[&str] = &["bin", "state/runs", "state", "cache", "stage", "inbox"];
 
-/// Whether `aterm pkg <args>` retires that job: `shell-setup`, the step that installs aterm,
-/// but not its `--dry-run`, which changes nothing.
+/// Whether `aterm pkg <args>` retires the LaunchAgent earlier builds installed: `shell-setup`
+/// without `--dry-run`.
 #[must_use]
 pub fn pkg_retires(args: &[OsString]) -> bool {
     args.first().is_some_and(|a| a == "shell-setup") && !args.iter().any(|a| a == "--dry-run")
 }
 
 /// Take away the LaunchAgent earlier builds installed in this account ([`retire_agent`]).
-///
-/// No-op as root, under a synthetic `$HOME` or a private state root (`ATERM_STATE_HOME`).
-/// It starts no process when there is nothing to take.
 pub fn retire_lan_agent() {
     let sys = Live::new();
     if sys.euid() == 0 || !crate::sessions::is_live_account() {
         return;
     }
-    // `is_live_account` has shown `$HOME` is the account's own home.
     if let Some(home) = aterm_types::dirs::home_dir() {
         retire_agent(&sys, &home);
     }
 }
 
-/// Unload and delete `~/Library/LaunchAgents/systems.alab.aterm-machines.plist`, then delete
-/// what that job left ([`sweep_retired_dir`]). Main's job was to answer LAN discovery and
-/// management on port 19740; it never did (the agent refused its argv), and launchd ran it
-/// again every ten seconds. Only bounded metadata walks when there is nothing to take.
 fn retire_agent(sys: &dyn System, home: &Path) {
     if sys.euid() == 0 {
         return;
@@ -254,8 +235,6 @@ fn retire_agent(sys: &dyn System, home: &Path) {
     sweep_retired_dir(sys, home, Path::new(RETIRED_AGENT_DIR));
 }
 
-/// Admit every directory from the validated home through `below` without following a
-/// directory alias. Missing, unreadable and non-directory components keep cleanup out.
 fn physical_directory_below(
     sys: &dyn System,
     home: &Path,
@@ -278,12 +257,6 @@ fn physical_directory_below(
     Some(dir)
 }
 
-/// Delete [`RETIRED_FILES`] from `dir`, then each of [`RETIRED_DIRS`] that is empty, then
-/// `dir` if it is empty. A name is deleted only when `lstat` shows what the job made there (a
-/// file that is neither a directory nor a link, or a directory), and only when every
-/// directory from `dir` down to it is a real one: the kernel follows a link in the middle of
-/// a path, so a `state` that is a link stops `state/runs` and `state/daemon.log`. A link,
-/// and anything else, stays.
 fn sweep_retired_dir(sys: &dyn System, home: &Path, below: &Path) {
     let Some(dir) = physical_directory_below(sys, home, below) else {
         return;
@@ -305,7 +278,6 @@ fn sweep_retired_dir(sys: &dyn System, home: &Path, below: &Path) {
             let _ = sys.remove(&path);
         }
     }
-    // `remove` takes a directory only when it is empty.
     for rel in RETIRED_DIRS {
         let path = dir.join(rel);
         if reached(Path::new(rel)) && is_dir(&path) {
@@ -368,7 +340,6 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// What a controller verb was given: its words, its flags, and after `--` an argv.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Opts {
     words: Vec<String>,
@@ -391,10 +362,8 @@ struct Opts {
     argv: Vec<String>,
 }
 
-/// The flags each controller verb takes.
 fn flags_of(verb: &str) -> &'static [&'static str] {
     match verb {
-        // `outstanding` is a to-do list for a person: `status --json` has the reports.
         "ls" | "attach" => &["--json"],
         "tabs" => &["--all", "--json"],
         "monitor" | "top" | "watch" => &[
@@ -416,7 +385,6 @@ fn flags_of(verb: &str) -> &'static [&'static str] {
     }
 }
 
-/// Parse `args` for `verb`: a flag it does not take is refused, never ignored.
 fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
     let allowed = flags_of(verb);
     let mut o = Opts::default();
@@ -485,7 +453,6 @@ fn parse(verb: &str, args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 
-/// Exactly `n` words, or the refusal naming what the verb takes.
 fn words(o: &Opts, min: usize, max: usize, takes: &str) -> Result<(), String> {
     if (min..=max).contains(&o.words.len()) {
         Ok(())
@@ -494,14 +461,12 @@ fn words(o: &Opts, min: usize, max: usize, takes: &str) -> Result<(), String> {
     }
 }
 
-/// A verb that runs on the controller.
 fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> ExitCode {
     let terminals = Terminals {
         stdin: std::io::stdin().is_terminal(),
         stderr: std::io::stderr().is_terminal(),
     };
     if verb == "enroll" {
-        // Enrollment parses its own arguments (controller::enroll::parse_args).
         return enroll::main(sys, &paths, args, terminals.stdin && terminals.stderr);
     }
     let o = match parse(verb, args) {
@@ -586,7 +551,6 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
     }
 }
 
-/// `aterm machines here plan|apply <baseline.toml> [--json]`.
 fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     let json = args.iter().any(|a| a == "--json");
     let rest: Vec<&String> = args.iter().filter(|a| *a != "--json").collect();
@@ -604,14 +568,12 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     commands::here(sys, mode, Path::new(path.as_str()), json)
 }
 
-/// One line, then the usage, on standard error; exit status 2.
 fn refuse(why: &str) -> ExitCode {
     eprintln!("aterm machines: {why}");
     eprint!("{USAGE}");
     ExitCode::from(2)
 }
 
-/// `aterm machines scan [--wait <s>] [--subnet <cidr>]`.
 fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
     let mut wait = Duration::from_secs(3);
     let mut cidr: Option<&str> = None;
@@ -653,9 +615,6 @@ fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
             }
         }
     }
-    // Which rows are enrolled Macs: by the host key each presents, never by name or address.
-    // An inventory that is there and cannot be read leaves every row unknown (`?`), never
-    // `new`: an unreadable inventory is not an empty one.
     let paths = root.or_else(Paths::default_root);
     let inventory = match &paths {
         Some(p) => match scan_inventory(&sys, p) {
@@ -721,9 +680,6 @@ fn scan(root: Option<Paths>, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// A row's MAC column: `enrolled <host>` only when the key it presents is the one pinned
-/// for that host ([`discover::pinned_host`]), `new` when its key is pinned for none, `?`
-/// when it shows no key (no Remote Login).
 fn mark(sys: &dyn System, paths: &Paths, inv: &Inventory, row: &discover::Found) -> String {
     match discover::pinned_host(sys, paths, inv, row) {
         Read::Value(name) => format!("enrolled {name}"),
@@ -732,9 +688,6 @@ fn mark(sys: &dyn System, paths: &Paths, inv: &Inventory, row: &discover::Found)
     }
 }
 
-/// The inventory `scan` compares host keys against: `Value` when it loads, `Absent` when
-/// there is none yet (nothing is enrolled, so a Mac whose key shows is new), `Unusable` when
-/// it is there and cannot be read or parsed.
 fn scan_inventory(sys: &dyn System, paths: &Paths) -> Read<Inventory> {
     match sys.stat(&paths.inventory()) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Read::Absent,
@@ -821,7 +774,6 @@ mod tests {
         retire_agent(&sys, home);
         let calls = sys.calls();
         let at = |c: &str| calls.iter().position(|x| x == c);
-        // Unloaded before its plist goes: launchd neither runs it now nor at the next login.
         assert!(at(bootout).is_some(), "{calls:?}");
         assert!(at(bootout) < at(&format!("remove {plist}")), "{calls:?}");
         for gone in [
@@ -833,7 +785,6 @@ mod tests {
         ] {
             assert_eq!(sys.written(&gone), None, "{gone}");
         }
-        // Its directories after its files, deepest first, and only those that are there.
         let removed: Vec<&str> = calls
             .iter()
             .filter_map(|c| c.strip_prefix("remove "))
@@ -852,12 +803,8 @@ mod tests {
                 dir.to_owned(),
             ]
         );
-        // What the job did not make stays (and `remove` takes no directory that is not
-        // empty: `a_retired_directory_is_swept_only_where_the_job_made_it`).
         assert!(sys.written(&format!("{dir}/state/notes.txt")).is_some());
 
-        // A `state` that is a link, and a file or a link where a directory of the job's
-        // was: nothing is taken at them or through them.
         let sys = installed();
         let link = crate::port::Stat {
             dir: false,
@@ -882,11 +829,9 @@ mod tests {
         }
         assert!(calls.contains(&format!("remove {dir}/.metadata_never_index")));
 
-        // Nothing there: nothing run or removed.
         let sys = alice();
         retire_agent(&sys, home);
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
-        // A link where its directory was is not followed.
         let sys = installed();
         sys.stat_of(
             dir,
@@ -903,7 +848,6 @@ mod tests {
                 .iter()
                 .any(|c| c.starts_with(&format!("remove {dir}")))
         );
-        // Root has no such job.
         let sys = Fake::root();
         sys.file(plist, b"<plist/>");
         retire_agent(&sys, home);
@@ -924,7 +868,6 @@ mod tests {
     #[test]
     fn a_retired_directory_is_swept_only_where_the_job_made_it() {
         use std::os::unix::fs::symlink;
-        // Under /tmp: a socket path must fit in 104 bytes.
         let tmp = aterm_tempfile::Builder::new()
             .prefix("at-retire-")
             .tempdir_in("/tmp")
@@ -937,7 +880,6 @@ mod tests {
         };
         let there = |p: &Path| p.symlink_metadata().is_ok();
 
-        // As the job left it, with a file of the account's in `stage` and a link at `inbox`.
         let job = t.join("job");
         for d in ["bin", "state/runs", "cache", "stage"] {
             std::fs::create_dir_all(job.join(d)).unwrap();
@@ -960,16 +902,12 @@ mod tests {
         for kept in ["stage/notes", "inbox", "inbox/keep"] {
             assert!(there(&job.join(kept)), "{kept}");
         }
-        // Once nothing else is there, the directory goes too.
         std::fs::remove_file(job.join("stage/notes")).unwrap();
         std::fs::remove_file(job.join("inbox")).unwrap();
         sweep_retired_dir(&live, t, Path::new("job"));
         assert!(!there(&job));
         assert!(there(&t.join("mine/inbox/keep")));
 
-        // Links and a file where the job's directories and files were: `state` a link to a
-        // directory holding an empty `runs` and a `daemon.log`, `bin` a link to one holding
-        // an `aterm`, a file at `cache`, a link at the marker.
         let job = t.join("job2");
         std::fs::create_dir_all(t.join("elsewhere/runs")).unwrap();
         write(&t.join("elsewhere/daemon.log"));
@@ -993,8 +931,6 @@ mod tests {
             assert!(there(&t.join(kept)), "{kept}");
         }
 
-        // An alias ABOVE the retired directory cannot redirect its whitelist into
-        // external owned data. These call the same gated sweep as retire_agent.
         for (i, prefix, tail) in [
             (0, ".local", "share/aterm-machines"),
             (1, ".local/share", "aterm-machines"),
@@ -1011,7 +947,6 @@ mod tests {
             assert!(there(&alias), "the ancestor alias stays");
             assert_eq!(std::fs::read(&marker).unwrap(), b"x", "external data stays");
         }
-        // The plist path uses the same admission, without calling launchctl here.
         for (i, prefix, tail) in [
             (0, "Library", "LaunchAgents"),
             (1, "Library/LaunchAgents", ""),

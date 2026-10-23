@@ -143,7 +143,7 @@ fn the_container_hash_answers_within_its_bound() {
     let fifo = dir.root.join("container.zip");
     let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
         .expect("a scratch path has no NUL");
-    // SAFETY: a valid NUL-terminated path.
+    // SAFETY: a valid NUL-terminated path; mkfifo reads it and nothing else.
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
     let (tx, rx) = std::sync::mpsc::channel();
     let path = fifo.clone();

@@ -165,12 +165,18 @@ fn closes_a_brace(tok: &str) -> bool {
 /// The directories a program may be named from by path and still be the program its basename says.
 const SYSTEM_BIN_DIRS: &[&str] = &["/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/"];
 
-/// Variables whose assignment changes what a later program runs or reads.
+/// Variables whose assignment changes what a later program runs or reads: the search path,
+/// shell startup and splitting, pagers and editors a read tool may exec, git and rg config
+/// roots. `CDPATH` moves where a following `cd` lands (so a later read runs in a directory
+/// the line chose), `FPATH` is zsh's autoload search path (loads function code) and
+/// `PYTHONHOME` relocates a python's standard library.
 const HAZARD_VARS: &[&str] = &[
     "PATH",
+    "CDPATH",
     "NULLCMD",
     "READNULLCMD",
     "MODULE_PATH",
+    "FPATH",
     "STTY",
     "IFS",
     "BASH_ENV",
@@ -195,6 +201,7 @@ const HAZARD_VARS: &[&str] = &[
     "NODE_OPTIONS",
     "PYTHONSTARTUP",
     "PYTHONPATH",
+    "PYTHONHOME",
 ];
 
 /// Prefixes of [`HAZARD_VARS`].
@@ -213,7 +220,8 @@ const ZSH_TIED: &[(&str, &str)] = &[
     ("zsh_eval_context", "ZSH_EVAL_CONTEXT"),
 ];
 
-/// The variables whose value zsh 5.9 runs.
+/// The variables whose value zsh 5.9 runs, loads or sources during an ordinary
+/// line of reads.
 #[cfg(test)]
 const ZSH_RUNS_A_VALUE: &[&str] = &[
     "MODULE_PATH",
@@ -283,6 +291,7 @@ pub fn classify_command(cmd: &str) -> Verdict {
 
 /// Classify `cmd`, permitting `python3 <path>` when `<path>` matches `python_allow`.
 pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Verdict {
+    let raw = cmd;
     let cmd = match prelex(cmd) {
         Ok(cmd) => cmd,
         Err(reason) => return Verdict::no(reason),
@@ -294,7 +303,13 @@ pub fn classify_command_with<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -> Ve
         return Verdict::no("empty command");
     }
 
+    if let Some(reason) = network_reach(raw) {
+        return Verdict::no(reason);
+    }
     if let Some(reason) = danger_scan(&segments) {
+        return Verdict::no(reason);
+    }
+    if let Some(reason) = bare_redirection(&stripped) {
         return Verdict::no(reason);
     }
     if let Some(reason) = program_scan(&cmd) {
@@ -323,20 +338,22 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
         Ok(cmd) => cmd,
         Err(reason) => return Verdict::no(reason),
     };
+    // The rm arm layers `network_free`/`brace_free` on top of this, with the
+    // reading-named "rm circuit breaker: …" message, so a network reach is not
+    // refused here (`classify_command_with`, the CLI/presence path, keeps it).
     let lexed = strip_alarm_idiom(&lexed);
+    let stripped = strip_quotes(&lexed);
     let (segments, left_out): (Vec<Vec<String>>, Vec<Vec<String>>) =
-        split_segments(&strip_quotes(&lexed))
-            .into_iter()
-            .partition(|seg| {
-                let head = seg.iter().find(|t| !is_assignment(t));
-                match head {
-                    None => false,
-                    Some(h) => {
-                        let p = program(h).to_ascii_lowercase();
-                        p != "rm" && p != "mktemp"
-                    }
+        split_segments(&stripped).into_iter().partition(|seg| {
+            let head = seg.iter().find(|t| !is_assignment(t));
+            match head {
+                None => false,
+                Some(h) => {
+                    let p = program(h).to_ascii_lowercase();
+                    p != "rm" && p != "mktemp"
                 }
-            });
+            }
+        });
     if let Some(reason) = left_out
         .iter()
         .flat_map(|seg| seg.iter().take_while(|t| is_assignment(t)))
@@ -351,6 +368,9 @@ pub(crate) fn classify_except_rm<S: AsRef<str>>(cmd: &str, python_allow: &[S]) -
         return Verdict::no(reason);
     }
     if let Some(reason) = danger_scan(&segments) {
+        return Verdict::no(reason);
+    }
+    if let Some(reason) = bare_redirection(&stripped) {
         return Verdict::no(reason);
     }
     if let Some(reason) = program_scan(&lexed) {
@@ -394,7 +414,8 @@ pub(crate) fn plain_zsh_line(line: &str) -> Result<(), String> {
 /// How deep [`plain_dollar`] follows a `$(…)` inside a `$(…)`.
 const PLAIN_NEST: u8 = 8;
 
-/// [`plain_zsh_line`] over `chars`.
+/// [`plain_zsh_line`] over `chars`, `depth` command substitutions in: inside one (`depth > 0`) a
+/// newline and a comment are refused too.
 fn plain_zsh(chars: &[char], depth: u8) -> Result<(), String> {
     #[derive(PartialEq)]
     enum Quote {
@@ -619,7 +640,8 @@ const ZSH_RESERVED: &[&str] = &[
     "while",
 ];
 
-/// A segment the rm rule's resolver.
+/// A segment the rm rule's resolver reads as a guard on a `$(mktemp -d)`: `exit`, `exit <n>`, or
+/// `:` with its words.
 fn is_mktemp_guard(seg: &[String]) -> bool {
     match seg {
         [head, ..] if head == ":" => true,
@@ -713,7 +735,8 @@ impl Prelex {
         Ok(())
     }
 
-    /// At a backslash inside a backtick substitution.
+    /// At a backslash inside a backtick substitution: the shell rereads the
+    /// body with `` \` `` as a backtick, so ``` `echo \`rm x\`` ``` runs `rm x`.
     fn nested_backtick(&self) -> Result<(), String> {
         if self.backticks > 0 && self.peek(1) == Some('`') {
             return Err("a backtick substitution nested in another (\\`)".to_string());
@@ -892,7 +915,7 @@ impl Prelex {
         }
     }
 
-    /// A `$` that opens neither `${` ([`Self::parameter_hazard`]).
+    /// A `$` that opens neither `${` nor `$(`: copied unless [`Self::parameter_hazard`] refuses it.
     fn bare_parameter(&mut self) -> Result<(), String> {
         if let Some(why) = self.parameter_hazard() {
             return Err(why);
@@ -902,8 +925,8 @@ impl Prelex {
         Ok(())
     }
 
-    /// Whether the `$` at the cursor opens an arithmetic evaluation ([`dollar_arithmetic`],
-    /// [`GLOB_SUBST_RUNS`]).
+    /// Whether the `$` at the cursor opens an arithmetic evaluation ([`dollar_arithmetic`]) or
+    /// carries zsh's `~` flag ([`GLOB_SUBST_RUNS`]).
     fn parameter_hazard(&self) -> Option<String> {
         let after = &self.chars[self.i + 1..];
         if after
@@ -916,7 +939,8 @@ impl Prelex {
         dollar_arithmetic(after).map(str::to_string)
     }
 
-    /// `${…}`: copied when it holds no quote ([`braced_is_literal`], [`Self::parameter_hazard`]).
+    /// `${…}`: copied when it holds no quote, nested expansion or substitution, its body passes
+    /// [`braced_is_literal`], and no `$` in it trips [`Self::parameter_hazard`].
     fn braced_parameter(&mut self) -> Result<(), String> {
         let start = self.i;
         self.i += 2;
@@ -1097,13 +1121,13 @@ fn braced_is_literal(body: &str) -> Result<(), String> {
     if rest.starts_with('@') {
         return refuse("a transformation (bash's @P expands the value as a prompt)");
     }
+    // `${name:offset[:length]}`: both are arithmetic.
     if let Some(r) = rest.strip_prefix(':')
         && !r.starts_with(['-', '=', '+', '?'])
-    {
         // `${name:offset[:length]}`: both are arithmetic.
-        if !r.split(':').take(2).all(int) || r.split(':').count() > 2 {
-            return refuse("a substring offset that is not a literal (evaluated as arithmetic)");
-        }
+        && (!r.split(':').take(2).all(int) || r.split(':').count() > 2)
+    {
+        return refuse("a substring offset that is not a literal (evaluated as arithmetic)");
     }
     if let Some(value) = rest.strip_prefix(":=").or_else(|| rest.strip_prefix('='))
         && let Some(why) = assignment_hazard(&format!("{name}={value}"))
@@ -1338,7 +1362,6 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
                 out.push(')');
             }
             _ => {
-                // A literal QUOTE_SUB_MARK is dropped: only the marker this
                 if c != QUOTE_SUB_MARK {
                     out.push(c);
                 }
@@ -1350,6 +1373,28 @@ fn strip_into(chars: &[char], i: &mut usize, out: &mut String, stop: Option<char
 
 /// Split on `;`, `&`, `&&`, `||`, `|`, `(`, `)` and newline.
 fn split_segments(s: &str) -> Vec<Vec<String>> {
+    split_segments_at(s)
+        .into_iter()
+        .map(|(seg, _)| seg)
+        .collect()
+}
+
+/// Where a segment of [`split_segments_at`] stands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SegAt {
+    /// A command's place.
+    Command,
+    /// The whole body of a `$(…)` or backquoted substitution that is one input
+    /// redirect: bash's and zsh's `$(<file)`, which reads `file` and runs no
+    /// command.
+    FileRead,
+    /// The redirects after the `)` that closes a subshell: `(cat) < f`
+    /// redirects the subshell.
+    AfterGroup,
+}
+
+/// [`split_segments`], each segment with where it stands.
+fn split_segments_at(s: &str) -> Vec<(Vec<String>, SegAt)> {
     let chars: Vec<char> = s.chars().collect();
     let mut segments = Vec::new();
     let mut i = 0;
@@ -1357,16 +1402,68 @@ fn split_segments(s: &str) -> Vec<Vec<String>> {
     segments
 }
 
+/// A substitution body [`split_level`] just read, from `start` to `end` (past
+/// its closing character), that left the one segment `segments[first]`:
+/// marked [`SegAt::FileRead`] when that segment is one input redirect from fd
+/// 0 (`<f`, `< f`, `0<f`) and the body holds no `;`, `&` or `|`. MEASURED
+/// 2026-10-23 under zsh 5.9 and bash 3.2.57 with `$READNULLCMD` and `$NULLCMD`
+/// set to marker scripts: `$(< f)`, `$(<f)`, `$( < f )`, `` `<f` ``, `$(0<f)`
+/// and `$(< f` newline `)` ran neither; `$(<f <f)` ran `$NULLCMD` and `$(< f;
+/// true)` `$READNULLCMD` under zsh, and both make more than one redirect or
+/// segment here.
+fn mark_file_read(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    first: usize,
+    segments: &mut [(Vec<String>, SegAt)],
+) {
+    let body = &chars[start.min(end)..end];
+    if segments.len() != first + 1 || body.iter().any(|c| matches!(c, ';' | '&' | '|')) {
+        return;
+    }
+    let (toks, at) = &mut segments[first];
+    let op = toks[0].strip_prefix('0').unwrap_or(&toks[0]);
+    let Some(rest) = op.strip_prefix('<') else {
+        return;
+    };
+    if rest.starts_with(['<', '>', '&', '(']) {
+        return;
+    }
+    if (toks.len() == 1 && !rest.is_empty()) || (toks.len() == 2 && rest.is_empty()) {
+        *at = SegAt::FileRead;
+    }
+}
+
 /// One level of [`split_segments`].
-fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut Vec<Vec<String>>) {
+fn split_level(
+    chars: &[char],
+    i: &mut usize,
+    stop: Option<char>,
+    segments: &mut Vec<(Vec<String>, SegAt)>,
+) {
     let mut cur = String::new();
-    let flush = |cur: &mut String, segments: &mut Vec<Vec<String>>| {
+    let mut at = SegAt::Command;
+    let flush = |cur: &mut String, at: &mut SegAt, segments: &mut Vec<(Vec<String>, SegAt)>| {
         let toks: Vec<String> = cur.split_whitespace().map(str::to_string).collect();
         if !toks.is_empty() {
-            segments.push(toks);
+            segments.push((toks, *at));
         }
         cur.clear();
+        *at = SegAt::Command;
     };
+    let body =
+        |chars: &[char], i: &mut usize, close: char, segments: &mut Vec<(Vec<String>, SegAt)>| {
+            let (start, first) = (*i, segments.len());
+            split_level(chars, i, Some(close), segments);
+            mark_file_read(
+                chars,
+                start,
+                i.saturating_sub(1).max(start),
+                first,
+                segments,
+            );
+        };
     let mut depth = 0usize;
     while *i < chars.len() {
         let c = chars[*i];
@@ -1383,13 +1480,13 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
                 && chars.get(*i + 2) == Some(&'(') =>
             {
                 *i += 3;
-                split_level(chars, i, Some(')'), segments);
+                body(chars, i, ')', segments);
                 cur.push_str(QUOTED_SUBSTITUTION);
                 continue;
             }
             _ if c == QUOTE_SUB_MARK && chars.get(*i + 1) == Some(&'`') => {
                 *i += 2;
-                split_level(chars, i, Some('`'), segments);
+                body(chars, i, '`', segments);
                 cur.push_str(QUOTED_SUBSTITUTION);
                 continue;
             }
@@ -1398,7 +1495,7 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
             }
             '$' if chars.get(*i + 1) == Some(&'(') => {
                 *i += 2;
-                split_level(chars, i, Some(')'), segments);
+                body(chars, i, ')', segments);
                 cur.push_str(SUBSTITUTION);
                 continue;
             }
@@ -1408,7 +1505,7 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
             }
             '`' => {
                 *i += 1;
-                split_level(chars, i, Some('`'), segments);
+                body(chars, i, '`', segments);
                 cur.push_str(SUBSTITUTION);
                 continue;
             }
@@ -1418,13 +1515,17 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
             }
             '(' => {
                 depth += 1;
-                flush(&mut cur, segments);
+                flush(&mut cur, &mut at, segments);
             }
             ')' => {
+                let closes_a_group = depth > 0;
                 depth = depth.saturating_sub(1);
-                flush(&mut cur, segments);
+                flush(&mut cur, &mut at, segments);
+                if closes_a_group {
+                    at = SegAt::AfterGroup;
+                }
             }
-            ';' | '|' | '\n' => flush(&mut cur, segments),
+            ';' | '|' | '\n' => flush(&mut cur, &mut at, segments),
             '>' | '<' => {
                 if glued_to_a_word(&cur) {
                     cur.push(' ');
@@ -1432,7 +1533,7 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
                 cur.push(c);
             }
             '&' if chars.get(*i + 1) == Some(&'&') => {
-                flush(&mut cur, segments);
+                flush(&mut cur, &mut at, segments);
                 *i += 1;
             }
             '&' => {
@@ -1444,14 +1545,14 @@ fn split_level(chars: &[char], i: &mut usize, stop: Option<char>, segments: &mut
                 } else if prev == Some('>') || prev == Some('<') || next == Some('>') {
                     cur.push(c);
                 } else {
-                    flush(&mut cur, segments);
+                    flush(&mut cur, &mut at, segments);
                 }
             }
             _ => cur.push(c),
         }
         *i += 1;
     }
-    flush(&mut cur, segments);
+    flush(&mut cur, &mut at, segments);
 }
 
 /// Whether a redirect glyph arriving now would be glued to a word.
@@ -1468,7 +1569,8 @@ pub(crate) fn program(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
-/// An output redirect token: `Some(target)` when `tok` redirects.
+/// An output redirect token: `Some(target)` when `tok` redirects (`>`, `>>`,
+/// `2>`, `&>`, `>|`, `>file`), `Some(None)` when the target is the next token.
 fn redirect_target(tok: &str) -> Option<Option<&str>> {
     let pos = tok.find('>')?;
     if tok[..pos].ends_with('<') {
@@ -1655,10 +1757,29 @@ fn flag_hazard_at(seg: &[String], i: usize) -> Option<String> {
         }
     }
     if prog == "sed" {
+        // macOS sed edits in place under `-I` as under `-i`, alone or in a
+        // cluster (`-nI`). An `i`/`I` counts only before the cluster's first
+        // value-taking letter (`f`/`e`): in `-fscript.sed` or `-es/x/i/` the
+        // `i` lives in the filename or script the flag consumes, not a flag.
         for t in &seg[i + 1..] {
+            let short_in_place = t.starts_with('-') && !t.starts_with("--") && {
+                let mut hit = false;
+                for c in t[1..].chars() {
+                    match c {
+                        'i' | 'I' => {
+                            hit = true;
+                            break;
+                        }
+                        'f' | 'e' => break,
+                        _ => {}
+                    }
+                }
+                hit
+            };
             if t == "--in-place"
                 || t.starts_with("--in-place=")
-                || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains(['i', 'I']))
+                || long_option_spells(t, "in-place")
+                || short_in_place
             {
                 return Some("sed -i".to_string());
             }
@@ -1716,12 +1837,23 @@ fn flag_hazard_at(seg: &[String], i: usize) -> Option<String> {
                 || t.starts_with("--open-files-in-pager")
                 || (t.starts_with("-O") && !t.starts_with("--"))
                 || (sub == "grep" && grep_opens_pager(t))
+                // `git cat-file` uses parse-options, which takes any unambiguous
+                // abbreviation, so `git cat-file --t HEAD:f` runs the repo's
+                // `diff.<driver>.textconv` program and `--fi` its filter driver
+                // (hole `git-cat-file-textconv-abbrev-runs-program`). git
+                // log/diff/show do not abbreviate these.
+                || (sub == "cat-file"
+                    && t.starts_with("--")
+                    && (long_option_spells(t, "textconv") || long_option_spells(t, "filters")))
             {
                 return Some(format!("git {sub} {t}"));
             }
             if t == "--help" {
                 return Some(format!("git {sub} --help {GIT_HELP_RUNS}"));
             }
+        }
+        if sub == "remote" && git_remote_show_contacts(&seg[sub_idx + 1..]) {
+            return Some("git remote show (contacts a remote)".to_string());
         }
         if GIT_DANGER.contains(&sub) {
             return Some(format!("git {sub}"));
@@ -1735,6 +1867,26 @@ fn flag_hazard_at(seg: &[String], i: usize) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `git remote` with the words `args` after `remote` contacts a remote:
+/// its verb (the first operand, so `git remote -v show origin` is a show) is
+/// `show`, a remote name follows it, and no `-n` is given. MEASURED 2026-10-22
+/// against an `ssh://127.0.0.1:1` remote with `GIT_SSH_COMMAND` a marker script:
+/// `git remote show origin`, `git remote -v show origin` and `git remote
+/// --verbose show origin` called ssh; `git remote show`, `git remote -v show`
+/// (they list the configured remotes) and `git remote show -n origin` did not.
+/// Ssh, the credential helpers and the remote's programs run on a contact.
+pub(crate) fn git_remote_show_contacts<S: AsRef<str>>(args: &[S]) -> bool {
+    let mut operands = args
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|a| !a.starts_with('-'));
+    operands.next() == Some("show")
+        && operands.next().is_some()
+        && !args
+            .iter()
+            .any(|a| matches!(a.as_ref(), "-n" | "--no-query"))
 }
 
 /// The flag-and-option hazards read from the shell's argv words ([`program_words`]).
@@ -1892,7 +2044,10 @@ fn expands_apart(t: &str) -> bool {
     t.contains('{') || t.contains(GLOB_CHARS) || t.chars().skip(1).any(|c| c == '~')
 }
 
-/// Whether `t` spells the long option `--{name}` as `getopt_long`.
+/// Whether `t` spells the long option `--{name}` as `getopt_long` (macOS
+/// `sort` 2.3-Apple, GNU tools) and git's option parser read one: the whole
+/// name or any prefix of it, bare or with `=value` (`--o`, `--outp=f`,
+/// `--compress`).
 fn long_option_spells(t: &str, name: &str) -> bool {
     t.strip_prefix("--")
         .map(|r| r.split_once('=').map_or(r, |(n, _)| n))
@@ -1946,8 +2101,9 @@ fn option_slots_end(head: &str, args: &[String]) -> usize {
     args.iter().position(|t| t == "--").unwrap_or(args.len())
 }
 
-/// The first quote-stripped word in `head`'s option slots the shell may brace-expand or glob into a
-/// flag ([`may_expand_into_a_flag`]).
+/// The first quote-stripped word in `head`'s option slots (every word for `uniq`) the shell may
+/// brace-expand or glob into a flag ([`may_expand_into_a_flag`]), or, for `uniq` and `sysctl`,
+/// into another operand.
 fn glob_in_an_option_slot<'a>(head: &str, args: &'a [String]) -> Option<&'a str> {
     if matches!(head, "test" | "[" | "printf") {
         return None;
@@ -1981,7 +2137,8 @@ fn has_unquoted_expansion(tok: &str) -> bool {
     )
 }
 
-/// Whether every expansion in a `test`/`[` expression is a quoted operand under POSIX's 1-.
+/// Whether every expansion in a `test`/`[` expression is a quoted operand under POSIX's 1-, 2- and
+/// 3-argument rules.
 fn test_expansions_are_operands(ops: &[String]) -> bool {
     if ops.iter().any(|t| has_unquoted_expansion(t)) {
         return false;
@@ -2009,7 +2166,7 @@ pub(crate) const TEST_BINARY: &[&str] = &[
     "=", "==", "!=", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-gt", "-ge", "-lt", "-le",
 ];
 
-/// Flags by which a read tool at a segment head runs a program or writes: `rg --pre`
+/// Flags by which a read tool at a segment head runs a program or writes, such as `rg --pre`
 /// ([`SELECTED_BY_AN_ARGUMENT`]).
 fn runs_or_writes_by_flag(head: &str, args: &[String]) -> Option<String> {
     runs_or_writes_by_flag_reading(head, args, Reading::QuoteStripped)
@@ -2087,7 +2244,18 @@ fn runs_or_writes_by_flag_reading(head: &str, args: &[String], reading: Reading)
             .iter()
             .find(|t| {
                 t.contains('=')
-                    || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('w'))
+                    || (t.starts_with('-')
+                        && !t.starts_with("--")
+                        && (t[1..].contains('w')
+                            // `-f FILE` / `-fFILE` / `-nfFILE`: macOS sysctl(8) reads
+                            // name=value pairs from FILE and SETS each kernel OID, and
+                            // Linux procps `-p`/`--system` applies settings from files;
+                            // the value is in FILE, never in argv, so refuse the flag.
+                            || t[1..].contains('f')
+                            || t[1..].contains('p')))
+                    || *t == "--file"
+                    || t.starts_with("--file=")
+                    || *t == "--system"
             })
             .map(|t| format!("sysctl {t} (sets a kernel value)")),
         "hostname" => args
@@ -2171,6 +2339,51 @@ fn segment_head<S: AsRef<str>>(seg: &[String], python_allow: &[S]) -> Option<Str
     head_from(seg, 0, true, python_allow)
 }
 
+/// `Some(reason)` when a segment of the quote-stripped line `stripped` holds an
+/// input redirection but resolves to no command ([`runs`] is `None`): a bare
+/// `< file`, which under zsh is no no-op — it runs `$READNULLCMD` (its default
+/// pager `more`), whose value the classifier does not read, so that value
+/// decides what runs. A pure assignment segment (`A=1`) holds no redirect and
+/// is left alone, and so are bash's and zsh's `$(<file)` file read
+/// ([`SegAt::FileRead`]) and a subshell's own redirect (`(cat) < f`,
+/// [`SegAt::AfterGroup`]), which run neither `$READNULLCMD` nor `$NULLCMD`
+/// (MEASURED 2026-10-23, zsh 5.9 and bash 3.2.57, marker scripts; a bare `< f`
+/// and `(< f)` ran `$READNULLCMD` under zsh).
+fn bare_redirection(stripped: &str) -> Option<String> {
+    for (seg, at) in split_segments_at(stripped) {
+        if at == SegAt::Command
+            && matches!(runs(&seg), Ok(None))
+            && has_input_redirect_with_target(&seg)
+        {
+            return Some(
+                "a bare input redirection with no command (zsh runs $READNULLCMD)".to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// Whether `seg` holds an input redirect (`<`, `N<`, `<&`, not `<<`) that has a
+/// target — glued (`<f`, `<&3`) or in the next word (`< f`). Only an input
+/// redirect runs `$READNULLCMD` (default `more`, which is not a read); a
+/// bare output redirect runs `$NULLCMD` (default `cat`, a read) and a bare
+/// write to a real file is a write [`danger_scan`] already names. A lone `<`
+/// with no target is the `<(…)` process-substitution artifact of
+/// [`split_segments`] (`diff <(ls a) <(ls b)`), not a redirection.
+fn has_input_redirect_with_target(seg: &[String]) -> bool {
+    seg.iter().enumerate().any(|(k, t)| {
+        let op = t.trim_start_matches(|c: char| c.is_ascii_digit());
+        let Some(rest) = op.strip_prefix('<') else {
+            return false;
+        };
+        if rest.starts_with('<') {
+            return false; // `<<` heredoc / `<<<` here-string
+        }
+        let glued = rest.strip_prefix('&').unwrap_or(rest);
+        !glued.is_empty() || seg.get(k + 1).is_some()
+    })
+}
+
 /// How many tokens a redirect in command-name position spans.
 fn redirect_span(tok: &str) -> usize {
     let op = tok.trim_start_matches(|c: char| c.is_ascii_digit());
@@ -2184,7 +2397,8 @@ fn redirect_span(tok: &str) -> usize {
     }
 }
 
-/// Where `seg`'s command starts from word `j`: past `VAR=value` assignments ([`skip_prefixes_at`]).
+/// Where `seg`'s command starts from word `j`: past assignments, redirects, zsh's `-`,
+/// `timeout`/`time` and keyword prefixes ([`skip_prefixes_at`]).
 fn skip_prefixes(seg: &[String], j: usize) -> usize {
     skip_prefixes_at(seg, j, true).0
 }
@@ -2379,6 +2593,476 @@ pub(crate) fn runs(seg: &[String]) -> Result<Option<Runs<'_>>, String> {
 /// Parse `line` into per-segment shell words with quotes resolved.
 pub(crate) fn command_words(line: &str) -> Result<Vec<Vec<String>>, String> {
     Ok(program_words(&strip_alarm_idiom(&prelex(line)?)))
+}
+
+/// The words of `line` that may name a path a command reads, for the secret
+/// check (`supervise::policy::approval`'s secret matcher, shared with the Read
+/// box). Every redirect's target (`< P`, `</P`, `2>P`, a bash or zsh `$(<P)`,
+/// which reads P), every word before the command (an assignment's value, a
+/// wrapper's `env -C P`), and then the command's own words as it takes them:
+///
+/// - A command that reads no file's contents names none (`echo`, `printf`,
+///   `which`, `type`, `test`, `ls`, `stat`, `df`, `basename`, `realpath`, a
+///   `find` with no `-exec`/`-ok`): its words are text, names, or a file it
+///   lists or measures, as a file `grep -r` reaches is not one it names.
+/// - `wc` and `du` measure their operands; only `--files0-from=F` (GNU, which
+///   echoes F's contents as file names) is a path they read.
+/// - A pattern-first command's first operand is its pattern (`grep`, `rg`,
+///   `pgrep`), program (`awk`, whose string literals may name a file it
+///   opens: `getline < "P"`) or filter (`jq`, whose `import "P" as $d;` reads
+///   `P.json`), unless an option
+///   supplies one (`-e`, `-f`, `--regexp`, `--from-file`), and a filter's
+///   value is no path (`--include=GLOB`, `rg -g GLOB`, `git log --grep X`);
+///   a file-valued option's value is (`grep -f P`, `jq --rawfile N P`).
+/// - `git`'s `REV:PATH` names a path in a tree (`git show HEAD:.env`).
+/// - Any other command: every operand and every `--flag=value` value (`cat`,
+///   `head`, `sort`, `sed`, whose `r` reads a file, `cd`, a `for` list).
+///
+/// Those readings are lifted wherever a command's output may become a path
+/// another reads: inside a substitution (`cat $(find ~/.ssh)`) and on a line
+/// that feeds file names to a reader (`find ~/.ssh | xargs cat`, `find ~/.ssh
+/// -print0 | sort --files0-from=-`); there every word is a path. A word that
+/// carries an expansion is kept with its literal parts (`$HOME/.ssh/id_rsa`
+/// still names `.ssh`).
+pub(crate) fn path_operands(line: &str) -> Result<Vec<String>, String> {
+    let segments = program_words_nested(&strip_alarm_idiom(&prelex(line)?));
+    let feeds_paths = segments.iter().flat_map(|(seg, _)| seg).any(|w| {
+        program(w) == "xargs" || w == "-files0-from" || long_option_spells(w, "files0-from")
+    });
+    let mut out = Vec::new();
+    for (seg, nested) in &segments {
+        segment_paths(seg, !nested && !feeds_paths, &mut out);
+    }
+    Ok(out)
+}
+
+/// A redirect word: `Some((the target glued to it, whether that target is
+/// text))` for `<P`, `2>P`, `&>P`, `>>P` or a bare operator (an empty target,
+/// the next word); a here-document's delimiter and a here-string (`<<EOF`,
+/// `<<<word`) are text, not a path. `None` for any other word.
+fn redirect_word(w: &str) -> Option<(&str, bool)> {
+    let op = w.trim_start_matches(|c: char| c.is_ascii_digit());
+    let op = op
+        .strip_prefix('&')
+        .filter(|r| r.starts_with('>'))
+        .unwrap_or(op);
+    if !op.starts_with(['<', '>']) {
+        return None;
+    }
+    Some((
+        op.trim_start_matches(['<', '>', '&', '|']),
+        op.starts_with("<<"),
+    ))
+}
+
+/// [`path_operands`] over one segment of quote-resolved words; `exempt`: the
+/// segment's output names no path another command reads, so a command's own
+/// grammar decides which of its words are paths.
+fn segment_paths(seg: &[String], exempt: bool, out: &mut Vec<String>) {
+    let mut taken = vec![false; seg.len()];
+    let mut k = 0;
+    while k < seg.len() {
+        if let Some((target, text)) = redirect_word(&seg[k]) {
+            taken[k] = true;
+            if target.is_empty() {
+                if let Some(next) = seg.get(k + 1) {
+                    taken[k + 1] = true;
+                    if !text {
+                        out.push(next.clone());
+                    }
+                    k += 1;
+                }
+            } else if !text {
+                out.push(target.to_string());
+            }
+        }
+        k += 1;
+    }
+    let words = |from: usize, to: usize| {
+        (from..to)
+            .filter(|k| !taken[*k])
+            .map(|k| seg[k].as_str())
+            .collect::<Vec<&str>>()
+    };
+    let at = match runs(seg) {
+        Ok(Some(r)) if !taken[r.at] => r.at,
+        _ => {
+            words(0, seg.len())
+                .into_iter()
+                .for_each(|w| push_word(w, out));
+            return;
+        }
+    };
+    words(0, at).into_iter().for_each(|w| push_word(w, out));
+    let head = program(&seg[at]);
+    if head == "git" {
+        let start = out.len();
+        match git_subcommand(seg, at) {
+            Some((sub_idx, sub)) if exempt => {
+                words(at + 1, sub_idx)
+                    .into_iter()
+                    .for_each(|w| push_word(w, out));
+                let args = words(sub_idx + 1, seg.len());
+                match sub {
+                    "grep" => grammar_paths(&GIT_GREP, &args, out),
+                    "log" | "show" | "shortlog" | "rev-list" | "whatchanged" => {
+                        grammar_paths(&GIT_LOG, &args, out);
+                    }
+                    "ls-files" => {}
+                    _ => args.into_iter().for_each(|w| push_word(w, out)),
+                }
+            }
+            _ => words(at + 1, seg.len())
+                .into_iter()
+                .for_each(|w| push_word(w, out)),
+        }
+        let in_trees: Vec<String> = out[start..]
+            .iter()
+            .filter_map(|w| w.split_once(':').map(|(_, p)| p.to_string()))
+            .filter(|p| !p.is_empty())
+            .collect();
+        out.extend(in_trees);
+        return;
+    }
+    let args = words(at + 1, seg.len());
+    if !exempt {
+        args.into_iter().for_each(|w| push_word(w, out));
+        return;
+    }
+    match head {
+        "echo" | "printf" | "which" | "type" | "true" | "sleep" | "seq" | "expr" | "pwd"
+        | "uptime" | "uname" | "whoami" | "id" | "sw_vers" | "ps" | "basename" | "dirname"
+        | "test" | "[" | "[[" | "sysctl" | "mdfind" | "realpath" | "readlink" | "ls" | "stat"
+        | "df" => {}
+        "find"
+            if !args.iter().any(|a| {
+                matches!(*a, "-exec" | "-execdir" | "-ok" | "-okdir" | "-files0-from")
+            }) => {}
+        "grep" | "egrep" | "fgrep" => grammar_paths(&GREP, &args, out),
+        "rg" => grammar_paths(&RG, &args, out),
+        "jq" => grammar_paths(&JQ, &args, out),
+        "awk" => grammar_paths(&AWK, &args, out),
+        "pgrep" => grammar_paths(&PGREP, &args, out),
+        "wc" | "du" => grammar_paths(&MEASURE, &args, out),
+        _ => args.into_iter().for_each(|w| push_word(w, out)),
+    }
+}
+
+/// A word a command takes as a path: an operand whole, a `--flag=value`'s
+/// value, an assignment-shaped word whole and its value (`X=~/.aws/x`), and
+/// for a short-option cluster each tail after one of its letters, since any
+/// letter may take the rest as its value (`git config -f.aws/credentials
+/// --list` prints that file: MEASURED 2026-10-23, git 2.54.0 on a fake file);
+/// a bare long flag names none.
+fn push_word(w: &str, out: &mut Vec<String>) {
+    match w.split_once('=') {
+        Some((_, v)) if w.starts_with('-') => out.push(v.to_string()),
+        Some((_, v)) => {
+            out.push(w.to_string());
+            out.push(v.to_string());
+        }
+        None if w.starts_with("--") => {}
+        None if w.starts_with('-') => {
+            out.extend(w.char_indices().skip(2).map(|(i, _)| w[i..].to_string()))
+        }
+        None => out.push(w.to_string()),
+    }
+}
+
+/// The contents of the double-quoted string literals of an awk program (`getline
+/// < "P"`, `ARGV[1] = "P"`: the files it may name to open), or with `imports`,
+/// of a jq filter's `import "P" …;`/`include "P";` only, each also with `.json`
+/// added (jq reads a data import from `P.json`); a jq filter opens no other
+/// file, so its other strings are text.
+fn push_literals(program: &str, imports: bool, out: &mut Vec<String>) {
+    let cs: Vec<char> = program.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == '"' {
+            let before: String = cs[..i].iter().collect();
+            let before = before.trim_end();
+            let named = before.ends_with("import") || before.ends_with("include");
+            let mut lit = String::new();
+            i += 1;
+            while i < cs.len() && cs[i] != '"' {
+                if cs[i] == '\\' {
+                    lit.extend(cs.get(i + 1));
+                    i += 2;
+                    continue;
+                }
+                lit.push(cs[i]);
+                i += 1;
+            }
+            if !imports {
+                out.push(lit);
+            } else if named {
+                out.push(format!("{lit}.json"));
+                out.push(lit);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// The kind of an option's value, for a [`Grammar`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Val {
+    /// Text, a number, a pattern or a glob filter: no path.
+    Text,
+    /// A path the command reads.
+    Path,
+    /// The pattern (`grep -e`): text, and the first operand is then no pattern.
+    Pattern,
+    /// The program (`gawk -e`): its string literals may name a path, and the
+    /// first operand is then no program.
+    Program,
+    /// A file of patterns or program (`grep -f`, `awk -f`): a path, and the
+    /// first operand is then no pattern.
+    PatternFile,
+}
+
+/// What a command's first operand is, for a [`Grammar`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum First {
+    /// An operand like the others.
+    Operand,
+    /// A pattern (`grep`, `rg`, `pgrep`): no path.
+    Pattern,
+    /// An awk program: its string literals may name a path.
+    Program,
+    /// A jq filter: the path of an `import`/`include` in it may.
+    Filter,
+}
+
+/// How a read-only command takes its words, for [`path_operands`]: only the
+/// options whose value kind matters are listed, so an unlisted value word is
+/// read as an operand, which only checks more (a word read as the pattern
+/// moves the real pattern among the checked operands).
+struct Grammar {
+    /// Short options that take a value (the rest of the word or the next).
+    short: &'static [(char, Val)],
+    /// Long options that take a required value (glued with `=` or the next
+    /// word; `--arg NAME VALUE` takes two), by full name; any prefix spells
+    /// one, as `getopt_long` reads it (an ambiguous one makes the tool fail).
+    long: &'static [(&'static str, &'static [Val])],
+    first: First,
+    /// Whether its operands are paths it reads (`wc` and `du` only measure).
+    operands_read: bool,
+}
+
+/// `grep`, `egrep`, `fgrep` (BSD 2.6.0-FreeBSD and GNU): `--include GLOB`
+/// takes its next word, and an `-e` after an operand still supplies the
+/// pattern (MEASURED 2026-10-23, macOS grep in a scratch directory: `grep -r
+/// --include *.txt hello d` searched only the `.txt` files; `grep hello f -e
+/// zzz` read `hello` as a file).
+const GREP: Grammar = Grammar {
+    short: &[('e', Val::Pattern), ('f', Val::PatternFile)],
+    long: &[
+        ("regexp", &[Val::Pattern]),
+        ("file", &[Val::PatternFile]),
+        ("include", &[Val::Text]),
+        ("exclude", &[Val::Text]),
+        ("exclude-dir", &[Val::Text]),
+        ("include-dir", &[Val::Text]),
+        ("exclude-from", &[Val::Path]),
+    ],
+    first: First::Pattern,
+    operands_read: true,
+};
+
+/// ripgrep: `-g`/`--glob`, `-t`/`--type` and `-T`/`--type-not` take a filter
+/// (REASONED from `rg --help`; no rg on this host).
+const RG: Grammar = Grammar {
+    short: &[
+        ('e', Val::Pattern),
+        ('f', Val::PatternFile),
+        ('g', Val::Text),
+        ('t', Val::Text),
+        ('T', Val::Text),
+    ],
+    long: &[
+        ("regexp", &[Val::Pattern]),
+        ("file", &[Val::PatternFile]),
+        ("glob", &[Val::Text]),
+        ("iglob", &[Val::Text]),
+        ("type", &[Val::Text]),
+        ("type-not", &[Val::Text]),
+        ("ignore-file", &[Val::Path]),
+    ],
+    first: First::Pattern,
+    operands_read: true,
+};
+
+/// jq 1.7.1 (`/usr/bin/jq --help`): `--arg`/`--argjson NAME VALUE` set text,
+/// `--slurpfile`/`--rawfile NAME FILE` read FILE, `-L DIR` searches modules.
+const JQ: Grammar = Grammar {
+    short: &[('f', Val::PatternFile), ('L', Val::Path)],
+    long: &[
+        ("from-file", &[Val::PatternFile]),
+        ("arg", &[Val::Text, Val::Text]),
+        ("argjson", &[Val::Text, Val::Text]),
+        ("slurpfile", &[Val::Text, Val::Path]),
+        ("rawfile", &[Val::Text, Val::Path]),
+        ("indent", &[Val::Text]),
+    ],
+    first: First::Filter,
+    operands_read: true,
+};
+
+/// awk (macOS BWK awk; gawk's `-e`/`--source`, `-E`/`--exec`, `-i`/`--include`
+/// REASONED from its manual): a `-v NAME=P` value may be a path the program
+/// opens, so it is checked.
+const AWK: Grammar = Grammar {
+    short: &[
+        ('F', Val::Text),
+        ('v', Val::Path),
+        ('f', Val::PatternFile),
+        ('e', Val::Program),
+        ('E', Val::PatternFile),
+        ('i', Val::Path),
+    ],
+    long: &[
+        ("file", &[Val::PatternFile]),
+        ("source", &[Val::Program]),
+        ("exec", &[Val::PatternFile]),
+        ("include", &[Val::Path]),
+        ("assign", &[Val::Path]),
+        ("field-separator", &[Val::Text]),
+    ],
+    first: First::Program,
+    operands_read: true,
+};
+
+/// pgrep: its operand is a pattern; `-F FILE` reads a pid file.
+const PGREP: Grammar = Grammar {
+    short: &[('F', Val::Path)],
+    long: &[("pidfile", &[Val::Path])],
+    first: First::Pattern,
+    operands_read: true,
+};
+
+/// `wc` and `du` measure their operands; GNU `--files0-from=F` prints F's
+/// contents as the names it cannot open, and `du -X F` reads exclusions.
+const MEASURE: Grammar = Grammar {
+    short: &[('X', Val::Path)],
+    long: &[
+        ("files0-from", &[Val::Path]),
+        ("exclude-from", &[Val::Path]),
+    ],
+    first: First::Operand,
+    operands_read: false,
+};
+
+/// `git grep`: its first operand is the pattern unless `-e`/`-f` supplies it.
+const GIT_GREP: Grammar = Grammar {
+    short: &[('e', Val::Pattern), ('f', Val::PatternFile)],
+    long: &[],
+    first: First::Pattern,
+    operands_read: true,
+};
+
+/// `git log`/`show`/`shortlog`/`rev-list`: `--grep`, `--author`, `--committer`
+/// and the pickaxe `-S`/`-G` take a pattern; `-L RANGE:PATH` reads PATH.
+const GIT_LOG: Grammar = Grammar {
+    short: &[('S', Val::Text), ('G', Val::Text), ('L', Val::Path)],
+    long: &[
+        ("grep", &[Val::Text]),
+        ("author", &[Val::Text]),
+        ("committer", &[Val::Text]),
+        ("grep-reflog", &[Val::Text]),
+    ],
+    first: First::Operand,
+    operands_read: true,
+};
+
+/// The value kinds an option word `a` of grammar `g` takes, and the value
+/// glued to it (`--include=GLOB`, `-eREGEX`, `-nfFILE`'s `FILE`): a long
+/// option by its full name or a prefix of it, an unlisted long option's glued
+/// value read as a path, a short cluster up to its first value-taking letter.
+fn option_values<'a>(g: &Grammar, a: &'a str) -> (Vec<Val>, Option<&'a str>) {
+    if let Some(body) = a.strip_prefix("--") {
+        let (name, glued) = body
+            .split_once('=')
+            .map_or((body, None), |(n, v)| (n, Some(v)));
+        let listed = g.long.iter().find(|(n, _)| *n == name).or_else(|| {
+            g.long
+                .iter()
+                .find(|(n, _)| !name.is_empty() && n.starts_with(name))
+        });
+        return match listed {
+            Some((_, kinds)) => (kinds.to_vec(), glued),
+            None => (glued.map_or_else(Vec::new, |_| vec![Val::Path]), glued),
+        };
+    }
+    let cluster = &a[1..];
+    for (at, c) in cluster.char_indices() {
+        if let Some((_, kind)) = g.short.iter().find(|(s, _)| *s == c) {
+            let rest = &cluster[at + c.len_utf8()..];
+            return (vec![*kind], (!rest.is_empty()).then_some(rest));
+        }
+    }
+    (Vec::new(), None)
+}
+
+/// A value of kind `kind`: a path or a pattern file pushed, a program's
+/// string literals pushed, text left out.
+fn push_value(kind: Val, v: &str, out: &mut Vec<String>) {
+    match kind {
+        Val::Text | Val::Pattern => {}
+        Val::Path | Val::PatternFile => out.push(v.to_string()),
+        Val::Program => push_literals(v, false, out),
+    }
+}
+
+/// The paths a command of grammar `g` reads among its words `args`. Options
+/// are read up to `--`, anywhere among the operands (GNU and BSD `getopt_long`
+/// permute); an option that supplies the pattern or program anywhere makes
+/// the first operand an operand like the others. A value in the next word
+/// after an operand is checked as a path whatever its kind, since a parser
+/// that does not permute reads it as an operand.
+fn grammar_paths(g: &Grammar, args: &[&str], out: &mut Vec<String>) {
+    let options_end = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+    let is_option = |k: usize, a: &str| k < options_end && a.starts_with('-') && a.len() > 1;
+    let supplied = args.iter().enumerate().any(|(k, a)| {
+        is_option(k, a)
+            && option_values(g, a)
+                .0
+                .iter()
+                .any(|v| matches!(v, Val::Pattern | Val::Program | Val::PatternFile))
+    });
+    let mut first = if supplied { First::Operand } else { g.first };
+    let mut seen_operand = false;
+    let mut k = 0;
+    while k < args.len() {
+        let a = args[k];
+        k += 1;
+        if is_option(k - 1, a) {
+            let (kinds, glued) = option_values(g, a);
+            let mut kinds = kinds.into_iter();
+            if let Some(v) = glued
+                && let Some(kind) = kinds.next()
+            {
+                push_value(kind, v, out);
+            }
+            for kind in kinds {
+                let Some(next) = args.get(k) else { break };
+                push_value(if seen_operand { Val::Path } else { kind }, next, out);
+                k += 1;
+            }
+            continue;
+        }
+        if k - 1 == options_end {
+            continue;
+        }
+        match std::mem::replace(&mut first, First::Operand) {
+            First::Pattern => {}
+            First::Program => push_literals(a, false, out),
+            First::Filter => push_literals(a, true, out),
+            First::Operand if g.operands_read => out.push(a.to_string()),
+            First::Operand => {}
+        }
+        seen_operand = true;
+    }
 }
 
 /// Whether a listed git read's arguments `args` (after the subcommand `sub`) take a write form.
@@ -2864,7 +3548,8 @@ fn arithmetic_scan(cmd: &str) -> Option<String> {
     None
 }
 
-/// A word zsh arithmetic reads as a number only: digits.
+/// A word zsh arithmetic reads as a number only: signs, points, blanks and runs that start
+/// with a digit (`0x1f`, `16#ff`), but not `8#A`, which `EXTENDED_GLOB` can glob to a file `A`.
 fn plain_number(w: &str) -> bool {
     let digit = |r: &str| r.starts_with(|c: char| c.is_ascii_digit());
     w.chars()
@@ -2938,7 +3623,8 @@ fn awk_args_write(args: &[String]) -> Option<String> {
         .then(|| "awk writes (system, a redirect or a pipe in the program)".to_string())
 }
 
-/// Whether an awk program does more than read: the `system` builtin in any spelling.
+/// Whether an awk program does more than read: `system` in any spelling, any `@`, `>>`, a
+/// coprocess, or a `>` or `|` redirect.
 fn awk_program_writes(p: &str) -> bool {
     if p.contains(">>") || p.contains("|&") || p.contains('@') || names_awk_word(p, "system") {
         return true;
@@ -3099,18 +3785,24 @@ fn sed_args_write(args: &[String]) -> Option<String> {
     let mut k = 0;
     while k < args.len() {
         let w = args[k].as_str();
-        if w == "-f" || w == "--file" || w.starts_with("--file=") {
+        // A script file (`-f`), spelled whole, abbreviated (GNU `getopt_long`
+        // takes any unambiguous prefix, so `--fi` = `--file`), attached
+        // (`-fFILE`, `-f-` for stdin) or clustered (`-nfFILE`): macOS and GNU
+        // read the script from the named file, and a `w` command in it writes.
+        if w == "-f" || w == "--file" || w.starts_with("--file=") || long_option_spells(w, "file") {
             return Some("sed -f (a script file)".to_string());
         }
-        if let Some(s) = w.strip_prefix("--expression=") {
-            scripts.push(s);
+        if w.starts_with("--") && w.contains('=') && long_option_spells(w, "expression") {
+            // `--expression=SCRIPT` or an abbreviation (`--e=SCRIPT`): the
+            // script is glued after the `=`.
+            scripts.push(w.split_once('=').map_or("", |(_, s)| s));
             explicit = true;
             k += 1;
             continue;
         }
         if w == "-e"
             || w == "--expression"
-            || (w.starts_with('-') && !w.starts_with("--") && w.ends_with('e') && w.len() > 1)
+            || (w.starts_with("--") && long_option_spells(w, "expression"))
         {
             if let Some(s) = args.get(k + 1) {
                 scripts.push(s);
@@ -3119,8 +3811,43 @@ fn sed_args_write(args: &[String]) -> Option<String> {
             k += 2;
             continue;
         }
-        if matches!(w, "-l" | "--line-length") {
-            k += 2;
+        if w.starts_with('-') && !w.starts_with("--") && w.len() > 1 {
+            // A short cluster: walk its letters to the first value-taking one.
+            // `f` is a script file (clustered here); `e` takes the rest of the
+            // cluster as the script, else the next word (`-eSCRIPT`, `-nes/…`,
+            // `-ne SCRIPT`). `l` on macOS takes no value (line-buffered; GNU's
+            // numeric value is then read as a script and refused as unparsed);
+            // every other letter takes none.
+            let cluster = &w[1..];
+            let mut consumed_next = false;
+            for (idx, c) in cluster.char_indices() {
+                match c {
+                    'f' => return Some("sed -f (a script file)".to_string()),
+                    'e' => {
+                        let rest = &cluster[idx + 1..];
+                        if rest.is_empty() {
+                            if let Some(s) = args.get(k + 1) {
+                                scripts.push(s.as_str());
+                            }
+                            consumed_next = true;
+                        } else {
+                            scripts.push(rest);
+                        }
+                        explicit = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            k += if consumed_next { 2 } else { 1 };
+            continue;
+        }
+        if w == "--line-length"
+            || w.starts_with("--line-length=")
+            || long_option_spells(w, "line-length")
+        {
+            // GNU's numeric value is on the next word unless glued with `=`.
+            k += if w.contains('=') { 1 } else { 2 };
             continue;
         }
         if w == "--" {
@@ -3130,7 +3857,7 @@ fn sed_args_write(args: &[String]) -> Option<String> {
             }
             break;
         }
-        if w.starts_with('-') && w.len() > 1 {
+        if w.starts_with("--") && w.len() > 2 {
             k += 1;
             continue;
         }
@@ -3164,6 +3891,55 @@ fn sed_script_writes(script: &str) -> Option<String> {
         }
         false
     };
+    // A regex-section skip (an address `/re/` or `\cREc`, or an `s` command's
+    // pattern): BSD and GNU sed read the delimiter LITERALLY inside a `[…]`
+    // bracket expression, so `s/[/]/x/w f` ends its pattern at the second `/`,
+    // not the one in `[/]`. A plain `skip_delimited` would end the pattern
+    // early and misread the `w` flag that follows as text (hole
+    // `sed-bracket-delimiter`). When the delimiter is itself `[` the bracket
+    // rule does not apply, so fall back to the plain skip.
+    let skip_regex = |i: &mut usize, d: char| -> bool {
+        if d == '[' {
+            return skip_delimited(i, d);
+        }
+        while *i < n {
+            match cs[*i] {
+                '\\' => {
+                    *i += 2;
+                    continue;
+                }
+                '[' => {
+                    *i += 1;
+                    if cs.get(*i) == Some(&'^') {
+                        *i += 1;
+                    }
+                    if cs.get(*i) == Some(&']') {
+                        *i += 1;
+                    }
+                    while *i < n && cs[*i] != ']' {
+                        if cs[*i] == '[' && matches!(cs.get(*i + 1), Some(':' | '.' | '=')) {
+                            let close = cs[*i + 1];
+                            *i += 2;
+                            while *i < n && !(cs[*i] == close && cs.get(*i + 1) == Some(&']')) {
+                                *i += 1;
+                            }
+                            *i += 2;
+                            continue;
+                        }
+                        *i += 1;
+                    }
+                    *i += 1;
+                    continue;
+                }
+                c if c == d => {
+                    *i += 1;
+                    return true;
+                }
+                _ => *i += 1,
+            }
+        }
+        false
+    };
     let to_line_end = |i: &mut usize| {
         while *i < n && cs[*i] != '\n' {
             *i += 1;
@@ -3194,7 +3970,7 @@ fn sed_script_writes(script: &str) -> Option<String> {
                 '$' => i += 1,
                 '/' => {
                     i += 1;
-                    if !skip_delimited(&mut i, '/') {
+                    if !skip_regex(&mut i, '/') {
                         return unparsed();
                     }
                     while i < n && matches!(cs[i], 'I' | 'M') {
@@ -3206,7 +3982,7 @@ fn sed_script_writes(script: &str) -> Option<String> {
                         return unparsed();
                     };
                     i += 2;
-                    if !skip_delimited(&mut i, d) {
+                    if !skip_regex(&mut i, d) {
                         return unparsed();
                     }
                     while i < n && matches!(cs[i], 'I' | 'M') {
@@ -3237,8 +4013,13 @@ fn sed_script_writes(script: &str) -> Option<String> {
         i += 1;
         match cmd {
             '{' | '}' => {}
-            '#' | ':' | 'a' | 'i' | 'c' | 'r' | 'R' => to_line_end(&mut i),
-            'b' | 't' | 'T' | 'v' => to_command_end(&mut i),
+            '#' | 'a' | 'i' | 'c' | 'r' | 'R' => to_line_end(&mut i),
+            // GNU sed ends a label or a branch target at `;` or whitespace,
+            // not at the line's end (the idiom `:a;N;$!ba`), so a `w` command
+            // after a `;` on a `:label` line is not swallowed (hole
+            // `sed-gnu-label-semicolon`). BSD reads the label to the line's
+            // end, so this only refuses a line BSD would reject.
+            ':' | 'b' | 't' | 'T' | 'v' => to_command_end(&mut i),
             'w' | 'W' => return Some("sed w (writes a file)".to_string()),
             'e' => return Some("sed e (runs a command)".to_string()),
             'q' | 'Q' | 'l' | 'L' => {
@@ -3251,7 +4032,8 @@ fn sed_script_writes(script: &str) -> Option<String> {
                     return unparsed();
                 };
                 i += 1;
-                if !skip_delimited(&mut i, d) || !skip_delimited(&mut i, d) {
+                // The pattern is a regex (bracket-aware); the replacement is not.
+                if !skip_regex(&mut i, d) || !skip_delimited(&mut i, d) {
                     return unparsed();
                 }
                 while i < n {
@@ -3281,6 +4063,15 @@ fn sed_script_writes(script: &str) -> Option<String> {
 
 /// Split `src` into segments of quote-resolved words with substitutions marked.
 pub(crate) fn program_words(src: &str) -> Vec<Vec<String>> {
+    program_words_nested(src)
+        .into_iter()
+        .map(|(seg, _)| seg)
+        .collect()
+}
+
+/// [`program_words`], each segment with whether it lies inside a `$(…)` or
+/// backquoted substitution (whose output becomes words of another command).
+fn program_words_nested(src: &str) -> Vec<(Vec<String>, bool)> {
     let chars: Vec<char> = src.chars().collect();
     let mut scan = WordScan {
         chars: &chars,
@@ -3289,6 +4080,7 @@ pub(crate) fn program_words(src: &str) -> Vec<Vec<String>> {
         seg: Vec::new(),
         cur: String::new(),
         in_word: false,
+        nest: 0,
     };
     scan.run(None);
     scan.segments
@@ -3297,10 +4089,12 @@ pub(crate) fn program_words(src: &str) -> Vec<Vec<String>> {
 struct WordScan<'a> {
     chars: &'a [char],
     i: usize,
-    segments: Vec<Vec<String>>,
+    segments: Vec<(Vec<String>, bool)>,
     seg: Vec<String>,
     cur: String,
     in_word: bool,
+    /// How many substitutions the scan is inside.
+    nest: usize,
 }
 
 impl WordScan<'_> {
@@ -3313,7 +4107,8 @@ impl WordScan<'_> {
     fn end_seg(&mut self) {
         self.end_word();
         if !self.seg.is_empty() {
-            self.segments.push(std::mem::take(&mut self.seg));
+            self.segments
+                .push((std::mem::take(&mut self.seg), self.nest > 0));
         }
     }
     /// A nested substitution ([`SUBSTITUTION`]).
@@ -3321,7 +4116,9 @@ impl WordScan<'_> {
         let seg = std::mem::take(&mut self.seg);
         let cur = std::mem::take(&mut self.cur);
         self.in_word = false;
+        self.nest += 1;
         self.run(Some(stop));
+        self.nest -= 1;
         self.seg = seg;
         self.cur = cur;
         self.cur.push_str(SUBSTITUTION);
@@ -3456,7 +4253,6 @@ impl WordScan<'_> {
                     self.i += 1;
                 }
                 '>' | '<' => {
-                    // Detach a redirect from the preceding word as
                     if self.in_word
                         && self
                             .cur
@@ -3480,6 +4276,229 @@ impl WordScan<'_> {
         }
         self.end_seg();
     }
+}
+
+/// The first brace expansion bash may perform in `line`, from its `{` to its
+/// `}`: an unquoted, unescaped `{` not right after a `$` whose matching `}`
+/// closes it with an unquoted `,` or `..` at its own level, before an
+/// unquoted blank, newline, `;`, `|`, `&`, `<`, `>` or an unopened `)` ends
+/// the word ([`brace_close`]). Quoted text (`'…'`, `"…"`, `$'…'` with its
+/// escapes) and a backslash's character are characters, but a `$(…)` or a
+/// backquoted command is a command of its own wherever it stands, inside
+/// double quotes too, and is scanned as one (`"$(sort x "a" {-o,y})"` runs
+/// the brace expansion). A `{` inside `${…}` is scanned all the same, a tie
+/// broken toward refusal. `{}`, `{a}` and a lone `{` are none.
+pub(crate) fn brace_expansion(line: &str) -> Option<String> {
+    let c: Vec<char> = line.chars().collect();
+    let mut found = None;
+    scan_unquoted(&c, 0, None, &mut |c, i| {
+        if found.is_none() && c[i] == '{' && (i == 0 || c[i - 1] != '$') {
+            found = brace_close(c, i).map(|end| c[i..=end].iter().collect());
+        }
+    });
+    found
+}
+
+/// The first glob character the shell may expand in `line`: an unquoted,
+/// unescaped `*`, `?` or `[` (Claude Code's own test of a word,
+/// `/[*?]|\[[^\]]*\]/`, read in its bundle; a lone `[` counted too). Quoted
+/// text and a backslash's character are characters, and a `$(…)` or a
+/// backquoted command is scanned as shell text wherever it stands
+/// ([`scan_unquoted`]).
+pub(crate) fn unquoted_glob(line: &str) -> Option<char> {
+    let c: Vec<char> = line.chars().collect();
+    let mut found = None;
+    scan_unquoted(&c, 0, None, &mut |c, i| {
+        if found.is_none() && matches!(c[i], '*' | '?' | '[') {
+            found = Some(c[i]);
+        }
+    });
+    found
+}
+
+/// Scans `c` from `i` as unquoted shell text up to `close` (the `)` of a
+/// `$(`, the backquote of a backquoted command, or `None`: the end), handing
+/// `visit` the index of each unquoted, unescaped character in order (a `(`
+/// or `)` of the text's own nesting aside); the index past `close`.
+fn scan_unquoted(
+    c: &[char],
+    mut i: usize,
+    close: Option<char>,
+    visit: &mut dyn FnMut(&[char], usize),
+) -> usize {
+    let mut parens = 0usize;
+    while i < c.len() {
+        let ch = c[i];
+        if Some(ch) == close && (ch != ')' || parens == 0) {
+            return i + 1;
+        }
+        i = match ch {
+            '\\' => i + 2,
+            '\'' => past_single(c, i + 1, false),
+            '$' if c.get(i + 1) == Some(&'\'') => past_single(c, i + 2, true),
+            '"' => scan_double(c, i + 1, visit),
+            '$' if c.get(i + 1) == Some(&'(') => scan_unquoted(c, i + 2, Some(')'), visit),
+            '`' if close != Some('`') => scan_unquoted(c, i + 1, Some('`'), visit),
+            '(' => {
+                parens += 1;
+                i + 1
+            }
+            ')' => {
+                parens = parens.saturating_sub(1);
+                i + 1
+            }
+            _ => {
+                visit(c, i);
+                i + 1
+            }
+        };
+    }
+    c.len()
+}
+
+/// Scans `c` from `i` inside double quotes, where only a `$(…)` or a
+/// backquoted command is shell text ([`scan_unquoted`], handed `visit`); the
+/// index past the closing `"`.
+fn scan_double(c: &[char], mut i: usize, visit: &mut dyn FnMut(&[char], usize)) -> usize {
+    while i < c.len() {
+        i = match c[i] {
+            '\\' => i + 2,
+            '"' => return i + 1,
+            '$' if c.get(i + 1) == Some(&'(') => scan_unquoted(c, i + 2, Some(')'), visit),
+            '`' => scan_unquoted(c, i + 1, Some('`'), visit),
+            _ => i + 1,
+        };
+    }
+    c.len()
+}
+
+/// The index past the `'` that closes single-quoted text starting at
+/// `c[i]`; `ansi` (`$'…'`): a backslash escapes its next character.
+const fn past_single(c: &[char], mut i: usize, ansi: bool) -> usize {
+    while i < c.len() {
+        match c[i] {
+            '\\' if ansi => i += 2,
+            '\'' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    c.len()
+}
+
+/// The index of the `}` that closes the brace opening at `c[open]` as a
+/// brace expansion ([`brace_expansion`]), if it does: depth-matched, with a
+/// separator at its own level, before the word ends. Quoted text and a
+/// command of its own inside are skipped whole (each is scanned for braces
+/// of its own by [`scan_unquoted`]).
+fn brace_close(c: &[char], open: usize) -> Option<usize> {
+    let (mut depth, mut parens, mut sep) = (1usize, 0usize, false);
+    let mut skip = |_: &[char], _: usize| {};
+    let mut j = open + 1;
+    while j < c.len() {
+        j = match c[j] {
+            '\\' => j + 2,
+            '\'' => past_single(c, j + 1, false),
+            '$' if c.get(j + 1) == Some(&'\'') => past_single(c, j + 2, true),
+            '"' => scan_double(c, j + 1, &mut skip),
+            '$' if c.get(j + 1) == Some(&'(') => scan_unquoted(c, j + 2, Some(')'), &mut skip),
+            '`' => scan_unquoted(c, j + 1, Some('`'), &mut skip),
+            '(' => {
+                parens += 1;
+                j + 1
+            }
+            ')' if parens == 0 => return None,
+            ')' => {
+                parens -= 1;
+                j + 1
+            }
+            ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>' if parens == 0 => return None,
+            '{' => {
+                depth += 1;
+                j + 1
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return sep.then_some(j);
+                }
+                j + 1
+            }
+            ',' if depth == 1 => {
+                sep = true;
+                j + 1
+            }
+            '.' if depth == 1 && c.get(j + 1) == Some(&'.') => {
+                sep = true;
+                j + 2
+            }
+            _ => j + 1,
+        };
+    }
+    None
+}
+
+/// `Some(reason)` when a reading may open a network connection by reading a
+/// file: an input redirect (`<`, `N<`, `<&`) from a target bash opens as a
+/// socket (`/dev/tcp/HOST/PORT`, `/dev/udp/…`, after quote removal) or from a
+/// target an expansion computes (`< $F`, which may name one), or a word naming
+/// gawk's network special files (`/inet/…`, `/inet4/…`, `/inet6/…`, which
+/// `getline <` opens). The words are the classifier's ([`command_words`], quotes
+/// resolved, an expansion marked with a `$`). A line this cannot read is no
+/// network reach here (the head/argv scans refuse it on their own).
+fn network_read(line: &str) -> Option<String> {
+    let socket = |t: &str| ["/dev/tcp/", "/dev/udp/"].iter().any(|p| t.starts_with(p));
+    let inet = |t: &str| {
+        ["/inet/", "/inet4/", "/inet6/"]
+            .iter()
+            .any(|p| t.contains(p))
+    };
+    let segments = command_words(line).ok()?;
+    for seg in &segments {
+        for (k, word) in seg.iter().enumerate() {
+            if inet(word) {
+                return Some(format!("names a gawk network file: {word}"));
+            }
+            let op = word.trim_start_matches(|c: char| c.is_ascii_digit());
+            let Some(rest) = op.strip_prefix('<') else {
+                continue;
+            };
+            if rest.starts_with('<') {
+                continue;
+            }
+            let rest = rest.strip_prefix('&').unwrap_or(rest);
+            let Some(target) = Some(rest)
+                .filter(|r| !r.is_empty())
+                .or_else(|| seg.get(k + 1).map(String::as_str))
+            else {
+                continue;
+            };
+            if socket(target) || target.contains(['$', '`']) {
+                return Some(format!(
+                    "an input redirect from {} may open a network connection",
+                    target.replace(SUBSTITUTION, "$(…)")
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// `Some(reason)` when `line` may open a network connection by reading a file
+/// ([`network_read`]: a `/dev/tcp`·`/dev/udp` redirect or gawk's `/inet/…`).
+/// The classifier itself refuses it so every consumer — the CLI `drive
+/// classify`, the presence advisory word and the approval rules — agrees;
+/// `approval::network_free` is kept only to name the reading in the box message
+/// and for the rm-breaker arm.
+///
+/// A brace expansion that can reach a flag or a path is refused by the
+/// classifier's per-head option-slot scan ([`glob_in_an_option_slot`],
+/// [`may_expand_into_a_flag`]), which is head-aware and precise, so `sort x
+/// {-o,y}` is refused while `echo {a,b}` and `for i in {1..3}` stay reads; a
+/// blanket brace refusal would blank those common reads and preempt the
+/// per-head reason. `approval::brace_free` adds a conservative box-level
+/// refusal of every brace expansion on top of that.
+fn network_reach(line: &str) -> Option<String> {
+    network_read(line)
 }
 
 /// Match `pattern` (`*` and `?`, spanning `/`) against the whole `text`.

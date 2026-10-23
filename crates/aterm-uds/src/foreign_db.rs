@@ -198,7 +198,8 @@ impl Drop for Private {
 /// READ `db`, ANOTHER PROGRAM'S LIVE SQLITE DATABASE, WITH NO LOCK ON IT (the module's rule).
 ///
 /// # Errors
-/// [`Unread`]: missing database, active write, concurrent change, or reader failure.
+/// [`Unread`]: no database file, a write under way, a change during the read, or a copy or reader
+/// that failed.
 pub fn read<T>(db: &Path, reader: impl FnOnce(&str) -> Option<T>) -> Result<T, Unread> {
     let before = look(db)?;
     let answer = if let Some(wal) = &before.wal {
@@ -235,7 +236,8 @@ pub mod witness {
         fl.l_whence = libc::SEEK_SET as _;
         fl.l_start = i64::try_from(start).ok()?;
         fl.l_len = i64::try_from(len).ok()?;
-        // SAFETY: `fl` is a valid, writable `flock` for the call's duration.
+        // SAFETY: `fl` is a valid, writable `flock` for the call's duration, and
+        // the descriptor is open.
         let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut fl) };
         (rc == 0 && fl.l_type != libc::F_UNLCK as _).then_some(fl.l_pid)
     }

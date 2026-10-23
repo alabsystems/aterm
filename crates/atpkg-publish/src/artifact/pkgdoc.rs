@@ -325,7 +325,14 @@ fn tool_set<'a>(tools: impl IntoIterator<Item = &'a str>) -> std::collections::B
 /// Appends `row` to an existing published manifest `base` as a byte-prefix extension.
 ///
 /// # Errors
-/// Returns an error if `base` fails to parse or conflicts with `header` or `row`.
+/// A refusal when the base does not parse, is another schema, program, build or version,
+/// shims another set of tools than this pack's `header` (one build, one exposed set: a
+/// shim the appended target cannot serve would break there), names a tool no shim may
+/// carry ([`check_exposes`], so a base signed before that name was refused is never
+/// extended), already carries a row for this target, or already names this asset (two
+/// rows, one release asset: their uploads would replace each other). Also a refusal for a
+/// `row` whose asset name is not plain, a digest not 64 hex, a zero size, or a provenance
+/// record [`check_provenance`] refuses.
 pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
     let (program, build) = (header.program.as_str(), header.build);
     check_exposes(program, &header.exposes)?;
@@ -419,7 +426,7 @@ pub fn merge(base: Vec<u8>, header: &Header, row: &Row) -> Result<Doc> {
 /// Verifies that `parsed` matches `header` and `row`.
 ///
 /// # Errors
-/// Returns an error naming the first field that differs.
+/// A refusal naming what differs.
 pub fn check_parsed(parsed: &atpkg::PkgManifest, header: &Header, row: &Row) -> Result<()> {
     if parsed.program != header.program || parsed.build_number != header.build {
         return Err(Error::refused(format!(

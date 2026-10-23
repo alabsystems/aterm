@@ -174,7 +174,9 @@ pub(crate) fn set_order(modes: Modes, kitty: u8) -> impl Iterator<Item = Mode> {
     .filter(move |mode| modes.contains(mode.bit()))
 }
 
-/// The bytes that set `mode` on a terminal where the modes in `set` (which lacks it) are set, a kitty entry among them carrying `kitty`'s flags: entering the alternate screen carries that entry onto it (see the module docs).
+/// The bytes that set `mode` on a terminal where the modes in `set` (which lacks it) are set, a
+/// kitty entry among them carrying `kitty`'s flags: entering the alternate screen carries that
+/// entry onto it.
 pub(crate) fn enable_bytes(mode: Mode, set: Modes, kitty: u8) -> Vec<u8> {
     carry_kitty(mode, set, kitty, mode.set_bytes())
 }
@@ -198,7 +200,8 @@ fn carry_kitty(mode: Mode, set: Modes, kitty: u8, switch: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// The bytes that put back every mode in `modes`, in the one order every restore uses (see the module docs).
+/// The bytes that put back every mode in `modes`, in the one order every restore uses
+/// (`RESET_ORDER`).
 #[must_use]
 pub fn reset_bytes(modes: Modes) -> Vec<u8> {
     RESET_ORDER

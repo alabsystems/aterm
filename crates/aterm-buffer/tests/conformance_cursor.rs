@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Tier-1 conformance: binds the real subscription cursor to the derived
-//! `Cursor` model (`aterm_models_core::cursor_model()`). `Grow` advances the
-//! writer's `seq`; `Deliver` (enabled while the reader is behind) catches
-//! `cursor` up to `seq`; `CursorBounded` says the reader never passes the
-//! writer. `Buggy = 1` is an off-by-one delivery that parks the cursor one past
-//! the head, silently skipping the next event.
-//!
-//! The test drives `Surface::apply` (Grow) and `Surface::subscribe`/`poll`
-//! (Deliver), a library API no product crate calls, and validates every real
-//! transition. Unlike `conformance_subscribe`, `cursor` is read back through the
-//! real `poll` ([`cursor_position`]), never tracked by the test, so an overshoot
-//! in the code projects as one. Negative control: the modelled overshoot from a
-//! real state is rejected by the model and admitted by `Buggy`.
+//! Conformance tests for the subscription [`Cursor`] ([`cursor_model`]).
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Cursor, Edit, SubUpdate, Surface};
@@ -23,13 +10,8 @@ use std::collections::BTreeMap;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Probe events written past the head on a clone: enough to see an overshoot of
-/// up to two positions.
 const PROBE: u64 = 3;
 
-/// Where the real cursor stands, observed through `poll`: on a clone of `s`,
-/// write [`PROBE`] events and poll `cur`; the first delivered event is
-/// `cursor + 1`. Nothing delivered reports `head + PROBE`, which the model rejects.
 fn cursor_position(s: &Surface, cur: Cursor) -> u64 {
     let mut probe = s.clone();
     for i in 0..PROBE {
@@ -55,8 +37,6 @@ fn project(s: &Surface, cur: Cursor) -> State {
     .collect()
 }
 
-/// Validate one real transition as the named action, with `MaxSeq` lifted so the
-/// model's bound never refuses a real write.
 fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
     verify::validate_transition_tiered(
         &cursor_model(),
@@ -82,8 +62,6 @@ fn real_subscription_cursor_conforms_to_cursor_model() {
 
     let mut grows = 0;
     let mut delivers = 0;
-    // Bursts of writes between polls, including an empty poll (Deliver disabled:
-    // nothing delivered, cursor stays put).
     for burst in [1u64, 3, 0, 2, 5, 0, 1] {
         for i in 0..burst {
             let edit = match i % 3 {
@@ -128,8 +106,6 @@ fn real_subscription_cursor_conforms_to_cursor_model() {
     }
     assert!(grows > 0 && delivers > 0, "both actions were driven");
 
-    // Negative control: one more write, then a delivery that parks the cursor
-    // one past the head.
     s.apply(&write_cap(), Edit::AppendLine("tail".into()));
     let behind = project(&s, cur);
     let mut overshoot = behind.clone();

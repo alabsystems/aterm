@@ -102,7 +102,13 @@ mod hid_lock_state {
     fn connection() -> Option<IoConnect> {
         static CONN: OnceLock<Option<IoConnect>> = OnceLock::new();
         *CONN.get_or_init(|| {
-            // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and returns an owned dictionary that `IOServiceGetMatchingService` consumes, so nothing leaks on either path.
+            // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and
+            // returns an owned dictionary that `IOServiceGetMatchingService`
+            // consumes, so nothing leaks on either path; a NULL dictionary makes the
+            // lookup return 0. `IOServiceOpen` writes the connect port only on
+            // success; `mach_task_self_` is libSystem's cached task port. The
+            // service ref is released after the open, which holds its own. All are
+            // thread-safe kernel RPCs.
             unsafe {
                 let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
                 if matching.is_null() {
@@ -130,7 +136,9 @@ mod hid_lock_state {
     pub(super) fn caps_lock() -> Option<bool> {
         let conn = connection()?;
         let mut state = false;
-        // SAFETY: `conn` is a live user-client port from `connection()`.
+        // SAFETY: `conn` is a live user-client port from `connection()`; the
+        // out-pointer is a valid `bool` for the call's duration; the selector is
+        // the SDK constant. Synchronous kernel RPC, safe from any thread.
         let kr = unsafe { IOHIDGetModifierLockState(conn, IOHID_CAPS_LOCK_STATE, &raw mut state) };
         (kr == KERN_SUCCESS).then_some(state)
     }
@@ -148,7 +156,8 @@ fn lock_modifiers() -> Modifiers {
     const VK_CAPITAL: i32 = 0x14;
     const VK_NUMLOCK: i32 = 0x90;
     let mut out = Modifiers::empty();
-    // SAFETY: GetKeyState is a pure per-thread keyboard-state query with no preconditions.
+    // SAFETY: GetKeyState is a pure per-thread keyboard-state query with no
+    // preconditions; reading the toggle bit is valid from any thread.
     if unsafe { GetKeyState(VK_CAPITAL) } & 1 != 0 {
         out |= Modifiers::CAPS_LOCK;
     }
@@ -557,7 +566,9 @@ fn layout_shift_state(c: char) -> Option<u8> {
         fn VkKeyScanExW(ch: u16, dwhkl: *mut core::ffi::c_void) -> i16;
     }
     let unit = u16::try_from(u32::from(c)).ok()?;
-    // SAFETY: both are pure keyboard-layout queries with no preconditions.
+    // SAFETY: both are pure keyboard-layout queries with no preconditions — `GetKeyboardLayout(0)`
+    // names the calling thread and returns a borrowed HKL (nothing to free), which `VkKeyScanExW`
+    // only reads.
     let scan = unsafe { VkKeyScanExW(unit, GetKeyboardLayout(0)) };
     if scan == -1 {
         return None;

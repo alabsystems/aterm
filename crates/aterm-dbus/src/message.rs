@@ -208,7 +208,8 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Invalid`] if serial is 0, a required field is missing, or a limit fails.
+    /// [`Error::Invalid`] for a message the specification forbids: serial 0, a
+    /// required field missing, an invalid name, a body over the limits.
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.check()?;
         let signature = self.signature();
@@ -268,7 +269,9 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Malformed`] or [`Error::Unsupported`] if decoding fails.
+    /// [`Error::Malformed`] for bytes that break the specification,
+    /// [`Error::Unsupported`] for an unknown message type or attached unix
+    /// descriptors.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let total = frame_len(bytes)?.ok_or(Error::malformed(
             "shorter than a message header",
@@ -393,7 +396,8 @@ const fn header_len(fields: usize) -> usize {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Malformed`] for an unknown byte order or lengths exceeding protocol limits.
+/// [`Error::Malformed`] for an unknown byte order or lengths past the
+/// specification's limits: the stream cannot be resynchronised after that.
 pub fn frame_len(head: &[u8]) -> Result<Option<usize>> {
     let Some(fixed) = head.first_chunk::<16>() else {
         return Ok(None);

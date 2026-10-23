@@ -104,6 +104,11 @@ pub struct ExplicitTarget {
 
 impl ExplicitTarget {
     /// The text as `RepoArg::parse` reads it, which must be a literal `OWNER/NAME`.
+    ///
+    /// # Errors
+    ///
+    /// Usage: `RepoArg::parse`'s errors; an `@target` → `a literal destination is OWNER/NAME,
+    /// not @{name}`.
     pub(crate) fn from_argv(arg: &std::ffi::OsStr) -> Result<ExplicitTarget> {
         match RepoArg::parse(&arg.to_string_lossy())? {
             RepoArg::Literal(slug) => Ok(ExplicitTarget { slug }),
@@ -392,7 +397,8 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    /// `Error::new(code.kind(), why)`, `Sub::Policy(code)`, `next`, `repo`.
+    /// `Error::new(code.kind(), why)`, `Sub::Policy(code)`, `next`, `repo`, and each judged step
+    /// as `Tried::Skipped { as_: step.label(), why: presence.slug() }`.
     #[must_use]
     pub fn into_error(self, repo: Option<&Slug>) -> Error {
         let tried = self
@@ -929,7 +935,8 @@ fn tier_mismatch(profile: &str, ptier: Tier, owner: &str, tier: Tier) -> Decisio
     )
 }
 
-/// The model's view of a decision, `(phase, used)`: Send at release tier → (1, 2).
+/// The model's view of a decision, `(phase, used)`: Send at release tier → (1, 2); any other
+/// Send → (1, 1); Anonymous → (2, 0); Refuse → (3, 0).
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub const fn project_decision(decision: &Decision) -> (i64, i64) {

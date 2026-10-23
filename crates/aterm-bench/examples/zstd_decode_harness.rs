@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Zstandard decode throughput harness: `aterm_zstd::Decoder`, the decoder
-// atpkg's installer reads `.tar.zst` through, streamed into a 64 KiB buffer as
-// the tar reader takes it (docs/AUDIT-third-party-2026-10-15.md ZC.4).
-//
-//   targo --unverified run --release -q -p aterm-bench --example zstd_decode_harness
-//   -> {"zstd_decode_median_mbps":...,"zstd_decode_min_mbps":...,
-//       "zstd_decode_max_mbps":...,"output_bytes":...,"n":...,"warmup":...}
-//
-// The workload is the decoder's own recorded answers: five of the frames the
-// zstd 1.5.7 CLI wrote (crates/aterm-zstd/tests/recorded/cli/, pinned by
-// SHA-256 in tests/cli_decode.rs): `-19` from a pipe as the packers write,
-// `--ultra -22 --long=27`, `--fast=5`, a 1 KiB window, and a single-segment
-// file frame over mixed text, noise and binary. (pzstd's frame is left out: its
-// input is one 20 KB run repeated, which decodes as long matches several times
-// faster and would set the number alone.) No encoder runs here, so the input
-// never drifts with a tool's version. MB/s is decoded bytes per second.
+
+//! Zstandard decode throughput harness over recorded `zstd` CLI frames.
 
 use std::hint::black_box;
 use std::io::Read;
@@ -24,7 +9,6 @@ use std::time::Instant;
 
 use aterm_zstd::Decoder;
 
-/// The recorded frames, and the length each decodes to.
 const FRAMES: [(&[u8], usize); 5] = [
     (
         include_bytes!("../../aterm-zstd/tests/recorded/cli/words-96k.19.zst"),
@@ -48,13 +32,10 @@ const FRAMES: [(&[u8], usize); 5] = [
     ),
 ];
 
-/// Passes over every frame per timed sample: ~37 MB decoded, long enough
-/// that one scheduler hiccup does not dominate a sample.
 const PASSES: usize = 64;
 const N_ITERS: usize = 7;
 const WARMUP: usize = 2;
 
-/// Decodes one frame through a 64 KiB read buffer; returns the bytes out.
 fn decode(zst: &[u8], buf: &mut [u8]) -> usize {
     let mut decoder = Decoder::with_buffer(zst);
     let mut total = 0;

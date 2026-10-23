@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: makes the fork→exec window deterministic.
-//!
-//! A `flock` belongs to the open file description, and a child forked by any thread holds a
-//! copy of every descriptor (close-on-exec ones included) until it execs. A lock released only
-//! by closing its `File` stays held in that copy for the child's fork→exec window, so a
-//! `try_lock` in that window is refused although nobody holds the lock. `LOCK_UN`
-//! ([`crate::native_document_host::HeldAdvisoryLock`]) strips the lock from the description
-//! itself, the child's copy included.
-//!
-//! [`ParkedChild::fork`] forks `/bin/sh` from its own thread and parks it short of `execve`
-//! until [`ParkedChild::release`]. [`arm_at`] makes the `n`-th [`fork_if_armed`] site (each
-//! sits just after a lock is taken) on the arming thread fork the child while that lock is held.
+//! Test-only helper that parks a forked child in its pre-exec hook.
 
 use std::cell::RefCell;
 use std::io::{PipeWriter, Read as _, Write as _};
@@ -21,8 +10,7 @@ use std::os::unix::process::CommandExt as _;
 use std::process::{ExitStatus, Stdio};
 use std::thread::JoinHandle;
 
-/// A child forked from another thread and parked in its pre-exec hook: it
-/// holds a copy of every descriptor this process had open when it forked.
+/// Child process parked in its pre-exec hook while holding inherited descriptors.
 pub(crate) struct ParkedChild {
     /// Closing (or writing to) this lets the child exec.
     go: Option<PipeWriter>,
@@ -33,7 +21,6 @@ pub(crate) struct ParkedChild {
 impl ParkedChild {
     /// Fork the child and return once it exists.
     pub(crate) fn fork() -> Self {
-        // `forked`: the child says it exists. `go`: the test lets it exec.
         let (mut forked_r, forked_w) = std::io::pipe().expect("pipe");
         let (go_r, go_w) = std::io::pipe().expect("pipe");
         let (forked_fd, go_fd, go_w_fd) =
@@ -46,8 +33,7 @@ impl ParkedChild {
                 .stderr(Stdio::null());
             // SAFETY: the hook runs in the forked child before exec and calls only
             // async-signal-safe functions (close, write, read, errno) on descriptors this closure
-            // keeps open across the spawn. It closes its copy of `go`'s write end first, so the
-            // parent's end closing (a panic included) lets it exec rather than wait.
+            // keeps open across the spawn.
             unsafe {
                 cmd.pre_exec(move || {
                     let interrupted = || {
@@ -67,7 +53,6 @@ impl ParkedChild {
                 });
             }
             let status = cmd.status();
-            // A child that failed before its byte: the parent's read ends.
             drop((forked_w, go_r));
             status
         });
@@ -79,8 +64,7 @@ impl ParkedChild {
         }
     }
 
-    /// The child has not exec'd yet: its spawn returns only at the exec, which
-    /// waits for [`Self::release`].
+    /// Returns whether the child is still parked before `exec`.
     pub(crate) fn still_parked(&self) -> bool {
         self.spawner.as_ref().is_some_and(|s| !s.is_finished())
     }
@@ -104,7 +88,6 @@ impl ParkedChild {
 }
 
 impl Drop for ParkedChild {
-    /// A test that panicked with the child parked: closing `go` lets it exec.
     fn drop(&mut self) {
         drop(self.go.take());
         if let Some(spawner) = self.spawner.take() {
@@ -124,8 +107,7 @@ thread_local! {
     static ARMED: RefCell<Option<Arm>> = const { RefCell::new(None) };
 }
 
-/// While this lives, the `n`-th (1-based) [`fork_if_armed`] site this thread
-/// reaches forks a [`ParkedChild`], once.
+/// Guard that arms the `n`-th (1-based) [`fork_if_armed`] site on this thread.
 pub(crate) struct Armed(());
 
 /// Arm this thread (see [`Armed`]).
@@ -136,8 +118,7 @@ pub(crate) fn arm_at(n: usize) -> Armed {
 }
 
 impl Armed {
-    /// The child the armed site forked, still parked. Panics when no armed site
-    /// was reached — a test whose fork never happened proves nothing.
+    /// Takes the [`ParkedChild`] forked at the armed site, panicking if none forked.
     pub(crate) fn child(&self) -> ParkedChild {
         ARMED.with(|armed| {
             let mut armed = armed.borrow_mut();
@@ -151,15 +132,12 @@ impl Armed {
 
 impl Drop for Armed {
     fn drop(&mut self) {
-        // An untaken child is released by its own drop.
         let left = ARMED.with(|armed| armed.borrow_mut().take());
         drop(left);
     }
 }
 
-/// A lock site's hook, placed just after the lock is taken: when this thread
-/// is armed and this is the site it counts to, fork a [`ParkedChild`] while the
-/// lock is held.
+/// Forks a [`ParkedChild`] when this thread is armed and reaches its target site.
 pub(crate) fn fork_if_armed() {
     ARMED.with(|armed| {
         let mut armed = armed.borrow_mut();

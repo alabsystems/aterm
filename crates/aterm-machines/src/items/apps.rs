@@ -430,9 +430,7 @@ impl Notes {
 /// # Errors
 /// Returns an error naming `at` if any field is malformed.
 pub(crate) fn check_artifact(at: &str, art: &Artifact) -> Result<(), String> {
-    //") {
     if !art.url.starts_with("https://") {
-        //", art.url));
         return Err(format!("{at}: url {:?} is not https://", art.url));
     }
     if !is_sha256(&art.sha256) {

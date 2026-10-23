@@ -396,7 +396,13 @@ fn owner_link(path: &str, first: &str, id: u64) -> Result<(), String> {
     }
 }
 
-/// Validate a next link (design §13.1): the api origin; a path `scope` accepts (`repo_id` for a numeric repository link, `None` there → Protocol); `page` strictly above `last_page`; `per_page` at most 100.
+/// Validate a next link (design §13.1): the api origin; a path `scope` accepts (`repo_id` for
+/// a numeric repository link, `None` there → Protocol); `page` strictly above `last_page`;
+/// `per_page` at most 100. Anything else → CouldNotRun, `Sub::Protocol`, why `GitHub's next
+/// link {url} is refused: {reason}`. A link with no usable `page` (none, or not a number) that
+/// carries `since`, `cursor`, `after` or `before` is refused naming that cursor, with a next
+/// that says to read one page at a time; any other link with no usable `page` is refused with
+/// the reason `it names no page` and keeps the kind's own next.
 /// # Errors
 /// As above.
 pub fn next_link(

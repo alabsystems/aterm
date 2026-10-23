@@ -158,7 +158,9 @@ fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
 ///
 /// # Errors
 ///
-/// Returns an error if the constant is absent, declared twice, malformed, or unterminated.
+/// Absent, declared twice, spelled in a form this writer does not know, unterminated, or
+/// holding a body line that is not a plain quoted literal with its trailing comma, a `//`
+/// comment or blank. None is guessed at.
 pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     let lines = lines_with_spans(src);
     let decl_prefix = concat(&["pub const ", name, ":"]);

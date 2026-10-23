@@ -3,7 +3,9 @@
 
 //! Profile-aware URL opener and headless mailbox OAuth flow for `aterm-open-url`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -35,7 +37,7 @@ pub const LOCAL_STATE_MAX: u64 = 8 * 1024 * 1024;
 pub(super) const EMAIL_FILE_MAX: u64 = 512 * 1024;
 
 /// Default timeout for headless OAuth + email magic-link authorization.
-pub const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Chrome's `Local State` under `home` (macOS).
 #[must_use]
@@ -817,8 +819,6 @@ fn http_exchange(
     }
 }
 
-/// Deliberately narrow admission, not a URL or cookie standard. This is
-/// the Claude origin the existing opener contract names (`claude.ai` and `claude.com`).
 fn provider_url(url: &str) -> bool {
     (url.starts_with("https://claude.ai/") || url.starts_with("https://claude.com/"))
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -953,6 +953,7 @@ fn follow_until_page_or_callback(
     Err("too many OAuth redirects")
 }
 
+#[cfg(test)]
 pub(super) fn poll_mailbox_for_magic_link(
     mailbox_dir: &Path,
     target_email: Option<&str>,
@@ -1013,10 +1014,46 @@ pub(super) fn poll_mailbox_for_magic_link(
     }
 }
 
-/// Completes the OAuth and email magic-link/OTP authorization flow end-to-end
-/// using any configured [`super::headless_oauth::MailboxConfig`] (Maildir, IMAP/IMAPS/Proton Bridge,
-/// or HTTP/JMAP/REST API), trying fast HTTP exchange first and falling back to the headless
-/// browser CDP authorizer when the provider serves a JavaScript SPA or OTP challenge.
+fn page_needs_browser_before_email(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let has_email_input = lower.contains("type=\"email\"")
+        || lower.contains("type='email'")
+        || lower.contains("name=\"email\"")
+        || lower.contains("name='email'")
+        || lower.contains("autocomplete=\"email\"")
+        || lower.contains("autocomplete='email'")
+        || lower.contains("autocomplete=\"username\"")
+        || lower.contains("autocomplete='username'");
+    if has_email_input {
+        return true;
+    }
+    let has_email_sent_notice = lower.contains("check your email")
+        || lower.contains("magic link")
+        || lower.contains("sent a link")
+        || lower.contains("verification code");
+    lower.contains("<script") && !has_email_sent_notice
+}
+
+fn poll_http_mailbox_credential(
+    mailbox_cfg: &super::headless_oauth::MailboxConfig,
+    email: Option<&str>,
+    timeout: Duration,
+    pending: &mut Option<super::headless_oauth::MailboxCredential>,
+) -> Result<String, &'static str> {
+    use super::headless_oauth::MailboxCredential;
+
+    let credential =
+        super::headless_oauth::poll_mailbox_config_for_credential(mailbox_cfg, email, timeout)?;
+    *pending = Some(credential.clone());
+    match credential {
+        MailboxCredential::MagicLink(url) => Ok(url),
+        MailboxCredential::Otp(_) => {
+            Err("verification email contained a 6-digit OTP requiring headless browser")
+        }
+    }
+}
+
+/// Completes the OAuth and email magic-link/OTP authorization flow using `mailbox_cfg`.
 ///
 /// # Errors
 ///
@@ -1030,50 +1067,69 @@ pub fn authorize_with_mailbox_config(
 ) -> Result<(), &'static str> {
     let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let has_headless_browser =
+        super::headless_oauth::find_headless_browser(home.as_deref()).is_some();
     let t0 = Instant::now();
     let resolved_email = target_email
         .filter(|e| !e.trim().is_empty())
         .map(str::to_owned)
         .or_else(|| extract_login_hint(authorize_url));
     if !force_headless && !mailbox_cfg.is_webmail_only(resolved_email.as_deref()) {
-        let first_res = authorize_using(
+        let mut pending_credential = None;
+        let first_res = authorize_using_with_page(
             authorize_url,
             target_email,
-            |email| {
-                if let Some(dir) = mailbox_cfg.dir.as_deref()
-                    && mailbox_cfg.imap_url.is_none()
-                    && mailbox_cfg.http_url.is_none()
-                {
-                    return poll_mailbox_for_magic_link(dir, email, timeout);
-                }
-                match super::headless_oauth::poll_mailbox_config_for_credential(
+            |email, initial_body| {
+                let poll_timeout =
+                    if has_headless_browser && page_needs_browser_before_email(initial_body) {
+                        timeout
+                            .saturating_sub(t0.elapsed())
+                            .min(Duration::from_millis(200))
+                    } else {
+                        timeout.saturating_sub(t0.elapsed())
+                    };
+                poll_http_mailbox_credential(
                     mailbox_cfg,
                     email,
-                    timeout,
-                )? {
-                    super::headless_oauth::MailboxCredential::MagicLink(url) => Ok(url),
-                    super::headless_oauth::MailboxCredential::Otp(_) => {
-                        Err("verification email contained a 6-digit OTP requiring headless browser")
-                    }
-                }
+                    poll_timeout,
+                    &mut pending_credential,
+                )
             },
             &mut http_exchange,
         );
         match first_res {
             Ok(()) => return Ok(()),
             Err(first_err) => {
+                if matches!(
+                    first_err,
+                    "this OAuth destination needs the manual browser"
+                        | "the local OAuth callback listener rejected the authorization code"
+                ) || !has_headless_browser
+                {
+                    return Err(first_err);
+                }
                 let remaining = timeout.saturating_sub(t0.elapsed());
                 if remaining.is_zero() {
                     return Err(first_err);
                 }
-                return super::headless_oauth::authorize_with_headless_browser_config(
+                return super::headless_oauth::authorize_with_headless_browser_config_and_credential(
                     authorize_url,
                     store_dir,
                     Some(mailbox_cfg),
                     target_email,
                     remaining,
+                    pending_credential,
                 )
-                .map_err(|_| first_err);
+                .map_err(|cdp_err| {
+                    if cdp_err.starts_with("no headless browser")
+                        || cdp_err == "could not spawn headless browser"
+                    {
+                        first_err
+                    } else {
+                        cdp_err
+                    }
+                });
             }
         }
     }
@@ -1086,9 +1142,7 @@ pub fn authorize_with_mailbox_config(
     )
 }
 
-/// Completes the OAuth and email magic-link/OTP authorization flow end-to-end,
-/// trying fast HTTP exchange first and falling back to the headless browser CDP
-/// authorizer when the provider serves a JavaScript SPA or OTP challenge.
+/// Completes the OAuth and email magic-link/OTP authorization flow using `mailbox_dir`.
 ///
 /// # Errors
 ///
@@ -1111,10 +1165,30 @@ pub fn authorize_with_mailbox(
 }
 
 /// The real flow with its two effects passed as capabilities.
+#[cfg(test)]
 pub(super) fn authorize_using(
     authorize_url: &str,
     target_email: Option<&str>,
     magic_link: impl FnOnce(Option<&str>) -> Result<String, &'static str>,
+    exchange: &mut impl FnMut(
+        &str,
+        &str,
+        &mut BTreeMap<String, String>,
+        Option<&str>,
+    ) -> Result<HttpResponse, &'static str>,
+) -> Result<(), &'static str> {
+    authorize_using_with_page(
+        authorize_url,
+        target_email,
+        |email, _| magic_link(email),
+        exchange,
+    )
+}
+
+fn authorize_using_with_page(
+    authorize_url: &str,
+    target_email: Option<&str>,
+    magic_link: impl FnOnce(Option<&str>, &str) -> Result<String, &'static str>,
     exchange: &mut impl FnMut(
         &str,
         &str,
@@ -1129,13 +1203,19 @@ pub(super) fn authorize_using(
         .or_else(|| extract_login_hint(authorize_url));
     let mut cookies = BTreeMap::new();
 
-    match follow_until_page_or_callback(&flow, exchange, "GET", authorize_url, &mut cookies, None)?
-    {
+    let initial_body = match follow_until_page_or_callback(
+        &flow,
+        exchange,
+        "GET",
+        authorize_url,
+        &mut cookies,
+        None,
+    )? {
         StepOutcome::CallbackDelivered => return Ok(()),
-        StepOutcome::Page { .. } => {}
-    }
+        StepOutcome::Page { body, .. } => body,
+    };
 
-    let magic_url = magic_link(email.as_deref())?;
+    let magic_url = magic_link(email.as_deref(), &initial_body)?;
 
     let mut page = match follow_until_page_or_callback(
         &flow,
@@ -1181,22 +1261,6 @@ fn discover_store_dir() -> Option<PathBuf> {
     store_dir.is_dir().then(|| store_dir.to_path_buf())
 }
 
-fn discover_mailbox_dir() -> Option<PathBuf> {
-    if let Some(mailbox) = std::env::var_os(MAILBOX_ENV).filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(mailbox));
-    }
-    if std::env::var_os(PROFILE_ENV).is_some_and(|v| !v.is_empty()) {
-        return None;
-    }
-    if let Some(store_dir) = discover_store_dir() {
-        let store_mailbox = store_dir.join(DEFAULT_MAILBOX_DIR);
-        if store_mailbox.is_dir() {
-            return Some(store_mailbox);
-        }
-    }
-    None
-}
-
 /// Entry point for the `aterm-open-url` argv0 alias.
 #[must_use]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
@@ -1209,20 +1273,16 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let store_dir = discover_store_dir();
     if let [url] = args.as_slice() {
-        let mailbox_cfg = discover_mailbox_dir()
-            .map(super::headless_oauth::MailboxConfig::from_dir)
-            .or_else(|| {
-                profile
-                    .as_deref()
-                    .is_none_or(|p| p.trim().is_empty())
-                    .then(|| {
-                        super::headless_oauth::discover_mailbox_config(
-                            home.as_deref(),
-                            store_dir.as_deref(),
-                        )
-                    })
-                    .flatten()
-            });
+        let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+        let has_mailbox_env = std::env::var_os(MAILBOX_ENV).is_some_and(|v| !v.is_empty());
+        let mailbox_cfg = (force_headless
+            || has_mailbox_env
+            || profile.as_deref().is_none_or(|p| p.trim().is_empty()))
+        .then(|| {
+            super::headless_oauth::discover_mailbox_config(home.as_deref(), store_dir.as_deref())
+        })
+        .flatten();
         if let Some(cfg) = mailbox_cfg {
             match authorize_with_mailbox_config(
                 url,
@@ -1233,15 +1293,13 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             ) {
                 Ok(()) => return ExitCode::from(0),
                 Err(why) => {
-                    if profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
+                    if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
                     }
                 }
             }
         } else {
-            let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
-                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
             let has_saved_profile = store_dir.as_deref().is_some_and(|s| {
                 super::headless_oauth::has_browser_profile(s, "default", email.as_deref())
             });

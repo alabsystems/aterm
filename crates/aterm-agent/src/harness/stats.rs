@@ -32,7 +32,7 @@ use crate::supervise::run::LINE_CHARS;
 /// absorbs a clock that stepped between the two.
 const MTIME_SLACK_MS: i64 = 60_000;
 
-/// What the harness did over one window, folded from its ledgers (the module docs' table says which row counts where).
+/// What the harness did over one window, folded from its ledgers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HarnessStats {
     /// The window's start, unix ms: rows at or after it count.
@@ -51,7 +51,8 @@ pub struct HarnessStats {
     pub continued: u64,
     /// Land's instruction and its nudges typed (`land@v1`, `land-nudge@v1`): land prompts, never landings.
     pub land_prompts: u64,
-    /// Land's landings: the journal's `DONE … rule=land@v1` notes, one per landing at its first note's time, never a restatement of it (module docs, THE LANDINGS).
+    /// Land's landings: the journal's `DONE … rule=land@v1` notes, one per landing at its first
+    /// note's time, never a restatement of it.
     pub landed: u64,
     /// The work carried on past a wall: a usage reset, an API error, a reply cut off, a full context.
     pub resumed: u64,
@@ -79,9 +80,9 @@ pub struct HarnessStats {
     pub bad: u64,
     /// The window may be partial.
     pub cut: bool,
-    /// Each session's share of the counts above, by `sid` (module docs, PER SESSION).
+    /// Each session's share of the counts above, by `sid`.
     pub by_session: Option<BTreeMap<String, Tally>>,
-    /// The choices the harness made in the person's name inside the window (module docs, DECIDED FOR YOU).
+    /// The choices the harness made in the person's name inside the window.
     pub decided: Option<Decided>,
     /// The folds' memory of what is still open.
     open: Open,
@@ -228,8 +229,7 @@ struct Open {
     /// The sessions [`HarnessStats::sessions`] counted.
     seen: BTreeSet<String>,
     /// The sessions whose last landing note has no land act journaled
-    /// after it: their next note restates that landing (module docs, THE
-    /// LANDINGS).
+    /// after it: their next note restates that landing.
     landed_since_act: BTreeSet<String>,
 }
 
@@ -328,8 +328,7 @@ impl HarnessStats {
         *n = n.saturating_add(1);
     }
 
-    /// `sid`'s journal says `line` of Land's landings (module docs, THE
-    /// LANDINGS); `inside`: the record is in the window.
+    /// `sid`'s journal says `line` of Land's landings; `inside`: the record is in the window.
     fn land(&mut self, sid: &str, line: LandLine, inside: bool) {
         match line {
             LandLine::Act => {
@@ -384,7 +383,7 @@ pub const DECIDED_CHARS: usize = 96;
 /// How close (ms) an unproven press of a command comes after the last press of that command in that session to be counted in its row (`×N`) rather than a row of its own.
 pub const BURST_MS: i64 = 60_000;
 
-/// What kind of choice the harness made in the person's name (module docs, DECIDED FOR YOU).
+/// What kind of choice the harness made in the person's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DecisionKind {
     /// A question dialog its keys answered.
@@ -1306,8 +1305,7 @@ fn is_adopted(r: &JournalRecord) -> bool {
     r.kind == "other" && r.line.split(' ').next() == Some(ADOPTED)
 }
 
-/// What a journal record says of Land's landings (module docs, THE
-/// LANDINGS).
+/// What a journal record says of Land's landings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LandLine {
     /// A land act typed: `CONTINUED` or `TYPED` under `land@v1`, `land-nudge@v1` or `land-answer@v1`, or a wall's continuation that typed Land's own words under the wall's rule ([`opens_with_land_words`]).
@@ -1635,7 +1633,8 @@ pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> Har
     acc
 }
 
-/// ONE READING, TWO WINDOWS (module docs): what the harness did since `today_ms`.
+/// ONE READING, TWO WINDOWS: what the harness did since `today_ms` (each session's share kept)
+/// and since `week_ms`, reading each file at most once.
 #[must_use]
 pub fn stats_windows(
     state_dir: &Path,

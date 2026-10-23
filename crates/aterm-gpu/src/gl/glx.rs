@@ -229,6 +229,8 @@ impl GlxContext {
             unsafe { (fns.destroy_context)(display, context) };
             return Err("gl: GLX refused a 1x1 pbuffer".to_owned());
         }
+        // SAFETY (each arm): the extension that defines the name is offered, so it resolves to the
+        // function its alias type declares.
         let swap = unsafe {
             let named = |ext: &str, name: &CStr| {
                 has_ext(&exts, ext)
@@ -363,6 +365,8 @@ impl GlxContext {
 
     /// Set `window`'s swap interval (0: post at once; 1: wait for the refresh).
     pub(crate) fn swap_interval(&self, window: GLXDrawable, interval: i32) -> Result<(), String> {
+        // SAFETY (each call): the function the offered extension defines; the window is current,
+        // which the MESA and SGI forms act on.
         match self.swap {
             SwapControl::Ext(f) => {
                 unsafe { f(self.display, window, interval) };
@@ -392,7 +396,8 @@ impl GlxContext {
 
 impl Drop for GlxContext {
     fn drop(&mut self) {
-        // SAFETY: the device owning this context is gone, so no thread holds it current.
+        // SAFETY: the device owning this context is gone, so no thread holds
+        // it current; the pbuffer and the context were made on this display.
         unsafe {
             (self.glx.fns.destroy_pbuffer)(self.display, self.pbuffer);
             (self.glx.fns.destroy_context)(self.display, self.context);
@@ -684,7 +689,8 @@ mod tests {
                 event_mask: xlib::STRUCTURE_NOTIFY_MASK | xlib::EXPOSURE_MASK,
                 ..Default::default()
             };
-            // SAFETY: a live display.
+            // SAFETY: a live display; a top-level window on its default screen with the root's
+            // depth and visual, its attributes read from `attributes`, then mapped.
             let (screen, win) = unsafe {
                 let screen = (x.default_screen)(dpy);
                 let root = (x.root_window)(dpy, screen);

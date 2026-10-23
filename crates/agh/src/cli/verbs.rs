@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! THE verb table (design §9.3, §9.6): the parser, help, schema and dispatch read it, and
-//! nothing else lists verbs.
+//! Verb table used by the CLI parser, help renderer, schema output, and command dispatch.
 
 use super::{
     Ctx, Outcome, args::Invocation, cmd_api, cmd_auth, cmd_can, cmd_content, cmd_git, cmd_meta,
@@ -50,7 +49,7 @@ pub struct FlagSpec {
     pub help: &'static str,
 }
 
-/// What a verb's answer is a document of: the projection and order of design §8.3.
+/// What a verb's answer is a document of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Noun {
     /// A release.
@@ -120,9 +119,7 @@ impl Noun {
         Noun::Meta,
     ];
 
-    /// `release`, `release-list`, `asset`, `content-entry`, `tree-entry`, `commit`, `repo`,
-    /// `branch`, `tag`, `user`, `rate`, `identity`, `policy`, `route`, `compare`, `raw`,
-    /// `download`, `wait`, `permission`, `meta`.
+    /// The canonical kebab-case slug for this noun.
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -162,12 +159,11 @@ pub struct Verb {
     pub path: &'static [&'static str],
     /// How it touches GitHub.
     pub class: Class,
-    /// The usage line, exactly as the plan's table gives it.
+    /// The usage line.
     pub usage: &'static str,
     /// One line, at most 100 characters.
     pub summary: &'static str,
-    /// One command line that parses, naming only `alabsystems/aterm`, fixture owners or
-    /// placeholders in angle brackets.
+    /// One command line that parses.
     pub example: &'static str,
     /// What its answer is a document of.
     pub noun: Noun,
@@ -197,7 +193,7 @@ impl PartialEq for Verb {
 
 impl Eq for Verb {}
 
-/// A refused verb (design §9.6).
+/// A refused verb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refused {
     /// The words of its path.
@@ -208,7 +204,6 @@ pub struct Refused {
     pub next: &'static str,
 }
 
-/// A flag that takes nothing.
 const fn on(name: &'static str, help: &'static str) -> FlagSpec {
     FlagSpec {
         name,
@@ -218,7 +213,6 @@ const fn on(name: &'static str, help: &'static str) -> FlagSpec {
     }
 }
 
-/// A flag that takes one value.
 const fn value(name: &'static str, help: &'static str) -> FlagSpec {
     FlagSpec {
         name,
@@ -228,7 +222,6 @@ const fn value(name: &'static str, help: &'static str) -> FlagSpec {
     }
 }
 
-/// A flag that takes a value per use.
 const fn repeat(name: &'static str, help: &'static str) -> FlagSpec {
     FlagSpec {
         name,
@@ -238,7 +231,6 @@ const fn repeat(name: &'static str, help: &'static str) -> FlagSpec {
     }
 }
 
-/// The same flag with a short name.
 const fn short(flag: FlagSpec, short: char) -> FlagSpec {
     FlagSpec {
         short: Some(short),
@@ -246,21 +238,16 @@ const fn short(flag: FlagSpec, short: char) -> FlagSpec {
     }
 }
 
-/// `--include-drafts`.
 const INCLUDE_DRAFTS: FlagSpec = on(
     "--include-drafts",
     "read as the owner's writer, so a draft release is seen",
 );
-/// `--id`.
 const ID: FlagSpec = value("--id", "the release's numeric id, in place of TAG");
-/// `--tag-regex`.
 const TAG_REGEX: FlagSpec = value("--tag-regex", "only tags this regular expression matches");
-/// `--prerelease`.
 const PRERELEASE: FlagSpec = on("--prerelease", "only prereleases");
-/// `--no-prerelease`.
 const NO_PRERELEASE: FlagSpec = on("--no-prerelease", "no prereleases");
 
-/// Every verb, in the plan's order.
+/// Every verb, in table order.
 pub static VERBS: &[Verb] = &[
     Verb {
         path: &["cat"],
@@ -677,7 +664,7 @@ pub static VERBS: &[Verb] = &[
     },
 ];
 
-/// The global flags, in the plan's order. No flag name anywhere contains `token`.
+/// The global flags, in table order.
 pub static GLOBAL_FLAGS: &[FlagSpec] = &[
     short(
         value("--repo", "the repository, in place of the first positional"),
@@ -715,9 +702,7 @@ pub static GLOBAL_FLAGS: &[FlagSpec] = &[
     short(on("--help", "this verb's page"), 'h'),
 ];
 
-/// Writes, for the refusals that share a why.
 const WRITES: &str = "writes arrive in M2";
-/// The next of every M2 write.
 const USE_GH: &str = "use gh for now";
 
 /// Every refused verb (exit 1).

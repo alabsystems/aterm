@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shipping `aterm_objc::WakeTimer`, on this thread's own run loop against real
-//! CoreFoundation, stepped beside `aterm_models_core::run_loop_waker_model`. Every projected
-//! variable is read back from the plan and from `CFRunLoopTimerGetNextFireDate`, never from the
-//! harness's bookkeeping; `steps` is CoreFoundation's catch-up walk, measured as how many repeat
-//! intervals past the armed date it moved the next fire date. Two negative controls replay the
-//! model's `Buggy` defects (a 0.1 µs interval, a plan deaf to the callout) on raw timers and
-//! show the projection catches each. No AppKit, no WindowServer.
+//! Live `WakeTimer` conformance tests against `run_loop_waker_model`.
 
 #![cfg(target_os = "macos")]
 
@@ -54,7 +48,6 @@ unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
-/// Run this thread's run loop long enough for a due timer to fire.
 fn pump() {
     // SAFETY: this thread's own run loop, CoreFoundation's own mode constant.
     unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, 0) };
@@ -65,8 +58,6 @@ fn now_abs() -> f64 {
     unsafe { CFAbsoluteTimeGetCurrent() }
 }
 
-/// A day: "will fire within the horizon" is CoreFoundation's armed; a spent or
-/// disarmed timer is a year or more out.
 const HORIZON: Duration = Duration::from_secs(86_400);
 
 fn step(model: &Model, state: &mut State, action: &'static str) {
@@ -75,7 +66,6 @@ fn step(model: &Model, state: &mut State, action: &'static str) {
     *state = successors[0].clone();
 }
 
-/// The real timer's state on the model's variables.
 fn project(timer: &mut WakeTimer, want: i64, delivered: i64) -> [(&'static str, i64); 5] {
     let plan = timer.plan();
     let cache = match plan.armed() {
@@ -105,8 +95,6 @@ fn agree(model: &Model, state: &State, observed: [(&'static str, i64); 5], after
     }
 }
 
-/// How many repeat intervals CoreFoundation moved the next fire date past the
-/// date the timer was armed for — its catch-up walk, seen from outside.
 fn catch_up_steps(next_fire: f64, armed: f64, interval: f64) -> i64 {
     ((next_fire - armed) / interval).round() as i64
 }
@@ -119,7 +107,6 @@ fn the_real_wake_timer_refines_the_run_loop_waker_model() {
     let (mut want, mut delivered) = (0, 0);
     agree(&model, &state, project(&mut timer, want, delivered), "init");
 
-    // Poll: arm now, CoreFoundation fires it, the timer is spent.
     timer.start();
     step(&model, &mut state, "RequestNow");
     (want, delivered) = (1, 0);
@@ -135,7 +122,6 @@ fn the_real_wake_timer_refines_the_run_loop_waker_model() {
     agree(&model, &state, project(&mut timer, want, delivered), "Fire");
     assert_eq!(delivered, 1, "CoreFoundation fired the armed timer");
 
-    // The same request again: the spent timer must be re-armed, not trusted.
     timer.start();
     step(&model, &mut state, "RequestNow");
     (want, delivered) = (1, 0);
@@ -155,7 +141,6 @@ fn the_real_wake_timer_refines_the_run_loop_waker_model() {
         "second Fire",
     );
 
-    // A deadline: armed for it, kept when asked again, disarmed on Wait.
     let far = Instant::now() + Duration::from_secs(10);
     timer.start_at(Instant::now(), Some(far));
     step(&model, &mut state, "RequestAt");
@@ -192,7 +177,6 @@ fn the_real_wake_timer_refines_the_run_loop_waker_model() {
         "RequestWait kept",
     );
 
-    // A near deadline that CoreFoundation fires on its own.
     let near = Instant::now() + Duration::from_millis(30);
     timer.start_at(Instant::now(), Some(near));
     step(&model, &mut state, "RequestAt");
@@ -214,8 +198,6 @@ fn the_real_wake_timer_refines_the_run_loop_waker_model() {
         "deadline Fire",
     );
 
-    // Armed, then the loop does not run (a stopped process), then CoreFoundation fires the
-    // late timer: one catch-up step.
     timer.start();
     step(&model, &mut state, "RequestNow");
     (want, delivered) = (1, 0);
@@ -249,8 +231,6 @@ fn the_real_wake_timer_refines_the_run_loop_waker_model() {
     );
 }
 
-/// Negative control: a raw timer at stock winit's 0.1 µs interval walks ~lateness/0.1 µs
-/// catch-up steps; the shipped model's `1` rejects that and the `tiny` mutant predicts it.
 #[test]
 fn the_historical_interval_is_caught_by_the_same_projection() {
     extern "C" fn fired(_timer: *mut c_void, info: *mut c_void) {
@@ -329,9 +309,6 @@ fn the_historical_interval_is_caught_by_the_same_projection() {
     );
 }
 
-/// Negative control: the shipping `WakePlan`, driving a raw year-interval timer but never told
-/// it fired, keeps the spent timer for an unchanged request; the projection reads `armed = 0`
-/// with a wake wanted and none delivered, and `NoLostWake` rejects that state.
 #[test]
 fn a_plan_deaf_to_the_callout_is_caught_as_a_lost_wake() {
     extern "C" fn fired(_timer: *mut c_void, info: *mut c_void) {
@@ -370,7 +347,6 @@ fn a_plan_deaf_to_the_callout_is_caught_as_a_lost_wake() {
     apply(plan.start());
     pump();
     assert!(flag.replace(false), "CoreFoundation fired the armed timer");
-    // Deaf: `plan.fired()` is never called.
     let arm = plan.start();
     apply(arm);
     // SAFETY: the live timer above.

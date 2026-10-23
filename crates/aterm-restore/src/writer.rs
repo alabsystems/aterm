@@ -1120,7 +1120,7 @@ impl ControlWriter {
         self.seq
     }
 
-    /// Write `carry` as the slot's next record (module doc, "Control slot").
+    /// Write `carry` as the slot's next record.
     ///
     /// # Errors
     /// [`WriteError::TooLarge`] for a record past the slot (nothing is stored: the caller carries less); the store's refusal.

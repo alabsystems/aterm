@@ -109,6 +109,14 @@ impl Authority {
     /// Mint the process root authority, from which any capability at any tier can be granted: the most powerful operation in the process.
     /// # Safety
     /// The caller must be the trusted launcher / process entry point, and must call this at most once, before any untrusted input is processed.
+    /// Leaking the returned `Authority` (or caps minted from it) to untrusted code defeats the
+    /// capability model.
+    ///
+    /// # Sealing
+    /// Exists only under the `launcher-mint` cargo feature (or this crate's `test` cfg), which only
+    /// the trusted launchers (`aterm-gui`, `aterm-cli`) enable; feature unification makes it
+    /// nameable by every crate in such a build, so the `launcher-mint` census guard keeps every
+    /// shipped call in those two crates.
     #[cfg(any(test, feature = "launcher-mint"))]
     #[doc(hidden)]
     #[inline]
@@ -309,7 +317,8 @@ mod tests {
     use super::*;
     use effects::Spawn;
 
-    // Test helper: mint the root authority.
+    // Test helper: mint the root authority. SAFETY: a test process with no untrusted input
+    // satisfies the trusted-launcher contract of `root_authority`.
     fn test_authority() -> Authority {
         unsafe { Authority::root_authority() }
     }

@@ -138,7 +138,7 @@ pub fn exe_is_alab(exe: &Path) -> bool {
 }
 
 /// The ALab package root whose entrypoint IS `exe` ([`exe_is_alab`]'s reading), canonical.
-fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
+pub(crate) fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
     let exe = std::fs::canonicalize(exe).ok()?;
     exe.ancestors()
         .skip(1)

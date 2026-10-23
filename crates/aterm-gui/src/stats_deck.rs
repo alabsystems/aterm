@@ -116,11 +116,11 @@ fn band_px(head_pts: f64, scale: f64) -> usize {
     (head_pts * scale).round().max(0.0) as usize
 }
 
-/// Headless stats seam (development only, [`aterm_types::dev_seam!`]): `$ATERM_STATS_DECK_HEADLESS=1` draws the bars on a window with no glass (the Deck when its headroom holds it, `$ATERM_HEADROOM_PX`; the sill in the bottom pad), so a lab instance's `image` shows them.
+/// Headless stats seam (development only, [`aterm_types::dev_seam!`]): `$ATERM_DEV_STATS_DECK_HEADLESS=1` draws the bars on a window with no glass (the Deck when its headroom holds it, `$ATERM_DEV_HEADROOM_PX`; the sill in the bottom pad), so a lab instance's `image` shows them (both are `ATERM_DEV_` names, which `lab instance --env` hands on).
 pub(crate) fn deck_on_headless() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        aterm_types::dev_seam!("ATERM_STATS_DECK_HEADLESS")
+        aterm_types::dev_seam!("ATERM_DEV_STATS_DECK_HEADLESS")
             .is_some_and(|v| v.to_str().is_some_and(|v| v.trim() == "1"))
     })
 }
@@ -908,10 +908,11 @@ impl<'a> Deck<'a> {
         kind_ink(&self.inks, k)
     }
 
-    /// A mark's ink: an arrow is words2 whatever its phrase's ink (§6.5).
+    /// A mark's ink: an arrow, and the cause's ∵, is words2 whatever its
+    /// phrase's ink (§6.5; RD §4.1).
     fn mark_ink(&self, mark: WellMark, k: InkKind) -> Rgb {
         match mark {
-            WellMark::Up | WellMark::Down => self.inks.words2,
+            WellMark::Up | WellMark::Down | WellMark::Cause => self.inks.words2,
             _ => self.ink(k),
         }
     }
@@ -3184,6 +3185,19 @@ pub(crate) mod tests {
             "CPU 98 percent of capacity: 17.7 of 18 cores. aterm 6.8 cores, Tab 2 0.1 cores. \
              Rose from about 49 percent. Over capacity 6 of the last 10 minutes. 8 waiting for \
              a core, load 25.7 on 18 cores. Busiest rustc, 9 processes in Tab 3, 5.9 cores."
+        );
+        // The cause the Deck's Details name, the meter says where no
+        // Details column shows (RD §4.1).
+        let trouble = scene(Scene::Trouble);
+        let cpu = meter(&trouble, Resource::Cpu);
+        assert_eq!(
+            cpu.words,
+            words::row_sentence(Resource::Cpu, &trouble, Some(FRONT), &MAC)
+        );
+        assert!(
+            cpu.words.contains(" Why: Spotlight, after start-up. "),
+            "{}",
+            cpu.words
         );
         assert_eq!(g.cores_name, "18 CPU cores");
         assert_eq!(g.cores.len(), 18);

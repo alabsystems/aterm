@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Start a program that inherits no descriptor but stdio: `posix_spawn(2)` with
-//! Darwin's `POSIX_SPAWN_CLOEXEC_DEFAULT`, which marks every descriptor the
-//! caller did not name close-on-exec inside the spawn, atomically.
-//!
-//! The PTY keeper holds a custody copy of every terminal's master, and the one program it
-//! starts is `/usr/bin/open -a <its own bundle>`. A master leaking into that child would be a
-//! holder no scan was asked about; a `fork` + strip in `pre_exec` leaves a window for a
-//! concurrently opened descriptor, this flag does not.
-//!
-//! Darwin only; elsewhere [`spawn_cloexec_default`] answers `Unsupported`.
+//! Spawn a child inheriting only `/dev/null` stdio via Darwin's `POSIX_SPAWN_CLOEXEC_DEFAULT`.
 
 use std::io;
 
 /// Spawn `program` with `args` (argv[1..]) and the caller's environment,
-/// inheriting no descriptor but a `/dev/null` stdio. Returns the child's pid;
-/// the caller reaps it (`waitpid`).
+/// inheriting no descriptor but a `/dev/null` stdio.
 ///
 /// # Errors
 /// `InvalidInput` for an argument holding a NUL; anything `posix_spawn`
@@ -28,7 +18,6 @@ pub fn spawn_cloexec_default(program: &str, args: &[&str]) -> io::Result<u32> {
     use std::ffi::CString;
     type Attr = *mut core::ffi::c_void;
     type Actions = *mut core::ffi::c_void;
-    // spawn.h.
     const POSIX_SPAWN_CLOEXEC_DEFAULT: i16 = 0x4000;
     const POSIX_SPAWN_SETSIGDEF: i16 = 0x4;
     const POSIX_SPAWN_SETSIGMASK: i16 = 0x8;
@@ -83,8 +72,6 @@ pub fn spawn_cloexec_default(program: &str, args: &[&str]) -> io::Result<u32> {
         return Err(io::Error::from_raw_os_error(rc));
     }
     let empty_mask: u32 = 0;
-    // Every catchable signal to its default in the child: a disposition this
-    // process set (SIGPIPE ignored, say) is not the program's to inherit.
     let all_signals: u32 = !0;
     let mut result = Ok(());
     let flags = POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
@@ -146,10 +133,6 @@ pub fn spawn_cloexec_default(_program: &str, _args: &[&str]) -> io::Result<u32> 
 mod tests {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-    /// An inheritable descriptor at a number no shell touches (200) does not reach the child.
-    /// Control: the same probe started by a `posix_spawn` without the flag
-    /// (`spawnfd::test_support`) sees it. Not a std `Command`: Trust's std hands a child
-    /// nothing above stdio, so it could not show the leak.
     #[test]
     fn the_child_inherits_nothing_but_stdio() {
         unsafe extern "C" {

@@ -38,6 +38,12 @@ pub(crate) fn sdr_white_scale(window: &Window) -> f32 {
     query(window).1
 }
 
+/// The owned interface pointer a successful DXGI call wrote to `out`; `None` on failure.
+///
+/// # Safety
+///
+/// `out` is what the call whose result is `hr` wrote: on success, a live interface pointer whose
+/// one reference nothing else releases.
 unsafe fn owned(hr: i32, out: *mut c_void) -> Option<Com> {
     // SAFETY: the caller's contract.
     (hr >= 0).then(|| unsafe { Com::from_raw(out) }).flatten()
@@ -174,7 +180,9 @@ unsafe extern "system" {
 
 fn displayconfig_primary() -> Option<(f32, bool)> {
     // SAFETY: hand-rolled DisplayConfig FFI with `#[repr(C)]` layouts validated against a live
-    // display; sizes are passed by the API contract and every call is return-code-checked.
+    // display; sizes are passed by the API contract and every call but the SDR-white query is
+    // return-code-checked (that one falls back on its zeroed default). Each device-info packet is
+    // a full struct whose first field is the header the API writes through.
     unsafe {
         let mut num_paths = 0u32;
         let mut num_modes = 0u32;

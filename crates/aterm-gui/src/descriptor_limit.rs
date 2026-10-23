@@ -285,7 +285,8 @@ impl OlderImageLimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        // SAFETY: A valid resource id and an exclusively borrowed, writable out-parameter.
+        // SAFETY: A valid resource id and an exclusively borrowed, writable out-parameter for the
+        // one call.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
             return None;
         }
@@ -302,7 +303,8 @@ impl OlderImageLimit {
     fn inheritable_at_or_above(&self) -> Option<libc::c_int> {
         let floor = libc::c_int::try_from(self.soft).unwrap_or(libc::c_int::MAX);
         (floor..self.table).find(|fd| {
-            // SAFETY: `F_GETFD` only reads one number's flags.
+            // SAFETY: `F_GETFD` only reads one number's flags; a number that
+            // is not open answers -1.
             let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
             flags >= 0 && flags & libc::FD_CLOEXEC == 0
         })
@@ -316,7 +318,8 @@ impl OlderImageLimit {
             rlim_cur: soft,
             rlim_max: self.raised.1,
         };
-        // SAFETY: A valid resource id and a fully initialised rlimit that keeps the hard limit.
+        // SAFETY: A valid resource id and a fully initialised rlimit that keeps the hard limit as
+        // it was.
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -357,7 +360,8 @@ pub(crate) fn start_older_image_at_its_limit(
          successor is started at the soft descriptor limit {soft} this process held before the \
          park's raise"
     );
-    // SAFETY: The closure runs between fork and exec and calls only `fcntl` and `setrlimit`.
+    // SAFETY: the closure runs between fork and exec and calls only `fcntl`
+    // and `setrlimit` over integers it owns — no allocation, no lock.
     unsafe {
         command.pre_exec(move || {
             // A descriptor the image would keep at or above the limit, or a
@@ -512,7 +516,8 @@ pub(crate) mod tests {
     fn mark_close_on_exec_at_or_above(floor: u64) {
         let floor = i32::try_from(floor).expect("a descriptor number");
         for fd in floor..aterm_uds::spawnfd::descriptor_bound() {
-            // SAFETY: F_GETFD/F_SETFD on any number only reads or sets its close-on-exec flag.
+            // SAFETY: F_GETFD/F_SETFD on any number only reads or sets its
+            // close-on-exec flag; a number that is not open answers -1.
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
@@ -688,7 +693,8 @@ pub(crate) mod tests {
         let cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
         let mut shell = std::process::Command::new("/bin/sh");
         shell.args(["-c", "ulimit -n"]);
-        // SAFETY: `apply` is a bare `getrlimit`/`setrlimit` loop with a valid cap.
+        // SAFETY: `apply` is a bare `getrlimit`/`setrlimit` loop with a valid
+        // cap — async-signal-safe, as the PTY's own post-fork child relies on.
         unsafe {
             shell.pre_exec(move || limits.apply(&cap));
         }

@@ -1,15 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Empty-channel no-op on the GPU, one row per effect channel: an empty channel (as built, or an
-// atlas with nothing drawn) renders the bare frame exactly; a populated channel paints (so a
-// dropped stream cannot look clean); `clear_overlays` (the `image plain` capture contract)
-// restores the bare frame. A row's `drain` clears the channel on a renderer that rendered the
-// populated input, which must then land on the bare bytes (no residue in persistent instance
-// streams). `cpu_too` rows also run every leg on the CPU; the CPU table is aterm-render's
-// `tests/empty_channels.rs`.
-//
-// No GPU or no font: COULD NOT RUN.
 
 use std::sync::Arc;
 
@@ -23,7 +13,6 @@ use aterm_render::{
 
 use crate::common::{backends, backends_fontdue, max_channel_delta};
 
-/// The grid and cell a row's setters build against.
 struct Ctx {
     rows: usize,
     cols: usize,
@@ -56,7 +45,6 @@ struct Channel {
     is_empty: fn(&RenderInput) -> bool,
 }
 
-/// A 64x64 patterned atlas: opaque on top, partial alpha below.
 fn cat_atlas(version: u64) -> SceneAtlas {
     let (w, h) = (64u32, 64u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -83,10 +71,7 @@ fn cat_atlas(version: u64) -> SceneAtlas {
     }
 }
 
-/// One burn of the synthetic fire field, emitted as per-row-band patches.
 fn burn_patches(ch: usize, grid_w: usize, grid_h: usize) -> Vec<FirePatch> {
-    // The hot tall burn of `fire_patch_parity`'s synthetic field, spanning
-    // several row bands.
     let (x, w, base_y, peak_h) = (ch, 8 * ch, grid_h - ch / 2, (3 * ch) as u16);
     let x0 = x.min(grid_w);
     let x1 = (x + w).min(grid_w);
@@ -118,7 +103,6 @@ fn burn_patches(ch: usize, grid_w: usize, grid_h: usize) -> Vec<FirePatch> {
     out
 }
 
-/// An additive glow quad (see `GlowQuad::alpha`).
 fn glow(row: usize, x: usize, y: usize, w: usize, h: usize, color: u32) -> GlowQuad {
     GlowQuad {
         row: row as u16,
@@ -133,7 +117,6 @@ fn glow(row: usize, x: usize, y: usize, w: usize, h: usize, color: u32) -> GlowQ
     }
 }
 
-/// A real rain field over the row's grid, driven until it rains.
 fn raining(i: &RenderInput, c: &Ctx) -> RainScene {
     let mut scene = RainScene::new(c.rows, c.cols, (c.cw, c.ch), i);
     scene.drive_until_raining();
@@ -148,12 +131,10 @@ const CHANNELS: &[Channel] = &[
         text: b"\x1b[?25lkitty",
         fontdue: false,
         cpu_too: false,
-        // Uploads but draws nothing.
         atlas_only: Some(|i, _| i.cat_atlas = Some(Arc::new(cat_atlas(1)))),
         populate: |i, c| {
             i.cat_atlas = Some(Arc::new(cat_atlas(1)));
             let h = (c.ch as u16).min(32);
-            // Bake == dest: the NEAREST 1:1 contract.
             i.cat_quads = vec![SpriteQuad {
                 row: 1,
                 x: 0,
@@ -213,8 +194,6 @@ const CHANNELS: &[Channel] = &[
         drain: None,
         is_empty: |i| i.glow_halo.is_empty(),
     },
-    // The aurora rides a persistent per-frame instance stream on the GPU, so
-    // residue has somewhere to live: the drain leg is the one that matters.
     Channel {
         name: "cursor_glow_add",
         rows: 4,
@@ -232,8 +211,6 @@ const CHANNELS: &[Channel] = &[
         drain: Some(|i| i.cursor_glow_add.clear()),
         is_empty: |i| i.cursor_glow_add.is_empty(),
     },
-    // A glow_under-free frame opens no extra passes: the fused base pass must reproduce the
-    // bare bytes.
     Channel {
         name: "glow_under + char_fg",
         rows: 6,
@@ -265,13 +242,10 @@ const CHANNELS: &[Channel] = &[
         atlas_only: None,
         populate: |i, c| {
             let (cw, ch) = (c.cw, c.ch);
-            // Crown: 3 stacked rects over rows 0..3 at column 6 (solar core).
             let core = premul_rgb(0x00FF_F2C8, 200);
             for r in 0..3 {
                 i.nova_add.push(glow(r, 6 * cw, r * ch, 2 * cw, ch, core));
             }
-            // Ring chords: left + right chord slabs in rows 1..4 (the
-            // fixed-count band idiom, one quad per chord per band).
             let fringe = premul_rgb(0x00FF_9A3C, 120);
             for r in 1..4 {
                 for col in [3, 9] {
@@ -291,7 +265,6 @@ const CHANNELS: &[Channel] = &[
         text: b"\x1b[?25l$ matrix off",
         fontdue: false,
         cpu_too: false,
-        // A genuine baked atlas from the real engine; uploads, draws nothing.
         atlas_only: Some(|i, c| {
             let atlas = raining(i, c).atlas();
             assert!(atlas.is_some(), "the engine must have baked an atlas");
@@ -304,9 +277,6 @@ const CHANNELS: &[Channel] = &[
     },
 ];
 
-/// Run every leg of `c` through one renderer. `exact` compares whole pixels
-/// (transmittance byte included); otherwise RGB must match exactly
-/// (`max_channel_delta == 0`).
 fn legs(
     c: &Channel,
     backend: &str,
@@ -377,7 +347,6 @@ fn every_empty_channel_is_byte_identical_on_the_gpu_and_clear_overlays_restores_
         } else {
             (&mut default.0, &mut default.1)
         };
-        // Cell metrics for payload geometry (the GPU shares the CPU face's).
         let (cw, ch) = cpu.cell_size();
         let ctx = Ctx {
             rows: c.rows,

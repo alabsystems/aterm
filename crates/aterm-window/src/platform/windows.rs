@@ -329,7 +329,7 @@ impl WindowExtWindows for Window {
     fn set_title_background_color(&self, color: Option<Color>) {
         // The windows docs don't mention NONE as a valid options but it works in practice and is
         // useful to circumvent the Windows option "Show accent color on title bars and
-        // window borders"
+        // window borders".
         self.window.set_title_background_color(color.unwrap_or(Color::NONE))
     }
 

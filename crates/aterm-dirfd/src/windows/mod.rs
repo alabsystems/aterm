@@ -97,7 +97,8 @@ impl Errno {
         )
     }
 
-    /// A failed NTSTATUS as a Win32 code (module docs: the two kept apart).
+    /// A failed NTSTATUS as a Win32 code (`STATUS_DELETE_PENDING` and
+    /// `STATUS_FILE_IS_A_DIRECTORY` kept apart from the table's mapping).
     fn from_status(status: ffi::NTSTATUS) -> Self {
         match status as u32 {
             ffi::STATUS_DELETE_PENDING => Self::DELETE_PENDING,
@@ -400,7 +401,7 @@ impl FileType {
         self.attributes & ffi::FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
 
-    /// A link: a name-surrogate reparse point (module docs), removed as itself.
+    /// A link: a name-surrogate reparse point, removed as itself.
     #[must_use]
     pub const fn is_link(self) -> bool {
         self.is_reparse() && self.reparse_tag & ffi::REPARSE_TAG_NAME_SURROGATE != 0
@@ -459,7 +460,8 @@ unsafe impl Info for ffi::FILE_ID_INFO {
 /// Read `T`'s class through `fd` into `out`.
 fn query<T: Info>(fd: BorrowedHandle<'_>, mut out: T) -> Result<T> {
     let len = u32::try_from(size_of::<T>()).map_err(|_| Errno(ffi::ERROR_INVALID_PARAMETER))?;
-    // SAFETY: `fd` is live for the call.
+    // SAFETY: `fd` is live for the call; `out` is a writable `T` of `len` bytes, and `T: Info`
+    // makes whatever the class writes there a valid `T`.
     let ok = unsafe {
         ffi::GetFileInformationByHandleEx(
             fd.as_raw_handle(),
@@ -630,18 +632,21 @@ impl Sid {
     /// The token could not be opened or read.
     pub fn current_user() -> Result<Self> {
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
-        // SAFETY: The process pseudo-handle needs no closing.
+        // SAFETY: the process pseudo-handle needs no closing; `raw` is a
+        // writable HANDLE that receives a token handle owned below.
         if unsafe {
             ffi::OpenProcessToken(ffi::GetCurrentProcess(), ffi::TOKEN_QUERY, &raw mut raw)
         } == 0
         {
             return Err(Errno::last());
         }
-        // SAFETY: A successful OpenProcessToken returned a fresh handle this function now owns.
+        // SAFETY: A successful OpenProcessToken returned a fresh handle this function now owns
+        // exclusively.
         let token = unsafe { OwnedHandle::from_raw_handle(raw) };
         let mut buf = [0u64; 16];
         let mut used = 0u32;
-        // SAFETY: `token` is live.
+        // SAFETY: `token` is live; `buf` is writable for the length passed, aligned for TOKEN_USER;
+        // `used` is a writable u32.
         let ok = unsafe {
             ffi::GetTokenInformation(
                 token.as_raw_handle(),
@@ -654,7 +659,8 @@ impl Sid {
         if ok == 0 {
             return Err(Errno::last());
         }
-        // SAFETY: On success the buffer starts with a TOKEN_USER (aligned, as `buf` is u64s).
+        // SAFETY: on success the buffer starts with a TOKEN_USER (aligned, as
+        // `buf` is u64s); its SID pointer points into `buf`, alive here.
         let sid = unsafe { (*buf.as_ptr().cast::<ffi::TOKEN_USER>()).User.Sid };
         // SAFETY: `sid` points at the token's SID, inside `buf`.
         unsafe { Self::copied(sid) }
@@ -668,9 +674,10 @@ impl Sid {
         if sid.is_null() || unsafe { ffi::IsValidSid(sid) } == 0 {
             return Err(Errno(ffi::ERROR_INVALID_DATA));
         }
-        // SAFETY: A valid SID's length is what GetLengthSid answers.
+        // SAFETY: a valid SID's length is what GetLengthSid answers, and the
+        // caller's contract makes that many bytes readable.
         let len = unsafe { ffi::GetLengthSid(sid) } as usize;
-        // SAFETY: As above: `len` readable bytes at `sid`, copied.
+        // SAFETY: As above: `len` readable bytes at `sid`, copied at once.
         Ok(Self(
             unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), len) }.to_vec(),
         ))
@@ -727,7 +734,8 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     let _exposed = expose_placeholders()?;
     let mut owner: *mut c_void = std::ptr::null_mut();
     let mut descriptor: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `fd` is live for the call.
+    // SAFETY: `fd` is live for the call; the two out-pointers are writable locals; the parts not
+    // asked for are null.
     let code = unsafe {
         ffi::GetSecurityInfo(
             fd.as_handle().as_raw_handle(),
@@ -743,7 +751,8 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     if code != 0 {
         return Err(Errno(code as i32));
     }
-    // SAFETY: On success `owner` is null or points into `descriptor`, which stays allocated.
+    // SAFETY: on success `owner` is null or points into `descriptor`, which
+    // stays allocated until the LocalFree below.
     let sid = unsafe { Sid::copied(owner) };
     // SAFETY: `descriptor` was allocated by GetSecurityInfo for this caller
     // and is freed once, here.
@@ -751,8 +760,7 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
     sid
 }
 
-/// Whether `OBJ_DONT_REPARSE` is still passed: cleared once a kernel refuses
-/// it (module docs).
+/// Whether `OBJ_DONT_REPARSE` is still passed: cleared once a kernel refuses it.
 static DONT_REPARSE: AtomicU32 = AtomicU32::new(ffi::OBJ_DONT_REPARSE);
 
 /// `NtCreateFile` of the one-component `name` (empty: `dir` itself) relative
@@ -785,7 +793,9 @@ fn nt_open(
             Information: 0,
         };
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
-        // SAFETY: Every pointer is to a live local.
+        // SAFETY: every pointer is to a live local (`object_name` outlives the
+        // call, its buffer is `name`, valid for `bytes`), `dir` is a live
+        // handle, and no EA buffer or allocation size is passed.
         let status = unsafe {
             ffi::NtCreateFile(
                 &raw mut raw,
@@ -804,7 +814,8 @@ fn nt_open(
         if status < 0 {
             return Err(status);
         }
-        // SAFETY: A successful NtCreateFile returned a fresh handle this function now owns.
+        // SAFETY: A successful NtCreateFile returned a fresh handle this function now owns
+        // exclusively.
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     };
     let extra = DONT_REPARSE.load(Ordering::Relaxed);
@@ -968,7 +979,8 @@ pub fn pin(path: &Path) -> Result<OwnedHandle> {
 fn volume_device(name: &OsStr) -> Result<()> {
     let wide: Vec<u16> = name.encode_wide().chain([0]).collect();
     let mut target = vec![0u16; 1024];
-    // SAFETY: `wide` is NUL-terminated and `target` writable for the length passed.
+    // SAFETY: `wide` is NUL-terminated and `target` writable for the length
+    // passed; both outlive the call.
     let stored =
         unsafe { ffi::QueryDosDeviceW(wide.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
     if stored == 0 {
@@ -1014,7 +1026,8 @@ fn is_volume_device(target: &[u16]) -> bool {
 /// `FileNameInfo`, the path within the volume, is `\`.
 fn is_volume_root(fd: BorrowedHandle<'_>) -> Result<bool> {
     let mut buf = [0u32; 1 + 32];
-    // SAFETY: `fd` is live.
+    // SAFETY: `fd` is live; `buf` is writable for the length passed and aligned as FILE_NAME_INFO
+    // is, and the class writes only within it.
     let ok = unsafe {
         ffi::GetFileInformationByHandleEx(
             fd.as_raw_handle(),
@@ -1154,7 +1167,8 @@ fn mounts_volume(fd: BorrowedHandle<'_>, kind: FileType) -> Result<bool> {
     }
     let mut buf = vec![0u32; ffi::MAXIMUM_REPARSE_DATA_BUFFER_SIZE / 4];
     let mut returned = 0u32;
-    // SAFETY: `fd` is live.
+    // SAFETY: `fd` is live; no input buffer; `buf` is writable for the length passed and outlives
+    // the call; `returned` is a writable u32; synchronous (no OVERLAPPED).
     let ok = unsafe {
         ffi::DeviceIoControl(
             fd.as_raw_handle(),
@@ -1226,7 +1240,8 @@ fn is_volume_name(target: &[u16]) -> bool {
 /// one where the file system has no extended class.
 fn dispose(handle: BorrowedHandle<'_>) -> Result<()> {
     let set = |class: i32, info: *const c_void, len: usize| -> Result<()> {
-        // SAFETY: `handle` is live and `info` points at `len` readable bytes of `class`'s input.
+        // SAFETY: `handle` is live and `info` points at `len` readable bytes
+        // of `class`'s input struct, alive for the call.
         let ok = unsafe {
             ffi::SetFileInformationByHandle(handle.as_raw_handle(), class, info, len as u32)
         };
@@ -1394,7 +1409,8 @@ impl Dir {
         let _exposed = expose_placeholders()?;
         loop {
             let restart = !self.started;
-            // SAFETY: `handle` is live.
+            // SAFETY: `handle` is live; `buf` is LISTING writable, 8-aligned bytes, and the class
+            // writes only within them.
             let ok = unsafe {
                 ffi::GetFileInformationByHandleEx(
                     handle.as_raw_handle(),
@@ -1421,7 +1437,8 @@ impl Dir {
 
     /// The entry at byte `at` of the buffer, and the next entry's offset.
     fn parse(&self, at: usize) -> Result<(DirEntry, Option<usize>)> {
-        // SAFETY: Any `u64` buffer is a valid `u8` buffer of eight times the length.
+        // SAFETY: any `u64` buffer is a valid `u8` buffer of eight times the
+        // length, and the borrow of `self.buf` outlives `bytes`.
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8)
         };
@@ -1606,7 +1623,9 @@ pub mod seam {
                 HardLink: 0,
                 PlaceholderManagement: 0,
             };
-            // SAFETY: `wide`, `name` and `version` are NUL-terminated and outlive the call.
+            // SAFETY: `wide`, `name` and `version` are NUL-terminated and
+            // outlive the call; both structs are live locals of their SDK
+            // layout (pinned in `ffi`), their sizes in `StructSize`.
             let hr = unsafe {
                 ffi::CfRegisterSyncRoot(
                     wide.as_ptr(),
@@ -1634,7 +1653,9 @@ pub mod seam {
                 .map_err(|e| Errno(e.raw_os_error().unwrap_or(ffi::ERROR_INVALID_FUNCTION)))?;
             let identity = b"aterm-dirfd test";
             let mut usn = 0i64;
-            // SAFETY: `file` is open for writing and live for the call.
+            // SAFETY: `file` is open for writing and live for the call;
+            // `identity` is readable for its length; `usn` is a writable
+            // i64; no OVERLAPPED, so the call completes before returning.
             let hr = unsafe {
                 ffi::CfConvertToPlaceholder(
                     file.as_raw_handle(),
@@ -1651,7 +1672,8 @@ pub mod seam {
 
     impl Drop for SyncRoot {
         fn drop(&mut self) {
-            // SAFETY: `path` is the NUL-terminated folder this root was registered on, alive.
+            // SAFETY: `path` is the NUL-terminated folder this root was registered on, alive for
+            // the call.
             let hr = unsafe { ffi::CfUnregisterSyncRoot(self.path.as_ptr()) };
             if hr < 0 {
                 let path = String::from_utf16_lossy(&self.path);
@@ -1718,7 +1740,8 @@ pub mod seam {
             ReparseGuid: guid,
         };
         let mut returned = 0u32;
-        // SAFETY: A live handle.
+        // SAFETY: A live handle; the input is `buffer`, alive for the call and exactly its length;
+        // no output buffer; synchronous (no OVERLAPPED).
         let ok = unsafe {
             ffi::DeviceIoControl(
                 fd.as_handle().as_raw_handle(),
@@ -1757,7 +1780,8 @@ pub mod seam {
             data.extend(value.to_ne_bytes());
         }
         let mut returned = 0u32;
-        // SAFETY: A live handle.
+        // SAFETY: a live handle; the input is `data`, live for the call and exactly its length; no
+        // output buffer; synchronous (no OVERLAPPED).
         let ok = unsafe {
             ffi::DeviceIoControl(
                 fd.as_handle().as_raw_handle(),

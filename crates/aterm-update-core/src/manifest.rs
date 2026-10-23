@@ -106,9 +106,6 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Wire invariants shared by parsing and emission. A manifest may retire older builds but
-    /// cannot demand one newer than itself, which would wedge the ratcheted client floor above
-    /// every published successor.
     fn validate(&self) -> Result<(), String> {
         if self.schema > SUPPORTED_SCHEMA {
             return Err(format!(
@@ -168,8 +165,6 @@ impl Manifest {
 mod tests {
     use super::*;
 
-    /// A fully populated manifest for the round-trip tests (the zip and Intel DMG pairs
-    /// included, so the round trip carries both).
     fn full() -> Manifest {
         Manifest {
             schema: 1,
@@ -290,7 +285,6 @@ mod tests {
         }
     }
 
-    /// Absent `schema` ⇒ 0, unknown keys tolerated, optional keys default to None.
     #[test]
     fn absent_schema_is_zero_and_unknown_keys_tolerated() {
         let m = Manifest::parse(
@@ -319,7 +313,6 @@ mod tests {
         assert_eq!(m.changelog, None);
     }
 
-    /// A newer schema is rejected rather than misread.
     #[test]
     fn rejects_newer_schema() {
         let r = Manifest::parse(
@@ -332,8 +325,6 @@ mod tests {
         assert!(r.is_err(), "a future schema must be rejected");
     }
 
-    /// Emit then parse reproduces the value exactly, and the changelog is a `'''` literal
-    /// block carrying raw `#`, `"` and `\`.
     #[test]
     fn full_manifest_round_trips_and_changelog_is_a_literal_block() {
         let m = full();
@@ -353,7 +344,6 @@ mod tests {
         );
     }
 
-    /// Absent optional keys are omitted from the emission, and the minimal shape round-trips.
     #[test]
     fn absent_optionals_are_omitted_from_emission() {
         let m = Manifest {
@@ -406,8 +396,6 @@ mod tests {
         assert_eq!(Manifest::parse(&text).unwrap(), m);
     }
 
-    /// A floor above the manifest's own build is refused on parse and emit: clients persist
-    /// floors monotonically, so accepting it could poison every later selection.
     #[test]
     fn rejects_min_build_above_build_number_on_parse_and_emit() {
         let text = r#"schema = 1
@@ -435,8 +423,6 @@ min_build = 551
         );
     }
 
-    /// A body with no trailing newline (closing `'''` right after the text) and one ending in
-    /// a quote (TOML allows up to two content quotes at the delimiter) round-trip exactly.
     #[test]
     fn changelog_literal_edge_cases_round_trip_exactly() {
         for body in [
@@ -456,7 +442,6 @@ min_build = 551
         }
     }
 
-    /// Bodies a multiline literal cannot represent are refused at emission, never mangled.
     #[test]
     fn to_toml_refuses_unrepresentable_changelog() {
         let mut m = full();

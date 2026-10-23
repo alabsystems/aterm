@@ -7,26 +7,15 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::DeadlineOwner;
 
-/// Detection threshold AND clamp distance for the stale-arm heal. At the
-/// observation-gate scale (the status classifier's 250 ms `min_interval`) on
-/// purpose: a healed spin degrades to <= 4 Hz, and no legitimate late arm —
-/// a busy turn runs tens of milliseconds, not hundreds — ever trips it.
 const STALE_ARM_HEAL_FLOOR_NS: u64 = 250_000_000;
 const STALE_ARM_HEAL_FLOOR: Duration = Duration::from_nanos(STALE_ARM_HEAL_FLOOR_NS);
 
 const PAST_ARM_WINDOW: u32 = 32;
-/// `> 90%` of the 32-arm window: `ceil(0.9 * 32) + ...` — the smallest count
-/// strictly greater than 28.8 past arms.
 const PAST_ARM_WINDOW_TRIGGER: u32 = 29;
-/// One 60 Hz display frame: the clamp cadence for a windowed-streak spin. The
-/// producer's own work still runs (its deadline stays armed and near), but at
-/// frame rate rather than event-loop rate.
 const PAST_ARM_STREAK_CLAMP_NS: u64 = 16_666_667;
 const PAST_ARM_STREAK_CLAMP: Duration = Duration::from_nanos(PAST_ARM_STREAK_CLAMP_NS);
 const PAST_ARM_BITS_MASK: u64 = 0xFFFF_FFFF;
 
-/// Advance one owner's packed past-arm window by one arm and decide whether
-/// the streak detector fires.
 const fn past_arm_window_step(packed: u64, past: bool) -> (u64, bool) {
     let bits = (((packed & PAST_ARM_BITS_MASK) << 1) | past as u64) & PAST_ARM_BITS_MASK;
     let seen = {
@@ -132,8 +121,6 @@ impl DeadlineHealer {
         self.episode_logged = false;
     }
 
-    /// Push one arm into the owner's window and report whether the streak
-    /// detector fires.
     fn step_window(&mut self, owner: DeadlineOwner, past: bool) -> bool {
         if owner == DeadlineOwner::None {
             return false;
@@ -154,7 +141,6 @@ mod tests {
     use crate::metrics::DeadlineOwner;
     use std::time::{Duration, Instant};
 
-    /// A heal that changed nothing.
     fn passed(deadline: Option<Instant>) -> Heal {
         Heal {
             armed: deadline,
@@ -163,11 +149,6 @@ mod tests {
         }
     }
 
-    /// HEAL-AT-THE-FOLD (busy-rearm audit, item 3). One late arm is legal — a
-    /// busy turn computes its deadline after real work — but the SAME owner
-    /// arming more than the floor in the past on CONSECUTIVE turns is a
-    /// self-rearming `WaitUntil(past)` spin, and the fold must clamp it to
-    /// `now + floor` and say so, so the loop survives the whole class visibly.
     #[test]
     fn consecutive_same_owner_stale_arms_heal_to_the_floor() {
         let mut healer = DeadlineHealer::default();
@@ -205,12 +186,6 @@ mod tests {
         assert_eq!(healer.heal(owner, Some(stale), now), passed(Some(stale)));
     }
 
-    /// The PURE window law behind the items-18/19 detector: a trigger needs a
-    /// FULL 32-arm window with more than 90% of it past (>= 29 of 32) — never
-    /// a short mostly-past warmup — and a healthy arm DILUTES the window
-    /// instead of resetting it (the property the consecutive-turn latch above
-    /// lacks, and exactly how a `late ≈ 0`/nanosecond-in-the-future blip used
-    /// to hide a spin).
     #[test]
     fn past_arm_window_step_requires_a_full_window_over_ninety_percent_past() {
         let run = |arms: &[bool]| {
@@ -248,11 +223,6 @@ mod tests {
         );
     }
 
-    /// ITEMS 18/19 (2026-08-24 wake follow-ups): the WINDOWED per-owner
-    /// detector heals the two flavours the 250 ms floor above is structurally
-    /// blind to — the `late ≈ 0` spin (every arm barely past, each one taking
-    /// the branch that RESETS the consecutive-turn latch) and two owners
-    /// alternating stale arms (defeating the single streak slot).
     #[test]
     fn windowed_past_arm_streaks_heal_at_any_lateness_and_per_owner() {
         let mut healer = DeadlineHealer::default();

@@ -2365,7 +2365,8 @@ pub fn replace_file(temporary: &Path, target: &Path, target_existed: bool) -> st
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call.
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call; the
+    // optional backup/exclusion/reserved pointers are null as required.
     let replaced = unsafe {
         if target_existed {
             ReplaceFileW(
@@ -2418,10 +2419,8 @@ mod tests {
     /// A well-formed URI of a missing file, absolute on the host (`/definitely/…` is not
     /// absolute on Windows, where it would fail as `NotAbsolute` instead).
     const MISSING_DOC_URI: &str = if cfg!(windows) {
-        // /C:/definitely/missing/aterm-doc.md"
         "file:///C:/definitely/missing/aterm-doc.md"
     } else {
-        // /definitely/missing/aterm-doc.md"
         "file:///definitely/missing/aterm-doc.md"
     };
 

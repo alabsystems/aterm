@@ -1,27 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The vendor corpus replay: every fixture under `tests/testdata/vendor/` is
-//! bytes a real Claude Code sent or painted, and this suite drives the shipping
-//! harness readers over them offline.
-//!
-//! Every other test hands the harness a payload its author wrote; the corpus
-//! is the vendor's own, recorded from a live vendor build (`README.md` beside
-//! it says how), and this suite replays it with no vendor installed.
-//!
-//! A green run means: every Bash command the vendor build was observed to ask
-//! a permission for is pressed at full power when drawn into its box, and the
-//! painted `/usage` panel yields its windows. The hook payloads are data, not
-//! a channel: the vendor's record of the commands a session runs. Each replay
-//! fails on a corpus that gives it nothing to replay.
+//! Offline replay of captured vendor fixtures through the shipping harness readers.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Where the corpus lives, relative to this crate.
 const CORPUS: &str = "tests/testdata/vendor";
-
-// Reading the corpus
 
 /// One captured payload: the bytes, and where they came from.
 #[derive(Debug, Clone)]
@@ -51,7 +36,6 @@ fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS)
 }
 
-/// Every captured build in the corpus, newest directory name last.
 fn captures() -> Vec<Capture> {
     let root = corpus_root();
     let Ok(entries) = fs::read_dir(&root) else {
@@ -91,7 +75,6 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
         if name == "manifest.toml" || name.starts_with('.') {
             continue;
         }
-        // Spelled with `/` on every host, as the corpus names its files.
         let rel = path
             .strip_prefix(base)
             .unwrap_or(&path)
@@ -105,14 +88,7 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<Fixture>) {
     }
 }
 
-// The replay
-
-/// Full power over the commands the vendor really asked about. Every
-/// `PermissionRequest` payload carries the command its Bash box asked about;
-/// drawn into that box (hand-built around the recorded command on the 2.1.280
-/// Bash box's geometry), the default presses its `1`, and the safe rules alone
-/// (`approve = "safe"`) press nothing full power would not. Non-vacuity: at
-/// least one box is pressed that the safe rules hand over.
+/// Every captured `PermissionRequest` command is approved at full power.
 #[test]
 fn every_captured_permission_request_is_pressed_at_full_power() {
     use aterm_agent::supervise::config::Approve;
@@ -199,13 +175,7 @@ fn every_captured_permission_request_is_pressed_at_full_power() {
     );
 }
 
-/// The painted screen is rank-1 evidence, and here it is a real paint: the
-/// `/usage` panel is the only place some windows (the model bucket among them)
-/// appear, and `harness limits`' reader over the vendor's paint yields every
-/// window the panel painted.
-///
-/// Negative control: the same reader over the session's own `status` line (a
-/// real capture that is not a usage panel) yields nothing.
+/// Captured `/usage` panels yield their windows while status lines yield none.
 #[test]
 fn the_painted_usage_panel_yields_its_windows() {
     use aterm_agent::harness::cli::limits_view;
@@ -234,7 +204,6 @@ fn the_painted_usage_panel_yields_its_windows() {
                     cap.version,
                     f.rel
                 );
-                // The model bucket is the point: it exists on no other source.
                 assert!(
                     kinds.contains(&"seven_day_overage_included"),
                     "{}/{}: the panel paints `Current week (Fable)` and the reader did not \

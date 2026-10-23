@@ -148,6 +148,10 @@ mod imp {
         Some(part(info[0], info[1]) + part(info[2], info[3]))
     }
 
+    /// `(pc, fp)` from a thread's saved registers.
+    ///
+    /// # Safety
+    /// `port` names a thread of this task that is SUSPENDED.
     #[cfg(target_arch = "aarch64")]
     unsafe fn pc_fp(port: MachPort) -> Option<(u64, u64)> {
         const ARM_THREAD_STATE64: i32 = 6;
@@ -165,6 +169,8 @@ mod imp {
         (kr == 0).then(|| (state[32], state[29]))
     }
 
+    /// # Safety
+    /// As the aarch64 twin: `port` names a thread of this task that is SUSPENDED.
     #[cfg(target_arch = "x86_64")]
     unsafe fn pc_fp(port: MachPort) -> Option<(u64, u64)> {
         const X86_THREAD_STATE64: i32 = 4;

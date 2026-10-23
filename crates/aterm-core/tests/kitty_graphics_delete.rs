@@ -1,30 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Kitty graphics `a=d` delete semantics (`delete_kitty_placements` in `handler_actions.rs`):
-//!
-//! * a lowercase selector deletes placements and keeps the transmitted data, so the id stays
-//!   placeable (preview cyclers such as yazi and icat rely on it); uppercase also frees the
-//!   data of every image it named or cleared that has no placement left on screen;
-//! * a selector addresses specific placements; it never clears the whole store or erases
-//!   another protocol's image.
-//!
-//! Placements are observed through `Terminal::images_row`, the surface the renderer reads;
-//! whether the store still holds an image, through a Unicode placeholder (`placeable`).
+//! Kitty graphics `a=d` delete semantics tests.
 
 use aterm_core::terminal::Terminal;
 
-/// Columns each test image spans (`c=` cells).
 const IMG_COLS: usize = 2;
 
-/// Move the cursor to the 0-based cell `(row, col)`.
 fn goto(term: &mut Terminal, row: u16, col: u16) {
     term.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
 }
 
-/// Transmit-and-display a tiny RGBA image under `id` (with `extra` control
-/// keys), 2×2 source pixels shown as a `c=2,r=1` (two-cell, one-row) placement
-/// at `(row, col)`.
 fn show_at(term: &mut Terminal, id: u32, extra: &str, row: u16, col: u16) {
     goto(term, row, col);
     let raw = [255u8, 0, 0, 255].repeat(4); // 2x2 px RGBA
@@ -38,32 +24,23 @@ fn show_at(term: &mut Terminal, id: u32, extra: &str, row: u16, col: u16) {
     term.process(&seq);
 }
 
-/// Put the stored image `id` (with `extra` control keys) at `(row, col)`.
 fn put_at(term: &mut Terminal, id: u32, extra: &str, row: u16, col: u16) {
     goto(term, row, col);
     control(term, &format!("a=p,i={id},q=2{extra}"));
 }
 
-/// Issue a bare control-only kitty command (no payload), e.g. `a=d,d=a`.
 fn control(term: &mut Terminal, body: &str) {
     term.process(format!("\x1b_G{body}\x1b\\").as_bytes());
 }
 
-/// The visible rows that carry at least one image cell.
 fn rows_with_images(term: &Terminal, rows: usize) -> Vec<usize> {
     (0..rows)
         .filter(|&r| !term.images_row(r).is_empty())
         .collect()
 }
 
-/// The scratch cell `placeable` prints its placeholder in: mid-screen, on a
-/// row no test places an image on.
 const PROBE: (u16, u16) = (4, 10);
 
-/// Whether the store still holds `id`: a Unicode placeholder naming it (its
-/// id in the foreground colour, tile (0, 0) in the diacritics) draws it. The
-/// placeholder reads the store directly, so the probe neither places nor
-/// deletes anything and cannot scroll; the cell is erased afterwards.
 fn placeable(term: &mut Terminal, id: u32) -> bool {
     let (row, col) = PROBE;
     assert!(
@@ -147,8 +124,6 @@ fn delete_by_id_uppercase_frees_that_data_and_no_other() {
     assert!(placeable(&mut term, 2), "image 2's data untouched");
 }
 
-/// `d=i` with a `p=` deletes one placement of the image; without it, every
-/// placement of the image goes (the control).
 #[test]
 fn delete_by_id_and_placement_id_removes_only_that_placement() {
     let mut term = Terminal::new(8, 20);
@@ -174,8 +149,6 @@ fn delete_by_id_and_placement_id_removes_only_that_placement() {
     );
 }
 
-/// A put that names an existing `(i, p)` moves that placement; unnamed puts
-/// each add a placement (the control).
 #[test]
 fn put_with_an_existing_placement_id_moves_it() {
     let mut term = Terminal::new(8, 20);
@@ -196,8 +169,6 @@ fn put_with_an_existing_placement_id_moves_it() {
     );
 }
 
-/// `I=` numbers: the terminal assigns the id, and `d=n` addresses the newest
-/// image under the number.
 #[test]
 fn delete_by_number_addresses_the_newest_image_with_that_number() {
     let mut term = Terminal::new(8, 20);
@@ -236,7 +207,6 @@ fn delete_at_point_clears_only_the_placement_covering_that_cell() {
         vec![0, 2],
         "an empty cell addresses nothing"
     );
-    // (x=6, y=3) is the second column of image 2's placement.
     control(&mut term, "a=d,d=p,x=6,y=3");
     assert_eq!(
         rows_with_images(&term, 8),
@@ -352,7 +322,6 @@ fn delete_at_cursor_clears_the_covering_placement_in_full() {
 fn delete_at_cursor_over_empty_cell_is_a_no_op() {
     let mut term = Terminal::new(8, 20);
     show_at(&mut term, 1, "", 0, 0);
-    // Kitty leaves the cursor just past the image, on an empty cell.
     control(&mut term, "a=d,d=c");
     assert_eq!(
         rows_with_images(&term, 8),
@@ -361,8 +330,6 @@ fn delete_at_cursor_over_empty_cell_is_a_no_op() {
     );
 }
 
-/// A Kitty delete never erases an image another protocol drew: `d=a` clears
-/// the Kitty placement and leaves the iTerm2 one.
 #[test]
 fn kitty_delete_never_erases_another_protocols_image() {
     let mut term = Terminal::new(8, 20);
@@ -381,8 +348,6 @@ fn kitty_delete_never_erases_another_protocols_image() {
     );
 }
 
-/// A selector missing its image or coordinates, or naming a cell no screen
-/// has (up to `u32::MAX`), deletes nothing and does not panic.
 #[test]
 fn unaddressed_selectors_delete_nothing() {
     for selector in [
@@ -415,8 +380,6 @@ fn unaddressed_selectors_delete_nothing() {
     }
 }
 
-/// `d=f` on an image with a single frame keeps it; `d=F` deletes the image
-/// outright — its placements and its data — as kitty does.
 #[test]
 fn frame_delete_of_a_single_frame_image() {
     let mut term = Terminal::new(8, 20);

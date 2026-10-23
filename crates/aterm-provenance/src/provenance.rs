@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-
 //! The [`Provenance<T, O>`] `#[repr(transparent)]` wrapper and its
 //! constructor [`Provenance::from_pty`].
 
@@ -8,22 +7,10 @@ use core::marker::PhantomData;
 
 use crate::origin::{Origin, Pty};
 
-/// A value tagged with its static origin.
-///
-/// `#[repr(transparent)]` is a load-bearing guarantee:
-/// `size_of::<Provenance<T, O>>() == size_of::<T>()` and the layout is
-/// identical to `T`. The parser relies on it: [`crate::pty_wrap_ref`] hands
-/// out `&Provenance<[u8], Pty>` over PTY byte slices without copying.
-///
-/// `O` is `PhantomData<fn() -> O>` so the struct is *invariant* in `O`.
-///
-/// `Provenance` does not implement `Deref` or any auto-converting trait;
-/// consumers must call [`Provenance::as_ref`] explicitly.
+/// A value tagged with its static origin `O` (invariant, `#[repr(transparent)]`).
 #[repr(transparent)]
 pub struct Provenance<T: ?Sized, O: Origin> {
-    // `_origin` is placed before `value` so the unsized-trailing layout works
-    // for unsized `T` (e.g. `[u8]`, `str`). `PhantomData` is zero-sized, so
-    // with `#[repr(transparent)]` the layout is identical to `T`.
+    // Placed before `value` so unsized `T` (`[u8]`, `str`) can trail.
     pub(crate) _origin: PhantomData<fn() -> O>,
     pub(crate) value: T,
 }
@@ -59,8 +46,7 @@ impl<T: PartialEq + ?Sized, O: Origin> PartialEq for Provenance<T, O> {
 impl<T: Eq + ?Sized, O: Origin> Eq for Provenance<T, O> {}
 
 impl<T> Provenance<T, Pty> {
-    /// Construct a `Provenance<T, Pty>`. Marks `value` as PTY-origin
-    /// (adversarial).
+    /// Tag `value` with [`Pty`] provenance.
     #[inline]
     #[must_use]
     pub const fn from_pty(value: T) -> Self {
@@ -72,18 +58,7 @@ impl<T> Provenance<T, Pty> {
 }
 
 impl<T: ?Sized, O: Origin> Provenance<T, O> {
-    /// Borrow the inner value. Preserves origin (the borrow is not tagged,
-    /// but the borrow's lifetime is bounded by `self`; most sinks consume
-    /// the full `Provenance<_, _>` instead).
-    ///
-    /// Named `as_ref` to match the design's §4.1 API surface. `Provenance`
-    /// deliberately does **not** implement the `AsRef` trait — requiring
-    /// the explicit call keeps the audit surface grep-able and prevents
-    /// silent deref coercions.
-    ///
-    /// This method is available for `T: ?Sized` so that the `pty_wrap_ref`
-    /// helper can hand out a `&Provenance<[u8], Pty>` whose inner reference
-    /// can still be borrowed.
+    /// Borrow the inner value explicitly (does not implement `AsRef` or `Deref`).
     #[allow(clippy::should_implement_trait)]
     #[inline]
     #[must_use]
@@ -142,8 +117,7 @@ const fn u64_from_be(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7:
     lo.wrapping_add(hi.wrapping_mul(0x1_0000_0000))
 }
 
-/// Read a little-endian `u16` from `bytes` at `offset` if in bounds,
-/// tagging the result with [`Pty`] provenance.
+/// Read a little-endian `u16` from `bytes` at `offset` with [`Pty`] provenance.
 #[inline]
 #[must_use]
 pub const fn pty_slice_u16_le_at(bytes: &[u8], offset: usize) -> Option<Provenance<u16, Pty>> {
@@ -157,8 +131,7 @@ pub const fn pty_slice_u16_le_at(bytes: &[u8], offset: usize) -> Option<Provenan
     Some(Provenance::from_pty(v))
 }
 
-/// Read a big-endian `u16` from `bytes` at `offset` if in bounds,
-/// tagging the result with [`Pty`] provenance.
+/// Read a big-endian `u16` from `bytes` at `offset` with [`Pty`] provenance.
 #[inline]
 #[must_use]
 pub const fn pty_slice_u16_be_at(bytes: &[u8], offset: usize) -> Option<Provenance<u16, Pty>> {
@@ -172,8 +145,7 @@ pub const fn pty_slice_u16_be_at(bytes: &[u8], offset: usize) -> Option<Provenan
     Some(Provenance::from_pty(v))
 }
 
-/// Read a little-endian `u32` from `bytes` at `offset` if in bounds,
-/// tagging the result with [`Pty`] provenance.
+/// Read a little-endian `u32` from `bytes` at `offset` with [`Pty`] provenance.
 #[inline]
 #[must_use]
 pub const fn pty_slice_u32_le_at(bytes: &[u8], offset: usize) -> Option<Provenance<u32, Pty>> {
@@ -194,8 +166,7 @@ pub const fn pty_slice_u32_le_at(bytes: &[u8], offset: usize) -> Option<Provenan
     Some(Provenance::from_pty(v))
 }
 
-/// Read a big-endian `u32` from `bytes` at `offset` if in bounds,
-/// tagging the result with [`Pty`] provenance.
+/// Read a big-endian `u32` from `bytes` at `offset` with [`Pty`] provenance.
 #[inline]
 #[must_use]
 pub const fn pty_slice_u32_be_at(bytes: &[u8], offset: usize) -> Option<Provenance<u32, Pty>> {
@@ -216,8 +187,7 @@ pub const fn pty_slice_u32_be_at(bytes: &[u8], offset: usize) -> Option<Provenan
     Some(Provenance::from_pty(v))
 }
 
-/// Read a little-endian `u64` from `bytes` at `offset` if in bounds,
-/// tagging the result with [`Pty`] provenance.
+/// Read a little-endian `u64` from `bytes` at `offset` with [`Pty`] provenance.
 #[inline]
 #[must_use]
 pub const fn pty_slice_u64_le_at(bytes: &[u8], offset: usize) -> Option<Provenance<u64, Pty>> {
@@ -267,8 +237,7 @@ pub const fn pty_slice_u64_le_at(bytes: &[u8], offset: usize) -> Option<Provenan
     Some(Provenance::from_pty(v))
 }
 
-/// Read a big-endian `u64` from `bytes` at `offset` if in bounds,
-/// tagging the result with [`Pty`] provenance.
+/// Read a big-endian `u64` from `bytes` at `offset` with [`Pty`] provenance.
 #[inline]
 #[must_use]
 pub const fn pty_slice_u64_be_at(bytes: &[u8], offset: usize) -> Option<Provenance<u64, Pty>> {
@@ -340,8 +309,7 @@ pub const fn pty_slice_has_dcs_prefix(bytes: &[u8]) -> bool {
 }
 
 impl Provenance<u8, Pty> {
-    /// True if the tainted byte is an ASCII C0 control byte (`0x00..=0x1f`) or
-    /// `DEL` (`0x7f`).
+    /// True if the tainted byte is an ASCII C0 control byte (`0x00..=0x1f`) or `DEL` (`0x7f`).
     #[inline]
     #[must_use]
     pub const fn is_c0_or_del(self) -> bool {
@@ -369,8 +337,7 @@ impl Provenance<u8, Pty> {
         self.value >= 0x40 && self.value <= 0x7e
     }
 
-    /// Decode an ASCII decimal digit (`'0'..='9'`) into `0..=9`, preserving
-    /// [`Pty`] provenance.
+    /// Decode an ASCII decimal digit (`'0'..='9'`) into `0..=9` with [`Pty`] provenance.
     #[inline]
     #[must_use]
     pub const fn to_ascii_digit(self) -> Option<Provenance<u8, Pty>> {
@@ -382,8 +349,7 @@ impl Provenance<u8, Pty> {
 }
 
 impl Provenance<u16, Pty> {
-    /// Clamp a PTY-origin `u16` parameter (such as a CSI repeat/cursor count)
-    /// into `[min_val, max_val]`, preserving [`Pty`] provenance.
+    /// Clamp a PTY-origin `u16` parameter into `[min_val, max_val]`.
     #[inline]
     #[must_use]
     pub const fn clamp_param(self, min_val: u16, max_val: u16) -> Self {
@@ -401,8 +367,7 @@ impl Provenance<u16, Pty> {
         Provenance::from_pty(v)
     }
 
-    /// Accumulate one ASCII decimal digit (`0..=9`) onto a PTY-origin CSI
-    /// parameter, saturating at `max_val` and preserving [`Pty`] provenance.
+    /// Accumulate one ASCII decimal digit (`0..=9`) onto a CSI parameter, saturating at `max_val`.
     #[inline]
     #[must_use]
     pub const fn push_csi_digit_capped(self, digit: Provenance<u8, Pty>, max_val: u16) -> Self {
@@ -412,8 +377,7 @@ impl Provenance<u16, Pty> {
         Provenance::from_pty(bounded)
     }
 
-    /// Encode this PTY-origin `u16` into 2 little-endian bytes, preserving
-    /// [`Pty`] provenance.
+    /// Encode this PTY-origin `u16` into 2 little-endian bytes.
     #[inline]
     #[must_use]
     pub const fn to_le_bytes_pty(self) -> Provenance<[u8; 2], Pty> {
@@ -421,8 +385,7 @@ impl Provenance<u16, Pty> {
         Provenance::from_pty([b[0], b[1]])
     }
 
-    /// Decode a PTY-origin `u16` from 2 little-endian bytes, preserving
-    /// [`Pty`] provenance.
+    /// Decode a PTY-origin `u16` from 2 little-endian bytes.
     #[inline]
     #[must_use]
     pub const fn from_le_bytes_pty(b: Provenance<[u8; 2], Pty>) -> Self {
@@ -432,8 +395,7 @@ impl Provenance<u16, Pty> {
 }
 
 impl Provenance<(u16, u16, u16, u16), Pty> {
-    /// Encode a PTY-origin 4-parameter CSI rectangle `(top, left, bottom, right)`
-    /// into an 8-byte little-endian frame, preserving [`Pty`] provenance.
+    /// Encode a PTY-origin CSI rectangle `(top, left, bottom, right)` into 8 little-endian bytes.
     #[inline]
     #[must_use]
     pub const fn encode_csi_rect_le(self) -> Provenance<[u8; 8], Pty> {
@@ -445,8 +407,7 @@ impl Provenance<(u16, u16, u16, u16), Pty> {
         Provenance::from_pty([t[0], t[1], l[0], l[1], b[0], b[1], r[0], r[1]])
     }
 
-    /// Decode a PTY-origin 4-parameter CSI rectangle `(top, left, bottom, right)`
-    /// from an 8-byte little-endian frame, preserving [`Pty`] provenance.
+    /// Decode a PTY-origin CSI rectangle `(top, left, bottom, right)` from 8 little-endian bytes.
     #[inline]
     #[must_use]
     pub const fn decode_csi_rect_le(wire: Provenance<[u8; 8], Pty>) -> Self {

@@ -17,7 +17,6 @@ fn push_block_returns_zero_for_corrupt_block() {
     let accepted = cold.push_block(&valid_block);
     assert_eq!(accepted, 5);
 
-    // A corrupt block is dropped.
     let corrupt_block = WarmBlock::with_corrupt_data(10);
     let accepted = cold.push_block(&corrupt_block);
 
@@ -52,14 +51,9 @@ fn truncate_back_lines_aborts_on_corrupt_boundary_page() {
 
     if let Some(page) = cold.pages.back_mut() {
         let old_bytes = page.compressed.len();
-        // Another codec's bytes in place of the page (a zstd frame's magic
-        // number). As the LZ4 page's size prefix they claim 4,247,762,216
-        // bytes, past the page cap, so the page cannot decode.
         let foreign_codec_page = vec![0x28, 0xB5, 0x2F, 0xFD];
         page.compressed = foreign_codec_page;
         cold.bytes_used = cold.bytes_used.saturating_sub(old_bytes) + page.compressed.len();
-        // Drop every cached decompressed page so the next read decodes the
-        // corrupted bytes.
         cold.clear_cache();
     }
     let compressed_after_corruption = cold.compressed_size();
@@ -113,7 +107,6 @@ fn cold_tier_find_page_logarithmic_scaling() {
         assert_eq!(cold.page_count(), page_count);
         assert_eq!(cold.line_count(), page_count);
 
-        // Clear any prior counter state from earlier tests.
         let _ = take_cold_find_page_steps();
 
         let found = cold.find_page(page_count - 1);
@@ -150,17 +143,14 @@ fn pop_front_batch_with_nonzero_front_offset() {
         cold.push_block(&WarmBlock::from_lines(&lines));
     }
 
-    // Set front_offset to 3 on the first page.
     cold.truncate_front_lines(3);
     assert_eq!(cold.line_count(), 37);
 
-    // Batch evict 2 pages: first page has 7 logical lines, second has 10.
     let evicted = cold.pop_front_batch(2);
     assert_eq!(evicted, 17); // 7 + 10
     assert_eq!(cold.line_count(), 20);
     assert_eq!(cold.page_count(), 2);
 
-    // After batch pop, front_offset resets. Line 0 = P2-L0.
     assert_eq!(
         cold.get_line(0).expect("ok").expect("present").to_string(),
         "P2-L0"
@@ -185,7 +175,6 @@ fn truncate_front_lines_updates_compressed_size() {
     let size_before = cold.compressed_size();
     assert!(size_before > 0);
 
-    // Truncate 5 lines — no page dropped (partial first page).
     cold.truncate_front_lines(5);
     assert_eq!(
         cold.compressed_size(),
@@ -194,16 +183,12 @@ fn truncate_front_lines_updates_compressed_size() {
     );
     assert_eq!(cold.compressed_size(), cold.recompute_compressed_size());
 
-    // Truncate 5 more — first page fully consumed, should be dropped.
     cold.truncate_front_lines(5);
     assert!(cold.compressed_size() < size_before);
     assert_eq!(cold.compressed_size(), cold.recompute_compressed_size());
 }
 
-/// ST-3 rotation oracle: front truncation, batch eviction and pushes
-/// interleave across page boundaries, and every surviving line is checked by
-/// content after each round, through base advances, dead-prefix reclamation
-/// and the drop-to-empty base reset.
+/// Front truncation, batch eviction, and pushes interleave across page boundaries and match a reference oracle.
 #[test]
 fn cold_tier_rotation_interleave_matches_oracle() {
     fn push_page(
@@ -240,7 +225,6 @@ fn cold_tier_rotation_interleave_matches_oracle() {
             push_page(&mut cold, &mut oracle, &mut next_page, 1 + (k % 5));
         }
         if k % 5 == 0 {
-            // Batch page eviction rides the same cursor+base maintenance.
             let evicted = cold.pop_front_batch(1.min(cold.page_count()));
             oracle.drain(..evicted);
         }
@@ -252,7 +236,6 @@ fn cold_tier_rotation_interleave_matches_oracle() {
         assert!(cold.get_line(oracle.len()).unwrap().is_none());
     }
 
-    // Drain to empty and refill: the base must reset with the cleared index.
     let evicted = cold.pop_front_batch(cold.page_count());
     oracle.drain(..evicted);
     let rest = cold.line_count();

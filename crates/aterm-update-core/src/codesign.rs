@@ -168,7 +168,8 @@ fn verify_developer_id(path: &Path, team: &str, deep: bool) -> Result<(), Codesi
 /// Verifies that `path` is signed with a Developer ID of `team` before `deadline`.
 ///
 /// # Errors
-/// Returns [`CodesignError`] on invalid team, unsupported OS, spawn/wait error, timeout, or signature refusal.
+/// [`CodesignError::InvalidTeam`] before anything runs; [`CodesignError::Unsupported`]
+/// off macOS; otherwise the spawn, wait, timeout or refusal, each a rejection.
 pub fn verify_developer_id_until(
     path: &Path,
     team: &str,

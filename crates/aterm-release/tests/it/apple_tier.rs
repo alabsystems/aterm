@@ -200,7 +200,7 @@ fn dist() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture")
 }
 
-/// A `codesign -dv` report for a properly Dev-ID-signed.
+/// A `codesign -dv` report for a properly Dev-ID-signed, hardened-runtime bundle.
 fn good_dv() -> &'static str {
     concat!(
         "Identifier=com.aterm.aterm\n",
@@ -434,7 +434,7 @@ fn a_cut_without_a_notary_credential_is_refused() {
     let path = root.join("profile.toml");
     std::fs::write(&path, format!("signing_key = \"{encoded}\"\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let profile = sign::ReleaseCredentials::load(&path).expect("the profile loads");
+    let profile = sign::ReleaseCredentials::load(&path, None).expect("the profile loads");
     assert_eq!(profile.profile(), Some(path.as_path()));
     sign::resolve_apple_tier(FAKE_TEAM, Some(&profile))
         .expect_err("a profile without notary_profile cannot notarize");

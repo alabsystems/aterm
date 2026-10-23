@@ -88,7 +88,8 @@ impl ClipboardOwner {
 
 impl Drop for ClipboardOwner {
     fn drop(&mut self) {
-        // SAFETY: same-thread window destroyed after OpenGuard closes the clipboard.
+        // SAFETY: this live window was created on this thread and is not shared. The clipboard's
+        // open guard has already closed.
         unsafe { DestroyWindow(self.0) };
     }
 }
@@ -123,7 +124,8 @@ pub(crate) fn get() -> Option<String> {
         return None;
     }
     let _guard = open_clipboard(0)?;
-    // SAFETY: clipboard is open; handle is locked, read within GlobalSize, and unlocked.
+    // SAFETY: the clipboard is open (guard live). The returned handle is owned by the clipboard —
+    // we only lock/read/unlock it, never free it, and read only within GlobalSize.
     let text = unsafe {
         let mem = GetClipboardData(CF_UNICODETEXT);
         if mem == 0 {
@@ -157,7 +159,9 @@ pub(crate) fn get_paths() -> Option<Vec<String>> {
         return None;
     }
     let _guard = open_clipboard(0)?;
-    // SAFETY: clipboard is open; DragQueryFileW sizes and fills each UTF-16 path buffer.
+    // SAFETY: the clipboard is open (guard live). The HDROP handle is owned by the clipboard —
+    // DragQueryFileW only reads it. Buffers are sized by the API's own length query (+1 for the
+    // NUL it always appends) before the fill.
     let paths = unsafe {
         let drop = GetClipboardData(CF_HDROP);
         if drop == 0 {
@@ -206,7 +210,9 @@ pub(crate) fn set(text: &str) -> bool {
 
 /// Populate and publish `CF_UNICODETEXT` while owner and `OpenGuard` are live.
 fn set_open(units: &[u16], bytes: usize) -> bool {
-    // SAFETY: clipboard is open; movable global buffer is sized for `units` and freed on failure.
+    // SAFETY: the clipboard is open (guard live). GlobalAlloc/GlobalLock give a writable, movable
+    // buffer of at least `bytes`; the copy stays in bounds. After a successful SetClipboardData the
+    // system owns `mem` (we must not free it); on any failure we GlobalFree it ourselves.
     unsafe {
         if EmptyClipboard() == 0 {
             return false;
@@ -409,7 +415,8 @@ mod tests {
         /// Read `CF_UNICODETEXT` without CRLF normalization.
         pub(super) fn raw_text() -> Option<String> {
             let _guard = super::open_clipboard(0)?;
-            // SAFETY: clipboard is open; handle is locked, read within GlobalSize, and unlocked.
+            // SAFETY: the clipboard is open; the handle is the clipboard's, only locked, read up to
+            // its NUL within its size, and unlocked.
             unsafe {
                 let mem = super::GetClipboardData(super::CF_UNICODETEXT);
                 if mem == 0 {

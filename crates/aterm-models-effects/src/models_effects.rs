@@ -1184,13 +1184,7 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
     }
 }
 
-/// Key-hint and delivered-insert license model for `CursorGlow::spawn` and `CursorTrail::spawn`:
-///
-/// ```text
-/// licensed = fresh(type_hint) || fresh(quench_hint) || fresh(nav_hint)
-///         || fresh(return_hint) || fresh(newline_hint)
-///         || fresh(user_gesture_hint) || synthetic_note_pending
-/// ```
+/// Key-hint and delivered-insert license model for `CursorGlow::spawn` and `CursorTrail::spawn`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_hint_license_model() -> Model {

@@ -80,7 +80,8 @@ fn register_probe_class_with(name: &'static CStr, imp: ProbeFn) -> ClassPtr {
 }
 
 fn instance_of(cls: ClassPtr) -> Id {
-    // SAFETY: `+alloc` then `-init` on an `NSObject` subclass uses `-(id)(id, SEL)`.
+    // SAFETY: `+alloc` then `-init` on an `NSObject` subclass is the canonical +1 construction, and
+    // both prototypes are `-(id)(id, SEL)`.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
         let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
@@ -89,7 +90,8 @@ fn instance_of(cls: ClassPtr) -> Id {
 }
 
 fn probe_value(obj: Id) -> i64 {
-    // SAFETY: `-probeValue` is registered `q@:` on every class here and `obj` is live.
+    // SAFETY: `-probeValue` is registered `q@:` on every class in this file and
+    // `obj` is a live instance of one.
     unsafe {
         let send: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = msg();
         send(obj, sel!(probeValue))
@@ -241,7 +243,8 @@ fn install_replaces_publishes_the_original_and_reports_the_owner() {
     assert_eq!(0, SITE_ORIGINAL_RUNS.load(Ordering::Relaxed));
 
     let original = SITE.original().expect("the site published the original");
-    // SAFETY: the install verified this prototype.
+    // SAFETY: the install verified this prototype; an IMP entered directly is not a message
+    // send, so the receiver must be live, and `instance_of` leaks a live one.
     let chained = unsafe { original(instance_of(parent), sel!(probeValue)) };
     assert_eq!(1, chained);
     assert_eq!(1, SITE_ORIGINAL_RUNS.load(Ordering::Relaxed));
@@ -419,7 +422,8 @@ fn a_kvo_isa_swap_leaves_the_swizzle_and_its_owner_where_they_were() {
     assert_eq!(done.owner(), cls);
     assert_eq!(probe_value(obj), 2);
 
-    // SAFETY: `-addObserver:forKeyPath:options:context:` is `v40@0:8@16@24Q32^v40` on `NSObject`.
+    // SAFETY: `-addObserver:forKeyPath:options:context:` is `v40@0:8@16@24Q32^v40` on `NSObject`,
+    // and `obj` observing itself is legal.
     let before = unsafe { class_of(obj) };
     unsafe {
         let add: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, usize, *const c_void) = msg();

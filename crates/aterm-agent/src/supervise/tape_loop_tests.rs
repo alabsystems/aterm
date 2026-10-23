@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// A RECORDED LOOP (`run_tests.rs`'s `tape_loop` module): recording changes
-// nothing the loop does — its lines and its requests are the unrecorded
-// run's, even when the tape cannot be written — a recorded approval reads
-// back as its decision with the screen, the act and the line, and a run that
-// dies inside a frame's write leaves a tape that reads to its tear.
-
 use crate::supervise::tape::doors;
 use crate::supervise::tape::frame_tests::Memory;
 use crate::supervise::tape::header::VERBATIM;
@@ -14,8 +8,6 @@ use crate::supervise::tape::header::VERBATIM;
 use crate::supervise::tape::recover::{Tail, recover};
 use crate::supervise::tape::show;
 
-/// The scripted worker these tests watch: a read box approved, a question and
-/// an idle point handed over, then the session gone.
 fn decisions_script() -> Mock {
     let mut m = fenced(vec![
         busy_screen(),
@@ -29,8 +21,6 @@ fn decisions_script() -> Mock {
     m
 }
 
-/// A watch over `m` as the whole-run helpers set one up, recorded into
-/// `tape` when one is given, unrecorded otherwise: its lines and code.
 fn watch_on(m: &mut Mock, opts: &SuperviseOpts, tape: Option<&MemoryTape>) -> (Vec<String>, u8) {
     let mut out: Vec<u8> = Vec::new();
     let code = match tape {
@@ -52,7 +42,6 @@ fn watch_on(m: &mut Mock, opts: &SuperviseOpts, tape: Option<&MemoryTape>) -> (V
     (text.lines().map(str::to_string).collect(), code)
 }
 
-/// A fixed clock not yet fixed, its door recording into `sink`.
 fn tape_on(sink: Memory) -> MemoryTape {
     MemoryTape::on(
         &Fx::over(ClockSource::Scripted(Arc::default())),
@@ -61,10 +50,6 @@ fn tape_on(sink: Memory) -> MemoryTape {
     )
 }
 
-/// RECORDING CHANGES NOTHING: the same scripted worker watched with the
-/// recorder off and on gives the very same lines, exit code and requests —
-/// an approval's guarded key, a question's and an idle point's EVENTs, the
-/// waits — and the tape holds every request the worker served, in order.
 #[test]
 fn recording_changes_nothing_the_loop_does() {
     let mut off = decisions_script();
@@ -91,16 +76,11 @@ fn recording_changes_nothing_the_loop_does() {
             _ => None,
         })
         .collect();
-    // The claim's renewals too, which skip the session's own `call`: the
-    // door wraps the transport.
     let sent: Vec<String> = on.order.iter().map(|(r, _)| r.clone()).collect();
     assert_eq!(taped, sent, "every request, the claim's included, in order");
     assert!(taped.iter().any(|r| r.starts_with("meta set supervisor ")));
 }
 
-/// A TAPE THAT CANNOT BE WRITTEN — every write refused, from its first — is
-/// said once and changes nothing: the run's lines, code and requests are the
-/// unrecorded run's.
 #[test]
 fn an_unwritable_tape_changes_nothing_the_loop_does() {
     let mut off = decisions_script();
@@ -122,11 +102,6 @@ fn an_unwritable_tape_changes_nothing_the_loop_does() {
     assert!(tape.sink.bytes().is_empty(), "nothing reached the file");
 }
 
-/// "WHY DID IT PRESS 1?" from the tape alone: the recorded run's decisions
-/// come back as `tape show --decisions` reads them — the approval with the
-/// screen it judged (the box's rows), its rule, the guarded key that
-/// followed and its reply, and the line the loop printed; the question and
-/// the idle point handed over (no act after either).
 #[test]
 fn a_recorded_approval_reads_back_as_its_decision() {
     let mut m = decisions_script();
@@ -164,17 +139,12 @@ fn a_recorded_approval_reads_back_as_its_decision() {
     );
     assert_eq!(approval.journal.as_deref(), Some(lines[0].as_str()));
     assert_eq!(lines[0], "APPROVED seq=102 git log --oneline -5");
-    // The question is decided by the turn-end policy (the box is no
-    // approval): its mark holds no act of its own.
     assert!(
         decisions
             .iter()
             .any(|d| d.door == doors::DECIDE_TURN_END && d.seq == 104),
         "{decisions:#?}"
     );
-    // The turn-end note before it — the fold and the reading, for `why` —
-    // holds every `Instant` as an offset from the tape's origin, never this
-    // process's raw clock.
     let notes: Vec<&str> = read
         .items
         .iter()
@@ -192,17 +162,12 @@ fn a_recorded_approval_reads_back_as_its_decision() {
     }
 }
 
-/// What the crashing child of [`a_crashed_run_leaves_a_tape_that_reads_to_its_tear`]
-/// is told, and where its tape goes.
 #[cfg(unix)]
 const CRASH_CHILD: &str = "ATERM_TAPE_CRASH_CHILD";
 #[cfg(unix)]
 const CRASH_TEST: &str =
     "supervise::run::tests::tape_loop::a_crashed_run_leaves_a_tape_that_reads_to_its_tear";
 
-/// A tape file that dies inside its `crash_at`-th frame's write: half the
-/// frame reaches the disk, then the process is killed (`SIGKILL`, no
-/// destructor runs) — a crash inside a frame's one `write(2)`.
 #[cfg(unix)]
 struct DyingFile {
     file: std::fs::File,
@@ -228,9 +193,6 @@ impl crate::supervise::tape::frame::FrameSink for DyingFile {
     }
 }
 
-/// The transport of the crashing child: every request appended to a log
-/// before it is served, so the parent knows what the child had sent when it
-/// died.
 #[cfg(unix)]
 struct Logged<'a> {
     inner: &'a mut Mock,
@@ -246,12 +208,6 @@ impl Ctl for Logged<'_> {
     }
 }
 
-/// A RUN THAT DIES INSIDE A FRAME'S WRITE leaves a tape that reads to its
-/// tear: a child of this test binary records a watch to a file and is killed
-/// halfway through its fourth frame. The tape it leaves reads back (its
-/// header, its whole frames), its torn tail dropped and said, no end on it;
-/// and every control request on it is one the child sent, in order. The
-/// child runs under a one-minute hang detector.
 #[cfg(unix)]
 #[test]
 fn a_crashed_run_leaves_a_tape_that_reads_to_its_tear() {
@@ -350,8 +306,6 @@ fn a_crashed_run_leaves_a_tape_that_reads_to_its_tear() {
     );
 }
 
-/// A window host that keeps what it was told and answers as a quiet host
-/// does: the hosted store's test's.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[derive(Debug, Default)]
 struct Kept {
@@ -375,15 +329,6 @@ impl IdleHost for Kept {
     }
 }
 
-/// A HOSTED RUN UNDER THE DEVELOPMENT SEAM (`tape::store::run_hosted_taped`,
-/// the window host's path when `ATERM_HARNESS_TAPE` is set): the run is
-/// taped to the store beside its ledger — `<state>/drive/tapes/<sid>/`, the
-/// file `0600`, every directory `0700` — with its window host's answers and
-/// notifications on it, and the tape, read back from the store, REPLAYS:
-/// the requests the worker was sent, asked again from the tape alone (the
-/// replay's host holds none to ask: `tape::host::ReplayHost`). A run a
-/// seamless update's Commit stopped ends its tape SUSPENDED, and replays
-/// all the same.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[test]
 fn a_hosted_run_is_taped_into_its_store_and_replays() {
@@ -395,8 +340,6 @@ fn a_hosted_run_is_taped_into_its_store_and_replays() {
     let guard = crate::supervise::ScratchDir::new("tape-hosted", "store");
     let state = guard.canonicalize().expect("owned canonical fixture");
     let ledger = approvals::path_under(&state, Some("@s-1")).expect("the ledger's drive/");
-    // The budget spent at once (a stop's `Ok`, as a Commit's is), and a run
-    // the worker's session ends under.
     for (max, suspended) in [(Duration::ZERO, true), (Duration::from_secs(30), false)] {
         let host = Arc::new(Kept::default());
         let opts = SuperviseOpts {
@@ -473,7 +416,6 @@ fn a_hosted_run_is_taped_into_its_store_and_replays() {
     }
 }
 
-/// A window host that panics while it is told the task's face.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[derive(Debug, Default)]
 struct PanicsTold;
@@ -495,16 +437,6 @@ impl IdleHost for PanicsTold {
     }
 }
 
-/// A HOST THAT PANICS WHILE IT IS TOLD REPLAYS TO PANICKED AT THAT DOOR, as a
-/// host that panics while it is asked does: the hosted run's tape holds the
-/// notification — said before the host was told — as its last record, and
-/// the door and request the run died at (`NOTE_UNWOUND_IN`, written by
-/// `Fx::host_tell`); its replay, which tells no host, reproduces every record
-/// and stops at that very notification: PANICKED at `host.task_face`, the
-/// recorded message, exit 4. NEGATIVE CONTROL: the same tape without its
-/// note — what the taped host wrote before it said where a notification died
-/// — goes on past the notification to a door the tape no longer holds, and
-/// is DIVERGED, as behaviour changed.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[test]
 fn a_host_that_panics_while_it_is_told_replays_to_panicked_at_that_door() {

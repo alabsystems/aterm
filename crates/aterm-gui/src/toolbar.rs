@@ -1058,7 +1058,9 @@ mod macos {
     /// # Safety
     /// `field` must be a live `NSTextField`.
     unsafe fn truncate_tail(field: Id) {
-        // SAFETY: `-cell` is a main-thread `-(id)` getter.
+        // SAFETY: `-cell` is a main-thread `-(id)` getter; every `NSTextField` cell is
+        // an `NSCell`, which responds to `-setLineBreakMode:` (`NSUInteger`). A nil
+        // cell is inert.
         unsafe {
             let cell = appkit::send_id(field, sel!(cell));
             if !cell.is_null() {
@@ -1278,7 +1280,8 @@ mod macos {
                 // SAFETY: `-bounds` is a side-effect-free `-(NSRect)` getter on this live view, inside AppKit's own draw cycle.
                 let bounds = unsafe { appkit::send_rect(self.as_id(), sel!(bounds)) };
                 let ivars = self.ivars();
-                // SAFETY: AppKit drawing primitives on the main thread inside a draw cycle.
+                // SAFETY: AppKit drawing primitives on the main thread inside a draw cycle; colors
+                // are autoreleased (+0) and used in this frame; none raise.
                 unsafe {
                     if ivars.pressed.get() || ivars.hovered.get() {
                         let pill = rect(
@@ -1438,7 +1441,8 @@ mod macos {
             if event.is_null() {
                 return false;
             }
-            // SAFETY: `event` is the live NSEvent AppKit passed.
+            // SAFETY: `event` is the live NSEvent AppKit passed; `-bounds` is a
+            // side-effect-free `-(NSRect)` getter on this live view.
             let (p, b) = unsafe {
                 (
                     point_in_view(self.as_id(), event),
@@ -1589,7 +1593,9 @@ mod macos {
             };
             let mut fields = Vec::with_capacity(5);
             for (index, bold) in [true, false, false, true, false].into_iter().enumerate() {
-                // SAFETY: `labelWithString:` is the documented non-raising factory (+0, retained here).
+                // SAFETY: `labelWithString:` is the documented non-raising
+                // factory (+0, retained here); plain setters follow, on the
+                // main thread; the labels pass the mouse through to the pill.
                 let field = unsafe {
                     let field = Obj::retain(appkit::send_id_id(
                         class(c"NSTextField").as_id(),
@@ -1645,7 +1651,8 @@ mod macos {
                 ivars.kind.set(None);
                 *ivars.words.borrow_mut() = None;
                 ivars.layout.set(None);
-                // SAFETY: plain main-thread setters on the live view.
+                // SAFETY: plain main-thread setters on the live view;
+                // `-setToolTip:` takes nil to clear the tip.
                 unsafe {
                     appkit::send_v_id(self.as_id(), sel!(setToolTip:), Id::NIL);
                     appkit::send_v_bool(self.as_id(), sel!(setHidden:), true);
@@ -1665,7 +1672,8 @@ mod macos {
                 words.more.as_deref().unwrap_or(""),
             ];
             let fields = ivars.fields.borrow();
-            // SAFETY: main-thread setters on the live retained labels.
+            // SAFETY: main-thread setters on the live retained labels; the
+            // colours are +0 and retained by `-setTextColor:`.
             unsafe {
                 let inks = [
                     ns_color(tone_of(model.kind)),
@@ -1839,7 +1847,9 @@ mod macos {
     /// `view` must be a live `NSView` on the main thread.
     unsafe fn make_accessibility_element(view: Id, role: &str) -> Option<()> {
         let role = appkit::nsstring(role)?;
-        // SAFETY: NSView implements the NSAccessibility setters on every supported macOS version.
+        // SAFETY: NSView implements the NSAccessibility setters on every supported
+        // macOS version; `-setAccessibilityElement:`/`-setAccessibilityEnabled:` are
+        // `-(void)(BOOL)` and `-setAccessibilityRole:` is `-(void)(NSString *)`.
         unsafe {
             appkit::send_v_bool(view, sel!(setAccessibilityElement:), true);
             appkit::send_v_id(view, sel!(setAccessibilityRole:), role.id());
@@ -1851,7 +1861,8 @@ mod macos {
     /// The whole `updateTrackingAreas` override: `[super updateTrackingAreas]`, then
     /// swap in a fresh hover area so hover detection follows a geometry change.
     fn update_tracking_areas(sup: aterm_objc::ObjcSuper, tracking: &RefCell<Option<Obj>>) {
-        // SAFETY: `[super updateTrackingAreas]` is `-(void)`.
+        // SAFETY: `[super updateTrackingAreas]` is `-(void)`; `super_receiver()` pairs
+        // the instance with the declaring class, so lookup starts at `NSView`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(*const aterm_objc::ObjcSuper, aterm_objc::Sel) =
                 aterm_objc::msg_super();
@@ -1887,7 +1898,8 @@ mod macos {
     /// # Safety
     /// `view` and `event` must be live AppKit objects on the main thread.
     unsafe fn point_in_view(view: Id, event: Id) -> CGPoint {
-        // SAFETY: `-locationInWindow` is a side-effect-free `-(NSPoint)`.
+        // SAFETY: `-locationInWindow` is a side-effect-free `-(NSPoint)`; a nil
+        // source view to `-convertPoint:fromView:` means window coordinates.
         unsafe {
             let win_pt = appkit::send_point(event, sel!(locationInWindow));
             appkit::send_point_point_id(view, sel!(convertPoint:fromView:), win_pt, Id::NIL)
@@ -2003,7 +2015,8 @@ mod macos {
                     (bounds.size.width - 2.0 * TAB_PILL_INSET_X).max(0.0),
                     TAB_PILL_HEIGHT,
                 );
-                // SAFETY: AppKit drawing primitives on the main thread inside a draw cycle.
+                // SAFETY: AppKit drawing primitives on the main thread inside a draw
+                // cycle; colors are autoreleased (+0) and used in this frame; none raise.
                 unsafe {
                     if ivars.active.get() {
                         let panel = match active_tab_color_override() {
@@ -2065,7 +2078,8 @@ mod macos {
                         f64::from(len),
                         h,
                     );
-                    // SAFETY: AppKit drawing primitives on the main thread inside this draw cycle.
+                    // SAFETY: AppKit drawing primitives on the main thread inside
+                    // this draw cycle; the colour is +0 and used in this frame.
                     unsafe {
                         appkit::send_v(strip_load_color(ivars.active.get()), sel!(set));
                         appkit::send_v(rounded_rect(bar, h * 0.5), sel!(fill));
@@ -2099,7 +2113,8 @@ mod macos {
                     return;
                 }
                 let ivars = self.ivars();
-                // SAFETY: `event` is the live event AppKit passed.
+                // SAFETY: `event` is the live event AppKit passed; a nil source view
+                // means window coordinates.
                 let p = unsafe { point_in_view(self.as_id(), event) };
                 ivars.press_x.set(p.x);
                 ivars.dragged.set(false);
@@ -2230,7 +2245,8 @@ mod macos {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender;
+                // `-tag` is `-(NSInteger)`, side-effect free.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = MenuAction::from_tag(tag) {
                     let ivars = self.ivars();
@@ -2251,7 +2267,8 @@ mod macos {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
+                // action sender; `-tag` is `-(NSInteger)`, side-effect free.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let ivars = self.ivars();
                 let Ok(i) = usize::try_from(tag) else { return };
@@ -2273,7 +2290,8 @@ mod macos {
                 if sender.is_null() {
                     return;
                 }
-                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender.
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the action sender;
+                // `-tag` is `-(NSInteger)`, side-effect free.
                 let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 let ivars = self.ivars();
                 let Ok(i) = usize::try_from(tag) else { return };
@@ -2563,7 +2581,8 @@ mod macos {
                 Retained::from_owned(appkit::send_id_rect(raw, sel!(initWithFrame:), frame))?
             };
 
-            // SAFETY: `buttonWithTitle:target:action:` is the documented factory.
+            // SAFETY: `buttonWithTitle:target:action:` is the documented factory; plain
+            // setters follow on the fresh button; all on the main thread.
             let close = unsafe {
                 let btn = appkit::send_id_id_id_sel(
                     class(c"NSButton").as_id(),
@@ -2586,7 +2605,8 @@ mod macos {
                 btn
             };
 
-            // SAFETY: `labelWithString:` is the documented non-raising factory.
+            // SAFETY: `labelWithString:` is the documented non-raising factory; plain setters
+            // follow; on the main thread.
             let (label, desc) = unsafe {
                 let lbl = Obj::retain(appkit::send_id_id(
                     class(c"NSTextField").as_id(),
@@ -2657,7 +2677,8 @@ mod macos {
             ivars.icon_rect.set(content.icon);
             ivars.status_rect.set(content.status);
             let active = ivars.active.get();
-            // SAFETY: plain main-thread setters on our retained live sub-views.
+            // SAFETY: plain main-thread setters on our retained live sub-views; every
+            // rect comes from `native_tab_content_layout` (finite, non-negative).
             unsafe {
                 if let Some(btn) = ivars.close_btn.borrow().as_ref() {
                     appkit::send_v_rect(btn.id(), sel!(setFrame:), rect_of(content.close));
@@ -2730,7 +2751,8 @@ mod macos {
                 0.0
             };
             ivars.close_available.set(false);
-            // SAFETY: plain main-thread AppKit setters/getters on our retained live sub-views.
+            // SAFETY: plain main-thread AppKit setters/getters on our retained live
+            // sub-views; `sizeToFit` only resizes the label it is sent to.
             let (title_w, desc_w) = unsafe {
                 if let Some(btn) = ivars.close_btn.borrow().as_ref() {
                     appkit::send_v_bool(btn.id(), sel!(setHidden:), true);
@@ -2887,7 +2909,8 @@ mod macos {
             let title = self.ivars().title.borrow();
             let label_text = tab_close_accessibility_label(&title);
             if let Some(btn) = self.ivars().close_btn.borrow().as_ref() {
-                // SAFETY: NSButton inherits the NSAccessibility setters.
+                // SAFETY: NSButton inherits the NSAccessibility setters; these are
+                // plain main-thread metadata updates on our retained live button.
                 unsafe {
                     if let (Some(label), Some(help)) = (
                         appkit::nsstring(&label_text),
@@ -2957,7 +2980,9 @@ mod macos {
                 })
                 .collect();
             let mut upgrade_index: isize = 0;
-            // SAFETY: `+[NSMenu new]` is `+(id)` and returns a +1 the `Obj` adopts.
+            // SAFETY: `+[NSMenu new]` is `+(id)` and returns a +1 the `Obj`
+            // adopts; the menu is released when this frame ends, after the
+            // synchronous tracking session `popUpContextMenu:` runs.
             let Some(menu) =
                 (unsafe { Obj::from_owned(appkit::send_id(class(c"NSMenu").as_id(), sel!(new))) })
             else {
@@ -3129,7 +3154,8 @@ mod macos {
             let title = ivars.title.borrow();
             let tooltip = ivars.tooltip.borrow();
             let help = tab_help(&title, tooltip.as_deref(), metadata, ivars.index.get());
-            // SAFETY: NSView implements the NSAccessibility setters on every supported macOS version.
+            // SAFETY: NSView implements the NSAccessibility setters on every supported macOS
+            // version.
             unsafe {
                 let v = self.as_id();
                 let (Some(label), Some(help)) = (appkit::nsstring(&title), appkit::nsstring(&help))
@@ -3332,7 +3358,8 @@ mod macos {
             );
         }
 
-        // SAFETY: standard NSView construction + setters on a fresh instance, on the main thread.
+        // SAFETY: standard NSView construction + setters on a fresh instance, on the
+        // main thread; `addSubview:` takes the live retained button.
         let container = unsafe {
             let v = Obj::from_owned(appkit::send_id_rect(
                 appkit::alloc(class(c"NSView")),
@@ -3394,7 +3421,8 @@ mod macos {
             window: wid,
             tabs: RefCell::new(Vec::new()),
             plus,
-            // SAFETY: `view` is winit's live content `NSView`.
+            // SAFETY: `view` is winit's live content `NSView`; `Obj::retain`
+            // takes one +1 of a live object, released when the handle drops.
             content_view: unsafe { Obj::retain(view) }?,
             rename: RefCell::new(None),
             pill: RefCell::new(None),
@@ -3519,7 +3547,7 @@ mod macos {
 
     /// Return the active tab's title `NSColor`.
     /// # Safety
-    /// Must be called on the main thread.
+    /// Main thread; the result is +0 and is handed straight to `-setTextColor:`, which retains it.
     unsafe fn active_label_color() -> Id {
         match active_tab_color_override() {
             // SAFETY: plain color constructors on the main thread.
@@ -3552,7 +3580,13 @@ mod macos {
 
     /// Resolve the system's selected-content color in the strip's appearance as sRGB.
     pub(crate) fn native_selected_pill_rgb(handle: &ToolbarHandle) -> Option<[u8; 3]> {
-        // SAFETY: main thread (the handle is main-thread only).
+        // SAFETY: main thread (the handle is main-thread only). Every call is a
+        // documented non-raising AppKit message: `+currentAppearance` and
+        // `-effectiveAppearance` return +0 appearances, `+setCurrentAppearance:`
+        // takes one (or nil, restoring the default) for the duration of the
+        // resolution and is put back before returning, `+sRGBColorSpace` is an
+        // immortal shared space, `-colorUsingColorSpace:` returns a +0 colour or
+        // nil, and the component getters return plain `CGFloat`s.
         unsafe {
             let appearance = class(c"NSAppearance").as_id();
             let previous = appkit::send_id(appearance, sel!(currentAppearance));
@@ -3714,7 +3748,8 @@ mod macos {
     /// height.
     fn plan_strip(handle: &ToolbarHandle, n: usize, active: usize) -> StripPlan {
         let container = handle.container.id();
-        // SAFETY: `container` is the live retained strip view.
+        // SAFETY: `container` is the live retained strip view; `-bounds` is a
+        // side-effect-free `-(NSRect)` getter.
         let (metrics, strip_h) = unsafe {
             (
                 strip_metrics(container),
@@ -3874,7 +3909,8 @@ mod macos {
             /// more and what the user sees is exactly what gets stored.
             @sel(controlTextDidChange:)
             fn control_text_did_change(&self, notification: Id) {
-                // SAFETY: `-object` on the live NSNotification is the edited NSControl.
+                // SAFETY: `-object` on the live NSNotification is the edited NSControl;
+                // `-stringValue` / `-setStringValue:` are its main-thread accessors.
                 unsafe {
                     let field = appkit::send_id(notification, sel!(object));
                     if field.is_null() {
@@ -4008,7 +4044,8 @@ mod macos {
         ) else {
             return false;
         };
-        // SAFETY: `textFieldWithString:` is the documented non-raising factory.
+        // SAFETY: `textFieldWithString:` is the documented non-raising factory; the
+        // rest are plain setters on the fresh field, all on the main thread.
         let Some(field) = (unsafe {
             let Some(seed_ns) = appkit::nsstring(seed) else {
                 return false;
@@ -4048,7 +4085,8 @@ mod macos {
         }) else {
             return false;
         };
-        // SAFETY: `-window` is `-(id)`.
+        // SAFETY: `-window` is `-(id)`; `-makeFirstResponder:` is `-(BOOL)(NSResponder *)` and an
+        // `NSTextField` is an `NSResponder`.
         let focused = unsafe {
             let w = appkit::send_id(handle.container.id(), sel!(window));
             !w.is_null() && appkit::send_bool_id(w, sel!(makeFirstResponder:), field.id())
@@ -4072,7 +4110,9 @@ mod macos {
             return;
         };
         editor.target.ivars().done.set(true);
-        // SAFETY: main-thread responder restore, then teardown.
+        // SAFETY: main-thread responder restore, then teardown;
+        // `-setDelegate: nil` drops AppKit's weak reference before the relay's
+        // last strong reference goes away here.
         unsafe {
             let window = appkit::send_id(handle.container.id(), sel!(window));
             if !window.is_null() {
@@ -4107,7 +4147,8 @@ mod macos {
         let Some(editor) = rename.as_ref() else {
             return false;
         };
-        // SAFETY: `currentEditor` is a plain main-thread getter.
+        // SAFETY: `currentEditor` is a plain main-thread getter; the returned NSText
+        // implements the standard editing actions, each taking a `sender`.
         unsafe {
             let text = appkit::send_id(editor.field.id(), sel!(currentEditor));
             if text.is_null() {
@@ -4189,7 +4230,8 @@ mod macos {
 
         /// A live, empty `NSView`, for the delegate's container ivar.
         fn a_view() -> Obj {
-            // SAFETY: `+alloc`/`-init` on `NSView` gives a +1 zero-frame view.
+            // SAFETY: `+alloc`/`-init` on `NSView` gives a +1 zero-frame view;
+            // `Obj::from_owned` adopts that one +1.
             unsafe { Obj::from_owned(appkit::send_id(appkit::alloc(class(c"NSView")), sel!(init))) }
                 .expect("NSView")
         }

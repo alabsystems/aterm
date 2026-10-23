@@ -45,7 +45,7 @@ impl HintMode {
 
     /// The hinter target this mode stands for; `None` = hinting disabled. Horizontal fitting
     /// inside the cell is wanted (that is the crispness); advances reported upstream stay linear
-    /// regardless (module doc).
+    /// regardless.
     #[inline]
     const fn options(self) -> Option<Target> {
         match self {

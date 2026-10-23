@@ -4,6 +4,9 @@
 // Derived from winit 0.30.13 build.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): the `cargo:rustc-cfg` lines `cfg_aliases!` expanded to, without the build
+// dependency; the Android, iOS, Orbital and Web aliases went with those backends.
+
 use std::env;
 
 fn main() {

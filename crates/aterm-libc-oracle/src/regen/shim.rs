@@ -314,10 +314,11 @@ fn header(cell: &Cell, out: &mut Vec<String>) {
         [
             "// Copyright 2026 Andrew Yates",
             "// SPDX-License-Identifier: Apache-2.0",
-            "",
         ]
         .map(String::from),
     );
+    out.push(aterm_census::seal::line("//", super::GENERATOR));
+    out.push(String::new());
     out.push(format!("//! `libc` for `{}`.", cell.triple));
     out.extend(
         [

@@ -48,7 +48,7 @@ fn pieces(out: &mut String, prefix: char, body: &[u8]) {
 }
 
 /// The prefix of a line that goes on with the piece before it, with no
-/// newline between: a screen's next row ([module docs](self)).
+/// newline between: a screen's next row.
 const GLUE: char = '=';
 
 /// `body`'s pieces, each behind `prefix`, and each piece cut again before
@@ -82,7 +82,7 @@ fn pieces_cut(out: &mut String, prefix: char, body: &[u8], cuts: &[usize]) {
 }
 
 /// Where a screen read's reply text is cut so that each of its rows is a
-/// line of its own ([module docs](self)): before each row of its
+/// line of its own: before each row of its
 /// `"rows":[…]` array and before the `]` that closes it.
 fn row_cuts(text: &[u8]) -> Vec<usize> {
     const KEY: &[u8] = b"\"rows\":[";

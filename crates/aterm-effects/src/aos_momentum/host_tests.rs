@@ -18,8 +18,6 @@ use super::test_fixtures::{
 use super::{MOMENTUM_QUEUE_CAP, MomentumCode, MomentumHost, PrebuiltMomentum};
 use crate::cursor_momentum::MomentumGlow;
 
-/// The burst-then-lane story on one glow: 24 keys at 60 ms, then the host's lane until it
-/// parks.
 fn story(g: &mut impl super::test_fixtures::Glow, t0: Instant, dark: bool) -> Vec<Seen> {
     let c = cfg(dark);
     let mut seen = Vec::new();
@@ -29,10 +27,6 @@ fn story(g: &mut impl super::test_fixtures::Glow, t0: Instant, dark: bool) -> Ve
     seen
 }
 
-/// Unattached (every production window), the host is the shipped engine: on random streams
-/// that include inputs outside the profile (NaN and oversized τ, a zero cell, a non-finite
-/// intensity, an inverted span, a 2 s lane) and on the typing story, every frame, every
-/// quad appended after other effects' and every wake is the engine's own.
 #[test]
 fn an_unattached_host_shows_exactly_what_the_engine_shows() {
     let t0 = Instant::now();
@@ -57,11 +51,6 @@ fn an_unattached_host_shows_exactly_what_the_engine_shows() {
     }
 }
 
-/// Attached under the shipped code, inside the profile, recording changes nothing the host
-/// sees: the same frames, appended quads (other effects' prefixes untouched) and wakes as
-/// the engine called directly, on random streams and on the typing story on both pages;
-/// every input was admitted and recorded once, except each reset of a glow already at rest,
-/// which changes nothing and is not an input.
 #[test]
 fn an_attached_shipped_host_shows_the_host_what_the_engine_shows() {
     let t0 = Instant::now();
@@ -110,9 +99,6 @@ fn an_attached_shipped_host_shows_the_host_what_the_engine_shows() {
     }
 }
 
-/// The live-recorded stream, replayed through `Code::step` from the attach checkpoint,
-/// lands on the live state's digest and reproduces the live observation chain exactly,
-/// for both codes, on random streams and the typing story.
 #[test]
 fn the_recorded_stream_replays_from_the_attach_checkpoint_to_the_live_state_and_chain() {
     let t0 = Instant::now();
@@ -145,9 +131,6 @@ fn the_recorded_stream_replays_from_the_attach_checkpoint_to_the_live_state_and_
     }
 }
 
-/// A checkpoint taken at any boundary of a recorded run, encoded, decoded and restored,
-/// continues exactly as the straight run: the same final state digest and, joined to the
-/// prefix's, the same observations and chain.
 #[test]
 fn restoring_at_every_boundary_continues_the_straight_run() {
     let t0 = Instant::now();
@@ -213,9 +196,6 @@ fn restoring_at_every_boundary_continues_the_straight_run() {
     }
 }
 
-/// A log that fills re-anchors at the next boundary (a fresh checkpoint, an empty log of the
-/// next epoch) and the live chain restarts with it: a replay from the newest checkpoint
-/// still lands on the live state and chain.
 #[test]
 fn a_rolling_reanchor_keeps_the_replay_exact() {
     let t0 = Instant::now();
@@ -238,9 +218,6 @@ fn a_rolling_reanchor_keeps_the_replay_exact() {
     assert_eq!(run.observation_chain, h.chain.chain);
 }
 
-/// Attaching mid-cool-down carries the keys typed before the epoch as negative offsets: the
-/// host goes on showing what the engine shows, and the replay from the attach checkpoint
-/// reproduces the live state.
 #[test]
 fn attaching_mid_cool_down_continues_exactly_and_replays() {
     let t0 = Instant::now();
@@ -266,8 +243,6 @@ fn attaching_mid_cool_down_continues_exactly_and_replays() {
     assert_eq!(run.observation_chain, h.chain.chain);
 }
 
-/// Detaching moves the live state back whole: the direct engine then continues exactly as
-/// an engine that was never attached.
 #[test]
 fn detaching_moves_the_live_state_back_whole() {
     let t0 = Instant::now();
@@ -284,11 +259,6 @@ fn detaching_moves_the_live_state_back_whole() {
     assert_eq!(pe.at, ph.at);
 }
 
-/// A reset that would change nothing is not an input: at rest, a hundred resets leave the
-/// log as it was; paused at rest, two thousand resets (more than the queue holds) neither
-/// queue nor reject the update; a reset of a glow that has seen a key is recorded once
-/// running and queued once paused, and the resets after it, which would change nothing
-/// more, are neither.
 #[test]
 fn a_reset_that_changes_nothing_is_neither_recorded_nor_queued() {
     let t0 = Instant::now();
@@ -346,10 +316,6 @@ fn a_reset_that_changes_nothing_is_neither_recorded_nor_queued() {
     assert!(!host.is_active() && !host.settling());
 }
 
-/// Once a running attach's live time passes the hosted horizon, no timed input can be
-/// admitted again, so the next live call ends the attach: a hot glow typed into right up
-/// to the horizon is drawn hot by the tick that crosses it (the shipped engine took the state
-/// back whole) and then cools and parks as the engine's would.
 #[test]
 fn a_hot_glow_crossing_the_horizon_ends_the_attach_and_still_cools() {
     let t0 = Instant::now();
@@ -387,12 +353,6 @@ fn a_hot_glow_crossing_the_horizon_ends_the_attach_and_still_cools() {
     assert!(paused.aos_attached() && paused.aos_paused());
 }
 
-/// The live host links every observation through one reused encoder and copies each frame's
-/// quads into the held overlay's recycled vectors, and neither changes a byte: on random
-/// streams (in and out of the profile) and the typing story on both pages, whose frames grow,
-/// shrink and draw nothing, after every tick the held overlay is exactly the frame and quads
-/// that tick appended, with no room kept when it drew nothing, and the live chain is the
-/// replay's, which encodes each observation from a fresh copy of its quads.
 #[test]
 fn the_reused_encoder_and_recycled_overlay_change_no_link_and_no_held_quad() {
     let t0 = Instant::now();
@@ -461,8 +421,6 @@ fn the_reused_encoder_and_recycled_overlay_change_no_link_and_no_held_quad() {
     );
 }
 
-/// The shipped engine, keeping each call made on it as a [`Call`], to be played on a host one
-/// call at a time.
 struct Recorder {
     glow: MomentumGlow,
     t0: Instant,

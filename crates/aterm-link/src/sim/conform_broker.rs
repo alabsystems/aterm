@@ -720,7 +720,7 @@ fn replay(journal: &[Event]) -> Vec<Step> {
     steps
 }
 
-/// The hand-written scripts ([module docs](self#the-scripts)).
+/// The hand-written scripts.
 pub(crate) mod scripts {
     use super::{Request, Step, ACK_SEQ_BASE};
     use astream_broker::{incarnation_base, will_seq, RETIRE_SUBJECT};
@@ -1240,12 +1240,22 @@ fn journalled(seed: u64, tier: Tier) -> super::world::Outcome {
     super::world::run(&opts)
 }
 
+/// Whether astream's broker serves `tier` as asked on this host: off Apple it serves an
+/// Ordered log Strict (`NotApple`: no barrier to order by), a tier the Strict comparison holds
+/// the model to, while the model's device keeps the barrier it simulates everywhere.
+fn served_here(tier: Tier) -> bool {
+    tier != Tier::Ordered || cfg!(target_vendor = "apple")
+}
+
 /// **THE MODEL ANSWERS EVERY SCRIPT AS ASTREAM'S BROKER DOES**, on every
-/// tier: each verb the bridge sends and each edge astream defines for it.
+/// tier the host serves: each verb the bridge sends and each edge astream defines for it.
 #[test]
 fn the_model_answers_every_script_as_astreams_broker_does() {
     let mut failed = Vec::new();
-    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed] {
+    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+    {
         for (name, script) in [
             ("publishing", scripts::publishing()),
             ("binary payload", scripts::binary_payload()),
@@ -1308,11 +1318,14 @@ fn what_real_bridges_sent_astream_answers_as_the_model_did() {
             out.violations
         );
         let steps = replay(&out.journal);
-        requests += steps.iter().filter(|s| matches!(s, Step::Send(..))).count();
         assert!(
             steps.iter().any(|s| matches!(s, Step::Stop(_))),
             "seed {seed}'s world never restarted its broker"
         );
+        if !served_here(tier) {
+            continue;
+        }
+        requests += steps.iter().filter(|s| matches!(s, Step::Send(..))).count();
         if let Err(e) = run(tier, ArmMutant::None, &steps) {
             failed.push(format!("seed {seed}: {e}"));
         }

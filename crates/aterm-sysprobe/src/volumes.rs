@@ -1042,7 +1042,8 @@ mod arm {
                 ..Table::default()
             };
         };
-        // SAFETY: `buf` has `bytes` writable bytes; `MNT_NOWAIT` does not block on mounts.
+        // SAFETY: `buf` has `bytes` writable bytes of whole `statfs` records, and `getfsstat`
+        // writes at most that many; `MNT_NOWAIT` does not block on mounts.
         let written = unsafe { getfsstat(buf.as_mut_ptr(), bytes, MNT_NOWAIT) };
         let Ok(written) = usize::try_from(written) else {
             return Table {

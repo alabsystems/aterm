@@ -718,7 +718,9 @@ fn quiet_stdio(log: &Path) {
         return;
     };
     let fd = file.as_raw_fd();
-    // SAFETY: `dup2` re-points fds 1 and 2 at an open file this process owns; `file` is leaked right after, so its descriptor stays valid for the rest of the process.
+    // SAFETY: `dup2` re-points fds 1 and 2 at an open file this process owns; `file` is
+    // leaked right after, so its descriptor stays valid for the rest of the process. No
+    // other thread relies on what fds 1 and 2 are.
     unsafe {
         libc::dup2(fd, 1);
         libc::dup2(fd, 2);

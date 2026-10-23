@@ -15,14 +15,14 @@ use super::frame::{FRAME_RAW_MAX, Format, HEAD, Kind, MAGIC, checksum, place_nam
 pub const HELD_MAX: usize = 1 << 30;
 
 /// The search for a whole frame after a short or bad one hashes at most this
-/// many times the bytes after it ([module docs](self)).
+/// many times the bytes after it.
 const SEARCH_PER_BYTE: usize = 64;
 
 /// The least the search may hash, however few bytes follow the frame: as much
 /// as one frame can hold.
 const SEARCH_FLOOR: usize = FRAME_RAW_MAX;
 
-/// What a tape's bytes hold ([module docs](self)).
+/// What a tape's bytes hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recovered {
     /// The header's text ([`super::header::Header::decode`] reads it).
@@ -199,7 +199,7 @@ pub(crate) enum Check {
     Unplaced,
 }
 
-/// The reader's own bounds ([module docs](self)).
+/// The reader's own bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub(crate) held: usize,
@@ -343,7 +343,7 @@ enum After {
     Whole,
     /// None does.
     Nothing,
-    /// The search met its bound before it could say ([module docs](self)).
+    /// The search met its bound before it could say.
     Unsearched,
 }
 
@@ -500,7 +500,7 @@ fn magic_tail(bytes: &[u8]) -> Tail {
 }
 
 /// What a read carries from one whole frame to the next: the items' decoder,
-/// and the bytes held so far against the limit ([module docs](self)).
+/// and the bytes held so far against the limit.
 struct Reader {
     decoder: Decoder,
     held: usize,

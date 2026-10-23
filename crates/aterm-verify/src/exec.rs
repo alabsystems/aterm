@@ -25,7 +25,7 @@ pub enum Capture {
 pub struct Cmd {
     pub program: PathBuf,
     pub args: Vec<OsString>,
-    /// Extra environment on top of the inherited one ([`Cmd::exact_env`]).
+    /// Extra environment on top of the inherited one, or the whole one under [`Cmd::exact_env`].
     pub envs: Vec<(OsString, OsString)>,
     pub capture: Capture,
     /// Spawn under utility QoS rather than the run's inherited tier.
@@ -113,7 +113,8 @@ impl Cmd {
         self
     }
 
-    /// At its ceiling.
+    /// At its ceiling, send this child's group `SIGTERM` and give it up to `grace` before
+    /// `SIGKILL`.
     #[must_use]
     pub const fn term_grace(mut self, grace: Duration) -> Self {
         self.term_grace = Some(grace);
@@ -230,7 +231,6 @@ pub fn bounded<T: Send + 'static>(
     })
 }
 
-/// [`bounded`] with the wait injected for testing.
 fn bounded_wait<T: Send + 'static>(
     walk: impl FnOnce() -> T + Send + 'static,
     wait: impl FnOnce(std::sync::mpsc::Receiver<T>) -> Result<T, Unfinished>,
@@ -263,7 +263,6 @@ fn bounded_wait<T: Send + 'static>(
 #[path = "exec_output.rs"]
 mod output;
 
-/// Upper bound on `--timeout` seconds before `Duration::from_secs_f64` would panic.
 const MAX_CEILING_SECS: f64 = 3_153_600_000.0;
 
 /// Parse a `--timeout` value ([`DEFAULT_CHILD_CEILING`]).
@@ -362,7 +361,6 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     }
 }
 
-/// The `Command` for `cmd` before its cwd and environment are applied.
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     let mut c = if cmd.demoted && crate::is_executable_file(taskpolicy) && resolves(cmd, env) {
         let mut c = Command::new(taskpolicy);
@@ -388,10 +386,8 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     c
 }
 
-/// Program placed between `taskpolicy` and a demoted child carrying `DYLD_*` variables.
 const ENV: &str = "/usr/bin/env";
 
-/// `K=V` for each `DYLD_*` variable in `envs`, in order.
 fn dyld_assignments(envs: &[(OsString, OsString)]) -> Vec<OsString> {
     envs.iter()
         .filter(|(k, _)| k.to_string_lossy().starts_with("DYLD_"))
@@ -404,7 +400,6 @@ fn dyld_assignments(envs: &[(OsString, OsString)]) -> Vec<OsString> {
         .collect()
 }
 
-/// Whether `execvp` would find `cmd.program` from the child's cwd and PATH.
 fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     let program = cmd.program.as_path();
     let cwd = cmd.cwd.as_deref().unwrap_or(env.cwd);
@@ -420,7 +415,6 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     std::env::split_paths(path).any(|d| crate::is_executable_file(&cwd.join(d).join(program)))
 }
 
-/// Spawn and wait under `ceiling`, returning the run result and captured log.
 fn finish(
     mut c: Command,
     cmd: &Cmd,
@@ -505,7 +499,6 @@ fn finish(
     }
 }
 
-/// End the group while its leader remains our unreaped child, then reap it.
 fn kill_and_reap(
     child: &mut std::process::Child,
     #[cfg(unix)] live: &mut group::Live,
@@ -553,7 +546,6 @@ fn kill_and_reap(
     note
 }
 
-/// Construct the [`Run`] for a child killed at the wall-clock ceiling.
 fn over_ceiling(cmd: &Cmd, elapsed: Duration, limit: Duration, kill: &str) -> Run {
     let argv = cmd.argv().join(" ");
     Run {
@@ -584,17 +576,13 @@ pub mod group {
     const SIGINT: i32 = 2;
     const SIGKILL: i32 = 9;
     const SIGTERM: i32 = 15;
-    /// `SIG_DFL`, as the handler-pointer value `signal(3)` takes.
     const SIG_DFL: libc::sighandler_t = libc::SIG_DFL;
 
-    /// Grace rounds (`NAP_MS` each) between `SIGTERM` and `SIGKILL` on interrupt.
     const GRACE_ROUNDS: u32 = 200;
     const NAP_MS: c_long = 10;
 
-    /// Process groups of currently running stage children (`0` for a free slot).
     static LIVE: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
 
-    /// Set by the first interrupt before signalling any group.
     static STOPPING: AtomicBool = AtomicBool::new(false);
     static SPAWNING: AtomicUsize = AtomicUsize::new(0);
 
@@ -707,7 +695,8 @@ pub mod group {
             self.reap_stage_sweeping(child, block, |_| {})
         }
 
-        /// Reap `child`, running `sweep` once after the leader exits and before it is reaped.
+        /// Reap `child`, running `sweep` once after the leader exits and before it is reaped (macOS
+        /// and Linux only).
         pub(super) fn reap_stage_sweeping(
             &mut self,
             child: &mut std::process::Child,
@@ -860,9 +849,11 @@ pub mod group {
         let options = libc::WEXITED | WNOWAIT | if block { 0 } else { WNOHANG };
         let mut nap = std::time::Duration::from_millis(1);
         loop {
-            // SAFETY: every field of `siginfo_t` is an integer or a pointer.
+            // SAFETY: every field of `siginfo_t` is an integer or a pointer, so all-zero is a valid
+            // value; the kernel overwrites it.
             let mut info: siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: `info` is live and writable.
+            // SAFETY: `info` is live and writable, and `pid` names the child whose exit is observed
+            // without reaping it (`WNOWAIT`).
             let got = unsafe { waitid(P_PID, pid, &raw mut info, options) };
             if got == 0 {
                 #[cfg(target_os = "macos")]
@@ -889,7 +880,6 @@ pub mod group {
         STOPPING.load(Ordering::SeqCst)
     }
 
-    /// Send `sig` to every listed group.
     fn sweep(sig: i32) {
         for slot in &LIVE {
             let g = slot.load(Ordering::SeqCst);
@@ -902,7 +892,6 @@ pub mod group {
         }
     }
 
-    /// Signal handler that terminates live stage groups and re-raises `sig`.
     extern "C" fn on_signal(sig: i32) {
         if STOPPING.swap(true, Ordering::SeqCst) {
             return;
@@ -952,7 +941,8 @@ pub mod group {
             return;
         }
         for sig in [SIGHUP, SIGINT, SIGTERM] {
-            // SAFETY: `on_signal` is an `extern "C" fn(i32)` that lives for the whole program.
+            // SAFETY: `on_signal` is an `extern "C" fn(i32)` that lives for the whole program and
+            // does only async-signal-safe work.
             unsafe {
                 signal(sig, on_signal as extern "C" fn(i32) as usize);
             }
@@ -968,7 +958,6 @@ pub mod group {
     }
 }
 
-/// A child that reached an exit status of its own.
 fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
     match st {
         Ok(st) => Run {
@@ -981,7 +970,6 @@ fn reaped(st: io::Result<std::process::ExitStatus>) -> Run {
     }
 }
 
-/// Construct a failed [`Run`] when a child could not be spawned or waited on.
 fn failed_to_wait(why: &str) -> Run {
     Run {
         ok: false,

@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `since=<cursor>` deltas (§13.5). THE SERVER REMEMBERS REPLIES, NOT
-//! SNAPSHOTS: for each reply it keeps the fingerprint of every line it
-//! displayed, keyed by the line's key (`global`, `tab 1`, `core S1`, `proc
-//! 52114`). A delta holds only the lines whose displayed text changed since
-//! that reply, plus the events recorded since; unchanged lines collapse to one
-//! `same <keys>` line. The text is already quantised to what the words print
-//! (0.1c, whole percent, two or three significant figures), so a figure that
-//! moves within its quantum is unchanged.
+//! `since=<cursor>` deltas (§13.5).
 
 use super::view::{Line, Reply};
 
@@ -19,8 +12,7 @@ pub struct Fingerprints {
     pub lines: Vec<(String, u64)>,
 }
 
-/// FNV-1a, 64-bit: stable across builds, so a cursor kept over a live
-/// upgrade's epoch change is refused by its epoch, never misread.
+/// FNV-1a 64-bit hash, stable across builds.
 #[must_use]
 pub fn fnv(text: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -31,8 +23,7 @@ pub fn fnv(text: &str) -> u64 {
     h
 }
 
-/// The fingerprints of `reply`'s value lines (record and sentence lines;
-/// `more=`, events and notes are not values).
+/// The fingerprints of `reply`'s value lines (record and sentence lines).
 #[must_use]
 pub fn fingerprints(reply: &Reply) -> Fingerprints {
     Fingerprints {
@@ -45,10 +36,7 @@ pub fn fingerprints(reply: &Reply) -> Fingerprints {
     }
 }
 
-/// `reply` as a delta against `base`: value lines whose text is unchanged
-/// fold into one `same <k1>,<k2>,…` line (keys with their spaces as `_`),
-/// placed where the first of them stood; every other line stays. Returns the
-/// keys that folded.
+/// Folds unchanged value lines in `reply` against `base` into one `same <k1>,<k2>,…` line.
 pub fn apply_delta(reply: &mut Reply, base: &Fingerprints) -> Vec<String> {
     let mut same = Vec::new();
     let mut first_same: Option<usize> = None;

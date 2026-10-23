@@ -1,20 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm_alloc::ArrayVec` against a `Vec` bounded to the same capacity,
-//! operation for operation.
-//!
-//! `crates/aterm-arrayvec` republishes `aterm_alloc::ArrayVec` under the
-//! package name `arrayvec` so that `[patch.crates-io]` can point `naga`,
-//! `wgpu`, `wgpu-core` and `wgpu-hal` at it.
-//! `crates/aterm-arrayvec/tests/consumer_forms.rs` proves the surface accepts
-//! what those crates write. This file proves it computes what they expect: both
-//! are driven through the same scripts and a deterministic-LCG operation fuzz,
-//! and their state is compared after every step — contents, length, capacity
-//! accounting, `Debug` rendering, `Hash` output, drop counts and whether an
-//! operation panicked. The model encodes upstream `arrayvec`'s contract: a
-//! full vector refuses (`try_*`) or panics (`push`, `insert`, `extend`,
-//! `collect`), and an overflowing `extend` keeps the prefix it wrote.
+//! Differential tests comparing `aterm_alloc::ArrayVec` against a bounded `Vec` model.
 
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
@@ -25,7 +12,6 @@ use std::rc::Rc;
 use aterm_alloc::ArrayVec as MyArrayVec;
 use model::Model as UpArrayVec;
 
-/// A `Vec` held to capacity `N`, with upstream `arrayvec`'s overflow contract.
 mod model {
     use std::ops::{Deref, DerefMut, RangeBounds};
 
@@ -167,22 +153,12 @@ mod model {
     }
 }
 
-// ── Comparison helpers ──────────────────────────────────────────────────────
-
 fn hash_of<T: Hash + ?Sized>(v: &T) -> u64 {
     let mut h = DefaultHasher::new();
     v.hash(&mut h);
     h.finish()
 }
 
-/// Compare every observable of the two vectors.
-///
-/// `Hash` is compared as a raw `u64` on purpose: both implementations are meant
-/// to delegate to the slice, so the two hashers must produce the same number,
-/// not merely be internally consistent. An implementation that hashed the
-/// backing `[MaybeUninit<T>; N]` would still satisfy Hash/Eq inside one process
-/// — it would pass every self-consistency test ever written — and this is the
-/// assertion that catches it.
 fn same<T, const N: usize>(mine: &MyArrayVec<T, N>, up: &UpArrayVec<T, N>, what: &str)
 where
     T: std::fmt::Debug + PartialEq + Hash,
@@ -226,9 +202,6 @@ where
     );
 }
 
-/// Run a closure with panic output suppressed, reporting only whether it
-/// unwound. Used to compare panic behaviour, which for a fixed-capacity vector
-/// is as much a part of the contract as the contents.
 fn panicked(f: impl FnOnce()) -> bool {
     let prev = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
@@ -236,8 +209,6 @@ fn panicked(f: impl FnOnce()) -> bool {
     panic::set_hook(prev);
     result.is_err()
 }
-
-// ── Scripted operations ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
@@ -328,8 +299,6 @@ fn apply(op: Op, mine: &mut MyArrayVec<u32, CAP>, up: &mut UpArrayVec<u32, CAP>)
             up.retain(|v| *v % 2 == 1);
         }
         Op::RetainAndBump => {
-            // `retain` hands the predicate `&mut T`; the writes it makes must
-            // survive.
             mine.retain(|v| {
                 *v = v.wrapping_add(1);
                 *v % 3 != 0
@@ -340,8 +309,6 @@ fn apply(op: Op, mine: &mut MyArrayVec<u32, CAP>, up: &mut UpArrayVec<u32, CAP>)
             });
         }
         Op::ExtendFromSlice(base, n) => {
-            // Upstream's public equivalent of `extend_from_slice` — "append
-            // these cloned elements, panicking on overflow" — is `extend`.
             let src: Vec<u32> = (0..n as u32).map(|i| base.wrapping_add(i)).collect();
             let a = panicked(|| {
                 let mut tmp = mine.clone();
@@ -406,7 +373,6 @@ fn apply(op: Op, mine: &mut MyArrayVec<u32, CAP>, up: &mut UpArrayVec<u32, CAP>)
             assert_eq!(a, b, "drain(s..) yielded different elements for {label}");
         }
         Op::Sort => {
-            // Reached through `DerefMut`, so this exercises the slice view.
             mine.sort_unstable();
             up.sort_unstable();
         }
@@ -429,7 +395,6 @@ fn scripted_operation_sequence() {
         Op::ExtendFromSlice(10, 3),
         Op::TryPush(7),
         Op::TryPush(8),
-        // Now full: these must fail identically on both.
         Op::TryPush(9),
         Op::Push(9),
         Op::Extend(3),
@@ -451,8 +416,6 @@ fn scripted_operation_sequence() {
     }
 }
 
-/// Deterministic-LCG operation fuzz. Fixed seeds, so a failure is reproducible
-/// from the seed alone.
 #[test]
 fn lcg_operation_fuzz() {
     struct Lcg(u64);
@@ -503,24 +466,14 @@ fn lcg_operation_fuzz() {
     }
 }
 
-// ── The behaviours that are dangerous to get subtly wrong ───────────────────
-
-/// `Extend` and `FromIterator` must panic on overflow, never truncate — and the
-/// elements written before the panic must survive on both sides. A truncating
-/// `extend` would silently drop DXC compiler arguments in `wgpu-hal` and a
-/// destination barrier in `wgpu-core`, with nothing to observe but wrong pixels.
 #[test]
 fn overflow_policy_parity() {
-    // Control: an extend that fits must not panic on either side. Without this,
-    // "both panicked" below could be satisfied by an implementation that
-    // panics unconditionally.
     let mut mine: MyArrayVec<u32, 4> = MyArrayVec::new();
     let mut up: UpArrayVec<u32, 4> = UpArrayVec::new();
     assert!(!panicked(|| mine.extend([1, 2, 3, 4])));
     assert!(!panicked(|| up.extend([1, 2, 3, 4])));
     assert_eq!(mine.as_slice(), up.as_slice());
 
-    // Overflowing extend: both panic, and both keep the prefix they wrote.
     let mut mine: MyArrayVec<u32, 4> = MyArrayVec::new();
     let mut up: UpArrayVec<u32, 4> = UpArrayVec::new();
     let a = panicked(|| mine.extend([1, 2, 3, 4, 5, 6]));
@@ -535,8 +488,6 @@ fn overflow_policy_parity() {
         "the prefix retained after an overflowing extend differs"
     );
 
-    // Overflowing collect (`from_iter`), the load-bearing over-limit guard at
-    // wgpu-core/src/device/resource.rs:3740 and wgpu/src/backend/wgpu_core.rs:1308.
     let a = panicked(|| {
         let _: MyArrayVec<u32, 4> = (1..=5).collect();
     });
@@ -548,7 +499,6 @@ fn overflow_policy_parity() {
         "collect must panic on overflow (mine={a}, model={b})"
     );
 
-    // …and the same collect one element smaller must not, on either side.
     let a = panicked(|| {
         let _: MyArrayVec<u32, 4> = (1..=4).collect();
     });
@@ -558,10 +508,6 @@ fn overflow_policy_parity() {
     assert!(!a && !b, "control: a fitting collect must not panic");
 }
 
-/// `into_inner` returns `Ok` only when the vector is full. naga spells this
-/// `.into_inner().unwrap()` in its const-expression evaluator; an inverted test
-/// would build shader constants out of a partially-filled array and never
-/// panic.
 #[test]
 fn into_inner_polarity_parity() {
     for fill in 0..=4usize {
@@ -586,13 +532,8 @@ fn into_inner_polarity_parity() {
     }
 }
 
-/// By-value iteration: order, `size_hint`, `DoubleEndedIterator`, and — the
-/// part that cannot be seen from the outside — that the un-yielded remainder is
-/// dropped exactly once. A missing drop leaks an `Arc<Texture>` per early
-/// return in `wgpu-core`; a double drop is a use-after-free.
 #[test]
 fn into_iter_parity_including_drop_counts() {
-    // Order and both ends.
     let mine: MyArrayVec<u32, 8> = (0..6).collect();
     let up: UpArrayVec<u32, 8> = (0..6).collect();
     let mut mi = mine.into_iter();
@@ -605,7 +546,6 @@ fn into_iter_parity_including_drop_counts() {
     assert_eq!(format!("{mi:?}"), format!("{:?}", ui.as_slice()));
     assert_eq!(mi.collect::<Vec<_>>(), ui.collect::<Vec<_>>());
 
-    // Drop counts, for every prefix length, on both sides.
     struct Bomb(Rc<Cell<usize>>);
     impl Drop for Bomb {
         fn drop(&mut self) {
@@ -635,7 +575,6 @@ fn into_iter_parity_including_drop_counts() {
                 up_counter.get(),
                 "drop count after {taken} yielded elements differs"
             );
-            // iterators dropped here, with 5 - taken elements un-yielded
         }
         assert_eq!(
             mine_counter.get(),
@@ -650,8 +589,6 @@ fn into_iter_parity_including_drop_counts() {
     }
 }
 
-/// `drain` must actually remove, on every range shape, and dropping the
-/// iterator early must leave the same vector an exhausted one would.
 #[test]
 fn drain_parity_over_every_range_shape() {
     for len in 0..=6usize {
@@ -668,7 +605,6 @@ fn drain_parity_over_every_range_shape() {
                 );
                 same(&mine, &up, &format!("drain({start}..{end}) on len {len}"));
 
-                // …and the same range, dropped without being consumed.
                 let mut mine: MyArrayVec<u32, 8> = (0..len as u32).collect();
                 let mut up: UpArrayVec<u32, 8> = (0..len as u32).collect();
                 drop(mine.drain(start..end));
@@ -681,7 +617,6 @@ fn drain_parity_over_every_range_shape() {
             }
         }
 
-        // The unbounded forms `wgpu-hal` actually writes.
         let mut mine: MyArrayVec<u32, 8> = (0..len as u32).collect();
         let mut up: UpArrayVec<u32, 8> = (0..len as u32).collect();
         let a: Vec<u32> = mine.drain(..).collect();
@@ -691,8 +626,6 @@ fn drain_parity_over_every_range_shape() {
     }
 }
 
-/// `clone_from` must land on the same value whichever way the lengths compare —
-/// our override reuses the initialized prefix exactly as upstream's does.
 #[test]
 fn clone_from_parity() {
     for dst_len in 0..=6usize {
@@ -708,8 +641,6 @@ fn clone_from_parity() {
     }
 }
 
-/// The by-reference iterators are bounded by `len`, not by `N`, on both sides.
-/// `tiny-skia` writes through every element a `for x in &mut av` visits.
 #[test]
 fn by_reference_iteration_parity() {
     let mut mine: MyArrayVec<u32, 8> = (0..3).collect();
@@ -729,9 +660,6 @@ fn by_reference_iteration_parity() {
     same(&mine, &up, "for v in &mut av");
 }
 
-/// Elements that own memory: the differential above uses `u32`, which cannot
-/// catch a leak or a double free. This runs the same script over a `String`
-/// payload with a drop counter attached, so it can.
 #[test]
 fn owning_elements_drop_parity() {
     struct Tracked(String, Rc<Cell<usize>>);
@@ -794,12 +722,6 @@ fn owning_elements_drop_parity() {
     );
 }
 
-/// `retain` whose predicate panics keeps what the predicate had kept and every
-/// element it had not yet returned for, closes the hole between them, and
-/// drops each element exactly once overall: std `Vec::retain`'s contract, which
-/// upstream's `BackshiftOnDrop` mirrors. Swept over every panic position and
-/// every keep/reject pattern before it, so a guard that drops the unprocessed
-/// tail (or the element under examination) shows up as missing elements.
 #[test]
 fn retain_with_a_panicking_predicate_parity() {
     use std::cell::RefCell;

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Test-only: the overflow row never hides live progress and is one link naming what it
-//! hides; a record about a previous run ranks a class lower; a progress row's numbers
-//! agree.
+//! Overflow row and progress meter presentation tests.
 
 use crate::center::MessageCenter;
 use crate::glass::{Hit, Links, Presentation, RowKind, job_stats};
@@ -26,7 +24,6 @@ fn present(c: &MessageCenter, cols: usize) -> Presentation {
     c.presentation(cols, &char_width, None, Links::Painted)
 }
 
-/// A download a person started: determinate, with an amount (an ETA), live.
 fn download(title: &str, done: u64) -> Message {
     let total = 74_000_000;
     Message::new(tags::UPDATE, Severity::Info, title)
@@ -45,9 +42,6 @@ fn download(title: &str, done: u64) -> Message {
         })
 }
 
-/// The five-kinds composition (the GUI's `95-five-kinds-overflow` shot): a misspelled
-/// setting, the download at 45 %, a fleet notice, a retrospective Error and a standing
-/// Error. Returns the center and the download's id.
 fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
     let mut c = MessageCenter::new(MessageLog::empty(), now - ms(5000));
     let near = now - ms(4000);
@@ -85,8 +79,6 @@ fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
     (c, dl)
 }
 
-/// At 60, 80 and 120 columns the download stays on the glass with its fill, the standing
-/// Error above it, and the overflow row is a single link with no capsule.
 #[test]
 fn five_kinds_keep_the_download_on_the_glass_at_every_width() {
     let now = Instant::now() + Duration::from_secs(10);
@@ -118,7 +110,6 @@ fn five_kinds_keep_the_download_on_the_glass_at_every_width() {
     }
 }
 
-/// A retrospective Error ranks below a Warn about now; without the flag it ranks above.
 #[test]
 fn a_retrospective_error_ranks_with_the_warnings() {
     let now = Instant::now();
@@ -149,8 +140,6 @@ fn a_retrospective_error_ranks_with_the_warnings() {
     }
 }
 
-/// The overflow row names a hidden download with its percent (`+ Downloading … 20% ·
-/// 1 more ›`) and falls back to `N more ›` where that does not fit whole.
 #[test]
 fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
     let now = Instant::now();
@@ -198,16 +187,13 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
         assert_eq!(p.rows[1].full_title, spoken, "{cols}");
         assert!(p.rows[1].capsules.is_empty(), "{cols}");
     }
-    // At 60 columns the long form fits whole.
     let p = present(&c, 60);
     assert_eq!(
         p.rows[1].title.1,
         "Downloading Homebrew 20% \u{b7} 1 more \u{203a}"
     );
-    // With the links withheld there is no arrow.
     let p = c.presentation(120, &char_width, None, Links::Withheld);
     assert_eq!(p.rows[1].title.1, "Downloading Homebrew 20% \u{b7} 1 more");
-    // A longer hidden title does not fit whole at 60 columns: `N more ›`.
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.post(
         download("Downloading aterm v0.91.0", 33_300_000),
@@ -234,7 +220,6 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
     assert_eq!(present(&c, 120).rows[1].glyph.1, '+');
 }
 
-/// The progress reservation never pushes an ask off the glass.
 #[test]
 fn an_ask_keeps_its_row_over_the_reserved_progress() {
     let now = Instant::now();
@@ -272,7 +257,6 @@ fn an_ask_keeps_its_row_over_the_reserved_progress() {
         p.rows[1].title.1,
         "Downloading aterm v0.91.0 45% \u{b7} 2 more \u{203a}"
     );
-    // One more row: the download takes it, ahead of the warning.
     c.commit_rows(now + ms(5), 3);
     let p = present(&c, 120);
     assert_eq!(p.rows.len(), 3);
@@ -281,8 +265,6 @@ fn an_ask_keeps_its_row_over_the_reserved_progress() {
     assert_eq!(p.rows[2].title.1, "2 more \u{203a}");
 }
 
-/// A count the row shows sets its fill whatever the reporter sent, a busy row stays a
-/// comet, and a size beside the percent names its total.
 #[test]
 fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     let counted = |fill: Option<u16>, stats: &str| {
@@ -301,8 +283,6 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
         counted(Some(420), "3 of 10 programs \u{b7} ~3 GB"),
         Some(300)
     );
-    // With an amount the fill is finer than the count but kept inside its span: 45 % is
-    // held one permille short of the fourth program's 40 %, 20 % is raised to 30 %.
     let measured = |fill: u16, stats: &str| {
         Meter {
             fill_permille: Some(fill),
@@ -322,7 +302,6 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     assert_eq!(measured(450, "3 of 10 programs"), Some(399));
     assert_eq!(measured(200, "3 of 10 programs"), Some(300));
     assert_eq!(measured(900, "10 of 10 programs"), Some(1000));
-    // Not a whole-number count: the reporter's fill stands.
     assert_eq!(counted(Some(420), "1.2M of 3.4M lines"), Some(420));
     assert_eq!(counted(Some(420), "31 MB / 74 MB"), Some(420));
     assert_eq!(
@@ -330,11 +309,9 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
         Some(420),
         "past its total"
     );
-    // A busy row stays a comet.
     let busy = Meter::busy("3 of 4 tabs").normalized();
     assert_eq!(busy.fill_permille, None);
     assert!(busy.busy);
-    // The painted percent is the count's.
     let now = Instant::now();
     let mut c = MessageCenter::new(MessageLog::empty(), now);
     c.post(
@@ -357,7 +334,6 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
         p.rows[0].stats.as_ref().map(|(_, t)| t.as_str()),
         Some("3 of 4 tabs")
     );
-    // A size beside the percent: part of the job, both figures.
     assert_eq!(
         job_stats("Downloading aterm v0.91.0", "33 MB / 74 MB").as_deref(),
         Some("33 of 74 MB")
@@ -368,9 +344,6 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
     );
 }
 
-/// A cut correction keeps the fix: whole where it fits, else `→ window_padding` (a bare key
-/// under `Misspelled setting` would read as the typo); never the typo or a clipped key, and
-/// nothing where the arrow and fix do not fit.
 #[test]
 fn a_cut_correction_keeps_the_fix_never_the_typo() {
     use crate::text::shape_detail;
@@ -382,8 +355,6 @@ fn a_cut_correction_keeps_the_fix_never_the_typo() {
     assert!(!shape_detail(excerpt, 10).contains("windw"));
 }
 
-/// Across a seamless handoff a retrospective row keeps its rank, and a measured fill
-/// keeps its value though the carry ships no amount (no backward snap to the count).
 #[test]
 fn a_carried_row_keeps_its_rank_and_its_measured_fill() {
     let now = Instant::now();

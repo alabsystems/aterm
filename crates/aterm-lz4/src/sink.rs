@@ -7,7 +7,7 @@
 use crate::fastcpy::slice_copy;
 
 pub trait Sink {
-    /// read byte at position
+    /// Read the byte at `pos`.
     fn byte_at(&mut self, pos: usize) -> u8;
 
     /// Pushes a byte to the end of the Sink.
@@ -26,8 +26,7 @@ pub trait Sink {
 
     fn extend_from_slice_wild(&mut self, data: &[u8], copy_len: usize);
 
-    /// Copies `wild_len` bytes from `start` to the end of the Sink and
-    /// advances by `copy_len`.
+    /// Copies `wild_len` bytes from `start` to the end of the Sink and advances by `copy_len`.
     /// # Panics
     /// Panics if `start` >= `pos`.
     fn extend_from_within(&mut self, start: usize, wild_len: usize, copy_len: usize);
@@ -35,9 +34,7 @@ pub trait Sink {
     fn extend_from_within_overlapping(&mut self, start: usize, num_bytes: usize);
 }
 
-/// A `Sink` over a preallocated `&mut [u8]`.
-///
-/// Extend methods panic when capacity runs out.
+/// A `Sink` over a preallocated `&mut [u8]` whose extend methods panic when capacity runs out.
 pub struct SliceSink<'a> {
     output: &'a mut [u8],
     /// Bytes written so far.
@@ -45,14 +42,12 @@ pub struct SliceSink<'a> {
 }
 
 impl<'a> SliceSink<'a> {
-    /// Creates a `Sink` backed by the given byte slice.
-    /// `pos` defines the initial output position in the Sink.
+    /// Creates a `Sink` backed by `output` at initial position `pos`.
     /// # Panics
     /// Panics if `pos` is out of bounds.
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)] // documented '# Panics if pos is out of bounds' constructor contract
     pub fn new(output: &'a mut [u8], pos: usize) -> Self {
-        // SAFETY: the caller has written `output[..pos]`.
         let _ = &mut output[..pos]; // bounds check pos
         SliceSink { output, pos }
     }
@@ -98,9 +93,6 @@ impl Sink for SliceSink<'_> {
     #[inline]
     #[cfg_attr(trust_verify, trust::skip)] // documented Sink contract: extend methods panic on insufficient capacity
     fn extend_from_slice_wild(&mut self, data: &[u8], copy_len: usize) {
-        // Caller contract: `copy_len <= data.len()`. No assert here: an
-        // assert! in a trust::skip'd trait-impl method leaks to every caller
-        // as an obligation the verifier cannot bind.
         slice_copy(data, &mut self.output[self.pos..(self.pos) + data.len()]);
         self.pos += copy_len;
     }

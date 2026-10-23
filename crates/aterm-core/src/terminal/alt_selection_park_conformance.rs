@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `AltSelectionPark`
-//! (`aterm_models_misc::alt_selection_park_model`): the alt-screen selection park,
-//! driven on the real [`Terminal`].
-//!
-//! Selections go through [`Terminal::text_selection_mut`] as a host's drag does;
-//! screen switches are real `?1049h` / `?1049l` bytes; each destroyer is driven from
-//! both screens: [`Terminal::clear_scrollback`] and a width [`Terminal::resize`]
-//! (`Wholesale`), [`Terminal::reset`], RIS alone and RIS then `?1049h` in one batch
-//! (`Reset`, the last as `Reset` then `Enter`), and [`Terminal::restore_checkpoint`]
-//! of a main- and an alt-screen checkpoint (`RestoreMain` / `RestoreAlt`).
-//!
-//! The projection reads `on_alt` ([`Terminal::is_alternate_screen`]), the live
-//! selection and the private parked slot (hence in-crate); `last_event` is the kind
-//! of step just driven. The walk replays a real trace to every reachable state,
-//! drives every enabled step, and requires the model's successor; the negative
-//! control injects each `Buggy = 1` member and requires rejection at its action.
-//!
-//! RIS is driven twice because RIS alone on the alt screen returns to main through
-//! the ordinary restore, which empties the parked slot anyway; RIS then a re-entry
-//! in one batch is the shape where only the RIS clear (`processing.rs`) empties it.
+//! Tier-1 conformance tests for `AltSelectionPark` against [`Terminal`].
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -72,9 +53,6 @@ impl Step {
         Self::RestoreAlt,
     ];
 
-    /// The model actions this real step is, in order. Every step is one action
-    /// except RIS then a re-entry in the same batch: that is `Reset` then
-    /// `Enter` with no `post_process` between them.
     const fn actions(self) -> &'static [&'static str] {
         match self {
             Self::Select => &["Select"],
@@ -89,7 +67,6 @@ impl Step {
         }
     }
 
-    /// The model's `last_event` code for the last action of this step.
     const fn last_event(self) -> i64 {
         match self {
             Self::Select | Self::Deselect => 0,
@@ -111,8 +88,6 @@ impl Step {
     }
 }
 
-/// A main screen with history under it, so the width resize has something to
-/// rewrap and `clear_scrollback` has something to erase.
 fn fixture() -> Terminal {
     let mut term = Terminal::new(ROWS, COLS);
     for i in 0..40 {
@@ -121,8 +96,6 @@ fn fixture() -> Terminal {
     term
 }
 
-/// The two sessions a restore can adopt: one on the main screen, one on the
-/// alternate screen.
 struct Checkpoints {
     main: TerminalCheckpoint,
     alt: TerminalCheckpoint,
@@ -139,8 +112,6 @@ impl Checkpoints {
     }
 }
 
-/// Drive one real step. On main a selection is made in history when there is any;
-/// the alt buffer has none, so there it is a live row.
 fn drive(term: &mut Terminal, step: Step, checkpoints: &Checkpoints) {
     match step {
         Step::Select => {
@@ -170,21 +141,15 @@ fn drive(term: &mut Terminal, step: Step, checkpoints: &Checkpoints) {
     }
 }
 
-/// Both slots as they stood before a step — what a mutant needs to undo.
 struct Before {
     live: TextSelection,
     parked: TextSelection,
 }
 
-/// A fault injected after the real step, or none.
 type Patch = fn(&mut Terminal, Step, Before);
 
-/// The healthy code, untouched.
 fn no_patch(_: &mut Terminal, _: Step, _: Before) {}
 
-/// The model's first `Buggy = 1` member as its net effect on the real terminal: a
-/// symmetric swap, handing the parked selection to the live slot on entry and the
-/// alt screen's own selection to the parked slot on exit.
 fn swap_patch(term: &mut Terminal, step: Step, before: Before) {
     match step {
         Step::Enter => term.text_selection = before.parked,
@@ -193,9 +158,6 @@ fn swap_patch(term: &mut Terminal, step: Step, before: Before) {
     }
 }
 
-/// The second member: a destroyer of shape `shape` that forgets the parked
-/// slot. One patch per shape, so each is rejected at its own action rather than
-/// at whichever destroyer the walk happens to reach first.
 fn forget_parked(term: &mut Terminal, step: Step, before: Before, shape: Shape) {
     if step.shape() == Some(shape) {
         term.parked_text_selection = before.parked;
@@ -243,7 +205,6 @@ fn project(term: &Terminal, last_event: i64) -> State {
     ])
 }
 
-/// Every state `model` can reach from `state` by firing `actions` in order.
 fn successors(model: &Model, state: &State, actions: &[&str]) -> Vec<State> {
     let mut states = vec![state.clone()];
     for action in actions {
@@ -255,19 +216,13 @@ fn successors(model: &Model, state: &State, actions: &[&str]) -> Vec<State> {
     states
 }
 
-/// What the walk covered, so a pass can be checked for non-vacuity.
 struct Coverage {
     states: usize,
     edges: usize,
     actions: BTreeSet<&'static str>,
-    /// Destroyers driven from a state with a selection parked — the only place
-    /// the forgetful member can show.
     destroyers_over_a_park: BTreeSet<&'static str>,
 }
 
-/// Walk `model`'s whole reachable space on the real terminal, with `patch`
-/// injected after every step. `Err` names the first real transition the model
-/// does not admit.
 fn walk(model: &Model, patch: Patch) -> Result<Coverage, String> {
     let checkpoints = Checkpoints::new();
     let init = model.init_state();
@@ -296,8 +251,6 @@ fn walk(model: &Model, patch: Patch) -> Result<Coverage, String> {
             let mut term = replay(&path, patch, &checkpoints);
             apply(&mut term, step, patch, &checkpoints);
             let after = project(&term, step.last_event());
-            // A one-action step must be admitted as that action, not merely land
-            // on a state some other action produces.
             let admitted = match actions {
                 [action] => admits(model, &state, &after) == Some(*action),
                 _ => true,
@@ -310,8 +263,6 @@ fn walk(model: &Model, patch: Patch) -> Result<Coverage, String> {
                     actions.join(" then ")
                 ));
             }
-            // No separate invariant check: every real state is a state the
-            // model reaches, and `bmc` proves the invariants over all of those.
             coverage.edges += 1;
             coverage.actions.extend(actions.iter().copied());
             if step.shape().is_some() && state["parked_sel"] == 1 {
@@ -357,15 +308,6 @@ fn the_real_park_conforms_to_the_model_over_its_whole_reachable_space() {
     );
 }
 
-/// Negative control: the same walk with each `Buggy = 1` member injected after the
-/// real step it corrupts is rejected by the healthy model at that member's own
-/// action, and the shipped park is rejected by the buggy model, so the bind tells
-/// the two apart in both directions.
-///
-/// The forgetful destroyer is visible only because the projection reads the parked
-/// slot: from outside it would pass, as `clear_scrollback`'s erase also records
-/// `SelectionDamage::All` on the parked grid and the exit batch retires the stale
-/// selection right after the restore.
 #[test]
 fn the_swap_and_each_forgetful_destroyer_are_rejected() {
     let healthy = alt_selection_park_model();

@@ -845,7 +845,7 @@ impl ConptyShell {
         let mut env_add = env_add.to_vec();
         env_add.extend(world.env());
         let cwd = world.root.path().to_str().expect("UTF-8 fixture cwd");
-        // SAFETY: A test process is its own trusted launcher.
+        // SAFETY: a test process is its own trusted launcher; the caps reach only this spawn.
         let authority = unsafe { aterm_cap::Authority::root_authority() };
         let shell = aterm_pty::spawn_shell_with_pid(
             50,

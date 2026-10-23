@@ -294,7 +294,8 @@ fn exit_readable(pid: u32) -> Option<ExitReadable> {
         fn syscall(number: core::ffi::c_long, ...) -> core::ffi::c_long;
     }
     let pid = i32::try_from(pid).ok().filter(|p| *p > 1)?;
-    // SAFETY: `pidfd_open` takes a pid and a flags word, and returns a new descriptor or -1.
+    // SAFETY: `pidfd_open` takes a pid and a flags word, and returns a new
+    // descriptor or -1; nothing is borrowed.
     let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid, 0u32) };
     let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
     // SAFETY: `fd` is a fresh descriptor this process exclusively owns.

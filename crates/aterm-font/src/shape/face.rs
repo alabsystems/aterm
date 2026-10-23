@@ -6,10 +6,7 @@
 // and modified by the aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The face the shaper reads: an [`crate::Face`] (with its variation
-//! instance already set), the `cmap` subtable upstream prefers, and the
-//! `GSUB` lookups, all parsed the first time a shape reaches one, within one
-//! budget for the face ([`LayoutWork`]).
+//! Font face wrapper for shaping with cached `cmap` and `GSUB` lookups.
 
 use std::cell::OnceCell;
 
@@ -30,16 +27,14 @@ const UNICODE_2_0_BMP_ENCODING: u16 = 3;
 const UNICODE_2_0_FULL_ENCODING: u16 = 4;
 const UNICODE_FULL_ENCODING: u16 = 6;
 
-/// lookup_props: the lookup flags in the low 16 bits and, when the lookup
-/// uses one, the mark filtering set in the high 16.
+/// Lookup property flags in the low 16 bits and mark filtering set in the high 16 bits.
 pub(crate) mod lookup_flags {
     pub(crate) const IGNORE_FLAGS: u16 = 0x000E;
     pub(crate) const USE_MARK_FILTERING_SET: u16 = 0x0010;
     pub(crate) const MARK_ATTACHMENT_TYPE_MASK: u16 = 0xFF00;
 }
 
-/// One `GSUB` lookup, parsed: its subtables, their coverage digest, whether
-/// it runs backwards (every subtable is a reverse chain), and its props.
+/// Parsed `GSUB` lookup with subtables, coverage digest, direction, and properties.
 pub(crate) struct SubstLookup<'a> {
     pub(crate) subtables: Vec<SubstitutionSubtable<'a>>,
     pub(crate) digest: Digest,
@@ -47,9 +42,7 @@ pub(crate) struct SubstLookup<'a> {
     pub(crate) props: u32,
 }
 
-/// A face set up for shaping. Building one parses nothing but the `cmap`
-/// directory; the `GSUB` lookups are parsed together when a shape first
-/// reaches one.
+/// A font face prepared for shaping, with `GSUB` lookups parsed lazily on first use.
 pub struct ShapeFace<'a> {
     pub(crate) face: Face<'a>,
     cmap_subtable: Option<u16>,
@@ -91,19 +84,12 @@ impl<'a> ShapeFace<'a> {
         self.face.tables().gsub.as_ref()
     }
 
-    /// Lookup `index`; `None` when it does not parse, and for every lookup
-    /// when the face's `GSUB` is refused.
+    /// Returns parsed `GSUB` lookup `index`, or `None` if unparseable or refused.
     #[inline]
     pub(crate) fn gsub_lookup(&self, index: LookupIndex) -> Option<&SubstLookup<'a>> {
         self.gsub_lookups()?.get(usize::from(index))?.as_ref()
     }
 
-    /// Every `GSUB` lookup, parsed on the first call, the lookups no feature
-    /// names (reached only through a nested lookup) included. So the budget
-    /// refuses a table before any of it applies, and every shape of the face
-    /// reads the same lookups: parsing only what a plan names would leave a
-    /// nested lookup to run past the budget mid-shape, after the lookups
-    /// before it had applied. Each lookup is parsed once: one traversal.
     fn gsub_lookups(&self) -> Option<&[Option<SubstLookup<'a>>]> {
         self.lookups
             .get_or_init(|| {
@@ -142,8 +128,6 @@ impl<'a> ShapeFace<'a> {
         match subtable.glyph_index(c) {
             Some(gid) => Some(gid),
             None => {
-                // A Windows symbol font duplicates U+F000..F0FF at
-                // U+0000..00FF, as Windows does.
                 if subtable.platform_id == PlatformId::Windows
                     && subtable.encoding_id == WINDOWS_SYMBOL_ENCODING
                     && c <= 0x00FF
@@ -218,8 +202,6 @@ impl<'a> ShapeFace<'a> {
 }
 
 impl<'a> SubstLookup<'a> {
-    /// The lookup's subtables and their digest, each subtable and coverage
-    /// entry spending one unit of `work`; `None` when it runs out.
     fn parse(lookup: crate::opentype_layout::Lookup<'a>, work: &LayoutWork) -> Option<Self> {
         let mut subtables: Vec<SubstitutionSubtable<'a>> = Vec::new();
         let mut digest = Digest::new();
@@ -268,8 +250,6 @@ fn collect_coverage(coverage: &Coverage<'_>, digest: &mut Digest) {
 }
 
 fn find_best_cmap_subtable(face: &Face) -> Option<u16> {
-    // A symbol subtable first (harfbuzz#1918), then the 32-bit subtables,
-    // the 16-bit ones, and MacRoman last.
     find_cmap_subtable(face, PlatformId::Windows, WINDOWS_SYMBOL_ENCODING)
         .or_else(|| find_cmap_subtable(face, PlatformId::Windows, WINDOWS_UNICODE_FULL_ENCODING))
         .or_else(|| find_cmap_subtable(face, PlatformId::Unicode, UNICODE_FULL_ENCODING))
@@ -312,7 +292,6 @@ static UNICODE_TO_MACROMAN: [u16; 128] = [
 ];
 
 fn unicode_to_macroman(c: u32) -> u32 {
-    // Upstream truncates the code point to 16 bits before the search.
     let u = c as u16;
     match UNICODE_TO_MACROMAN.iter().position(|&m| m == u) {
         Some(index) => 0x80 + index as u32,

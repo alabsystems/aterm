@@ -5,6 +5,19 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! LOCAL PATCH (aterm): upstream's `ActiveEventLoopExtX11`, `EventLoopExtX11`,
+//! `EventLoopBuilderExtX11` (`with_x11`, `with_any_thread`), the `WindowExtX11` and
+//! `WindowAttributesExtX11` settings (a visual, a screen, override-redirect,
+//! `_NET_WM_WINDOW_TYPE`, a base size, an embedding parent), `MonitorHandleExtX11` and the Xlib
+//! error hooks are gone: no aterm crate called them. The window's `WM_CLASS` and startup token
+//! are set through `platform::wayland::WindowAttributesExtWayland`, whose attributes both
+//! backends read. aterm adds the key event's server time ([`key_event_server_time`]), the newest
+//! press's ([`user_time`]), the window's background ([`WindowAttributesExtX11`],
+//! [`WindowExtX11`]), whether a redraw is the server's ([`redraw_is_exposure`]), the
+//! application's word that a frame is on the window ([`WindowExtX11::x11_frame_presented`]),
+//! which the window manager's resize sync request waits for, and its bell
+//! ([`WindowExtX11::ring_x11_bell`]).
 
 /// The X server timestamp (milliseconds) of the key event currently being dispatched.
 pub fn key_event_server_time() -> Option<u32> {

@@ -25,7 +25,6 @@ use std::fmt::Debug;
 use std::iter;
 use std::path::PathBuf;
 
-/// ///////////////////////////////////////////////////////////////////////.
 #[derive(Copy, Clone, PartialEq, Debug, Deserialize)]
 struct UnitStruct;
 
@@ -113,7 +112,6 @@ impl<'de> Deserialize<'de> for IgnoredAny {
     }
 }
 
-/// ///////////////////////////////////////////////////////////////////////.
 #[track_caller]
 fn test<'de, T>(value: T, tokens: &'de [Token])
 where

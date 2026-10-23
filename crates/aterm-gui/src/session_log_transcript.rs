@@ -104,7 +104,7 @@ impl SessionLog {
     }
 }
 
-/// Which tap's steps a batch carries (module docs).
+/// Which tap's steps a batch carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Source {
     /// Claude Code's transcript, by the footer resolver's tap (plan §2.1).
@@ -406,7 +406,7 @@ enum Item<'a> {
     Count(TxEvent<'static>),
 }
 
-/// The order a batch applies in (module docs): its leading binds and
+/// The order a batch applies in: its leading binds and
 /// latch, then its counts — the steps an overflow dropped were the oldest
 /// after the bind (a bind is never dropped), so the join is desynced
 /// before the newest apply, on the file they are of — then its other
@@ -438,7 +438,9 @@ pub(crate) enum Hold {
     Last,
 }
 
-/// APPLY `source`'s `batch` to `timeline`'s session log (module docs): at most [`CHUNK`] events a hold, the lock released between chunks, the wall judged, the batch's unsaid loss said and the owed wake taken in the last.
+/// APPLY `source`'s `batch` to `timeline`'s session log: at most [`CHUNK`] events a hold, the lock
+/// released between chunks, the wall judged, the batch's unsaid loss said and the owed wake taken
+/// in the last.
 pub(crate) fn apply_batch(
     timeline: &Mutex<SessionTimeline>,
     source: Source,

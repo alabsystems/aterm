@@ -7,8 +7,6 @@ fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-held-{label}-"))
 }
 
-/// The row a real hold writes (full 64-hex `tree_root` digests and the real retry text), so
-/// the pending stub is tested at the length it prints.
 fn real_held_row() -> String {
     crate::state::held_failed(
         "tree_root mismatch: expected \
@@ -19,9 +17,6 @@ fn real_held_row() -> String {
     )
 }
 
-/// A held row (`held: last attempt failed with …; <retry>`) is quoted by `which` as the
-/// reason nothing runs, and said by the pending stub without the `error` arm's "the next
-/// pass installs it" promise and without a bump, which could only repeat the hold.
 #[test]
 fn a_held_row_is_quoted_by_which_and_said_by_the_pending_stub_without_a_promise() {
     let layout = temp_layout("row");
@@ -36,12 +31,10 @@ fn a_held_row_is_quoted_by_which_and_said_by_the_pending_stub_without_a_promise(
         },
         "bootstrap install claude: held".into(),
     );
-    // `which`: a recorded row with no shim is quoted.
     let line = which_line(&layout, "claude", None).unwrap();
     assert_eq!(line, format!("claude → (nothing runs) — {row}"));
     assert!(!line.contains("next pass"), "{line}");
 
-    // The pending stub: the row, verbatim, and nothing promised.
     let mut said: Vec<String> = Vec::new();
     let mut sink = |l: String| said.push(l);
     let mut io = PendingIo {
@@ -51,7 +44,6 @@ fn a_held_row_is_quoted_by_which_and_said_by_the_pending_stub_without_a_promise(
     };
     assert_eq!(pending_state(&layout, "claude", &mut io), PendingNext::Done);
     let all = said.join("\n");
-    // The last line is the hold (the program's introduction comes first).
     assert!(
         said.last().is_some_and(|l| l.contains(row.as_str())),
         "a real row fits both caps: the failure, digests whole, and the retry whole: {said:?}"
@@ -71,8 +63,6 @@ fn a_held_row_is_quoted_by_which_and_said_by_the_pending_stub_without_a_promise(
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// The stub caps the failure and never the retry: a failure longer than its cap is
-/// elided, and the retry after it still prints whole.
 #[test]
 fn the_held_stub_line_caps_the_failure_and_prints_the_retry_whole() {
     let how = "not downloaded again until a new build is published \u{2014} now: aterm pkg \
@@ -89,7 +79,6 @@ fn the_held_stub_line_caps_the_failure_and_prints_the_retry_whole() {
              Settings ▸ Packages shows details."
         )
     );
-    // A row with no seam at all (not one atpkg writes): the failure half, capped.
     let bare = held_stub_line("claude", &"y".repeat(3 * HELD_WHY_CAP));
     assert!(
         bare.ends_with("y… — Settings ▸ Packages shows details."),
@@ -97,10 +86,6 @@ fn the_held_stub_line_caps_the_failure_and_prints_the_retry_whole() {
     );
 }
 
-/// A member the memo held is the bootstrap lane's skip, not its failure: the canonical row
-/// lands in the record (the pass outcome naming it), with no `error:` head and a
-/// hard-failure count of 0, so the pass exits clean and the window keeps its normal
-/// interval instead of the failure backoff. `doctor` still counts the row as a problem.
 #[test]
 fn a_held_member_is_the_bootstrap_lanes_skip_not_its_failure() {
     let layout = temp_layout("skip");
@@ -134,8 +119,6 @@ fn a_held_member_is_the_bootstrap_lanes_skip_not_its_failure() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `update --retry` forgets the digest-refusal memos — the named program's, or every
-/// program's — and counts them; the one-operand gate counts the flag out.
 #[test]
 fn update_retry_forgets_the_memos_and_says_how_many() {
     let layout = temp_layout("retry");
@@ -153,7 +136,6 @@ fn update_retry_forgets_the_memos_and_says_how_many() {
     assert_eq!(crate::store::clear_stage_refusals(&layout, "claude"), 0);
     assert_eq!(crate::store::clear_all_stage_refusals(&layout), 1);
     assert_eq!(crate::store::clear_all_stage_refusals(&layout), 0);
-    // …and the vendor lane's own memo in a vendor-direct program's stamp.
     crate::vendor_direct::ProgramStamp::record_refusal(
         &layout,
         "claude",
@@ -178,8 +160,6 @@ fn update_retry_forgets_the_memos_and_says_how_many() {
         !forget_vendor_refusal(&layout, "ay"),
         "an index program keeps no stamp"
     );
-    // The arity gate counts the flag out, in either position, and still refuses a
-    // second name at the edge, before the store lock.
     let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     assert!(arity_refusal(&argv(&["claude", "--retry"]), "update").is_none());
     assert!(arity_refusal(&argv(&["--retry", "claude"]), "update").is_none());
@@ -191,15 +171,9 @@ fn update_retry_forgets_the_memos_and_says_how_many() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
-/// `update --retry <operand>` admits the name before it forgets anything: an operand that
-/// is not one directory name is refused (exit 2) with nothing forgotten or run, and the
-/// store's clear refuses it too, so a memo outside `store/` (`store/../outside`, or a
-/// drive-relative `C:x` on Windows) survives every door that clears by name.
 #[test]
 fn update_retry_refuses_a_path_before_forgetting_anything() {
     let layout = temp_layout("retry-path");
-    // `store/` exists, so `store/../outside` resolves on Unix too: without the gate the
-    // clear below would reach the memo.
     std::fs::create_dir_all(layout.prefix.join("store")).unwrap();
     let outside = layout.prefix.join("outside");
     std::fs::create_dir_all(&outside).unwrap();
@@ -218,9 +192,6 @@ fn update_retry_refuses_a_path_before_forgetting_anything() {
         );
     }
     assert!(memo.is_file(), "the memo outside the store survives");
-    // A drive-relative operand has no separator, yet on Windows `store.join("C:")` is `C:`
-    // (drive C's current directory), so it is refused there; on Unix it is a name inside
-    // the store.
     let store = layout.prefix.join("store");
     for drive in ["C:", "C:x", "C:.."] {
         let escapes = !store.join(drive).starts_with(&store);

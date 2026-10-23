@@ -13,9 +13,6 @@ use aterm_render::{GlowQuad, InkCell, RenderInput, WordDecoration};
 const ROWS: usize = 8;
 const COLS: usize = 48;
 
-/// How many allocations `f` makes on this thread, and the first sizes: the
-/// suite's per-thread counter (`alloc_count`), so the warm-path gate is
-/// deterministic beside every other test of `effects_suite`.
 fn allocations_during(f: impl FnOnce()) -> (usize, [usize; crate::alloc_count::SIZE_SLOTS]) {
     let ((), count, sizes) = crate::alloc_count::allocations_during(f);
     (count, sizes)
@@ -101,14 +98,12 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
     let lexicon = Lexicon::with_languages(&["en"]);
     let cfg = DecoConfig {
         profanity_style: ProfanityStyle::Rainbow,
-        // Non-vacuity: every genuinely fresh profanity episode must burst.
         supernova_chance: 100,
         ..DecoConfig::default()
     };
     let t0 = Instant::now();
     let mut engine = WordDecorations::default();
 
-    // The original profanity occupies row 1, columns 4..=7.
     let original = snapshot(&[(1, "old fuck remains visible")]);
     rescan(&mut engine, &lexicon, &cfg, &original, 1, t0);
     let born = tick(&mut engine, &cfg, t0);
@@ -117,14 +112,10 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "positive control: first occurrence bursts"
     );
 
-    // Past the 2400 ms supernova (`SUPER_TOTAL_MS`).
     let settled_at = t0 + Duration::from_millis(3000);
     let settled = tick(&mut engine, &cfg, settled_at);
     assert!(settled.nova.is_empty(), "the original burst is fully spent");
 
-    // A Codex-style full-row redraw at the same width moves the old sentence down one row and
-    // right one column while the composer shows the nonmatching word `fix`: one logical
-    // episode.
     let redrawn = snapshot(&[(2, " old fuck remains visible"), (5, "fix")]);
     let moved_at = t0 + Duration::from_millis(3100);
     rescan(&mut engine, &lexicon, &cfg, &redrawn, 2, moved_at);
@@ -144,8 +135,6 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "the visible `fix` row owns no word-reaction decoration"
     );
 
-    // Warm both directions of the transfer, then measure a same-row scan and a rekey scan over
-    // the same two rows: with every scanner and identity buffer resident, neither allocates.
     let redraw_back = snapshot(&[(1, "old fuck remains visible"), (5, "fix")]);
     rescan(
         &mut engine,
@@ -200,8 +189,6 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "same-width warm rekey rescan must be allocation-free; sizes={allocation_sizes:?}"
     );
 
-    // Exact lexical negative control: with no profanity elsewhere, `fix` is the
-    // byte-identical off path through the public API.
     let mut fix_only = WordDecorations::default();
     let fix = snapshot(&[(5, "fix")]);
     rescan(&mut fix_only, &lexicon, &cfg, &fix, 1, t0);
@@ -209,7 +196,6 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
     assert_eq!(no_match.fp, 0);
     assert!(no_match.decorations.is_empty() && no_match.ink.is_empty() && no_match.nova.is_empty());
 
-    // A distinct profanity in a different sentence is not the moved episode, so it still bursts.
     let with_new_occurrence = snapshot(&[
         (2, " old fuck remains visible"),
         (5, "fix"),
@@ -230,9 +216,6 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "positive control: a genuinely new occurrence still bursts"
     );
 
-    // Neighbour churn: every ±4 context voter changes, the profanity moves down one row and
-    // eight columns, and `fix` appears on that row. Re-arming the old profanity as a fresh
-    // episode would look as though `fix` caused the flash.
     let mut churn_engine = WordDecorations::default();
     let before_churn = snapshot(&[(1, "one two three fuck four five six")]);
     rescan(&mut churn_engine, &lexicon, &cfg, &before_churn, 1, t0);
@@ -264,9 +247,6 @@ fn spent_profanity_horizontal_redraw_does_not_rearm_or_decorate_fix() {
         "only the exact `fuck` surface owns ink; the nearby `fix` owns none"
     );
 
-    // Fixed-width soft-wrap witness: reading-order distance is small even
-    // though Manhattan distance is large (high column -> next row low column),
-    // and the row-local context is deliberately unrelated.
     let mut wrap_engine = WordDecorations::default();
     let before_wrap = snapshot(&[(1, "                                        fuck old")]);
     rescan(&mut wrap_engine, &lexicon, &cfg, &before_wrap, 1, t0);

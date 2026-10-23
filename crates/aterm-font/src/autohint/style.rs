@@ -53,8 +53,6 @@ impl GlyphStyle {
     }
 
     fn maybe_assign(&mut self, other: Self) {
-        // Note that we keep the extra bits because FreeType allows
-        // setting the NON_BASE bit to an already mapped style.
         if other.0 & Self::STYLE_INDEX_MASK <= self.0 & Self::STYLE_INDEX_MASK {
             self.0 = (self.0 & !Self::STYLE_INDEX_MASK) | other.0;
         }
@@ -68,8 +66,7 @@ impl GlyphStyle {
         self.0 &= !Self::FROM_GSUB_OUTPUT;
     }
 
-    /// Assign a style if we've been marked as GSUB output _and_
-    /// we don't currently have an assigned style.
+    /// Assigns `style` if marked as GSUB output and currently unassigned.
     pub(super) fn maybe_assign_gsub_output_style(&mut self, style: &StyleClass) -> bool {
         let style_ix = style.index as u16;
         if self.0 & Self::FROM_GSUB_OUTPUT != 0 && self.is_unassigned() {
@@ -88,7 +85,6 @@ impl Default for GlyphStyle {
     }
 }
 
-/// Sentinel for unused styles in [`GlyphStyleMap::metrics_map`].
 const UNMAPPED_STYLE: u8 = 0xFF;
 
 /// Maps glyph identifiers to glyph styles.
@@ -237,8 +233,7 @@ impl Default for GlyphStyleMap {
     }
 }
 
-/// Determines which algorithms the autohinter will use while generating
-/// metrics and processing a glyph outline.
+/// Selects the autohinting algorithm used for metrics and glyph outlines.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub enum ScriptGroup {
     /// All scripts that are not CJK or Indic.

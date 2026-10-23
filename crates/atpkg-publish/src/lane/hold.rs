@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The coherence hold: a coherence group moves all-or-nothing, so when one member is not
-//! ready for a target, the others are packed and staged but not pinned (Apple) or not
-//! signed (Linux) for that target. A partial tuple aborts the whole group on every client
-//! of that target, where no rows at all is a clean skip.
-//!
-//! The Apple lane holds a group as a whole (the `rustc` group ships aarch64 only); the
-//! Linux lane per (group, target), so a group complete on one architecture keeps
-//! publishing it while the other waits.
+//! Coherence group holds across Apple whole-group and Linux per-target publish lanes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,7 +22,7 @@ impl Holds {
         Self::default()
     }
 
-    /// `member` of `group` is not ready for `scope`: the group holds there.
+    /// `member` of `group` is not ready for `scope`.
     pub fn not_ready(&mut self, group: &str, scope: Scope, member: &str) {
         self.0
             .entry((group.to_string(), scope))
@@ -37,8 +30,7 @@ impl Holds {
             .insert(member.to_string());
     }
 
-    /// The members holding `group` at `scope`, if it is held there (a whole-group hold
-    /// holds every target too).
+    /// The members holding `group` at `scope`.
     #[must_use]
     pub fn holding(&self, group: &str, scope: Scope) -> Option<BTreeSet<String>> {
         let mut out = BTreeSet::new();
@@ -66,8 +58,7 @@ impl Holds {
     }
 }
 
-/// The holds the members' readiness puts on their groups, from `(group, member, scope,
-/// ready)` tuples.
+/// The holds the members' readiness puts on their groups.
 #[must_use]
 pub fn of_members<'a>(members: impl IntoIterator<Item = (&'a str, &'a str, Scope, bool)>) -> Holds {
     let mut holds = Holds::new();
@@ -79,14 +70,10 @@ pub fn of_members<'a>(members: impl IntoIterator<Item = (&'a str, &'a str, Scope
     holds
 }
 
-/// Every pinned program's coherence group as clients enforce it: the verified head's
-/// `coherence_group`, else the [`crate::programs::PROGRAMS`] table's (a fallback that can
-/// only make a hold stricter). A head and table naming different groups refuse the run: a
-/// hold computed on the wrong group could pin or sign a partial tuple.
-///
+/// Every pinned program's coherence group as clients enforce it: the head's `coherence_group`,
+/// else [`crate::programs::PROGRAMS`]'s.
 /// # Errors
-///
-/// The divergence, naming both groups.
+/// When the head and the table name different groups.
 pub fn groups_of<'a>(
     head: &atpkg::Index,
     pinned: impl IntoIterator<Item = &'a str>,

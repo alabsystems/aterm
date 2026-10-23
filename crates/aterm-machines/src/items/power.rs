@@ -243,7 +243,6 @@ fn render(kind: Kind, value: u64) -> String {
     }
 }
 
-/// One setting of one profile.
 struct Power {
     source: Source,
     setting: &'static Setting,
@@ -261,7 +260,6 @@ impl Power {
         ])
     }
 
-    /// The profile's current value, or the probe that ends here (not applicable, unusable).
     fn read(&self, sys: &dyn System) -> Result<u64, Probe> {
         let cmd = Cmd::new(PMSET).args(["-g", "custom"]);
         let text = tool_out(sys, &cmd)?;
@@ -306,7 +304,6 @@ impl Power {
     }
 }
 
-/// `cmd`'s standard output when it exited 0, else the probe that says why not.
 fn tool_out(sys: &dyn System, cmd: &Cmd) -> Result<String, Probe> {
     match sys.run(cmd) {
         Ok(r) if r.success() => Ok(r.out()),
@@ -392,7 +389,6 @@ mod tests {
         }
     }
 
-    /// `pmset -g custom` in the desktop-form macOS 27.0 VM.
     const VM_CUSTOM: &str = "AC Power:
  Sleep On Power Button 1
  standby              0
@@ -404,7 +400,6 @@ mod tests {
  disksleep            0
 ";
 
-    /// `pmset -g cap` in the VM.
     const VM_CAP: &str = "Capabilities for AC Power:
  displaysleep
  disksleep
@@ -415,7 +410,6 @@ mod tests {
  tcpkeepalive
 ";
 
-    /// `pmset -g custom` on an Apple silicon MacBook Pro (Mac17,4, macOS 27.0.1), read-only.
     const LAPTOP_CUSTOM: &str = "Battery Power:
  Sleep On Power Button 1
  lowpowermode         0
@@ -447,7 +441,6 @@ AC Power:
  disksleep            10
 ";
 
-    /// `pmset -g cap` on that MacBook Pro: no autorestart.
     const LAPTOP_CAP: &str = "Capabilities for AC Power:
  displaysleep
  disksleep
@@ -462,7 +455,6 @@ AC Power:
  lowpowermode
 ";
 
-    /// The starter baseline's `[power.ac]` (controller/templates.rs), plus a battery profile.
     fn starter() -> Table {
         Table {
             ac: Some(Profile {
@@ -526,7 +518,6 @@ AC Power:
         assert_eq!(get("power.battery.sleep"), Outcome::NotApplicable);
     }
 
-    /// `text` with `key`'s row in `section` holding `value`, laid out as pmset lays it out.
     fn with_row(text: &str, section: &str, key: &str, value: &str) -> String {
         let mut out = String::new();
         let mut inside = false;
@@ -543,7 +534,6 @@ AC Power:
         out
     }
 
-    /// Apply the starter item `id` on the laptop, whose profile reads `after` once written.
     fn apply_on_laptop(
         id: &str,
         write: &str,

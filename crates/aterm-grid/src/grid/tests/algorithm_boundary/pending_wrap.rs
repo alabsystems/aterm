@@ -2,23 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pending wrap conformance tests.
-//!
-//! Which operations clear `pending_wrap` (xterm's `do_wrap`) and which keep it.
-//! Per xterm (`util.c` / `charproc.c`) these clear it: ICH/DCH, IL/DL once their
-//! margin tests pass, ECH, ED 0/1/2 and EL 0/1/2, the selective DECSEL/DECSED
-//! erases (unless every cell of the span is protected, except DECSEL 0 and
-//! DECSED 0 away from the origin, which always clear), DECALN, and CSI ?1049 h.
-//! SU/SD, TAB and CBT, ED 3 and the rectangle ops keep it.
+//! Pending wrap (`do_wrap`) and `wrap_serial` conformance tests.
 
 use super::super::*;
 
-/// A grid with pending_wrap set by writing the last column via
-/// `write_char_wrap` (`write_char` alone does not defer the wrap).
 fn grid_with_pending_wrap(rows: u16, cols: u16) -> Grid {
     let mut grid = Grid::new(rows, cols);
     grid.set_cursor(0, 0);
-    // Fill first row to the last column to trigger pending_wrap.
     for col in 0..cols {
         grid.write_char_wrap((b'A' + (col % 26) as u8) as char);
     }
@@ -30,14 +20,7 @@ fn grid_with_pending_wrap(rows: u16, cols: u16) -> Grid {
     grid
 }
 
-/// Each operation either consumes the parked wrap (xterm `ResetWrap`) or
-/// keeps it. IL/DL reset it only once their margin tests pass: xterm's
-/// `InsertLine`/`DeleteLine` return before `ResetWrap` when the cursor row is
-/// outside the scroll region or its column outside the DECLRMM margins. SU/SD
-/// keep it (`xtermScroll` saves and restores `do_wrap`, `RevScroll` never
-/// touches it), as do HT and CBT (`TabToNextStop`/`TabToPrevStop`). LF always
-/// resets it (`CursorDown`), moving or scrolling, or the next glyph would
-/// scroll a second time.
+/// IL/DL (within region and margins) and LF consume `pending_wrap`, while SU/SD, HT, and CBT keep it.
 #[test]
 fn each_operation_keeps_or_consumes_the_parked_wrap() {
     type Op = fn(&mut Grid);
@@ -155,11 +138,7 @@ fn each_operation_keeps_or_consumes_the_parked_wrap() {
     );
 }
 
-// wrap_serial: the emulator wrap fact
-
-/// `wrap_serial` bumps once per resolved autowrap and never on a hard newline:
-/// a parked `pending_wrap` is not yet a wrap, the resolving glyph is one wrap,
-/// and CR+LF stays invisible to it.
+/// `wrap_serial` increments once per resolved autowrap and ignores hard newlines.
 #[test]
 fn wrap_serial_counts_resolved_wraps_and_ignores_hard_newlines() {
     let mut grid = grid_with_pending_wrap(3, 5);
@@ -169,22 +148,17 @@ fn wrap_serial_counts_resolved_wraps_and_ignores_hard_newlines() {
         "a parked deferred wrap is not yet a wrap"
     );
 
-    // The next printable resolves the deferred wrap: exactly one bump.
     grid.write_char_wrap('f');
     assert_eq!(grid.wrap_serial(), 1, "one wrapped line, one bump");
     assert_eq!(grid.cursor_row(), 1, "the resolve advanced the line");
 
-    // Ordinary typing inside the line never bumps.
     grid.write_char_wrap('g');
     assert_eq!(grid.wrap_serial(), 1, "mid-line typing is not a wrap");
 
-    // A hard newline (CR + LF) moves the caret the same way on glass but
-    // must stay invisible to the wrap fact.
     grid.carriage_return();
     grid.line_feed();
     assert_eq!(grid.wrap_serial(), 1, "a hard newline is not a wrap");
 
-    // A second full line resolves a second wrap: exactly one more bump.
     for col in 0..5 {
         grid.write_char_wrap((b'A' + col as u8) as char);
     }

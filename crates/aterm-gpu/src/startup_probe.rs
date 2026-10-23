@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cold-build sub-phase timing: the breakdown of the frontend's `backend_finalize` startup
-//! phase, which is one `handle.join()` on the backend-build worker. These legs record the split
-//! where the work happens; `aterm-gui` folds them into its startup ledger.
-//!
-//! * Slots are `u64` nanosecond durations; the wire converts to ms.
-//! * First write wins: a later rebuild (GPU loss recovery, a second renderer in a test) never
-//!   overwrites the cold build; [`record`] admits a leg only while its slot is zero.
-//! * Zero means unset: a sub-ns leg records as 1 ns; a leg that never ran (the CPU fallback)
-//!   reads 0, making the frontend's `startup_gpu_valid` false.
-//! * Durations, not stamps: the legs run on two threads with no shared epoch.
-//! * Published in build order: [`record`] stores with Release and [`leg_ns`] loads with Acquire,
-//!   and [`Leg::PipeTotal`] is the last leg a build records (the font thread is joined before
-//!   it), so a reader that loads it first and finds it set reads every leg and cell-pipeline
-//!   split of that build. A reader on another thread racing a build in flight finds it unset,
-//!   never half a build.
-//!
-//! Cost: one `Instant::now()` pair and one release compare-exchange per leg, off the frame path.
+//! Cold-build sub-phase timing for the `backend_finalize` startup phase.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,10 +9,7 @@ use aterm_time::Duration;
 #[cfg(wgpu_arm)]
 use aterm_time::Instant;
 
-/// The exclusive legs of one cold GPU-renderer build, in execution order.
-/// [`Leg::FontThread`] runs in parallel on the font thread spawned by
-/// `GpuRenderer::new_with_family` and is not part of the exclusive sum;
-/// [`Leg::FontJoin`] is the wait the GPU leg paid for it.
+/// Exclusive legs of one cold GPU-renderer build, in execution order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Leg {
@@ -40,11 +21,10 @@ pub enum Leg {
     GpuDevice = 2,
     /// Downlevel-capability read, device-lost callback, context assembly.
     GpuContextTail = 3,
-    /// System font discovery, face parse and the ASCII prewarm, on the font thread. Runs in
-    /// parallel with every GPU leg; not in the exclusive sum.
+    /// System font discovery, face parse, and ASCII prewarm on the font thread; runs in
+    /// parallel with the `Gpu*` legs and is not in the exclusive sum.
     FontThread = 4,
-    /// The GPU leg's wait at the font-thread join: the part of
-    /// [`Leg::FontThread`] that did not fit under the GPU legs.
+    /// GPU leg wait time at the font-thread join.
     FontJoin = 5,
     /// The main cell shader module (one WGSL parse/compile submission).
     PipeShader = 6,
@@ -69,13 +49,10 @@ pub enum Leg {
 /// How many slots [`LEG_NS`] carries (`Leg::PipeTotal as usize + 1`; a test pins it).
 pub const LEG_COUNT: usize = 15;
 
-/// Cell render pipelines `build_cell_pipelines` builds and times individually: background fill,
-/// mono glyphs and colour emoji, the only ones a default frame binds. Effect pipelines are built
-/// on demand (`renderer::EffectPipelines`); if this grows, launch pays for them again.
+/// Number of cell render pipelines built and timed during cold startup.
 pub const CELL_PIPELINE_COUNT: usize = 3;
 
-/// Names of the [`CELL_PIPELINE_COUNT`] slots, in build order. Read by the
-/// frontend so the wire can label the split without duplicating the order.
+/// Names of the [`CELL_PIPELINE_COUNT`] slots in build order.
 pub const CELL_PIPELINE_NAMES: [&str; CELL_PIPELINE_COUNT] = ["bg", "glyph", "color_glyph"];
 
 static LEG_NS: [AtomicU64; LEG_COUNT] = [const { AtomicU64::new(0) }; LEG_COUNT];
@@ -89,8 +66,7 @@ fn slot_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1)
 }
 
-/// Record `elapsed` for `leg`, first write wins, publishing every leg recorded before it (see
-/// the module docs).
+/// Records `elapsed` for `leg` (first write wins) with release ordering.
 #[inline]
 pub fn record(leg: Leg, elapsed: Duration) {
     let _ = LEG_NS[leg as usize].compare_exchange(
@@ -110,8 +86,7 @@ pub(crate) fn timed<T>(leg: Leg, build: impl FnOnce() -> T) -> T {
     built
 }
 
-/// Close the cell pipeline at `index` against `since` and return the stamp the next pipeline
-/// closes against (a running split, so the descriptor literals need no closures).
+/// Records the elapsed time since `since` for cell pipeline `index` and returns `Instant::now()`.
 #[cfg(wgpu_arm)]
 pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     let now = Instant::now();
@@ -126,8 +101,7 @@ pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
     now
 }
 
-/// Read one leg; 0 means it never ran in this process. Set, it carries every leg recorded
-/// before it (see the module docs).
+/// Reads the nanosecond duration recorded for `leg` (`0` if unset).
 #[inline]
 pub fn leg_ns(leg: Leg) -> u64 {
     LEG_NS[leg as usize].load(Ordering::Acquire)
@@ -139,12 +113,8 @@ pub fn cell_pipeline_ns() -> [u64; CELL_PIPELINE_COUNT] {
     std::array::from_fn(|index| CELL_PIPELINE_NS[index].load(Ordering::Relaxed))
 }
 
-/// Effect pipelines this process has compiled on demand, and the wall time spent.
-/// Process-global (a fail-soft rebuild can create a second renderer), and accumulating, unlike
-/// the legs.
 static EFFECT_BUILDS: AtomicU64 = AtomicU64::new(0);
 static EFFECT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
-/// Which effect slots were built, as a bitmask over `renderer::EffectPipeline as usize`.
 static EFFECT_BUILT_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Book one demand-built effect pipeline (slot `index`) into the ledger.
@@ -157,8 +127,7 @@ pub(crate) fn record_effect_build(index: usize, elapsed: Duration) {
     }
 }
 
-/// `(count, nanoseconds, slot bitmask)` of demand-built effect pipelines;
-/// `(0, 0, 0)` for a launch with default settings.
+/// Returns `(count, nanoseconds, slot_bitmask)` of demand-built effect pipelines.
 #[inline]
 pub fn effect_build_ledger() -> (u64, u64, u64) {
     (
@@ -172,8 +141,6 @@ pub fn effect_build_ledger() -> (u64, u64, u64) {
 mod tests {
     use super::{Duration, slot_ns};
 
-    /// A recorded leg is never the unset sentinel (0), and an unrepresentable
-    /// duration saturates instead of wrapping.
     #[test]
     fn slot_ns_avoids_the_sentinel_and_saturates() {
         assert_eq!(slot_ns(Duration::ZERO), 1);

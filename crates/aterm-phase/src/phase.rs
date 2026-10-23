@@ -245,7 +245,8 @@ const CARRIED: Busy = Busy {
     soft: true,
 };
 
-/// The WAIT claude code carries (module docs).
+/// The WAIT claude code carries: a `Waiting for N … to finish` row, met as the first glyph row
+/// above the composer's top rule `top`.
 fn carried_wait(rows: &[String], top: usize) -> bool {
     carried_row(rows, top).is_some()
 }

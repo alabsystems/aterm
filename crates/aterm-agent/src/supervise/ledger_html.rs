@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm drive ledger --format html`: one self-contained page with the
-//! summary, swimlanes (manager, watcher, worker, fabric) on a time axis, and
-//! every row as a table.
-//!
-//! No network: style and script are inline, and a `Content-Security-Policy`
-//! of `default-src 'none'` keeps a URL in a worker's words from becoming a
-//! request. Every string from the worker, journal or bus is escaped, as HTML
-//! text ([`html_text`]) and as embedded JSON with `<`, `>` and `&` as `\u`
-//! escapes ([`html_json_str`]), so nothing can close a tag.
+//! Self-contained HTML renderer for `aterm drive ledger --format html`.
 
 use std::fmt::Write as _;
 
@@ -50,7 +42,6 @@ pub fn render_html(l: &Ledger) -> String {
         ))
     );
 
-    // The summary, as tiles.
     out.push_str("<section class=\"tiles\" aria-label=\"summary\">\n");
     for (k, v) in summary_rows(l, &s) {
         let _ = writeln!(
@@ -62,7 +53,6 @@ pub fn render_html(l: &Ledger) -> String {
     }
     out.push_str("</section>\n");
 
-    // What was read.
     out.push_str("<section aria-label=\"sources\">\n<h2>Sources</h2>\n<ul class=\"sources\">\n");
     for src in &l.sources {
         let _ = writeln!(
@@ -75,7 +65,6 @@ pub fn render_html(l: &Ledger) -> String {
     }
     out.push_str("</ul>\n</section>\n");
 
-    // The swimlanes.
     out.push_str(
         "<section aria-label=\"swimlanes\">\n<h2>Swimlanes</h2>\n\
          <div class=\"controls\">\n\
@@ -98,7 +87,6 @@ pub fn render_html(l: &Ledger) -> String {
     }
     out.push_str("</ul>\n</section>\n");
 
-    // Every row.
     out.push_str(
         "<section aria-label=\"timeline\">\n<h2>Timeline</h2>\n<div class=\"scroll\">\n\
          <table>\n<thead><tr><th>time</th><th>lane</th><th>what</th>\
@@ -130,7 +118,6 @@ pub fn render_html(l: &Ledger) -> String {
     }
     out.push_str("</tbody>\n</table>\n</div>\n</section>\n</main>\n");
 
-    // The data the script draws, and the script.
     out.push_str("<script type=\"application/json\" id=\"ledger-data\">\n");
     out.push_str(&data_json(l, &items));
     out.push_str("\n</script>\n<script>\n");
@@ -139,7 +126,6 @@ pub fn render_html(l: &Ledger) -> String {
     out
 }
 
-/// The lanes, top to bottom, and the items on them — one JSON object.
 fn data_json(l: &Ledger, items: &[super::ledger::Item]) -> String {
     let placed: Vec<&super::ledger::Item> = items.iter().filter(|i| i.t.is_some()).collect();
     let t0 = placed.iter().filter_map(|i| i.t).min().unwrap_or(0);
@@ -174,7 +160,6 @@ fn data_json(l: &Ledger, items: &[super::ledger::Item]) -> String {
     out
 }
 
-/// The legend: one row per mark the page draws.
 const LEGEND: &[(&str, &str)] = &[
     ("turn", "manager: a turn typed into the worker"),
     ("reply", "worker: the turn verb, from typing to settled"),
@@ -185,8 +170,6 @@ const LEGEND: &[(&str, &str)] = &[
     ("mail", "fabric: a message to or from the worker"),
 ];
 
-/// The page's style: one hue per lane and a status pair, declared under both
-/// the media query and the theme attribute.
 const STYLE: &str = r#"<style>
 .viz-root {
   color-scheme: light;
@@ -301,8 +284,6 @@ tr.lane-fabric td:nth-child(2) { color: var(--fabric); }
 </style>
 "#;
 
-/// The page's script: draws the lanes from the embedded data. No fetch, no
-/// import, no timer.
 const SCRIPT: &str = r#"(function () {
   var el = document.getElementById("ledger-data");
   var data = JSON.parse(el.textContent);
@@ -439,8 +420,7 @@ const SCRIPT: &str = r#"(function () {
 })();
 "#;
 
-/// Whether `html` is one self-contained file: nothing it would fetch, and a
-/// policy that forbids a fetch. (The SVG namespace is a name, not a request.)
+/// Checks that `html` contains no external fetches and has a strict `Content-Security-Policy`.
 #[cfg(test)]
 pub(super) fn is_self_contained(html: &str) -> Result<(), String> {
     for bad in [

@@ -2,18 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Keys typed at the start of a lit line step one stop a key.
-//!
-//! A shell line typed at 12 cps, Home (stamped `clear_typed`, `note_motion`), then `XYZ ` typed at
-//! the line's start inside the grace, each key an insert the shell answers by reprinting the line
-//! one column on. The shift pass (`Ribbon::shift_run`) re-reads each pushed cell's stop at the
-//! column it moved to and leaves the walk's anchor (`Cohort::anchor_col`) in place: the colour
-//! stays with the screen column (C2) while the light rides the glyph. The keys take the line's
-//! first stops `0, 1/16, 2/16, 3/16`, and the pushed text walks on from `4/16`. Mid-line inserts
-//! are `tests/midline_insert_band.rs` (holes) and `tests/midline_insert_colour_seam.rs` (colour).
-//!
-//! The law is the walk's own: text-adjacent lit cells of one line never repeat a stop or step
-//! backward, and every column lit before the insert keeps its stop. Controls: the same keys typed
-//! at the line's end step forward, and one key at the start steps into the pushed line.
 
 use crate::walk_census::*;
 
@@ -31,8 +19,6 @@ fn stops(s: &Shell) -> Vec<Option<f32>> {
         .collect()
 }
 
-/// The line typed, `keys` typed at its start (after Home) or at its end,
-/// read settled: `(before, after)`.
 fn take(keys: &str, at_start: bool) -> (Shell, Vec<Option<f32>>, Vec<Option<f32>>) {
     let mut s = Shell::new(60, 83, Echo::After(2));
     s.type_str(&prose(LINE_CELLS));
@@ -47,8 +33,6 @@ fn take(keys: &str, at_start: bool) -> (Shell, Vec<Option<f32>>, Vec<Option<f32>
     (s, before, after)
 }
 
-/// The steps between text-adjacent cells `a..b` of `ts` that do not step
-/// forward: `(left index, dt)`.
 fn not_forward(ts: &[Option<f32>], a: usize, b: usize) -> Vec<(usize, f32)> {
     (a..b)
         .filter_map(|i| {
@@ -60,7 +44,6 @@ fn not_forward(ts: &[Option<f32>], a: usize, b: usize) -> Vec<(usize, f32)> {
 
 #[test]
 fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
-    // The control: the same keys at the line's end each step forward.
     let (_, _, after) = take(INSERT, false);
     let n = LINE_CELLS + INSERT.len();
     assert!(
@@ -69,20 +52,17 @@ fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
     );
     let bad = not_forward(&after, LINE_CELLS - 1, n - 1);
     assert!(bad.is_empty(), "the control: typed at the end, {bad:?}");
-    // The control: one key at the start steps into the pushed line.
     let (_, _, after) = take("X", true);
     let bad = not_forward(&after, 0, 1);
     assert!(bad.is_empty(), "the control: one key at the start, {bad:?}");
 
     let (s, before, after) = take(INSERT, true);
     let k = INSERT.len();
-    // The premise: the whole line is lit.
     assert!(
         (0..LINE_CELLS + k).all(|i| after[i].is_some()),
         "the premise: the whole line is lit\n{}",
         s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
     );
-    // The law: the keys step forward.
     let bad = not_forward(&after, 0, k);
     assert!(
         bad.is_empty(),
@@ -91,8 +71,6 @@ fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
         &after[..=k],
         s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
     );
-    // §41: every column lit before the insert keeps its stop (the colour stays with the screen
-    // column while the text slides under it).
     for i in 0..LINE_CELLS {
         let (b, a) = (before[i].expect("lit"), after[i].expect("lit"));
         assert!(
@@ -102,7 +80,6 @@ fn keys_typed_at_the_start_of_a_lit_line_step_one_stop_a_key() {
             s.dump(s.snaps.len() - 1, s.snaps.len() - 1)
         );
     }
-    // The whole phrase (keys, pushed text, text pushed past the old end) walks on.
     let bad = not_forward(&after, 0, LINE_CELLS + k - 1);
     assert!(
         bad.is_empty(),

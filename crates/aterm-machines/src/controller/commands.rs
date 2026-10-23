@@ -4150,13 +4150,7 @@ mod tests {
     fn the_starter_baseline_and_inventory_parse() {
         let b = crate::baseline::parse(templates::DEFAULT_BASELINE).unwrap();
         assert!(b.keyboard.is_some());
-        assert_eq!(
-            b.apps
-                .iter()
-                .map(|app| app.name.as_str())
-                .collect::<Vec<_>>(),
-            ["Emacs", "Caffeine"]
-        );
+        assert!(b.homebrew.is_none() && b.apps.is_empty());
         let inv: Inventory = aterm_toml::from_str(templates::INVENTORY).unwrap();
         assert_eq!(inv.schema, 1);
         assert!(inv.hosts.is_empty());
@@ -6023,16 +6017,38 @@ mod tests {
 
     #[test]
     fn a_starter_baseline_nobody_edited_follows_the_starter_shipped_now() {
-        const REMOVED_ROW: &str = "# gh's installer package carries no installer signature; its binary is checked against\n\
+        const HOMEBREW_AND_APPS: &str = "[homebrew]\n\
+             pkg = { url = \"https://github.com/Homebrew/brew/releases/download/7.0.9/Homebrew.pkg\", \
+             sha256 = \"e021295947a4a9b7ca1a8eff310c9ea1db14d923c5acf7d79e325b60a81f1a15\", \
+             team_id = \"927JGANW46\" }\n\
+             formulae = [\"git\", \"ripgrep\", \"fd\", \"jq\", \"tmux\", \"fzf\", \"wget\", \
+             \"htop\", \"coreutils\", \"git-lfs\"]\ncasks = []\n\n\
+             [[app]]\nname = \"Emacs\"\nkind = \"dmg-app\"\n\
+             url = \"https://emacsformacosx.com/emacs-builds/Emacs-31.1-universal.dmg\"\n\
+             sha256 = \"f0383bcbf0104947d3a46266aae43e3dc9e38fd68eeb35f11ee6b9444277b8ec\"\n\
+             team_id = \"5BRAQAFB8B\"\nbundle = \"Emacs.app\"\nversion = \"31.1\"\n\n\
+             [[app]]\nname = \"Caffeine\"\nkind = \"dmg-app\"\n\
+             url = \"https://github.com/IntelliScape/caffeine/releases/download/1.1.4/Caffeine.dmg\"\n\
+             sha256 = \"1ad34c3299a0c866873c4feb432c3e11186375adb6f43c5f481ae9d46d06d723\"\n\
+             team_id = \"YD6LEYT6WZ\"\nbundle = \"Caffeine.app\"\nversion = \"1.1.4\"\n\n";
+        const GH_ROW: &str = "# gh's installer package carries no installer signature; its binary is checked against\n\
              # GitHub's Team ID instead (design §8).\n[[app]]\nname = \"gh\"\nkind = \"pkg\"\n\
              url = \"https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_macOS_universal.pkg\"\n\
              sha256 = \"1787e65f36626245a6b3cee353a458f6ea4372008548ceb8fb5d5dfb55b006d0\"\n\
              team_id = \"VEKTX9H2N7\"\nunsigned = true\npkg_id = \"com.github.cli\"\n\
              binary = \"/usr/local/bin/gh\"\nversion = \"2.102.0\"\n\n";
+        let pointer = "# Other software is yours to add: a [homebrew] table installs Homebrew and its \
+             formulae,\n# an [[app]] row one signed app (docs/DESIGN-machines-2026-10-16.md §8). For \
+             keeping a Mac\n# awake and editing a file, aterm has its own `aterm caffeine` and \
+             `aterm edit`.\n\n";
+        assert!(templates::DEFAULT_BASELINE.contains(pointer));
+        let previous = templates::DEFAULT_BASELINE.replace(pointer, HOMEBREW_AND_APPS);
+        assert!(
+            templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&previous).as_str()),
+            "the digest is of the starter as a6c1342e82 wrote it"
+        );
         let anchor = "# A per-host GitHub key for each user";
-        let earlier =
-            templates::DEFAULT_BASELINE.replace(anchor, &format!("{REMOVED_ROW}{anchor}"));
-        assert_ne!(earlier, templates::DEFAULT_BASELINE);
+        let earlier = previous.replace(anchor, &format!("{GH_ROW}{anchor}"));
         assert!(
             templates::EARLIER_DEFAULT_BASELINES.contains(&text_sha256(&earlier).as_str()),
             "the digest is of the starter as 326cdca677 wrote it"
@@ -6055,7 +6071,9 @@ mod tests {
         );
         let default = format!("{ROOT}/baselines/default.toml");
         for (on_disk, after) in [
+            (previous.clone(), templates::DEFAULT_BASELINE.to_owned()),
             (earlier.clone(), templates::DEFAULT_BASELINE.to_owned()),
+            (format!("{previous}# mine\n"), format!("{previous}# mine\n")),
             (format!("{earlier}# mine\n"), format!("{earlier}# mine\n")),
             (
                 templates::DEFAULT_BASELINE.to_owned(),

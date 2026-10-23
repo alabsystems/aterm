@@ -3976,7 +3976,9 @@ impl App {
         wake_after(session, REFUSAL_SHOWN);
     }
 
-    /// The keyboard half (see the module header).
+    /// The keyboard half: on macOS `ctrl+shift+tab` selects the next chip (or fact) the rule has
+    /// room for; while one is selected, Return or Space clicks it, and Escape or any other key
+    /// lets go.
     pub(crate) fn on_key_claude_lights(
         &mut self,
         wid: WindowId,
@@ -5208,7 +5210,8 @@ mod gesture_tests {
                 "the PTY observer's socket never hung up (a copy outlived the drop)"
             );
             pfd.revents = 0;
-            // SAFETY: `pfd` is one live, initialized pollfd.
+            // SAFETY: `pfd` is one live, initialized pollfd; poll writes only
+            // its `revents`, and the sink keeps `fd` open for this call.
             unsafe { libc::poll(&mut pfd, 1, 100) };
         }
     }

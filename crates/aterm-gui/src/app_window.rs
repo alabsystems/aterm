@@ -1191,7 +1191,8 @@ impl App {
             }
         }
         if reveal_after_chrome {
-            // reveal site (carried pixels first, never a bg-only frame).
+            // Handoff boots stay hidden here: the first successful present reveals them,
+            // or the 1.5 s `pending_reveal` deadline when none has landed by then.
             if !defer_reveal && early_reveal_size.is_none() {
                 window.set_visible(true);
                 crate::metrics::mark_first_window_visible();
@@ -1878,6 +1879,8 @@ impl App {
             CloseConfirm::Programmatic => return true,
             CloseConfirm::WireRefuseBusy => {
                 if busy {
+                    // Every consumer of this channel clears it before its own action
+                    // (`apply_tab_cmd_in`, `invoke_menu_action_by_name`), so this
                     // refusal is never reported against a later `tab` or `invoke`.
                     self.pending_action_refusal = Some(WIRE_CLOSE_REFUSED.to_string());
                 }
@@ -1886,7 +1889,9 @@ impl App {
             CloseConfirm::Interactive => {}
         }
         let Some(prompt) = self.destructive_prompt(wid, exits_app, busy, replay) else {
-            // is busy; Windows: also a single idle tab): the close needs no confirm.
+            // Nothing worth interrupting for (macOS and Linux: app keeps running and nothing is
+            // busy; Windows: nothing is busy and at most one tab closes): the close needs no
+            // confirm.
             return true;
         };
         if cfg!(windows) {
@@ -1994,6 +1999,7 @@ impl App {
             return;
         };
         if w.is_minimized() == Some(true) {
+            // `focus_window` no-ops on a minimized window and the restore is
             // asynchronous: the `Occluded(false)` arm finishes the raise.
             if focus {
                 self.pending_deminiaturize_focus = Some(wid);
@@ -2050,6 +2056,7 @@ impl App {
             w.request_redraw();
         }
         if !proceed {
+            // The attribution `present_close_banner` stashed was for a replay that
             // will not run; a later close must not inherit this gesture's name.
             if let Some(ws) = self.windows.get_mut(&pending.wid) {
                 ws.pending_close_attribution = None;
@@ -2506,6 +2513,7 @@ impl App {
             W::ResizeWindowPixels { height, width } => {
                 #[cfg(target_os = "linux")]
                 if let Some(ws) = self.windows.get_mut(&wid) {
+                    // A driven resize owns the geometry from here: the launch
                     // settle must not re-assert the attach grid over it.
                     ws.initial_frame_settle = None;
                 }
@@ -2697,7 +2705,11 @@ pub(crate) mod taskbar {
                 return None;
             }
             self.tried_init = true;
-            // SAFETY: standard COM bring-up.
+            // SAFETY: standard COM bring-up. `CoInitializeEx` is idempotent (S_FALSE
+            // and RPC_E_CHANGED_MODE are non-fatal, so its HRESULT is ignored).
+            // A failed `CoCreateInstance` HRESULT or null pointer is rejected before
+            // use; `HrInit` precedes any progress call, and on failure the object
+            // is released.
             unsafe {
                 let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
                 let mut ppv: *mut c_void = std::ptr::null_mut();
@@ -2889,7 +2901,8 @@ pub(crate) mod placement {
             RawWindowHandle::Win32(h) => h.hwnd.get(),
             _ => return None,
         };
-        // SAFETY: out-params are stack locals of the documented layouts, `length` pre-set.
+        // SAFETY: out-params are stack locals of the documented layouts, `length`
+        // pre-set as `GetWindowPlacement` requires; no pointer outlives the call.
         unsafe {
             let mut wp = WindowPlacement {
                 length: std::mem::size_of::<WindowPlacement>() as u32,

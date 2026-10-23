@@ -5,17 +5,11 @@
 //! Packed color types for 8-byte terminal cells.
 
 /// Foreground and background colours packed into 4 bytes of an 8-byte cell.
-///
-/// ## Colour modes (bits 24-27 for FG, bits 28-31 for BG)
-/// - 0x0: default
-/// - 0x1: indexed (FG index in bits 0-7, BG index in bits 8-15)
-/// - 0x2: RGB (values in the CellExtra overflow, keyed by (row, col))
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
 pub struct PackedColors(pub u32);
 
 impl PackedColors {
-    // Color mode flags (4 bits each for FG and BG)
     const FG_MODE_SHIFT: u32 = 24;
     const BG_MODE_SHIFT: u32 = 28;
     const MODE_MASK: u32 = 0x0F;
@@ -198,9 +192,6 @@ impl PackedColors {
         self.fg_is_default() && self.bg_is_default()
     }
 
-    // Bit 16: the cell has a CellExtras entry, so the renderer skips hash
-    // probes for cells without one.
-
     const HAS_EXTRAS_BIT: u32 = 1 << 16;
 
     /// Check if this cell has a CellExtras entry.
@@ -305,14 +296,12 @@ mod tests {
         Rgb,
     }
 
-    /// Every state a side can be in: default, RGB and all 256 indexes.
     fn every_side() -> impl Iterator<Item = Side> {
         [Side::Default, Side::Rgb]
             .into_iter()
             .chain((0..=255u8).map(Side::Indexed))
     }
 
-    /// Assert one side reads back as `want` and as nothing else.
     fn assert_side(
         label: &str,
         (default, indexed, rgb, index): (bool, bool, bool, u8),
@@ -385,9 +374,6 @@ mod tests {
             }
         }
 
-        // Every (fg, bg) state reached by the setters from every kind of start,
-        // in both orders: each setter clears the mode it replaces and leaves the
-        // other side untouched.
         let starts = [
             PackedColors::DEFAULT,
             PackedColors::with_indexed(100, 200),
@@ -423,7 +409,6 @@ mod tests {
 
     #[test]
     fn packed_color_every_mode() {
-        // DEFAULT_FG/BG carry type byte 0xFF (default), never 0x00 (indexed).
         for d in [PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG] {
             assert!(d.is_default(), "{d:?}");
             assert!(!d.is_indexed(), "{d:?}");

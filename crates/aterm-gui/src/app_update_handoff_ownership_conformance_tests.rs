@@ -16,7 +16,6 @@ const TO_DESCRIPTORS_TRANSFERRED: [&str; 4] = [
     "DuplicateDescriptorsToCandidate",
 ];
 
-/// `TO_DESCRIPTORS_TRANSFERRED` plus the proof: the model's `ProofMatched`.
 const TO_PROOF_MATCHED: [&str; 5] = [
     "ParkOutgoingReaders",
     "CaptureCheckpoints",
@@ -25,8 +24,6 @@ const TO_PROOF_MATCHED: [&str; 5] = [
     "MatchAdoptionProof",
 ];
 
-/// Fire a deterministic sequence, checking at every step that the model admits
-/// exactly the named action — never that it admits *something*.
 fn walk(model: &Model, actions: &[&'static str]) -> State {
     let mut state = model.init_state();
     for &action in actions {
@@ -53,7 +50,6 @@ fn assert_every_invariant_holds(model: &Model, state: &State) {
     }
 }
 
-/// Is a state satisfying `goal` reachable from `from`?
 fn reaches(model: &Model, from: &State, goal: impl Fn(&State) -> bool) -> bool {
     let mut seen: std::collections::BTreeSet<State> = std::collections::BTreeSet::new();
     let mut queue: std::collections::VecDeque<State> = std::collections::VecDeque::new();
@@ -92,16 +88,9 @@ fn facts_from_bits(bits: u32) -> HandoffCommitFacts {
     }
 }
 
-/// How many bounded facts the Commit admission reads ([`facts_from_bits`]).
 const FACTS: u32 = 13;
-
-/// Every fact true: the one combination that may Commit.
 const ALL_FACTS: u32 = (1 << FACTS) - 1;
 
-/// The model's `revoked` is "some mutable pre-Commit admission fact turned
-/// false". `parent_still_parked` and `proof_exact` are separate model variables
-/// (`out_readers`, `proof_matched`), since the ownership invariants are about
-/// them.
 fn model_revoked(facts: HandoffCommitFacts) -> bool {
     !(facts.exact_sessions
         && facts.exact_layout
@@ -116,8 +105,6 @@ fn model_revoked(facts: HandoffCommitFacts) -> bool {
         && facts.commit_channel)
 }
 
-/// Projects one fact combination onto the model's pre-Commit state, including states the
-/// healthy model never reaches (a reader resumed mid-attempt).
 fn project_commit_facts(transferred: &State, matched: &State, facts: HandoffCommitFacts) -> State {
     let mut state = if facts.proof_exact {
         matched.clone()
@@ -129,8 +116,6 @@ fn project_commit_facts(transferred: &State, matched: &State, facts: HandoffComm
     state
 }
 
-/// A handed session that ended between capture and Commit refuses the Commit as activity
-/// (`ActivityRevoked`), the same filing the park gives it, never `Physical(Transient)`.
 #[test]
 fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
     use crate::app_native::HandoffFailureLane;
@@ -164,7 +149,6 @@ fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
             );
         }
     }
-    // Negative control: a genuine fault (a mismatched proof) stays on the physical schedule.
     let proof = HandoffCommitFacts {
         proof_exact: false,
         ..all
@@ -172,10 +156,6 @@ fn session_death_before_commit_is_filed_as_the_activity_the_park_files_it_as() {
     assert!(!handoff_rejection_activity_shaped(proof));
 }
 
-/// An agent relaunch owed or settled between the two captures refuses the Commit by its own
-/// name, as activity: the successor would restore a layout without it, and the rollback lets
-/// this process relaunch it. Lossless and repeatable, never a fault against the build, and
-/// never read as the topology changing.
 #[test]
 fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     let all = facts_from_bits(ALL_FACTS);
@@ -186,7 +166,6 @@ fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     assert!(!handoff_commit_admitted(moved));
     assert!(handoff_rejection_activity_shaped(moved));
     let reason = handoff_rejection_reason(moved, &Err(Vec::new()), false, false);
-    // Negative control: never read as the topology changing.
     let topology = HandoffCommitFacts {
         exact_layout: false,
         ..all
@@ -198,8 +177,6 @@ fn an_agent_carry_that_moved_refuses_the_commit_by_its_own_name() {
     );
 }
 
-/// `handoff_commit_admitted` alone decides whether ownership moves; all 2^13 fact combinations
-/// must get the same verdict from it and from the model's `CommitAtomically` guard.
 #[test]
 fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact_combination() {
     let model = native_update_seamless_handoff_ownership_model();
@@ -239,8 +216,6 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
             "the shipping admission and the model's Commit guard disagree for {facts:?}"
         );
 
-        // An activity-shaped rejection is a refusal first: it never coexists with
-        // an admitted Commit, or the automatic lane would retry a landed handoff.
         if handoff_rejection_activity_shaped(facts) {
             assert!(
                 !admitted,
@@ -271,8 +246,6 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
         );
     }
 
-    // Rollback is available for every refusal, checked once per distinct projected state (the
-    // projection is many-to-one).
     assert!(refused_parked.len() > 1, "vacuous refusal projection");
     for state in &refused_parked {
         assert!(
@@ -287,7 +260,6 @@ fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact
         );
     }
 
-    // Non-vacuity: the conjunction admits exactly the all-facts-hold combination.
     assert_eq!(
         admitted_combinations, 1,
         "exactly one bounded combination may authorize a Commit"

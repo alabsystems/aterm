@@ -12,12 +12,6 @@ fn character(value: &str) -> Key {
     Key::Character(value.into())
 }
 
-/// Exhaust all 16 modifier subsets for both navigation keys (plus case and
-/// a non-navigation negative control), at a shell and in an agent's composer.
-/// The exact bare-Super subset (where `HARDCODED_SUPER_CHORDS` is on) is
-/// aterm's everywhere; the bare-Control subset only in an agent's composer, so
-/// at a shell bash's readline gets its C-r / C-s. The front program is asked
-/// for a bare Control-S/R and nothing else.
 #[test]
 fn bare_super_s_r_classifier_is_exhaustive_over_modifier_power_set() {
     use std::cell::Cell;
@@ -239,8 +233,6 @@ fn accepting_a_live_composer_match_does_not_write_to_its_program() {
 
     let mut pipe = [-1; 2];
     assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    // Own both descriptors before any later assertion can unwind. The sink
-    // borrows the write end and never closes it.
     let _reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
     let _writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
@@ -524,8 +516,6 @@ fn a_departed_agents_publication_leaves_ctrl_r_to_the_shell_in_front() {
 /// and its leader's name are still Claude's. The agent has handed the
 /// terminal off (`SessionFactory::handed_terminal`, asked of the agent's
 /// group), so vim gets its C-r (redo) and its repeat, and no find bar opens.
-/// NEGATIVE CONTROL: once the editor has exited the same press is aterm's
-/// find again.
 #[cfg(unix)]
 #[test]
 fn an_editor_the_agent_handed_the_terminal_to_gets_ctrl_r() {
@@ -556,9 +546,6 @@ fn an_editor_the_agent_handed_the_terminal_to_gets_ctrl_r() {
     assert_eq!(drain(&pty), [], "the composer saw nothing");
 }
 
-/// The members that take the terminal from the agent leading their group are
-/// any program but an agent or a runtime one runs as: a launcher's agent child
-/// is the agent itself. NEGATIVE CONTROLS: each agent name and runtime.
 #[test]
 fn any_program_but_an_agent_or_its_runtime_takes_the_terminal_off_it() {
     for editor in ["vim", "nvim", "nano", "emacs", "hx", "sh", "less", "-zsh"] {

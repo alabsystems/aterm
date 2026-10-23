@@ -3,19 +3,6 @@
 // Author: Andrew Yates
 
 //! key-material: no release-trust secret in the checkout.
-//!
-//! Two shapes no other scan sees (the publication engine's secret scan matches
-//! PEM headers, and only over the export):
-//! * the paper master, 52 base32 symbols (`0-9a-z` minus `i l o u`, bare or as
-//!   13 groups of 4), on the key surface ([`KEY_SURFACE`], [`KEY_TOOL`]):
-//!   path-scoped because truncated hashes of that length occur elsewhere. A
-//!   phrase whose symbols step through the alphabet in order, in reverse or not
-//!   at all (its last, check symbol aside) is a fixture, which no random master is;
-//! * a key file: the machine key is binary pkcs8 with no text marker, so its
-//!   name gives it away (`machine|master|release|signing|root.key`, `*.pkcs8`),
-//!   anywhere in the checkout but `.git`, build output and the directories
-//!   `.gitignore` keeps out (no commit takes those without `-f`), dot
-//!   directories included (`.cargo/machine.key`; [`super::walk`]).
 
 use super::{Finding, Rule, Tree};
 
@@ -28,7 +15,6 @@ pub(super) const KEY_MATERIAL: Rule = Rule {
     check: key_material,
 };
 
-/// The files a master could be pasted into, where no phrase-shaped value belongs.
 const KEY_SURFACE: &[&str] = &[
     "crates/aterm-update-core/src/pins.rs",
     "crates/aterm-update-core/src/roster.rs",
@@ -37,13 +23,10 @@ const KEY_SURFACE: &[&str] = &[
     "docs/RELEASE-KEYS.md",
 ];
 
-/// The owner-side key tool: every file under it is key surface.
 const KEY_TOOL: &str = "crates/atpkg-keys";
 
-/// The phrase alphabet, in order.
 const PHRASE_ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Symbols in a master phrase.
 const PHRASE_LEN: usize = 52;
 
 fn key_material(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -113,7 +96,6 @@ fn unreadable(rel: &str, why: &str) -> Finding {
     }
 }
 
-/// A file name only a secret key wears.
 fn key_file_name(name: &str) -> bool {
     matches!(
         name,
@@ -121,7 +103,6 @@ fn key_file_name(name: &str) -> bool {
     ) || name.ends_with(".pkcs8")
 }
 
-/// The symbol value of a phrase character (either case), if it is one.
 fn symbol(c: u8) -> Option<u8> {
     PHRASE_ALPHABET
         .iter()
@@ -129,9 +110,6 @@ fn symbol(c: u8) -> Option<u8> {
         .and_then(|p| u8::try_from(p).ok())
 }
 
-/// Every master-phrase-shaped run in `line`, as its symbol values: 52 phrase
-/// symbols bounded by non-alphanumerics, bare or as 13 groups of 4 each split
-/// from the next by one space or dash.
 fn phrases(line: &str) -> Vec<Vec<u8>> {
     let b = line.as_bytes();
     let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -167,8 +145,6 @@ fn phrases(line: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// Does the phrase step through the alphabet by one symbol up, one down or
-/// none at all (its last, check symbol aside)? A fixture, never a random key.
 fn synthetic(phrase: &[u8]) -> bool {
     let body = &phrase[..phrase.len().saturating_sub(1)];
     let step = |w: &[u8]| (w[1] + 32 - w[0]) % 32;
@@ -182,8 +158,6 @@ fn synthetic(phrase: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// A phrase-shaped run no fixture rule excuses, built at run time so no
-    /// real-looking key is ever committed: symbols from a fixed LCG.
     fn random_phrase() -> String {
         let mut x: u32 = 0x2545_f491;
         (0..PHRASE_LEN)

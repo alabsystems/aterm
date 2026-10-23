@@ -11,7 +11,6 @@ use aterm_wasm_abi::{export, host, panic_hook};
 
 aterm_wasm_abi::export_runtime!();
 
-/// Values dropped so far.
 static DROPS: AtomicU32 = AtomicU32::new(0);
 
 macro_rules! echo {

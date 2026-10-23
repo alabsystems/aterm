@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Hot tier: uncompressed lines in a `VecDeque`, no decompression on access.
 
@@ -38,9 +37,6 @@ impl HotTier {
     }
 
     /// Push a line to the back.
-    ///
-    /// Saturating: the counters track bytes this process holds, so the sum always
-    /// fits; saturation only discharges the Trust lane's overflow obligations.
     #[inline]
     pub(crate) fn push(&mut self, line: Line) {
         let mem = line.memory_used();
@@ -62,9 +58,6 @@ impl HotTier {
     /// Take n lines from the front.
     pub(crate) fn take_front(&mut self, n: usize) -> Vec<Line> {
         let n = n.min(self.lines.len());
-        // Capacity is a hint only. Real callers pass block-size counts (`block_size`
-        // is clamped to MAX_DECODE_PAGE_LINES), so the bounded branch always runs;
-        // the bound makes the Trust lane's allocation-budget obligation provable.
         let mut result = if n <= crate::line::MAX_DECODE_PAGE_LINES {
             Vec::with_capacity(n)
         } else {
@@ -95,10 +88,7 @@ impl HotTier {
         }
     }
 
-    /// Remove the `n` most recent lines (from the back).
-    ///
-    /// Used by Kitty CSI +T unscroll: recovered lines must be removed
-    /// from scrollback after being placed back into the visible grid.
+    /// Remove the `n` most recent lines from the back.
     // Skip: the same ring-pop class as truncate_front.
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn truncate_back(&mut self, n: usize) {
@@ -133,8 +123,6 @@ impl HotTier {
     }
 
     /// Saturating for the same Trust-lane reason as [`push`](Self::push).
-    ///
-    /// Test-only: the invariant recomputation that calls it is.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn recompute_memory_used(&self) -> usize {

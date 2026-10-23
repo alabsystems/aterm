@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Apple lane, end to end over the fake channel and real git: every decision, the
-//! row gate, the latch and its attempts, the coherence hold, the gap to trust main, the
-//! downgrade refusals, the once-a-day notices and the lock.
+//! End-to-end Apple lane tests over the fake channel and real git.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,11 +20,7 @@ use atpkg_publish::triple::{AARCH64_APPLE_DARWIN as ARM, X86_64_APPLE_DARWIN as 
 use super::super::shared::{Made, made_once, scratch};
 use super::fixture::{self, Fx, Held, Release, git};
 
-/// The shell suite's world: index 5 pins ay 2, nn 2, trust-ir 1, trust 5, trust-mc 4 and
-/// carries a claude pin. ay's newest SIGNED release is v0.2.0 (build 3) beside a prerelease
-/// v0.3.0 and an unsigned v0.4.0; nn and trust-mc sit at their releases; trust's v0.9.0 is
-/// build 7 (a bundle: the bundle lane); trust-ir's v0.3.0 is build 2 (packed, then held by
-/// the rustc group while trust waits).
+/// Test fixture world with index 5 pinning `ay`, `nn`, `trust-ir`, `trust`, `trust-mc`, and `claude`.
 struct World {
     fx: Fx,
     pins: Mutex<BTreeMap<(String, Build), PinCommit>>,
@@ -41,7 +35,6 @@ fn sha_at(dir: &Path, build: u64) -> String {
         .to_string()
 }
 
-/// The commit at `build` of a history, oldest first.
 fn at(history: &[String], build: u64) -> &str {
     &history[usize::try_from(build).expect("small") - 1]
 }
@@ -51,7 +44,6 @@ impl World {
         Self::new_at(scratch(label))
     }
 
-    /// [`World::new`] in `tmp`.
     fn new_at(tmp: aterm_tempfile::TempDir) -> Self {
         let fx = Fx::at(tmp);
         let (_, ay) = fx.dev_repo("ay", 4);
@@ -106,10 +98,7 @@ impl World {
         }
     }
 
-    /// [`World::new`], run until every program sits at its pin: ay packed and pinned, the
-    /// person's trust bundle landed, the rustc group moved (head 7). Two runs of the lane
-    /// (about 90 git processes), so it is made once per process, by the first caller in its
-    /// own directory, and laid down for every caller after ([`Fx::laid`]).
+    /// [`World::new`] run until every program sits at its pin (cached once per process via [`Fx::laid`]).
     fn settled(label: &str) -> Self {
         static MADE: Made<(), Held> = Mutex::new(BTreeMap::new());
         let mut tmp = Some(scratch(label));
@@ -194,8 +183,6 @@ fn a_dry_run_before_any_clone_decides_nothing_and_writes_nothing() {
     assert!(w.fx.notes.shown().is_empty(), "a dry run notifies nobody");
 }
 
-/// An unreadable channel is COULD NOT RUN (exit 3) under `--dry-run`, which a person runs to
-/// learn what the lane would do; the unattended run keeps exit 0 and counts the failure.
 #[test]
 fn an_unreadable_channel_is_could_not_run_only_for_a_dry_run() {
     let w = World::new("alab-dry-unreadable");
@@ -236,8 +223,6 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
         rendered(&o, "clean").starts_with("SKIP: not pinned by index-5"),
         "an unpinned program is a human decision"
     );
-    // The packs: ay on both Apple targets, aarch64 fresh and x86_64 merged onto a copy of
-    // it beside the stage; trust-ir aarch64 only; the bundle never.
     let legs = w.fx.packer.legs();
     let out = w.state().dir.join("out/ay");
     assert_eq!(legs.len(), 3, "{legs:?}");
@@ -260,7 +245,6 @@ fn the_first_run_packs_both_apple_targets_and_holds_the_rustc_group() {
         w.fx.staging_asset("trust-ir", 2, "pkg-trust-ir-2.toml")
             .is_some()
     );
-    // The hold, and the one index: ay alone moves.
     assert_eq!(o.held, ["trust-ir"]);
     assert_eq!(
         w.fx.indexer.deltas(),
@@ -298,7 +282,6 @@ fn a_held_build_on_staging_reads_index_and_is_never_repacked() {
 fn the_bundle_landing_on_staging_moves_the_whole_group_together() {
     let w = World::new("alab-group");
     ok(w.run(false));
-    // The person's bundle pack shows up as a staging release, like any pack.
     w.fx.stage("trust", 7, &[ARM]);
     let (o, _) = ok(w.run(false));
     assert!(rendered(&o, "trust").starts_with("INDEX: v0.9.0 (build 7)"));
@@ -362,7 +345,6 @@ fn a_pin_that_fell_on_the_channel_refuses_everything() {
 fn an_index_head_below_the_one_processed_refuses_everything() {
     let w = World::new("alab-index-down");
     ok(w.run(false));
-    // The channel loses index 6: its head reads 5 again.
     w.fx.host
         .set_draft(&w.fx.ctx.index_slug(), "atpkg-index-6", true);
     let (r, _) = w.run(false);
@@ -375,7 +357,6 @@ fn an_index_head_below_the_one_processed_refuses_everything() {
     assert_eq!(w.fx.packer.legs().len(), 3, "nothing is packed");
 }
 
-/// A signed release `tag` of ay past the pin, on one fresh dev commit; its build.
 fn ay_release(w: &World, tag: &str) -> u64 {
     let ay = w.dev("ay");
     fixture::commit(&ay, tag, None);
@@ -512,7 +493,6 @@ fn an_unreachable_staging_owner_decides_nothing_and_a_retried_500_never_repacks(
     let packs = w.fx.packer.legs().len();
     w.fx.host.set_unreachable("alabsystems", true);
     let (o, _) = ok(w.run(false));
-    // The clone is fetched as the staging identity too, so nothing about ay is known.
     assert!(
         rendered(&o, "ay").starts_with(
             "UNRESOLVED: git fetch failed in ~/.local/state/aterm-auto/alab/progs/ay: \
@@ -553,7 +533,6 @@ fn what_is_built_is_what_was_signed() {
     fixture::commit(&ay, "v0.8.0", None);
     let sha = git(&ay, &["rev-parse", "HEAD"]);
     let packs = w.fx.packer.legs().len();
-    // A tampered signature.
     w.fx.release(
         "ay",
         "v0.8.0",
@@ -569,7 +548,6 @@ fn what_is_built_is_what_was_signed() {
         "{:?}",
         row(&o, "ay").decision
     );
-    // A SUMS signed for another tag, re-served here.
     w.fx.release(
         "ay",
         "v0.8.0",
@@ -588,7 +566,6 @@ fn what_is_built_is_what_was_signed() {
         "{}",
         rendered(&o, "ay")
     );
-    // A signed release the ledger does not bind to a dev commit.
     w.fx.host.put(
         &fixture::public(&w.fx, "ay"),
         "v0.8.0",
@@ -614,7 +591,6 @@ fn what_is_built_is_what_was_signed() {
         packs,
         "nothing unverified or unbound is built"
     );
-    // The control: verified and bound, it packs.
     w.fx.release("ay", "v0.8.2", &sha, Release::GOOD);
     let (o, _) = ok(w.run(false));
     assert!(
@@ -624,12 +600,9 @@ fn what_is_built_is_what_was_signed() {
     );
 }
 
-/// A trust world for the gap to main: pin 9 ahead of the newest signed release (v0.9.0,
-/// build 7), main at build 12, the pin's compiler reporting commit build 9.
 fn gap_world(label: &str) -> World {
     static MADE: Made<(), Vec<String>> = Mutex::new(BTreeMap::new());
     let fx = Fx::new(label);
-    // Fixed dates and a fixed identity: the same history every time, made once per process.
     let dir = fx.path("dev/trust");
     let trust = made_once(&MADE, &(), &dir, |dir| {
         fixture::repo(dir, 0);
@@ -680,11 +653,9 @@ fn the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day() {
             .count(),
         1
     );
-    // A dry run notifies nobody.
     let before = w.fx.notes.shown().len();
     ok(w.run(true));
     assert_eq!(w.fx.notes.shown().len(), before);
-    // The same gap is told once a day; the next day again.
     ok(w.run(false));
     assert_eq!(
         w.fx.notes
@@ -711,7 +682,6 @@ fn the_gap_to_trust_main_is_counted_on_the_graph_and_told_once_a_day() {
 fn a_pin_off_main_is_said_to_be_off_it() {
     let w = gap_world("alab-gap-off");
     let trust = w.dev("trust");
-    // The pin is cut from a side branch that parted at build 7.
     git(
         &trust,
         &["checkout", "-q", "-b", "side", &sha_at(&trust, 7)],
@@ -798,8 +768,6 @@ fn a_finished_run_leaves_no_start_stamp_for_the_next_lock_holder_to_be_read_as()
     ok(w.run(false));
     let state = w.state();
     assert!(!state.started.exists(), "the run that stamped it ended");
-    // `lane install` (or a person's dry run) holds the lock a day later: that is not a
-    // stalled run, and nobody is told it is.
     let holder = aterm_update_core::FileLock::acquire(&state.lock).expect("hold the lane lock");
     let mut later = w.fx.ctx.clone();
     later.now_unix = fixture::later(1);
@@ -827,10 +795,6 @@ fn a_signing_run_needs_the_key_and_both_token_files() {
     ok(w.run(true));
 }
 
-/// Every pack is compressed by the zstd CLI: a Mac without it (what the production probe
-/// says over an empty `PATH`) is refused before any build, so no program counts an
-/// attempt toward its latch for a tool the machine lacks. The control: the same world
-/// packs once the tool is there.
 #[test]
 fn a_signing_run_needs_the_compressor_before_any_build() {
     let w = World::new("alab-compressor");
@@ -906,10 +870,6 @@ fn a_compilers_version_names_the_pins_commit_and_date() {
     assert_eq!(alab::parse_vv("commit-hash: unknown\n"), None);
 }
 
-/// The bundle lane's commands, over typed rows: trust is the group publish from one seal;
-/// trust-mc is one `pack-bundle` leg per Apple row its pin carries, aarch64 first and the
-/// x86_64 leg merged onto a copy of it, each naming the Trust sysroot its hello compiles
-/// against, never `--no-hello`.
 #[test]
 fn the_bundle_lane_prints_the_bundle_packs_never_runs_them() {
     let w = World::new("alab-bundle");
@@ -921,7 +881,6 @@ fn the_bundle_lane_prints_the_bundle_packs_never_runs_them() {
         &git(&mc, &["rev-parse", "HEAD"]),
         Release::GOOD,
     );
-    // The pinned trust-mc manifest carries both Apple rows: the new build must too.
     w.fx.stage("trust-mc", 4, &[ARM, X86]);
     let (o, _) = ok(w.run(false));
     let mc_row = row(&o, "trust-mc");
@@ -962,7 +921,6 @@ fn a_pins_record_from_other_targets_is_retired_once_never_believed() {
     let w = World::new("alab-restamp");
     let state = w.state();
     state.ensure().expect("state");
-    // A record resolved for another target set, with a pin that would read as a downgrade.
     std::fs::write(
         &state.pins_seen,
         "# pins-resolved-for aarch64-apple-darwin\nay 99\n",
@@ -1035,8 +993,6 @@ fn a_staged_pack_that_does_not_verify_is_never_pinned_or_packed_over() {
     assert_eq!(w.fx.indexer.count(), 2);
 }
 
-/// A head whose horizon is inside the warning window notifies the operator before every
-/// client starts refusing the index. Control: the FAR_FUTURE heads elsewhere notify nobody.
 #[test]
 fn a_horizon_inside_thirty_days_is_told() {
     let w = World::new("alab-horizon");
@@ -1052,7 +1008,6 @@ fn a_horizon_inside_thirty_days_is_told() {
     );
 }
 
-/// World's head, with `program`'s `[programs.*]` block naming `group`.
 fn head_with_group(w: &World, n: u64, program: &str, group: &str) {
     let pins = [
         ("ay", 2),
@@ -1074,7 +1029,6 @@ fn head_with_group(w: &World, n: u64, program: &str, group: &str) {
 #[test]
 fn the_hold_follows_the_group_the_channel_enforces() {
     let w = World::new("alab-head-group");
-    // The table puts ay in no group; the head clients enforce puts it with trust.
     head_with_group(&w, 6, "ay", "rustc");
     let (o, _) = ok(w.run(false));
     assert!(o.packed.contains(&"ay".to_string()), "{:?}", o.packed);
@@ -1101,7 +1055,6 @@ fn a_head_and_table_that_disagree_on_a_group_refuse_the_run() {
 fn a_scratch_clone_is_fetched_as_the_staging_identity_never_by_its_origin() {
     let w = World::settled("alab-fetch");
     let clone = w.state().dir.join("progs/ay");
-    // A bare `git fetch origin` would now fail, and the new release would not resolve.
     git(&clone, &["remote", "set-url", "origin", "/nonexistent/ay"]);
     let build = ay_release(&w, "v0.7.0");
     let (o, tx) = ok(w.run(false));
@@ -1116,8 +1069,6 @@ fn a_scratch_clone_is_fetched_as_the_staging_identity_never_by_its_origin() {
     );
 }
 
-/// A release's signed SHA256SUMS lists every file it ships, so it outgrows the manifest
-/// cap (trust v0.8.0's is 8.7 MB): it is read under its own bound, and still verified.
 #[test]
 fn a_sums_larger_than_a_manifest_is_still_read_and_verified() {
     let w = World::settled("alab-big-sums");

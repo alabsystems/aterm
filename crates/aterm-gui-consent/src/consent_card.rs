@@ -182,7 +182,8 @@ impl NeedWords {
 pub enum Marker {
     /// *Not now* was pressed: the card is not offered again for the life of the config directory.
     NotNow,
-    /// *Open Settings* was pressed and the outcome is not yet known (see the module doc).
+    /// *Open Settings* was pressed and the outcome is not yet known: a launch that finds the
+    /// grant held records it once and clears this ([`LaunchVerdict::Confirm`]).
     Opened,
 }
 

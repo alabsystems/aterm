@@ -109,7 +109,8 @@ struct Audit {
     missed: Vec<String>,
 }
 
-/// Walk the host's loop from `from` to `to` (see the module doc).
+/// Walk the host's loop from `from` to `to`, waking at each motion deadline: a frame before
+/// it that draws differently is missed, a wake that draws the same is wasted.
 fn audit(c: &MessageCenter, p: &Presentation, look: Look, from: Instant, to: Instant) -> Audit {
     let mut a = Audit::default();
     let mut t = from;

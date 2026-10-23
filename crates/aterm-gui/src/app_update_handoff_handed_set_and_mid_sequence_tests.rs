@@ -10,8 +10,7 @@ use super::{
 use crate::native_update_auto_intent::{ActivityFacts, ApplyPhase};
 use crate::native_updater_service::ApplyMode;
 
-/// A PTY pair, both ends close-on-exec from birth: a child another test spawns never keeps
-/// the slave open past its exec, so a closed slave reads as hung up.
+/// A PTY pair with both ends marked close-on-exec.
 fn openpty() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
@@ -22,8 +21,7 @@ fn write_all(fd: i32, bytes: &[u8]) {
     assert_eq!(usize::try_from(wrote).ok(), Some(bytes.len()), "write");
 }
 
-/// Take every byte queued on `master` — the reader catching up — so the PTY
-/// is quiet again.
+/// Drain all queued bytes from `master` until the PTY is quiet.
 fn drain(master: i32) {
     let entry = [(0u64, master, 0i32)];
     let mut buffer = [0u8; 4096];
@@ -34,14 +32,12 @@ fn drain(master: i32) {
     }
 }
 
-/// The shipping park capture over the shipping handed set, with a time
-/// window long enough that a loaded machine cannot make it a deadline: the
-/// ids carried, or the typed failure.
+/// Capture parked screens for the live handed set under current wire capabilities.
 fn capture(app: &mut crate::App) -> Result<Vec<u64>, CaptureFailure> {
     capture_for(app, crate::seamless::WireCaps::current())
 }
 
-/// [`capture`] for a successor with `caps` — an older build's, say.
+/// [`capture`] for a successor with `caps`.
 fn capture_for(
     app: &mut crate::App,
     caps: crate::seamless::WireCaps,
@@ -59,9 +55,7 @@ fn capture_for(
     .map(|parked| parked.screens.iter().map(|(id, _)| *id).collect())
 }
 
-/// A build predating the parser carry resumes at Ground (a reader parked in `ESC [ 38;5;19`
-/// with `6mcompiling` queued would print `6mcompiling`), so on a hop to it any partial sequence
-/// over queued output misses; the stalled case and the boundary are still carried.
+/// On a hop to a successor without parser carry, a partial sequence over queued output misses the park while stalled or boundary states are carried.
 #[test]
 fn an_older_successor_misses_a_split_csi_over_queued_output() {
     let running = 200;
@@ -89,18 +83,15 @@ fn an_older_successor_misses_a_split_csi_over_queued_output() {
         "the same parser is carried whole to a successor that reads it"
     );
 
-    // The stalled case is carried to the older build too (abandoned there).
     drain(master);
     assert_eq!(capture_for(&mut app, older), Ok(vec![0]));
-    // And a boundary over a busy PTY is no reason to miss.
     crate::term_lock(&term).process(b"6m");
     write_all(slave, b"compiling\r\n");
     assert_eq!(capture_for(&mut app, older), Ok(vec![0]));
 
     set_master(&mut app, 0, -1);
     drop(app);
-    // The master first: a slave closed over output its master never read
-    // waits out the tty's drain (0.6 s on macOS).
+    // Close master first so closing slave does not block on macOS tty drain.
     aterm_pty::close_fd(master);
     aterm_pty::close_fd(slave);
 }
@@ -114,10 +105,7 @@ fn set_master(app: &mut crate::App, id: u64, master: i32) {
         .master = master;
 }
 
-/// A reader parked inside a hooked DCS query (DECRQSS) with the rest queued must miss: no carry
-/// holds a query, so the successor would print the rest as text. Carried: the same parser over
-/// a quiet PTY, queued output at a boundary, a split CSI, and a hooked string the engine only
-/// consumes (a tmux passthrough wrapper).
+/// A parser parked inside a hooked DCS query (`DECRQSS`) over queued output misses the park, whereas quiet PTYs, boundaries, split CSIs, and tmux passthrough wrappers are carried.
 #[test]
 fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
     let mut app = crate::App::headless_for_test();
@@ -156,8 +144,6 @@ fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
         "timing: re-parked on the next rung, never a refusal"
     );
 
-    // The reader caught up and the program went quiet mid-sequence: the
-    // stalled case, carried by abandoning the partial sequence.
     drain(master);
     assert_eq!(
         capture(&mut app),
@@ -165,8 +151,6 @@ fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
         "a stalled sequence is carried"
     );
 
-    // Output queued again, but the parser is at a boundary: nothing to
-    // abandon, so queued output is no reason to miss.
     crate::term_lock(&term).process(b"\x1b\\");
     write_all(slave, b"more output\r\n");
     assert_eq!(
@@ -177,16 +161,12 @@ fn a_parser_parked_mid_sequence_over_queued_output_misses_the_park() {
 
     set_master(&mut app, 0, -1);
     drop(app);
-    // The master first: a slave closed over output its master never read
-    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(master);
     aterm_pty::close_fd(slave);
 }
 
-/// A carry that would only swallow the queued tail is a miss: an OSC over the 4 KiB cap or a
-/// started APC is carried only as a sequence to ignore, so the successor would dispatch nothing.
-/// Each re-parks on a boundary on either lane; only a picture is carried once no free re-park
-/// is left. Quiet, each is carried. Controls: a short OSC and a DCS header carry exactly.
+/// An over-cap OSC or started APC over queued output misses the park (a picture only while a free
+/// re-park remains), whereas short OSCs and DCS headers are carried.
 #[test]
 fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     let mut app = crate::App::headless_for_test();
@@ -198,7 +178,6 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     let mut image = b"\x1b]1337;File=inline=1:".to_vec();
     image.extend(std::iter::repeat_n(b'A', 5000));
     for free_repark in [false, true] {
-        // The fork lane has no free re-park; the launched lane's attempt has one left.
         app.update_handoff_prelaunch = free_repark.then(|| {
             let (mut prelaunch, ..) =
                 super::late_park_record_tests::prelaunch_record(1, ApplyMode::AutomaticPastGrace);
@@ -247,16 +226,12 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
                 expected,
                 "{at} over queued output (a free re-park left: {free_repark})"
             );
-            // Quiet: the stalled case, carried.
             drain(master);
             assert_eq!(capture(&mut app), Ok(vec![0]), "{at}, stalled, is carried");
-            // Back to a boundary for the next case.
             crate::term_lock(&term).process(b"\x18");
         }
     }
     app.update_handoff_prelaunch = None;
-    // Controls: what the carry continues exactly (a short OSC, a DCS header) is carried over
-    // queued output.
     for (at, parked, queued) in [
         ("a short OSC", &b"\x1b]0;a ti"[..], &b"tle\x07"[..]),
         (
@@ -282,10 +257,7 @@ fn a_carry_that_only_swallows_the_queued_tail_misses_the_park() {
     aterm_pty::close_fd(master);
 }
 
-/// The held capture projects at most `MAX_HELD_PANES` exited panes (the manifest writer drops
-/// the rest), nothing once its own deadline has come, and that deadline is a quarter of the
-/// budget short of the park's (`held_capture_deadline`), so it never turns a landed park into
-/// a miss.
+/// Held-pane capture projects at most `MAX_HELD_PANES` exited panes and stops at `held_capture_deadline` (a quarter of the budget before the park deadline).
 #[test]
 fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
     let mut app = crate::App::headless_for_test();
@@ -310,8 +282,6 @@ fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
     let live = app.handoff_live_sessions();
     assert_eq!(live.len(), 1, "PRECONDITION: only session 0 is handed");
 
-    // A hang detector, not a budget: the held capture needs half of it to spare and stops a
-    // quarter short of it, so on any machine it stops at the cap.
     let window = std::time::Duration::from_secs(120);
     let parked = app
         .capture_parked_screens(
@@ -341,8 +311,6 @@ fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
         "a held capture whose deadline has come projects no pane"
     );
 
-    // Its own deadline, on fixed instants: held panes only with half the budget (`comfort`) to
-    // spare, and then a quarter of it short of the park's deadline.
     let now = std::time::Instant::now();
     let comfort = std::time::Duration::from_millis(200);
     let deadline = now + comfort;
@@ -364,9 +332,7 @@ fn the_held_capture_stops_at_the_held_caps_and_at_its_own_deadline() {
     aterm_pty::close_fd(master);
 }
 
-/// Parked inside an OSC 8 link, or between a VT52 `ESC Y` and its address bytes, over queued
-/// output: carried to a successor that carries the output state, a miss for an older one
-/// (which would print the rest unlinked, or print the address). Quiet, both carry it.
+/// An open OSC 8 link or pending VT52 `ESC Y` address over queued output is carried to a current successor and misses on an older hop.
 #[test]
 fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() {
     let running = 200;
@@ -377,7 +343,6 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
     let (master, slave) = openpty();
     set_master(&mut app, 0, master);
     let term = app.pool.get(0).expect("session 0").term.clone();
-    // The launched lane's attempt, its free re-parks unspent, so an open link still misses.
     let (prelaunch, ..) =
         super::late_park_record_tests::prelaunch_record(1, ApplyMode::AutomaticPastGrace);
     app.update_handoff_prelaunch = Some(prelaunch);
@@ -409,7 +374,6 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
             Err(CaptureFailure::MidSequence { local_id: 0, state }),
             "{at} over queued output misses an older successor's park"
         );
-        // Quiet: the stalled case, carried.
         drain(master);
         assert_eq!(
             capture_for(&mut app, older),
@@ -418,7 +382,6 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
         );
         crate::term_lock(&term).process(reset);
     }
-    // Control: a link opened and closed before the park is no hazard.
     crate::term_lock(&term).process(b"\x1b]8;;https://example.com\x07a\x1b]8;;\x07");
     write_all(slave, b"more output\r\n");
     assert_eq!(
@@ -435,9 +398,7 @@ fn an_open_link_or_a_vt52_address_over_queued_output_misses_only_an_older_hop() 
     aterm_pty::close_fd(master);
 }
 
-/// On a hop to a successor older than the output-state carry, an open link that never closes
-/// spends only the launched lane's free mid-sequence re-parks; then, and on the fork lane, the
-/// screen is carried. Negative control: a VT52 address still misses with the re-parks spent.
+/// On an older hop, an unclosed OSC 8 link is carried once free mid-sequence re-parks are exhausted (or on the fork lane), while a VT52 address still misses.
 #[test]
 fn an_open_link_past_the_free_reparks_is_carried_not_missed() {
     let running = 200;
@@ -448,7 +409,6 @@ fn an_open_link_past_the_free_reparks_is_carried_not_missed() {
     let term = app.pool.get(0).expect("session 0").term.clone();
     crate::term_lock(&term).process(b"\x1b]8;;https://example.com/rg\x07src/ma");
     write_all(slave, b"compiling crate 1 of 400\r\n");
-    // The fork lane: no attempt record, no free re-parks.
     assert_eq!(
         capture_for(&mut app, older),
         Ok(vec![0]),
@@ -474,7 +434,6 @@ fn an_open_link_past_the_free_reparks_is_carried_not_missed() {
         Ok(vec![0]),
         "the free re-parks are spent: carried, not a miss the ladder charges"
     );
-    // Negative control: a VT52 address keeps its hard miss.
     crate::term_lock(&term).process(b"\x1b]8;;\x07\x1b[?2l\x1bY");
     write_all(slave, b"\x22\x24");
     assert_eq!(
@@ -514,22 +473,18 @@ fn calm_land(live: &[(u64, i32, i32)]) -> ParkGateFacts {
     }
 }
 
-/// `aterm --hold` with one pane's command exited: its master stays hung up until the pane
-/// closes, so it is left out of the handed set and the gate, capture and manifest see only the
-/// live sessions. Control: the whole pool, fed to the same gate, still waits.
+/// An exited `--hold` pane is excluded from the handed set so its hung-up master does not block the park gate, capture, or manifest.
 #[test]
 fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
     let mut app = crate::App::headless_for_test();
     app.hold = true;
     let (exited_master, exited_slave) = openpty();
     write_all(exited_slave, b"build finished\r\n");
-    // Nonblocking, so the close flushes the unread output at once instead of
-    // waiting out the tty's drain (0.6 s on macOS) to flush it.
+    // Nonblocking close flushes unread output without waiting for macOS tty drain.
     aterm_pty::set_nonblocking(exited_slave, true).expect("nonblocking slave");
     aterm_pty::close_fd(exited_slave);
     let probe = [(1u64, exited_master, 0i32)];
-    // A hang detector: the hang-up arrives only once every copy of the slave is closed, and a
-    // child another test is forking holds one until it execs.
+    // Wait for the slave hang-up in case a concurrent test forked a child before close-on-exec.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while !handoff_masters_closed(&probe) {
         assert!(
@@ -539,14 +494,11 @@ fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let held = crate::stub_session(1);
-    // Never signal a pid this test does not own on teardown.
     held.child_reaped
         .store(true, std::sync::atomic::Ordering::Release);
     let mut held = held;
     held.master = exited_master;
     let _ = app.insert_logical_window(held, 24, 80);
-    // What the reader's EOF does under `--hold`: the registry marks the
-    // session exited and the pane stays.
     app.store
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -606,9 +558,7 @@ fn an_exited_held_pane_is_not_handed_and_does_not_hold_the_park() {
     aterm_pty::close_fd(exited_master);
 }
 
-/// The foreground holder crosses even at the Repaint rung: the successor restores a
-/// blank-carried session's modes from it, or a job that died during the handoff would keep its
-/// alt screen and mouse under the prompt.
+/// A `CarryCeiling::Repaint` session still carries its `fg_holder` in the manifest so the successor can restore terminal modes.
 #[test]
 fn a_repaint_rung_session_still_carries_its_foreground_holder() {
     let mut app = crate::App::headless_for_test();
@@ -664,7 +614,6 @@ fn a_repaint_rung_session_still_carries_its_foreground_holder() {
     let read = crate::session_store::SessionHandoff::from_toml(&wire).expect("parse the manifest");
     assert_eq!(read.sessions[0].fg_holder, Some(4242), "round trip");
 
-    // A holder that is no pgid (nothing seen yet) is not written.
     let none = stamp_fg_holders(manifest.clone(), &[(0, 0)]);
     assert_eq!(none.sessions[0].fg_holder, None);
     assert!(!none.to_toml().expect("serialize").contains("fg_holder"));
@@ -672,9 +621,7 @@ fn a_repaint_rung_session_still_carries_its_foreground_holder() {
     assert_eq!(absent.sessions[0].fg_holder, None, "another session's");
 }
 
-/// The crash journal's key rides the record it names, and only that one. `App::journal_keys`
-/// is empty for a process with nothing taken over, so a healthy update writes no key and an
-/// older reader sees the wire it always saw.
+/// `stamp_journal_keys` attaches a crash-journal key only to its matching session record.
 #[test]
 fn a_journal_key_rides_the_record_it_names_and_no_other() {
     let app = crate::App::headless_for_test();
@@ -699,9 +646,7 @@ fn a_journal_key_rides_the_record_it_names_and_no_other() {
     assert_eq!(other.sessions[0].journal_key, None, "another session's");
 }
 
-/// The render debt crosses the handoff: an alternate-screen session whose engine owes rows is
-/// read under the park and rides the manifest record as `render_debt`; one that owes nothing,
-/// one on the main screen and one carried blank on purpose write no key.
+/// `stamp_render_debts` records `render_debt` only for alternate-screen sessions with non-zero debt carried under `CarryCeiling::Full`.
 #[test]
 fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() {
     let window = std::time::Duration::from_secs(30);
@@ -722,8 +667,6 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     let owing = || {
         let mut t = aterm_core::terminal::Terminal::new(12, 20);
         t.process(b"\x1b[?1049h\x1b[2J");
-        // Every row painted, the cursor parked on the composer: a shrink then demotes the top
-        // row, not a blank bottom one.
         for r in 0..12 {
             t.process(format!("\x1b[{};1HL{r}", r + 1).as_bytes());
         }
@@ -769,8 +712,6 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
         "round trip"
     );
 
-    // Columns cut ride a key of their own: the rows key stays the two fields
-    // a build older than the column judge reads, so a rollback keeps the rows.
     let cut = aterm_core::terminal::RenderDebt {
         shift: -1,
         pushed: 0,
@@ -788,7 +729,6 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
         "round trip"
     );
 
-    // A debt-free session writes no key at all.
     *crate::term_lock(&app.pool.get(0).expect("session 0").term) = {
         let mut t = aterm_core::terminal::Terminal::new(12, 20);
         t.process(b"\x1b[?1049h\x1b[2J\x1b[3;1Hcomposer");
@@ -803,7 +743,6 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     assert_eq!(none.sessions[0].render_debt, None);
     assert!(!none.to_toml().expect("serialize").contains("render_debt"));
 
-    // A session carried blank on purpose has no screen the debt is about.
     *crate::term_lock(&app.pool.get(0).expect("session 0").term) = owing();
     let (_, parked) = capture(
         &mut app,
@@ -812,7 +751,6 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     assert_eq!(parked.repaint, vec![0], "carried blank");
     assert!(parked.render_debts.is_empty(), "{:?}", parked.render_debts);
 
-    // The main screen owes nothing, whatever the engine journalled.
     *crate::term_lock(&app.pool.get(0).expect("session 0").term) = {
         let mut t = aterm_core::terminal::Terminal::new(12, 20);
         t.process(b"$ ls\r\n");
@@ -825,7 +763,6 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
         aterm_update_core::handoff_policy::CarryCeiling::Full,
     );
     assert!(parked.render_debts.is_empty());
-    // Another session's debt lands on no record of this one.
     let other = stamp_render_debts(
         manifest,
         &[(7, aterm_core::terminal::RenderDebt::of_rows(-1, 0))],
@@ -833,15 +770,7 @@ fn a_session_that_owes_rows_carries_its_render_debt_and_the_others_carry_none() 
     assert_eq!(other.sessions[0].render_debt, None);
 }
 
-/// THE PRODUCT'S LOG CARRY AT THE PARK AND AT A STAND-DOWN (phase 2A; the
-/// review found every carry test fed the export or the adoption by hand):
-/// the park's capture hands each handed session's timeline to the export,
-/// whose sidecar for a successor that reads logs carries the session's log;
-/// the export's take fences the log's readers at what it carried; and
-/// `rollback_overlap` (the update stood down) lifts the fence, so `log`
-/// reads the records written after the take. NEGATIVE CONTROLS: the same
-/// park exported for a successor older than this build writes no member,
-/// and until the rollback the read stops at the fence.
+/// Park capture exports each handed session's log sidecar for capable successors and fences local `log` reads until `rollback_overlap` lifts the fence.
 #[test]
 fn the_park_hands_its_logs_to_the_export_and_a_stand_down_lifts_the_fence() {
     let mut app = crate::App::headless_for_test();
@@ -870,7 +799,6 @@ fn the_park_hands_its_logs_to_the_export_and_a_stand_down_lifts_the_fence() {
     assert_eq!(parked.carries.len(), live.len(), "every handed session");
     let ceiling = crate::control::turn_ids_for_handoff();
     let build = crate::running_build_number();
-    // NEGATIVE CONTROL: an older successor's sidecars carry no log.
     for (_, bytes) in crate::handoff_carry::export_for_target(&parked.carries, ceiling, build - 1) {
         let carry = crate::handoff_carry::decode(&bytes).expect("a sidecar");
         assert!(carry.log.is_none(), "no member for an older successor");
@@ -889,7 +817,6 @@ fn the_park_hands_its_logs_to_the_export_and_a_stand_down_lifts_the_fence() {
             lines[0]
         );
     }
-    // The overlap: this process writes on, its readers fenced at the take.
     let after = written(3);
     assert!(after > fenced);
     let reply = crate::control::cmd_log(&ctx, "");

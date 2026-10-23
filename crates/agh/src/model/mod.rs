@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! GitHub's REST objects (design §10.1).
+//! GitHub's REST objects.
 
 use aterm_json::Value;
 
@@ -486,7 +486,7 @@ impl AssetObject {
     }
 }
 
-/// A sha256 digest; shown as `sha256:<64 lowercase hex>`.
+/// A sha256 digest.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha256Digest([u8; 32]);
 

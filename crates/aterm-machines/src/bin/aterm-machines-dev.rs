@@ -1,29 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Dev only: the aterm-machines crate as a standalone executable (AGENTS.md: `aterm` is the
-//! one shipped executable; a crate's `[[bin]]` is a dev tool).
-//!
-//! * `aterm-machines-dev machines <verb> …` is `aterm machines <verb> …`. Installed as a
-//!   host's agent, it answers the forced command `…/bin/aterm machines agent ssh` and the
-//!   sudoers rule's `… machines agent apply` exactly as aterm would.
-//! * `aterm-machines-dev enroll-through --master <socket> --address <a> --user <u>
-//!   --fingerprint <SHA256:…> --controller <dir> [--name <n>]` enrolls over an OpenSSH
-//!   control master that is already open and authenticated (a VM harness's), in place of
-//!   the master `aterm machines enroll` opens with the owner's password. Everything after
-//!   the master is the production path (`controller::enroll::enroll_through`).
-//! * `aterm-machines-dev relay --controller <dir> --address <a> --user <u> --alias <uuid>`
-//!   opens `screen`'s relay (`System::relay`) carrying each connection over the fleet's
-//!   `screen` request (`controller::screen::relay_cmd`); `relay --master <socket>
-//!   --destination <user@address> --remote '<command>'` carries it over a command run
-//!   through a control master that is already open instead. Either prints `relay
-//!   127.0.0.1:<port>`, holds the relay until standard input ends, then closes it. No viewer
-//!   is opened: a test connects to the port itself.
-//! * `aterm-machines-dev screen-headless <host> [<step>] --controller <dir>` is `aterm
-//!   machines screen <host> [<step>]` with an opener that prints the `vnc://…:<port>` URL
-//!   instead of opening Screen Sharing.app, so the same walk runs where no window may open on
-//!   the controller. A headless RFB client connects to the printed port itself. Like `screen`
-//!   it needs a terminal on standard input and standard error, so a harness runs it on a pty.
+//! Dev-only standalone executable for `aterm-machines` (`machines`, `enroll-through`, `seal`,
+//! `relay`, and `screen-headless`).
 
 #[cfg(unix)]
 use aterm_machines::controller::enroll::{self, Master, Request, Trust};
@@ -37,7 +16,6 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-// The crate is unix-only (`src/lib.rs`); elsewhere this dev tool honestly refuses.
 #[cfg(not(unix))]
 fn main() -> ExitCode {
     eprintln!("aterm-machines-dev: unsupported here (aterm machines manages Macs, from a Mac)");
@@ -46,8 +24,6 @@ fn main() -> ExitCode {
 
 #[cfg(unix)]
 fn main() -> ExitCode {
-    // Enrolled from this dev binary, `ssh` runs it as `enroll`'s SSH_ASKPASS helper through
-    // the link `aterm-machines-askpass`, as crates/aterm's front door routes that alias.
     let argv0 = std::env::args_os().next().unwrap_or_default();
     if Path::new(&argv0)
         .file_name()
@@ -80,10 +56,7 @@ fn main() -> ExitCode {
     aterm_machines::cli::main_entry(args)
 }
 
-/// `seal --key <signing key> --host <uuid> --serial <n> --action <a> [--baseline <file>]
-/// [--artifact <sha256>] [--exec '<absolute program> <args>'] [--upgrade <dev-zip sha256>
-/// --version <v>] [--issued <unix>] [--expires <unix>]`:
-/// one envelope, signed by `envelope::seal`, on standard output.
+/// Sign and write an envelope to standard output.
 #[cfg(unix)]
 fn seal(words: &[String]) -> ExitCode {
     use aterm_machines::envelope::{self, Action, ArtifactRef, Disrupt, Envelope, Exec, Upgrade};
@@ -251,9 +224,7 @@ fn relay(words: &[String]) -> ExitCode {
     }
 }
 
-/// An opener that opens nothing: it prints the URL it was handed (which carries the relay's
-/// local port) and returns, so the walk goes on to wait for the login session while a
-/// headless RFB client connects to that port. No window is ever opened on the controller.
+/// Headless VNC opener that prints the `vnc://` URL to standard output.
 #[cfg(unix)]
 struct PrintOpener;
 

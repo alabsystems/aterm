@@ -2,23 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! eager-drop: `bool::then_some` never builds a value whose type has a `Drop`.
-//!
-//! `then_some`'s argument is evaluated before the test, so on `false` the value
-//! is built and dropped at once. aterm-sysprobe's `Cf::adopt` was
-//! `(!p.is_null()).then_some(Self(p))`: an absent registry property built
-//! `Cf(NULL)`, whose drop is `CFRelease(NULL)`, which traps, and it killed the
-//! stats thread (and aterm) on a paravirtual GPU with no `model`. `then(|| …)`
-//! builds it only on `true`. Clippy cannot name this:
-//! `unnecessary_lazy_evaluations` points the other way, and a
-//! `disallowed-methods` row would ban `then_some` on every `Copy` value.
-//!
-//! Read a file at a time, in the code view: a `then_some(` whose argument
-//! opens with a constructor (`Name(`, `Name {`, `Self(`, `Self {`) of a type
-//! the same file gives an `impl Drop`; `Self` is the type of the nearest
-//! `impl` above it. A value built elsewhere and moved in (a guard, an
-//! `OwnedFd` field of a type with no `Drop` of its own) is no finding:
-//! dropping it is the same on either path.
+//! `eager-drop`: reject `bool::then_some` when constructing a type that implements `Drop`.
 
 use super::rules::PRODUCT;
 use super::{Finding, Rule, SourceFile, Tree, is_word};
@@ -73,7 +57,6 @@ fn check_file(file: &SourceFile, out: &mut Vec<Finding>) {
     }
 }
 
-/// The type an `impl Drop for <Type>` line names.
 fn drop_impl(line: &str) -> Option<&str> {
     let t = line.trim_start();
     let t = t.strip_prefix("unsafe ").unwrap_or(t);
@@ -87,9 +70,6 @@ fn drop_impl(line: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// What a line opens: `Some(Some(type))` for an `impl` (its self type),
-/// `Some(None)` for a `trait` (where `Self` is no one type), `None` for
-/// anything else.
 fn item_header(line: &str) -> Option<Option<&str>> {
     let mut t = line.trim_start();
     loop {
@@ -115,7 +95,6 @@ fn item_header(line: &str) -> Option<Option<&str>> {
     Some((!name.is_empty()).then_some(name))
 }
 
-/// `s` past its leading `<…>` (balanced).
 fn skip_generics(s: &str) -> Option<&str> {
     let mut depth = 0usize;
     for (at, c) in s.char_indices() {
@@ -133,8 +112,6 @@ fn skip_generics(s: &str) -> Option<&str> {
     None
 }
 
-/// The last segment of the path `s` opens with (`a::b::Name<T>` is `Name`),
-/// and what follows the path.
 fn split_path(s: &str) -> (&str, &str) {
     let s = s.trim_start();
     let end = s
@@ -149,8 +126,6 @@ fn last_segment(s: &str) -> &str {
     split_path(s).0
 }
 
-/// The type a constructor at the start of `arg` builds: a capitalised path
-/// followed by `(` or `{`.
 fn constructed(arg: &str) -> Option<&str> {
     let (name, after) = split_path(arg);
     let after = after.trim_start();
@@ -164,7 +139,6 @@ mod tests {
     use super::super::tests::{run, spots};
     use super::*;
 
-    /// A `Cf` that releases on drop, `adopt` on line 4, and a plain type.
     const OWNER: &str = "struct Cf(Ref);\n\
                          impl Cf {\n    \
                              fn adopt(p: Ref) -> Option<Self> {\n        \

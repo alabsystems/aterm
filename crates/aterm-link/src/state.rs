@@ -296,11 +296,11 @@ fn incarnation_of_seq(seq: u64) -> u64 {
     astream_broker::incarnation_of(seq).unwrap_or(u64::MAX)
 }
 
-/// How many incarnations one flushed write of `inc` covers (the module doc's "The incarnation lease").
+/// How many incarnations one flushed write of `inc` covers.
 pub const INC_LEASE: u64 = 64;
 const _: () = assert!(INC_LEASE >= 1 && INC_LEASE <= INC_MAX);
 
-/// The token a session's presence row carries this state dir's mark under ([`StateDir::mark`], the module doc's "Whose row it is").
+/// The token a session's presence row carries this state dir's mark under ([`StateDir::mark`]).
 pub(crate) const PRESENCE_MARK: &str = "statedir";
 
 /// What `inc-lease` holds.
@@ -1791,7 +1791,8 @@ impl StateDir {
         None
     }
 
-    /// The mark this state dir's bridges put on every presence row of a session they write ([`PRESENCE_MARK`], the module doc's "Whose row it is").
+    /// The mark this state dir's bridges put on every presence row of a session they write
+    /// ([`PRESENCE_MARK`]).
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn mark(&self, node: &str) -> Option<String> {

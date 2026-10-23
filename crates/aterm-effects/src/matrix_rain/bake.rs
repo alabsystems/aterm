@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Phosphor `RainBaker`: box-filters the 24x48 1-bit glyph master down to
-//! live-cell-metric tiles in one [`SceneAtlas`] (`docs/matrix-rain-design.md`
-//! §2). The atlas is an 8x8 grid of `(cell_w, cell_h)` white-RGB
-//! straight-alpha tiles, baked progressively (at most
-//! [`MAX_RAIN_BAKES_PER_TICK`] per engine tick), version-bumped on every
-//! rebake and restarted on a cell-metric change. Coverage is integer
-//! fixed-point (denominator `24*48`, exact area weighting), so the atlas bytes
-//! are deterministic.
+//! Progressive box-filtering [`RainBaker`] from the 24×48 1-bit [`RomMaster`] into an 8×8 [`SceneAtlas`].
 
 use std::sync::Arc;
 
@@ -16,45 +9,32 @@ use aterm_render::SceneAtlas;
 
 use super::rom::{MASTER_H, MASTER_W, ROM_GLYPHS, RomMaster};
 
-/// Tiles per atlas row/column (8×8 grid of the 64 glyphs).
+/// Tiles per atlas row and column (8×8 grid of the 64 glyphs).
 pub const RAIN_TILE_GRID: usize = 8;
-/// Progressive bake budget: at most this many tiles per engine tick, so a
-/// cell-metric change never spikes one frame with a 64-tile bake.
+/// Maximum tiles baked per engine tick.
 pub const MAX_RAIN_BAKES_PER_TICK: usize = 8;
 
-/// Progressive master -> cell-metric tile baker. Resident; the only transient
-/// allocation is the published [`SceneAtlas`] snapshot after a bake tick, so
-/// a complete atlas is allocation-free.
+/// Progressive master-to-cell-metric tile baker publishing [`SceneAtlas`] snapshots.
 #[derive(Default)]
 pub struct RainBaker {
     cell_w: u16,
     cell_h: u16,
-    /// Straight-alpha RGBA8 texels, `(8·cell_w) × (8·cell_h)`.
+    /// Straight-alpha RGBA8 texels (`(8 * cell_w) * (8 * cell_h)`).
     rgba: Vec<u8>,
-    /// Monotonic; bumped on every rebake batch and every restart, so a
-    /// partially-baked atlas re-uploads progressively and the repaint key sees
-    /// each batch. Per-instance, because the engine fingerprint folds it and
-    /// two engines fed identical inputs must emit identical fingerprints. A
-    /// rebuilt engine therefore replays the same sequence, so the GPU texture
-    /// cache keys on the published snapshot's `Arc` identity, not on
-    /// `(version, w, h)`.
+    /// Per-instance monotonic version bumped on every rebake batch and restart.
     version: u64,
-    /// Next tile index to bake; `>= ROM_GLYPHS` ⇒ complete.
+    /// Next tile index to bake (`>= ROM_GLYPHS` when complete).
     next_tile: usize,
     published: Option<Arc<SceneAtlas>>,
     dirty: bool,
-    /// Per-dest-column source geometry: the ascending `(mx, wx)` box-filter
-    /// segments for every dest column, flattened. Depends only on `x` and
-    /// `cell_w`, so it is shared by all 64 tiles and rebuilt only when
-    /// `cell_w` changes.
+    /// Flattened `(mx, wx)` horizontal box-filter segments shared across all 64 tiles for `cell_w`.
     col_seg: Vec<(u32, u32)>,
     /// Per-dest-column offsets into `col_seg` (length `cell_w + 1`).
     col_off: Vec<u32>,
 }
 
 impl RainBaker {
-    /// Per-tick prologue: a cell-metric change wholesale-restarts the bake
-    /// (tiles of the old metric must never be sampled at the new one).
+    /// Restart the bake whenever `(cell_w, cell_h)` changes.
     #[inline]
     pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {
         if (cell_w, cell_h) == (self.cell_w, self.cell_h) {
@@ -65,8 +45,7 @@ impl RainBaker {
         self.restart();
     }
 
-    /// Restart the bake from tile 0 (metric change / config rebuild). Keeps
-    /// the buffer allocation when the size is unchanged.
+    /// Restart the bake from tile 0 at the current cell metrics.
     #[inline]
     pub fn restart(&mut self) {
         let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
@@ -86,9 +65,7 @@ impl RainBaker {
         self.next_tile >= ROM_GLYPHS || self.cell_w == 0 || self.cell_h == 0
     }
 
-    /// Bake up to [`MAX_RAIN_BAKES_PER_TICK`] pending tiles. Returns whether
-    /// any tile was baked (each batch bumps the version, so a rebake repaints
-    /// and re-uploads).
+    /// Bake up to [`MAX_RAIN_BAKES_PER_TICK`] pending tiles, returning whether any tile was baked.
     pub fn bake_tiles(&mut self, rom: &RomMaster) -> bool {
         if self.complete() {
             return false;
@@ -103,26 +80,14 @@ impl RainBaker {
         true
     }
 
-    /// Whether a selective re-bake is sound: a live cell metric and a complete
-    /// atlas, so every tile holds exactly what a full bake of the current
-    /// master would produce. Before the first geometry `complete()` is
-    /// vacuously true (`cell_w == 0`) but there is no buffer to patch, so that
-    /// case is excluded.
+    /// Return whether the baker has non-zero cell metrics and all 64 tiles baked.
     #[must_use]
     #[inline]
     pub const fn can_rebake(&self) -> bool {
         self.cell_w != 0 && self.cell_h != 0 && self.next_tile >= ROM_GLYPHS
     }
 
-    /// Re-bake only the tiles named by `mask` (bit `i` = tile `i`) into the
-    /// finished atlas. Untouched tiles keep their texels, which match a full
-    /// bake as long as their master glyphs did not change; the caller
-    /// guarantees that by listing exactly the slots it re-authored. The
-    /// published bytes equal a `restart()` plus full bake of the same master.
-    ///
-    /// The version advances exactly as the wholesale path would (one restart
-    /// plus one bump per progressive batch), even though fewer tiles are
-    /// baked, so the frame fingerprint sequence is identical.
+    /// Re-bake the tiles selected by `mask` into the completed atlas and advance `version` to match a full rebuild.
     pub fn rebake_tiles(&mut self, rom: &RomMaster, mask: u64) -> bool {
         if !self.can_rebake() || mask == 0 {
             return false;
@@ -141,15 +106,14 @@ impl RainBaker {
         true
     }
 
-    /// Monotonic atlas version (folded into the frame fingerprint).
+    /// Monotonic atlas version folded into the frame fingerprint.
     #[must_use]
     #[inline]
     pub const fn version(&self) -> u64 {
         self.version
     }
 
-    /// The published atlas snapshot, rebuilt lazily after a bake batch.
-    /// `None` until the first bake — rain-free frames carry no atlas.
+    /// Return the published atlas snapshot, rebuilding it lazily after a dirty bake batch.
     #[inline]
     pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
         if self.dirty {
@@ -164,7 +128,7 @@ impl RainBaker {
         self.published.clone()
     }
 
-    /// Atlas texel origin of `glyph`'s tile (its rect is `cell_w × cell_h`).
+    /// Atlas texel origin of `glyph`'s `cell_w × cell_h` tile.
     #[must_use]
     #[inline]
     pub const fn tile_origin(&self, glyph: u32) -> (u16, u16) {
@@ -175,11 +139,7 @@ impl RainBaker {
         )
     }
 
-    /// Box-filter one glyph's 24x48 master into its `(cell_w, cell_h)` tile
-    /// with exact integer area weighting. Dest pixel `x` covers master x-range
-    /// `[x*24/cw, (x+1)*24/cw)`; scaling both axes by `(cw, ch)` keeps every
-    /// overlap an integer, and the per-pixel denominator is the constant
-    /// `24*48`.
+    /// Box-filter `tile`'s 24×48 master into its `(cell_w, cell_h)` atlas slot with integer area weighting.
     fn bake_tile(&mut self, rom: &RomMaster, tile: usize) {
         let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
         if cw == 0 || ch == 0 {
@@ -189,11 +149,6 @@ impl RainBaker {
         let (ox, oy) = ((tile % RAIN_TILE_GRID) * cw, (tile / RAIN_TILE_GRID) * ch);
         const DEN: u32 = (MASTER_W * MASTER_H) as u32;
 
-        // The per-dest-column source range and horizontal weights `wx` depend
-        // only on `x` and `cw`, so the ascending `(mx, wx)` segments are built
-        // once per `cw` and shared across all 64 tiles. `mx1 = ((x+1)*MW -
-        // 1)/cw <= MW-1` always, so no clamp is needed. Iterating ascending
-        // keeps the `num` accumulation order fixed.
         if self.col_off.len() != cw + 1 {
             self.col_seg.clear();
             self.col_off.clear();
@@ -209,12 +164,8 @@ impl RainBaker {
             }
         }
 
-        // Per-dest-row source scratch `(wy, row_bits)`, indexed by `my`; it
-        // depends only on `(y, my)`, so it is computed once per dest row. Only
-        // `my0..=my_end` is read, so no per-row zeroing.
         let mut src: [(u32, u32); MASTER_H] = [(0, 0); MASTER_H];
         for y in 0..ch {
-            // Master rows overlapping dest row `y`, with overlaps in 1/ch units.
             let (a, b) = (y * MASTER_H, (y + 1) * MASTER_H);
             let (my0, my1) = (a / ch, (b - 1) / ch);
             let my_end = my1.min(MASTER_H - 1);
@@ -246,9 +197,6 @@ impl RainBaker {
                         }
                     }
                 }
-                // num <= DEN: a dest pixel's scaled extent is exactly
-                // MASTER_W*MASTER_H = DEN at full coverage, so the rounded
-                // alpha is at most 255 without a clamp.
                 let alpha = ((num * 255 + DEN / 2) / DEN) as u8;
                 let idx = (row_base + x) * 4;
                 self.rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, alpha]);
@@ -272,7 +220,6 @@ mod tests {
         b
     }
 
-    /// Max tile alpha for glyph `g` in a finished baker.
     fn tile_peak(b: &mut RainBaker, g: u32) -> u8 {
         let atlas = b.atlas().expect("baked atlas");
         let (ax, ay) = b.tile_origin(g);
@@ -287,7 +234,7 @@ mod tests {
         peak
     }
 
-    /// All 64 tiles carry ink at both a small and a retina cell metric.
+    /// Verify that all 64 tiles carry ink across small and retina cell metrics.
     #[test]
     fn all_tiles_nonempty_at_live_metrics() {
         for (cw, ch) in [(7u16, 14u16), (10, 20), (20, 40)] {
@@ -301,9 +248,7 @@ mod tests {
         }
     }
 
-    /// Versions are deterministic per instance, so a rebuilt baker replays
-    /// its predecessor's sequence; every publish is still a fresh allocation,
-    /// so the GPU cache's `Arc`-identity key never aliases.
+    /// Verify that rebuilt bakers replay the same version sequence while publishing distinct `Arc`s.
     #[test]
     fn rebuilt_bakers_replay_versions_but_publish_fresh_arcs() {
         let rom = rasterize_master();
@@ -331,7 +276,7 @@ mod tests {
         }
     }
 
-    /// A same-metric `begin_frame` is a no-op (no restart churn per tick).
+    /// Verify that `begin_frame` with unchanged metrics preserves bake progress.
     #[test]
     fn same_metric_begin_frame_keeps_progress() {
         let rom = rasterize_master();

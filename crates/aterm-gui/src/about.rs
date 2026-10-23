@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The build-provenance rows the native Settings `/about` route paints, and the
-//! clipboard block its Copy action writes. One source
-//! ([`crate::build_info::about_fields`]) feeds the route's pixels, its semantics
-//! (`controls about`) and [`provenance_text`], so no observer can disagree with another.
+//! Build-provenance rows for the native Settings `/about` route and its Copy action,
+//! sourced from [`crate::build_info::about_fields`].
 
 /// The build-provenance rows for the native Settings `/about` route.
 pub(crate) struct AboutState {
@@ -12,9 +10,7 @@ pub(crate) struct AboutState {
     rows: Vec<(&'static str, String)>,
 }
 
-/// The whole provenance block as clipboard-ready `key: value` lines, from the same
-/// [`crate::build_info::about_fields`] rows the route paints. A function of the build,
-/// so the copy path needs no [`AboutState`].
+/// The provenance block as clipboard-ready `key: value` lines.
 #[must_use]
 pub(crate) fn provenance_text() -> String {
     let mut out = String::from("aterm\n");
@@ -24,8 +20,7 @@ pub(crate) fn provenance_text() -> String {
     out
 }
 
-/// The byline link's target: the `site` provenance row as an absolute https URL
-/// (`None` if the build carries no site row).
+/// The `site` provenance row as an absolute URL (`https://` when it names no scheme), if present.
 pub(crate) fn site_url(state: &AboutState) -> Option<String> {
     let (_, v) = state.rows.iter().find(|(k, _)| *k == "site")?;
     Some(if v.contains("://") {
@@ -60,11 +55,8 @@ impl AboutState {
 mod tests {
     use super::*;
 
-    /// The site row becomes an absolute URL with or without a scheme; no row, no link.
     #[test]
     fn site_url_is_absolute_or_absent() {
-        // One stand-in provenance row ahead of the site row, so the link must be
-        // found among others: the real rows hash the whole test binary.
         let mut state = AboutState {
             rows: vec![("version", "0.0.0".to_string())],
         };

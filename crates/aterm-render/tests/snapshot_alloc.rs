@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the CPU snapshot and image paths allocate, read off a counting
-//! allocator.
-//!
-//! An owned CPU capture moves the completed framebuffer out of its temporary
-//! window cache: one full-frame allocation, which byte parity alone cannot
-//! tell from a second clone. A zoomed inline image decodes within its raster
-//! budget, and the window's decode cache keeps each on-screen placement
-//! decoded once.
+//! Counting-allocator tests for CPU snapshot framebuffer transfers, zoomed inline image raster budgets, and decode caching.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -22,8 +15,7 @@ static FRAME_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 /// The largest single allocation while [`TRACK_LARGEST`] is set.
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
 static TRACK_LARGEST: AtomicBool = AtomicBool::new(false);
-/// Bytes live in the process, and the most of them live at once since
-/// [`PEAK_LIVE`] was last reset.
+/// Bytes currently live in the process and the peak live bytes since [`PEAK_LIVE`] was last reset.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK_LIVE: AtomicUsize = AtomicUsize::new(0);
 /// How many allocations of at least [`BIG_BYTES`] were made while it is non-zero.
@@ -72,7 +64,6 @@ unsafe impl GlobalAlloc for CountingAlloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note_alloc(new_size);
-        // Both blocks are live while the bytes move.
         note_live(new_size, layout.size());
         // SAFETY: the pointer and layout came from this System-backed allocator.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -118,8 +109,7 @@ fn red_sixel(w: usize, h: usize) -> Vec<u8> {
     sixel.into_bytes()
 }
 
-/// The largest single allocation `f` makes, and the most bytes it holds live at
-/// once beyond what was live when it began.
+/// Returns `(result, largest_single_alloc, peak_live_delta)` for `f`.
 fn largest_alloc<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     LARGEST.store(0, Ordering::Relaxed);
     let before = LIVE.load(Ordering::Relaxed);
@@ -163,7 +153,6 @@ fn owned_snapshots_transfer_pixels_without_a_full_frame_clone() {
         let dims = (view.width(), view.height());
         let expected = view.pixels().to_vec();
         let bytes = expected.len() * std::mem::size_of::<u32>();
-        // A plain copy: the counter's negative control.
         let (copy, copies) = count_frames(bytes, || expected.clone());
         assert_eq!(copies, 1, "the counter must observe a full-frame clone");
         assert_eq!(copy, expected);
@@ -183,11 +172,7 @@ fn owned_snapshots_transfer_pixels_without_a_full_frame_clone() {
     }
 }
 
-/// Zoom a window holding `placement` — written at 16 px over the top 40 of 44
-/// rows, 64 columns wide — to the 200 px font ceiling in a window of the same
-/// size, scroll `rows_down` rows below the top of the picture (now in history),
-/// and render that frame: its pixels, its cell px, the largest single
-/// allocation the render makes and the most bytes it holds live at once.
+/// Renders `placement` zoomed to the 200 px font ceiling scrolled `rows_down` rows and returns `(frame, cell_px, largest_alloc, peak_live, renderer)`.
 fn render_zoomed(
     placement: impl FnOnce(&mut Terminal, (usize, usize)),
     rows_down: i32,
@@ -216,26 +201,17 @@ fn render_zoomed(
     (frame, (zw, zh), largest, peak, renderer)
 }
 
-/// What a zoomed placement's frame may hold at once: the decoded raster
-/// (`MAX_PLACEMENT_RASTER_PX`, 128 MiB of RGBA) plus the frame's own buffers,
-/// a few of the window's size — never a float plane of the raster's (16
-/// bytes a pixel, 512 MiB at the budget).
+/// Maximum live bytes allowed while rendering a zoomed placement (`MAX_PLACEMENT_RASTER_PX` RGBA plus frame buffers).
 fn zoomed_frame_budget(frame: &aterm_render::Frame) -> usize {
     aterm_render::MAX_PLACEMENT_RASTER_PX * 4 + 8 * frame.width * frame.height * 4
 }
 
-/// A placement keeps its cells when the font is zoomed, so its footprint in
-/// device px grows with the square of the cell: a sixel filling 64 x 40 cells at
-/// 16 px is a 7 680 x 9 320 px footprint at the 200 px zoom ceiling. Drawing it
-/// there must decode no more than `MAX_PLACEMENT_RASTER_PX` (128 MiB of RGBA),
-/// not the 273 MiB footprint — and still draw the picture.
+/// A placement zoomed to the 200 px ceiling decodes within `MAX_PLACEMENT_RASTER_PX` and renders its pixels.
 #[test]
 fn a_zoomed_placement_decodes_within_the_raster_budget() {
     let _counters = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A solid red sixel exactly 64 cells wide and 40 cells tall (its height a
-    // whole number of six-pixel bands).
     let (frame, (zw, zh), largest, peak, renderer) = render_zoomed(
         |terminal, (cw, ch)| terminal.process(&red_sixel(64 * cw, (40 * ch) / 6 * 6)),
         0,
@@ -260,19 +236,12 @@ fn a_zoomed_placement_decodes_within_the_raster_budget() {
     );
 }
 
-/// The same zoom for a picture the program sized in cells (Kitty `c=`/`r=`,
-/// iTerm2 `imgcat`'s width/height): fit, the source upscaled into the raster.
-/// The resample writes the raster row by row, never a float plane of the
-/// fitted box (16 bytes a pixel, 263 MiB here), so the raster is the largest
-/// buffer and what the frame holds stays within it.
+/// A cell-fitted placement zoomed to the 200 px ceiling resamples row by row within the raster budget.
 #[test]
 fn a_zoomed_fit_placement_decodes_within_the_raster_budget() {
     let _counters = COUNTERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // A 64 x 40 px raster fitted to 64 x 40 cells: at 200 px it is wider than
-    // its footprint, so it fills the width and is letterboxed top and bottom.
-    // Twenty rows down the picture's middle is on screen.
     let place = |terminal: &mut Terminal, _: (usize, usize)| {
         let rgba: Vec<u8> = [255u8, 10, 10, 255].repeat(64 * 40);
         let payload = aterm_codec::base64::encode(&rgba).expect("base64");
@@ -301,10 +270,7 @@ fn a_zoomed_fit_placement_decodes_within_the_raster_budget() {
     );
 }
 
-/// Two placements whose decodes together pass the decode cache's byte budget,
-/// both on screen (two window-wide pictures scrolled to their seam), are each
-/// decoded once: a repaint finds both in the window's cache. A strict LRU under
-/// the budget would evict each just before the next repaint asks for it.
+/// Two simultaneously visible placements exceeding the decode cache byte budget are each decoded once across repaints.
 #[test]
 fn two_placements_past_the_byte_budget_are_decoded_once() {
     let _counters = COUNTERS
@@ -320,13 +286,11 @@ fn two_placements_past_the_byte_budget_are_decoded_once() {
     terminal.process(&sixel);
     terminal.process(&sixel);
 
-    // Zoomed in, each footprint decodes to over half the budget (64 MiB).
     renderer.set_px(200.0);
     let (zw, zh) = renderer.cell_size();
     let (zcols, zrows) = ((cols * cw / zw).max(1), (rows * ch / zh).max(1));
     terminal.resize(zrows as u16, zcols as u16);
     terminal.set_cell_pixel_size(zw as u16, zh as u16);
-    // Scroll back until both pictures are on screen.
     let mut input = terminal.cell_frame(zrows, zcols);
     let shown = |input: &aterm_render::RenderInput| {
         let mut ids: Vec<usize> = input
@@ -369,14 +333,7 @@ fn two_placements_past_the_byte_budget_are_decoded_once() {
     }
 }
 
-/// Pictures layered on the same cells (three Kitty placements at z = 0, 1, 2
-/// over 64 x 40 cells) at the 200 px ceiling, where each full raster is
-/// 127 MiB and the three together pass the frame's working set. The CPU image
-/// passes walk each row cell by cell with the cell's layers together, so a
-/// cache that evicted one layer to admit another would miss on every covered
-/// cell; the frame's rasters are sized to fit the working set instead. Each
-/// picture decodes once, the frame holds no more than the working set, and
-/// every later repaint decodes nothing.
+/// Layered placements whose full rasters exceed `MAX_IMAGE_WORKING_SET_BYTES` are scaled to fit the working set and decoded once.
 #[test]
 fn layered_placements_past_the_working_set_are_decoded_once() {
     let _counters = COUNTERS
@@ -415,7 +372,6 @@ fn layered_placements_past_the_working_set_are_decoded_once() {
         "the full rasters pass the working set together"
     );
 
-    // Each decode allocates its raster: a third of the working set, past 48 MiB.
     let big = 48 << 20;
     let mut cache = WindowCpu::new();
     let (((), first), _, peak) = largest_alloc(|| {
@@ -441,11 +397,7 @@ fn layered_placements_past_the_working_set_are_decoded_once() {
     }
 }
 
-/// More distinct placements on screen than the decode cache's 64-entry cap (a
-/// 9 x 9 contact sheet of Kitty thumbnails) are each decoded once: a repaint
-/// finds all 81 in the window's cache. The frame in progress keeps all of its
-/// own entries; a strict LRU under the cap would evict each just before the
-/// next repaint asks for it.
+/// A visible contact sheet exceeding the decode cache's 64-entry cap keeps all on-screen tiles cached across repaints.
 #[test]
 fn a_contact_sheet_past_the_entry_cap_is_decoded_once() {
     let _counters = COUNTERS
@@ -460,7 +412,6 @@ fn a_contact_sheet_past_the_entry_cap_is_decoded_once() {
     terminal.set_cell_pixel_size(cw as u16, ch as u16);
     for i in 0..side * side {
         let (r, c) = (i / side * tile_rows + 1, i % side * tile_cols + 1);
-        // A distinct 8x6 raw RGBA raster per tile, so each is its own image.
         let rgba: Vec<u8> = [i as u8, 100, 200, 255].repeat(8 * 6);
         let payload = aterm_codec::base64::encode(&rgba).expect("base64");
         terminal.process(
@@ -481,7 +432,6 @@ fn a_contact_sheet_past_the_entry_cap_is_decoded_once() {
     shown.dedup();
     assert_eq!(shown.len(), side * side, "every thumbnail is on screen");
 
-    // Each decode allocates exactly one tile-sized raster.
     let raster = tile_cols * cw * tile_rows * ch * 4;
     let mut cache = WindowCpu::new();
     let ((), first) = count_frames(raster, || {

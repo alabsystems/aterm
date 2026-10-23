@@ -43,7 +43,8 @@ fn sent_order() -> Vec<&'static str> {
     KEPT_HEADERS.iter().rev().copied().collect()
 }
 
-/// Twenty headers: the fifteen kept ones in upper case and in reverse order.
+/// Twenty headers: the fifteen kept ones in upper case and in reverse order, among five that
+/// are not.
 fn twenty_headers() -> Vec<(String, String)> {
     let mut headers = Vec::new();
     for (i, name) in KEPT_HEADERS.iter().enumerate().rev() {
@@ -837,7 +838,8 @@ fn a_tape_is_private() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
-/// A directory made readable again.
+/// A directory made readable again (0700) when this drops, a panic included, so the scratch
+/// directory's own drop can list and remove it.
 #[cfg(unix)]
 struct Readable<'a>(&'a Path);
 

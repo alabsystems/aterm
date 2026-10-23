@@ -11,21 +11,14 @@ use super::extra_collection::CellExtras;
 use crate::extra::{CellCoord, CellExtra};
 
 impl CellExtras {
-    /// Shift rows up within `[top, bottom]` by `n`: rows `[top, top + n)` drop,
-    /// `[top + n, bottom]` shift up, rows outside stay. One drain-rebuild (O(E)
-    /// for any `n`) that also compacts the row offset.
+    /// Shifts rows up within `[top, bottom]` by `n`, dropping `[top, top + n)` and compacting the row offset.
     pub(crate) fn shift_region_up_by(&mut self, top: u16, bottom: u16, n: u16) {
-        // The dense rings shift the same way (in every shift below): ring-only
-        // entries never reach the map, so a wholesale wipe would drop truecolor
-        // and complex chars outside the region.
         self.shift_rings_region_up(top, bottom, n);
         if n == 0 || self.data.is_empty() {
             return;
         }
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
-        // No pending offset and no entry inside `[top, bottom]`: the rebuild
-        // would be an identity copy.
         let offset = self.take_row_offset();
         if offset == 0
             && !self
@@ -60,9 +53,7 @@ impl CellExtras {
         self.enforce_hyperlink_limit();
     }
 
-    /// Shift rows down within `[top, bottom]` by `n`: rows `[bottom-n+1, bottom]`
-    /// drop, `[top, bottom-n]` shift down. One drain-rebuild that also compacts
-    /// the row offset.
+    /// Shifts rows down within `[top, bottom]` by `n`, dropping `[bottom - n + 1, bottom]` and compacting the row offset.
     pub(crate) fn shift_region_down_by(&mut self, top: u16, bottom: u16, n: u16) {
         self.shift_rings_region_down(top, bottom, n);
         if n == 0 || self.data.is_empty() {
@@ -90,7 +81,6 @@ impl CellExtras {
 
             if ext_row >= top && ext_row <= bottom {
                 if ext_row < drop_start {
-                    // ext_row + n <= bottom, so this never saturates.
                     new_data.insert(CellCoord::new(ext_row.saturating_add(n), coord.col), extra);
                 }
             } else {
@@ -101,9 +91,7 @@ impl CellExtras {
         self.enforce_hyperlink_limit();
     }
 
-    /// Shift extras up within the rect `[top, bottom] × [left, right]` (DECLRMM
-    /// scroll and DL): rows `[top, top + n)` drop, rows `[top + n, bottom]` move
-    /// up by `n`, entries outside the rect stay.
+    /// Shifts extras up by `n` within `[top, bottom] × [left, right]` (DECLRMM scroll and DL).
     pub(crate) fn shift_rect_up_by(
         &mut self,
         top: u16,
@@ -128,7 +116,6 @@ impl CellExtras {
             }
             let ext_row = coord.row - offset;
 
-            // Outside row range or outside column range: preserve unchanged.
             if ext_row < top || ext_row > bottom || coord.col < left || coord.col > right {
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
                 continue;
@@ -144,9 +131,7 @@ impl CellExtras {
         self.enforce_hyperlink_limit();
     }
 
-    /// Shift extras down within the rect `[top, bottom] × [left, right]`
-    /// (DECLRMM scroll and IL): rows `[top, bottom - n]` move down by `n`, rows
-    /// `[bottom - n + 1, bottom]` drop, entries outside the rect stay.
+    /// Shifts extras down by `n` within `[top, bottom] × [left, right]` (DECLRMM scroll and IL).
     pub(crate) fn shift_rect_down_by(
         &mut self,
         top: u16,
@@ -171,7 +156,6 @@ impl CellExtras {
             }
             let ext_row = coord.row - offset;
 
-            // Outside row range or outside column range: preserve unchanged.
             if ext_row < top || ext_row > bottom || coord.col < left || coord.col > right {
                 new_data.insert(CellCoord::new(ext_row, coord.col), extra);
                 continue;
@@ -185,12 +169,7 @@ impl CellExtras {
         self.enforce_hyperlink_limit();
     }
 
-    /// Extract every entry on `internal_row` in `[start_col, max_col)`, removing
-    /// it from the map, and return the `(col, extra)` pairs.
-    ///
-    /// Probes the column range (O(width)) unless the map is smaller than the
-    /// range, where a key scan is cheaper. The two branches extract in different
-    /// orders, which is unobservable: the caller's reinsert is order-independent.
+    /// Removes and returns all `(col, extra)` entries on `internal_row` in `[start_col, max_col)`.
     fn take_row_range(
         &mut self,
         internal_row: u16,
@@ -223,11 +202,7 @@ impl CellExtras {
         extracted
     }
 
-    /// Shift columns right within a single row for ICH (Insert Character).
-    ///
-    /// Columns in `[start_col, max_col - count)` shift right by `count`;
-    /// `[start_col, start_col + count)` are cleared; columns pushed past
-    /// `max_col` drop. Only the target row's entries move.
+    /// Shifts columns in `[start_col, max_col)` right by `count` on `row` for ICH, dropping entries pushed past `max_col`.
     pub fn shift_cols_right(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         self.shift_rings_cols_right(row, start_col, count, max_col);
         if count == 0 || self.data.is_empty() {
@@ -236,9 +211,6 @@ impl CellExtras {
         #[cfg(any(test, debug_assertions))]
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let internal_row = self.internal_row(row);
-        // Extract all affected entries, then reinsert shifted, so a destination
-        // cannot collide with a not-yet-processed source key. Entries at or past
-        // max_col are outside the margin (DECLRMM) and stay in place.
         let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             let new_col = col.saturating_add(count);
@@ -250,11 +222,7 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Shift columns left within a single row for DCH (Delete Character).
-    ///
-    /// Columns in `[start_col, start_col + count)` are deleted; columns in
-    /// `[start_col + count, max_col)` shift left by `count`. Only the target
-    /// row's entries move.
+    /// Shifts columns in `[start_col + count, max_col)` left by `count` on `row` for DCH, deleting `[start_col, start_col + count)`.
     pub(crate) fn shift_cols_left(&mut self, row: u16, start_col: u16, count: u16, max_col: u16) {
         self.shift_rings_cols_left(row, start_col, count, max_col);
         if count == 0 || self.data.is_empty() {
@@ -264,7 +232,6 @@ impl CellExtras {
         crate::test_counters::count_extras_shift_ops(self.data.len());
         let internal_row = self.internal_row(row);
         let shift_start = start_col.saturating_add(count);
-        // Extract then reinsert, as in shift_cols_right.
         let extracted = self.take_row_range(internal_row, start_col, max_col);
         for (col, extra) in extracted {
             if col >= shift_start {
@@ -445,16 +412,7 @@ mod tests {
         char::from_u32(0x1F000 + u32::from(row) * 64 + u32::from(col)).expect("valid char")
     }
 
-    /// EVERY SHIFT MOVES EVERY STORE BY THE SAME CONTRACT. Each scenario fills
-    /// a 24x24 grid (densely, then sparsely so `take_row_range` takes both its
-    /// probe and its scan branch) in all three stores: a HashMap entry
-    /// carrying an fg RGB, an RGB-ring bg and a complex-ring codepoint, each
-    /// naming its origin cell. After the shifts every store must hold exactly
-    /// what the model moves where — nothing lost, nothing duplicated, nothing
-    /// left behind — including rows outside a region (ORACLE BUG A: a
-    /// truecolor cell above an SU region kept its bg), columns outside a
-    /// DECLRMM rect or past an ICH/DCH margin, and an accumulated full-screen
-    /// row offset.
+    /// Verifies that every shift moves entries in the HashMap, RGB ring, and complex-char ring according to `Shift::model`.
     #[test]
     fn every_shift_moves_every_store_by_the_model() {
         use Shift::*;

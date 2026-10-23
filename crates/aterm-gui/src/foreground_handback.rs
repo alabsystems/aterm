@@ -219,7 +219,9 @@ impl FgCutter {
     }
 }
 
-/// Which foreground group armed each evidence bit in force: the parse stage's half of the handback rule (module doc).
+/// Which foreground group armed each evidence bit in force: the parse stage's half of the
+/// handback rule, which restores the modes only once a group that armed an input-hijacking bit
+/// still in force is gone.
 #[derive(Debug, Default)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct FgOwners {
@@ -384,7 +386,8 @@ pub(crate) fn leader_gone(pgid: i32) -> bool {
         if pgid <= 0 {
             return false;
         }
-        // SAFETY: signal 0 performs only the existence and permission checks and delivers nothing.
+        // SAFETY: signal 0 performs only the existence and permission checks
+        // and delivers nothing; `pgid > 0` names one process, never a group.
         let rc = unsafe { libc::kill(pgid, 0) };
         rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
@@ -430,7 +433,8 @@ pub(crate) fn group_empty(pgid: i32) -> bool {
         if pgid <= 1 {
             return false;
         }
-        // SAFETY: signal 0 performs only the existence and permission checks and delivers nothing.
+        // SAFETY: signal 0 performs only the existence and permission checks
+        // and delivers nothing; `-pgid` with `pgid > 1` names that one group.
         let rc = unsafe { libc::kill(-pgid, 0) };
         rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
@@ -471,7 +475,9 @@ fn linux_group_has_stopped_member(master: i32, pgid: i32) -> bool {
             .is_ok_and(|stat| proc_stat_is_stopped_in(&stat, pgid))
     };
     let sid = if master >= 0 {
-        // SAFETY: TIOCGSID reads the session id of the terminal `master` names (a pty master answers for its slave).
+        // SAFETY: TIOCGSID reads the session id of the terminal `master`
+        // names (a pty master answers for its slave); an fd that is not a
+        // terminal answers -1 and writes nothing.
         unsafe { libc::tcgetsid(master) }
     } else {
         -1
@@ -553,6 +559,9 @@ fn tree_any(
 /// status ([`darwin_member_status`], `PROC_PIDT_SHORTBSDINFO`).
 #[cfg(target_os = "macos")]
 fn darwin_group_has_stopped_member(pgid: i32) -> bool {
+    // SAFETY (declaration): libproc in libSystem exports this with exactly this signature
+    // (`<libproc.h>`): a pgid, a buffer of `buffersize` bytes, and the number of pids written, or
+    // -1.
     unsafe extern "C" {
         fn proc_listpgrppids(
             pgrpid: libc::pid_t,

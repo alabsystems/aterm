@@ -5,10 +5,6 @@
 
 use super::*;
 
-/// A real queued key follows an unknown-width insert on the FIFO wire, while its dispatch stamp
-/// precedes the insert's delivery receipt. The first frame shows only the insert's placeholder;
-/// cleanup runs after two seconds with the key still unpaid. Shared by the positive and refusal
-/// paths below.
 fn unknown_insert_orphan_key_setup(
     t0: Instant,
     keys: usize,
@@ -182,7 +178,6 @@ fn two_unknown_insert_orphan_keys_light_only_on_separate_exact_echoes() {
     assert!(glow.insert.orphan_exact.is_none());
     assert_eq!(glow.typed_credits_within(at(3_400)), 0);
 
-    // A later live key joins the two recovered cells with no dark notch.
     glow.note_typed_expected(at(3_600), 1, false, rk::TypedClass::Glyph, 'q');
     row[15] = 'q';
     glow.observe_print_anchor(Some((3, 16, 4)));
@@ -201,14 +196,11 @@ fn two_unknown_insert_orphan_keys_light_only_on_separate_exact_echoes() {
         "the next live key sees one continuous painted run"
     );
 
-    // A later keyless program print cannot borrow either spent key.
     row[16] = 'z';
     glow.observe_print_anchor(Some((3, 17, 5)));
     glow.observe_row(3, 17, &row, at(3_800));
     glow.tick(Some((3, 17)), at(3_800), &c, g, &mut out);
     assert_eq!(glow.spawns(), 7);
-    // The smooth ribbon can blur into the neighbouring pixel column;
-    // owned field cells and the admission count are the licence check.
     assert!(!v2_cols(&glow, 3).contains(&16));
 }
 
@@ -246,7 +238,6 @@ fn two_unknown_insert_orphans_reject_unrelated_or_stale_second_prints() {
         assert!(glow.insert.orphan_exact.is_none());
         assert_eq!(glow.typed_credits_within(at(3_400)), 0);
 
-        // Even a later matching glyph cannot reclaim the discarded key.
         row[15] = 'm';
         glow.observe_print_anchor(Some((3, 16, 4)));
         glow.observe_row(3, 16, &row, at(3_600));
@@ -320,14 +311,11 @@ fn two_unknown_insert_orphans_coalesced_exact_cells_light_without_generic_credit
         state["generic"] as usize
     );
 
-    // A later keyless program print cannot spend either batch credit.
     row[15] = 'z';
     glow.observe_print_anchor(Some((3, 16, 3)));
     glow.observe_row(3, 16, &row, at(3_400));
     glow.tick(Some((3, 16)), at(3_400), &c, g, &mut out);
     assert_eq!(glow.spawns(), 5);
-    // Pixel bloom may extend next door; no field at 15 means no keyless
-    // program cell was admitted into the typed ribbon.
     assert!(!v2_cols(&glow, 3).contains(&15));
 }
 
@@ -389,9 +377,6 @@ fn two_unknown_insert_orphans_reject_partial_wrong_stale_or_unprobed_batch() {
     assert!(!v2_cols(&too_many, 3).contains(&13));
     assert!(!v2_cols(&too_many, 3).contains(&14));
 
-    // On the alternate screen, the normal coalesced classifier needs a
-    // repaint blink. An exact orphan proof cannot restore credits for a
-    // spawn that would then skip the typed sweep and leave both cells dark.
     let (mut alt, mut out, mut row) = unknown_insert_orphan_key_setup(t0, 2, true);
     let mut alt_state = model.init_state();
     for action in [
@@ -429,8 +414,6 @@ fn unknown_insert_orphan_space_cannot_claim_an_unchanged_blank() {
     let (mut glow, mut out, row) = unknown_insert_orphan_key_setup_with_glyph(t0, 1, true, ' ');
     assert_eq!(glow.insert.orphan_exact.is_some(), state["escrow"] != 0);
     assert_eq!(glow.typed_credits_within(at(3_000)), 0);
-    // A program print elsewhere advances the PTY print generation, then
-    // moves the caret one cell. The candidate cell never changed.
     glow.observe_print_anchor(Some((10, 8, 2)));
     glow.observe_row(3, 14, &row, at(3_200));
     glow.tick(Some((3, 14)), at(3_200), &c, g, &mut out);
@@ -480,8 +463,6 @@ fn unknown_insert_orphan_key_escrow_expires_and_drops_on_space_changes() {
     );
 }
 
-/// The host composes the normal and under-ink streams for one frame;
-/// sample both without appending under-quads to `out` across test ticks.
 fn rendered_ribbon_cols(
     glow: &CursorGlow,
     out: &[GlowQuad],

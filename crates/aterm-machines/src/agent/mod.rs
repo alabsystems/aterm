@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm machines agent …`: the host side (design §3, §4).
-//!
-//! | verb | runs as | what |
-//! |---|---|---|
-//! | `ssh` | the admin, as the fleet key's forced command | reads `SSH_ORIGINAL_COMMAND` and runs one of `hello`, `put`, `apply`, `attach`, `screen` ([`dispatch`], [`relay`]) |
-//! | `hello` | the admin | one [`crate::protocol::Hello`] JSON line ([`hello`]) |
-//! | `put <sha256>` | the admin | standard input into the admin's inbox, checked against the hash ([`inbox`]) |
-//! | `apply` | root, through the one sudoers rule | verifies the envelope on standard input, starts the run job, streams it ([`apply`]) |
-//! | `run-job <run>` | root, started by `apply` | the run itself, detached from the SSH session ([`job`]) |
-//! | `attach <run>` | the admin | streams a run from its start ([`apply::follow`]) |
-//! | `put-file <path> <mode>` | a user, never root | standard input atomically into a file in that user's home ([`inbox`]) |
-//! | `install …` | root, through a password `sudo` at enrollment only | puts the staged agent in place ([`install`]) |
-//! | `lock-screen` | the admin, in their login session, run by `screen` through a signed `exec` | locks that session and reads it back locked ([`lock`]) |
-//! | `screen-watch arm …`, `disarm <id>` | root, run by `screen` through a signed `exec` | starts, and ends, a watcher that locks the admin's session should `screen` vanish before its own lock ([`watch`]) |
-//! | `screen-watch run <id>` | root, started by `arm` | the watcher itself, detached from the run ([`watch`]) |
-//! | `version` | anyone | the agent's version |
-//!
-//! Nothing here reads the environment, `HOME` or aterm's own configuration, except `ssh`,
-//! whose input is `SSH_ORIGINAL_COMMAND`, and `hello`'s tab list, read only in the
-//! account's own home (`crate::sessions::is_live_account`): every path comes from
-//! [`Layout`], every account from `crate::facts::user`, and every child gets an explicit
-//! environment from the port.
+//! Host-side `aterm machines agent` entry points and layout.
 
 use crate::port::System;
 use std::io::{Read, Write};
@@ -42,8 +21,7 @@ pub mod relay;
 pub mod state;
 pub mod watch;
 
-/// Where everything the agent keeps lives: [`crate::AGENT_ROOT`] on a managed host, a
-/// temporary directory in tests.
+/// Where everything the agent keeps lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     /// The agent's root (root:wheel 0755).
@@ -77,8 +55,7 @@ impl Layout {
         self.root.join("bin")
     }
 
-    /// `bin/aterm`: the stable path the sudoers rule and the forced command name, a
-    /// root-owned link to the agent's executable.
+    /// `bin/aterm`: root-owned symlink to the agent's executable.
     #[must_use]
     pub fn exe_link(&self) -> PathBuf {
         self.bin().join("aterm")
@@ -96,8 +73,7 @@ impl Layout {
         self.root.join("managed.toml")
     }
 
-    /// `.metadata_never_index`: keeps Spotlight and LaunchServices away from the second
-    /// aterm.app.
+    /// `.metadata_never_index`: keeps Spotlight and LaunchServices away from the second aterm.app.
     #[must_use]
     pub fn never_index(&self) -> PathBuf {
         self.root.join(".metadata_never_index")
@@ -139,8 +115,7 @@ impl Layout {
         self.state().join("last_run")
     }
 
-    /// `state/last_busy` (0644): the newest signed request refused `busy`, named as its run
-    /// would have been: a heartbeat of the screen watch ([`watch`]).
+    /// `state/last_busy` (0644): newest signed request refused as `busy` ([`watch`]).
     #[must_use]
     pub fn last_busy(&self) -> PathBuf {
         self.state().join("last_busy")
@@ -188,8 +163,7 @@ impl Layout {
         self.root.join("stage")
     }
 
-    /// `inbox/`: where an artifact copied from the admin's inbox lands, root-owned, until
-    /// its hash is checked and it moves into `cache/`.
+    /// `inbox/`: root-owned staging directory before hash verification into `cache/`.
     #[must_use]
     pub fn inbox(&self) -> PathBuf {
         self.root.join("inbox")
@@ -222,7 +196,7 @@ pub const FAMILIES: &[&str] = &[
     "person",
 ];
 
-/// The exit status of a refusal (design `protocol`: `refused: <why>`, status 2).
+/// Exit status returned when an agent command is refused (`refused: <why>`).
 pub const REFUSED: u8 = 2;
 
 /// `aterm machines agent <args>`.
@@ -253,7 +227,6 @@ pub fn run(
 ) -> ExitCode {
     match args {
         ["ssh"] => {
-            // The one environment read in the agent: the forced command's input.
             let original = std::env::var("SSH_ORIGINAL_COMMAND").ok();
             dispatch::ssh(sys, layout, original.as_deref(), stdin, out)
         }
@@ -305,7 +278,6 @@ pub fn is_run_id(s: &str) -> bool {
 }
 
 /// The account this process runs as, resolved through the directory (never `HOME`).
-///
 /// # Errors
 /// One line.
 pub fn me(sys: &dyn System) -> Result<crate::model::User, String> {
@@ -319,9 +291,7 @@ pub fn me(sys: &dyn System) -> Result<crate::model::User, String> {
     crate::facts::user(sys, &name)
 }
 
-/// Remove `path` and everything below it, never following a link (a link is removed, not
-/// entered).
-///
+/// Remove `path` and everything below it, never following a link (a link is removed, not entered).
 /// # Errors
 /// The first I/O error.
 pub fn remove_tree(sys: &dyn System, path: &Path) -> std::io::Result<()> {

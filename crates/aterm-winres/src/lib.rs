@@ -3,12 +3,6 @@
 
 //! Compile a Win32 resource script (`.rc`) and emit `cargo:rustc-link-arg-bins`
 //! for the calling package's binaries.
-//!
-//! Selects a resource compiler for the target (`rc.exe` or `llvm-rc` producing
-//! `.res` for MSVC/LLD; `windres` producing COFF `.o` for GNU), searching
-//! `ATERM_RC`, `PATH`, `WindowsSdkVerBinPath`, and the Windows Kits install root
-//! (newest SDK first). Returns an [`Outcome`] so callers can warn or fail when
-//! no compiler is found.
 #![allow(
     clippy::disallowed_types,
     reason = "never linked into the shipped binary: a build-script step"
@@ -21,16 +15,13 @@ use std::process::Command;
 /// What happened to the resource script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The resource compiled and the link argument was emitted for this
-    /// package's bins. Carries the compiled artifact's path.
+    /// The resource compiled and the link argument was emitted.
     Linked(PathBuf),
-    /// The TARGET is not Windows: nothing was compiled and nothing was emitted,
-    /// so the binary is byte-identical to one built without the step.
+    /// The target is not Windows; nothing was compiled or emitted.
     NotWindows,
-    /// No resource compiler could be found; the message says where it looked.
+    /// No resource compiler could be found.
     NoCompiler(String),
-    /// A compiler was found and ran, and failed; the message carries its
-    /// exit status and stderr.
+    /// The resource compiler failed.
     Failed(String),
 }
 
@@ -125,18 +116,7 @@ pub const fn decode_winres_version_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     (major, minor, patch, build)
 }
 
-/// Compile `rc` for the TARGET and link the result into this package's bins.
-///
-/// `rc` may be relative, in which case it is resolved against
-/// `CARGO_MANIFEST_DIR` — the directory cargo runs build scripts from. The
-/// script's own directory is put on the compiler's include path, so a
-/// `1 ICON "aterm.ico"` beside the `.rc` resolves wherever the compiler runs.
-///
-/// Emits `cargo:rerun-if-changed` for the script and
-/// `cargo:rerun-if-env-changed` for `ATERM_RC` (and, when no compiler was
-/// found, for the variables the search read, so installing one re-runs the
-/// step); the caller still owns the rerun lines for anything the script pulls
-/// in (the `.ico`, the manifest).
+/// Compile `rc` for the target and link the result into this package's bins.
 pub fn compile(rc: &Path) -> Outcome {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return Outcome::NotWindows;
@@ -159,9 +139,6 @@ pub fn compile(rc: &Path) -> Outcome {
     let (compiler, dialect) = match locate_compiler(&target_env, &target_arch) {
         Ok(found) => found,
         Err(why) => {
-            // A miss can be fixed without a source change (a Developer prompt,
-            // an SDK install), so declare the env vars the search read. Only
-            // on the miss path: a hit must not re-run on every PATH change.
             for var in [
                 "PATH",
                 "WindowsSdkVerBinPath",
@@ -194,8 +171,6 @@ pub fn compile(rc: &Path) -> Outcome {
 
     let mut cmd = Command::new(&compiler);
     cmd.args(arguments(dialect, &include_dir, &rc, &artifact));
-    // rc.exe resolves the file names inside the script against ITS working
-    // directory as well as /I; running beside the script covers both.
     if include_dir.is_dir() {
         cmd.current_dir(&include_dir);
     }
@@ -228,7 +203,7 @@ pub fn compile(rc: &Path) -> Outcome {
     Outcome::Linked(artifact)
 }
 
-/// The argument vector for one dialect. Pure, so the shape is unit-tested.
+/// The argument vector for one dialect.
 fn arguments(dialect: Dialect, include_dir: &Path, rc: &Path, artifact: &Path) -> Vec<String> {
     let inc = include_dir.display().to_string();
     let rc = rc.display().to_string();
@@ -267,16 +242,12 @@ fn dialect_of(program: &Path) -> Dialect {
     }
 }
 
-/// Find a resource compiler for the target, in a fixed order that is stated
-/// in the error when every step misses.
+/// Find a resource compiler for the target.
 fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dialect), String> {
     let mut looked = Vec::new();
 
     let gnu = target_env == "gnu";
 
-    // 1. An explicit choice wins outright, but is held to the TARGET's
-    //    linker: a `.res` handed to GNU `ld` fails later with "file format
-    //    not recognized", so refuse that dialect here.
     if let Some(explicit) = std::env::var_os("ATERM_RC") {
         let p = PathBuf::from(explicit);
         let found = if p.is_file() {
@@ -302,8 +273,6 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
     }
 
     let path_candidates: &[&str] = if gnu {
-        // A target-prefixed windres first: on a cross host the bare name, if
-        // present at all, is the HOST's binutils and emits the wrong COFF.
         match target_arch {
             "x86_64" => &["x86_64-w64-mingw32-windres", "windres"],
             "x86" => &["i686-w64-mingw32-windres", "windres"],
@@ -330,10 +299,6 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
             }
             looked.push(format!("{}", p.display()));
         }
-        // 3. The documented Windows Kits root, every installed SDK version,
-        //    newest first: partial kits (an arch directory with no rc.exe)
-        //    are common, and a partial newer kit must not hide a full older
-        //    one. Both program roots are tried; x64 installs under (x86).
         for root_var in ["ProgramFiles(x86)", "ProgramFiles"] {
             let Some(root) = std::env::var_os(root_var) else {
                 continue;
@@ -383,8 +348,7 @@ fn locate_compiler(target_env: &str, target_arch: &str) -> Result<(PathBuf, Dial
     ))
 }
 
-/// The SDK `bin\<version>\<arch>` subdirectory for the machine running the
-/// build script. Build scripts run on the HOST, and `rc.exe` is a host tool.
+/// The host SDK `bin\<version>\<arch>` subdirectory.
 fn host_sdk_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -393,9 +357,7 @@ fn host_sdk_arch() -> &'static str {
     }
 }
 
-/// The `10.a.b.c` directory names, newest first, compared numerically so
-/// `10.0.26100.0` outranks `10.0.9600.0` — a lexical sort gets that wrong.
-/// Anything that is not four numeric components starting with 10 is dropped.
+/// The `10.a.b.c` directory names, sorted numerically newest first.
 fn sdk_versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut versions: Vec<([u64; 4], &str)> = Vec::new();
     for n in names {
@@ -429,9 +391,7 @@ fn sdk_versions_newest_first<'a>(names: impl IntoIterator<Item = &'a str>) -> Ve
     out
 }
 
-/// Resolve a bare program name against `PATH`, trying the Windows executable
-/// extensions when the name has none. A name with a directory component is
-/// returned as-is when it exists.
+/// Resolve a program name against `PATH`.
 #[allow(clippy::question_mark)]
 fn find_on_path(program: &Path) -> Option<PathBuf> {
     if program.components().count() > 1 {

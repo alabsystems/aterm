@@ -12,12 +12,17 @@ use aterm_cg::{CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGDisplayCopyDispl
 use aterm_objc::cf::CFUUID;
 use tracing::warn;
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{send_f64, send_id, send_id_id, send_id_usize, send_u32, send_usize};
 use aterm_objc::{autoreleasepool, class, run_on_main, sel, Id, Obj};
 
 use super::ffi;
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 
+// LOCAL PATCH (aterm): `VideoModeHandle` and `video_modes` are gone with exclusive fullscreen; this
+// only owns the current mode `refresh_rate_millihertz` reads.
 pub struct NativeDisplayMode(pub ffi::CGDisplayModeRef);
 
 impl Drop for NativeDisplayMode {
@@ -29,6 +34,9 @@ impl Drop for NativeDisplayMode {
 }
 
 /// CoreGraphics display handle backed by a `CFUUID`.
+///
+/// LOCAL PATCH (aterm): `aterm_objc::cf::CFUUID` is `Send + Sync` itself, so upstream's two `unsafe
+/// impl`s are gone.
 #[derive(Clone)]
 pub struct MonitorHandle(CFUUID);
 
@@ -82,6 +90,8 @@ impl std::hash::Hash for MonitorHandle {
     }
 }
 
+/// LOCAL PATCH (aterm): a display that leaves before its UUID is read is skipped, where upstream
+/// unwrapped (a panic inside whatever AppKit callback asked).
 pub fn available_monitors() -> VecDeque<MonitorHandle> {
     if let Ok(displays) = CGDisplay::active_displays() {
         let mut monitors = VecDeque::with_capacity(displays.len());
@@ -106,6 +116,9 @@ pub fn available_monitors() -> VecDeque<MonitorHandle> {
 }
 
 /// Returns the primary monitor, or `None` during display reconfiguration.
+///
+/// LOCAL PATCH (aterm): upstream unwraps the main display's UUID, which is `None` for an instant
+/// mid-reconfiguration; this falls back to the first active display, then `None`.
 pub fn primary_monitor() -> Option<MonitorHandle> {
     MonitorHandle::new(CGDisplay::main().id).or_else(|| {
         warn!("main display has no UUID right now; falling back to the first active display");
@@ -190,7 +203,9 @@ impl MonitorHandle {
         let _ = w;
         let uuid = self.uuid();
         autoreleasepool(|_| {
-            // SAFETY: `+screens`, `-count`, and in-bounds `-objectAtIndex:` are valid on `NSScreen`.
+            // SAFETY: `+screens` is `@16@0:8` and answers a live `NSArray`;
+            // `-count` is `Q16@0:8` and `-objectAtIndex:` is `@24@0:8Q16`,
+            // which cannot be out of range for an index below the count.
             unsafe {
                 let screens = send_id(class(c"NSScreen").as_id(), sel!(screens));
                 let n = send_usize(screens, sel!(count));
@@ -215,7 +230,13 @@ impl MonitorHandle {
 
 /// Returns the `CGDirectDisplayID` for a live `NSScreen`.
 pub(crate) fn get_display_id(screen: Id) -> u32 {
-    // SAFETY: `-deviceDescription` returns a dictionary whose `NSScreenNumber` is an `NSNumber`.
+    // SAFETY: `-deviceDescription` is `@16@0:8` on `NSScreen` and answers a +0
+    // autoreleased `NSDictionary` whose entries are borrowed for as long as it
+    // is; `-objectForKey:` is `@24@0:8@16`. The value at `@"NSScreenNumber"` is
+    // documented to be an `NSNumber`, and `-unsignedIntValue` is `I16@0:8` — an
+    // `unsigned int`, matching `CGDirectDisplayID`'s `uint32_t`, which is why
+    // this is `send_u32` and not `send_usize`.
+    // <https://developer.apple.com/documentation/appkit/nsscreen/1388360-devicedescription?language=objc>
     autoreleasepool(|_| unsafe {
         let key = aterm_objc::ns_string("NSScreenNumber").expect("a Foundation string");
         let device_description = send_id(screen, sel!(deviceDescription));

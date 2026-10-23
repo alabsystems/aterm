@@ -76,7 +76,8 @@ fn host_port() -> libc::mach_port_t {
 pub(crate) fn sysctl_int(name: &CStr) -> Option<i64> {
     let mut buf = [0u8; 8];
     let mut len: libc::size_t = buf.len();
-    // SAFETY: `name` is NUL-terminated.
+    // SAFETY: `name` is NUL-terminated; `buf` is writable for `len` bytes and
+    // the kernel writes at most `len`, reporting how many in `len`.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -105,7 +106,8 @@ pub(crate) fn sysctl_timeval_ms(name: &CStr) -> Option<i64> {
         tv_usec: 0,
     };
     let mut len: libc::size_t = std::mem::size_of::<libc::timeval>();
-    // SAFETY: `name` is NUL-terminated.
+    // SAFETY: `name` is NUL-terminated; `tv` is writable for `len` bytes and
+    // the kernel writes at most `len`, reporting how many in `len`.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -220,7 +222,8 @@ pub(crate) fn group_memory(pid: u32) -> Option<crate::GroupMemory> {
     }
     let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
     let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call returns how many
+    // bytes it wrote.
     let n = unsafe { proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), bytes) };
     let n = usize::try_from(n).ok()? / std::mem::size_of::<c_int>();
     let (mut kib, mut measured) = (0u64, 0u32);
@@ -249,7 +252,8 @@ pub(crate) fn lone_group_leader(pid: u32) -> Option<String> {
     }
     let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
     let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call returns how many
+    // bytes it wrote.
     let n = unsafe {
         proc_listpids(
             PROC_PGRP_ONLY,
@@ -319,7 +323,8 @@ pub(crate) fn stdin_sharers(leader: u32) -> Option<Vec<u32>> {
     let device = stdin_device(pid)?;
     let mut pids = [0 as c_int; crate::MAX_GROUP_PIDS];
     let bytes = c_int::try_from(std::mem::size_of_val(&pids)).ok()?;
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the call
+    // returns how many bytes it wrote.
     let n = unsafe { proc_listpids(PROC_PGRP_ONLY, leader, pids.as_mut_ptr().cast(), bytes) };
     let n = usize::try_from(n).ok().filter(|n| *n > 0)? / std::mem::size_of::<c_int>();
     Some(
@@ -432,7 +437,9 @@ pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
     let mut count: libc::natural_t = 0;
     let mut info: libc::processor_info_array_t = std::ptr::null_mut();
     let mut words: libc::mach_msg_type_number_t = 0;
-    // SAFETY: The three out-parameters are writable.
+    // SAFETY: the three out-parameters are writable; on success the kernel
+    // maps `words` 32-bit words at `info` into this task, which this
+    // function owns and deallocates below.
     let kr = unsafe {
         libc::host_processor_info(
             host_port(),
@@ -451,7 +458,9 @@ pub(crate) fn core_ticks() -> Option<Vec<CoreTicks>> {
         unsafe { std::slice::from_raw_parts(info, len) },
         count as usize,
     );
-    // SAFETY: `info` and its size are the kernel's MIG out-of-line mapping, released once.
+    // SAFETY: `info` and its size are exactly what the kernel mapped for this
+    // call (MIG out-of-line memory), released once; `mach_task_self_` is
+    // this task's own port.
     unsafe {
         libc::vm_deallocate(
             mach_task_self_,
@@ -479,7 +488,8 @@ fn sysctl_text(name: &CStr) -> Option<String> {
 pub(crate) fn sysctl_text_in<const N: usize>(name: &CStr) -> Option<String> {
     let mut buf = [0u8; N];
     let mut len: libc::size_t = buf.len();
-    // SAFETY: `name` is NUL-terminated.
+    // SAFETY: `name` is NUL-terminated; `buf` is writable for `len` bytes and the kernel writes at
+    // most `len`, reporting how many in `len`.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -550,7 +560,8 @@ impl Cf {
 
     /// `entry`'s registry property `key`.
     fn property(entry: io_registry_entry_t, key: CFTypeRef) -> Option<Self> {
-        // SAFETY: `entry` is a live registry entry and `key` a live CFString.
+        // SAFETY: `entry` is a live registry entry and `key` a live CFString;
+        // the result is +1 (the Create rule) or NULL.
         Self::adopt(unsafe {
             iokit::IORegistryEntryCreateCFProperty(entry, key.cast(), std::ptr::null(), 0)
         })
@@ -569,7 +580,8 @@ fn cf_u64(value: CFTypeRef) -> Option<u64> {
     if value.is_null() {
         return None;
     }
-    // SAFETY: `value` is a live CF object (borrowed for this call).
+    // SAFETY: `value` is a live CF object (borrowed for this call); each type
+    // is checked before the reader for that type touches it.
     unsafe {
         let ty = iokit::CFGetTypeID(value);
         if ty == iokit::CFNumberGetTypeID() {
@@ -593,7 +605,8 @@ fn cf_u64(value: CFTypeRef) -> Option<u64> {
 /// # Safety
 /// `value` is a live CF object that outlives the returned slice.
 unsafe fn cf_bytes<'a>(value: CFTypeRef) -> Option<&'a [u8]> {
-    // SAFETY: The caller's; the type is checked before the data is read.
+    // SAFETY: The caller's; the type is checked before the data is read, and
+    // CFData's byte pointer is valid for its length while it lives.
     unsafe {
         if iokit::CFGetTypeID(value) != iokit::CFDataGetTypeID() {
             return None;
@@ -628,7 +641,8 @@ fn cf_text(value: CFTypeRef) -> Option<String> {
         return None;
     }
     let mut buf = [0 as libc::c_char; 128];
-    // SAFETY: `value` is live (borrowed).
+    // SAFETY: `value` is live (borrowed); its type is checked before each
+    // reader; `buf` is writable for the length passed.
     let bytes: Vec<u8> = unsafe {
         if iokit::CFGetTypeID(value) == iokit::CFStringGetTypeID() {
             if iokit::CFStringGetCString(
@@ -679,7 +693,8 @@ fn dt_cpus() -> Vec<DtCpu> {
     }
     let cpus = Io(cpus);
     let mut iter: io_object_t = 0;
-    // SAFETY: `cpus` is a live entry, the plane name NUL-terminated, `iter` writable.
+    // SAFETY: `cpus` is a live entry, the plane name NUL-terminated, `iter`
+    // writable; on success the iterator is +1.
     let kr = unsafe {
         iokit::IORegistryEntryGetChildIterator(cpus.0, c"IODeviceTree".as_ptr(), &raw mut iter)
     };
@@ -740,7 +755,8 @@ fn swap_usage() -> Option<(u64, u64)> {
     // SAFETY: Integers only; all-zero is a value.
     let mut xsw: libc::xsw_usage = unsafe { std::mem::zeroed() };
     let mut len: libc::size_t = std::mem::size_of::<libc::xsw_usage>();
-    // SAFETY: `xsw` is writable for `len` bytes and the kernel writes at most that.
+    // SAFETY: `xsw` is writable for `len` bytes and the kernel writes at
+    // most that, reporting how many in `len`.
     let rc = unsafe {
         libc::sysctlbyname(
             c"vm.swapusage".as_ptr(),
@@ -808,7 +824,9 @@ struct Accel {
     cores: Option<u16>,
 }
 
-// SAFETY: The service is a Mach port name and the keys immutable CFStrings.
+// SAFETY: The service is a Mach port name and the keys immutable CFStrings,
+// all kept for the process (never released) and usable from any thread;
+// Rust dereferences none of them.
 unsafe impl Send for Accel {}
 // SAFETY: As for `Send`.
 unsafe impl Sync for Accel {}
@@ -826,7 +844,9 @@ fn accel() -> Option<&'static Accel> {
     static ACCEL: OnceLock<Option<Accel>> = OnceLock::new();
     ACCEL
         .get_or_init(|| {
-            // SAFETY: A NUL-terminated class name.
+            // SAFETY: A NUL-terminated class name; the dictionary is +1 and
+            // consumed by `IOServiceGetMatchingService`, whose service is
+            // kept for the process.
             let service = unsafe {
                 let matching = iokit::IOServiceMatching(c"IOAccelerator".as_ptr());
                 if matching.is_null() {
@@ -883,7 +903,8 @@ pub(crate) fn gpu() -> Option<GpuReading> {
     let Some(stats) = Cf::property(a.service, a.keys.stats) else {
         return Some(reading);
     };
-    // SAFETY: `stats` is live.
+    // SAFETY: `stats` is live; its type is checked before it is read as a
+    // dictionary, and each value is borrowed (the Get rule) while it lives.
     let value = |key: CFTypeRef| unsafe {
         cf_u64(iokit::CFDictionaryGetValue(stats.0.cast(), key)).and_then(|v| i64::try_from(v).ok())
     };
@@ -954,7 +975,9 @@ fn iflist_sysctl(buf: Option<&mut [u8]>) -> iflist::Asked {
         Some(b) => (b.as_mut_ptr().cast::<c_void>(), b.len()),
         None => (std::ptr::null_mut(), 0),
     };
-    // SAFETY: `mib` names its length in integers.
+    // SAFETY: `mib` names its length in integers; `ptr` is writable for
+    // `len` bytes and the kernel writes at most that, reporting how many,
+    // or it is null, which asks only for the size, written to `len`.
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -992,7 +1015,8 @@ fn ioctl_socket() -> Option<Fd> {
         return None;
     }
     let fd = Fd(fd);
-    // SAFETY: `fd` is a descriptor this process holds.
+    // SAFETY: `fd` is a descriptor this process holds; Darwin's `socket`
+    // takes no `SOCK_CLOEXEC`, so the flag is set before anything else.
     unsafe { libc::fcntl(fd.0, libc::F_SETFD, libc::FD_CLOEXEC) };
     Some(fd)
 }
@@ -1006,7 +1030,8 @@ fn functional_type(sock: &Fd, name: &str) -> Option<u32> {
         return None;
     }
     req.ifr_name[..bytes.len()].copy_from_slice(bytes);
-    // SAFETY: `req` is a writable 32-byte `struct ifreq`.
+    // SAFETY: `req` is a writable 32-byte `struct ifreq`, the size the
+    // request encodes, with a NUL-terminated name.
     let rc = unsafe { libc::ioctl(sock.0, iflist::SIOCGIFFUNCTIONALTYPE, &raw mut req) };
     (rc == 0).then_some(req.ifru_functional_type)
 }
@@ -1014,7 +1039,8 @@ fn functional_type(sock: &Fd, name: &str) -> Option<u32> {
 /// `index`'s name by `if_indextoname`, for an interface whose message carried none.
 fn index_name(index: u32) -> Option<String> {
     let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
-    // SAFETY: `buf` is `IFNAMSIZ` writable bytes.
+    // SAFETY: `buf` is `IFNAMSIZ` writable bytes, which the call fills
+    // NUL-terminated, or it returns NULL.
     let named = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
     let name = (!named.is_null()).then(|| c_text(&buf))?;
     (!name.is_empty()).then_some(name)
@@ -1077,9 +1103,13 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     let Ok(bytes) = c_int::try_from(std::mem::size_of_val(pids.as_slice())) else {
         return (None, None);
     };
-    // SAFETY: `pids` is writable for `bytes` bytes, the size passed.
+    // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the
+    // call returns how many pids it wrote.
     let all = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
     // SAFETY: As above; this call returns how many bytes it wrote.
+    // `errno` is this thread's, cleared first: libproc answers zero for a
+    // uid that owns no process and for a failure, and only a failure sets
+    // it.
     let (own, errno) = unsafe {
         *libc::__error() = 0;
         let own = proc_listpids(PROC_RUID_ONLY, uid, pids.as_mut_ptr().cast(), bytes);
@@ -1129,7 +1159,8 @@ mod tests {
     #[test]
     fn an_absent_property_adopts_as_none_without_a_release() {
         assert!(Cf::adopt(std::ptr::null()).is_none());
-        // SAFETY: A NUL-terminated registry path (the platform expert device, on every Mac and VM).
+        // SAFETY: A NUL-terminated registry path (the platform expert
+        // device, on every Mac and VM); the entry is +1 or 0.
         let device =
             unsafe { iokit::IORegistryEntryFromPath(MAIN_PORT_DEFAULT, c"IOService:/".as_ptr()) };
         assert_ne!(device, 0, "the platform expert device");

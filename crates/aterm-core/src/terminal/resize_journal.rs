@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Engine resize journal ([`ResizeReport`], [`aterm_grid::ResizeShape`]) and heal counters
-//! ([`ResizeReport::healed_by`]).
+//! Engine resize journal ([`ResizeReport`], [`aterm_grid::ResizeShape`]) and heal counters.
 
 use super::Terminal;
 use crate::grid::{ResizeLaw, ResizePolicy};
@@ -15,7 +14,6 @@ mod tests;
 /// How many resizes the journal keeps ([`Terminal::resize_journal_since`]).
 pub const RESIZE_JOURNAL_CAP: usize = 16;
 
-/// [`RESIZE_JOURNAL_CAP`] in ordinal arithmetic (a lossless widening).
 const CAP_U64: u64 = RESIZE_JOURNAL_CAP as u64;
 
 /// One resize as the engine applied it to the active grid.
@@ -37,11 +35,11 @@ pub struct ResizeReport {
     pub in_sync: bool,
     /// Trailing blank rows below the cursor dropped by a shrink (nothing moved).
     pub trimmed: u16,
-    /// Top rows demoted into history by a shrink: every surviving row moved up by this count.
+    /// Top rows demoted into history by a shrink.
     pub demoted: u16,
     /// Bottom rows pushed off the screen with nothing above them moving.
     pub pushed: u16,
-    /// History lines a grow revealed at the top: every row moved down by this count.
+    /// History lines a grow revealed at the top.
     pub revealed: u16,
     /// Blank rows a grow appended at the bottom (nothing moved).
     pub appended: u16,
@@ -111,7 +109,7 @@ pub struct RenderDebt {
     pub shift: i32,
     /// Rows pushed off the bottom and not put back (the sum of [`ResizeReport::net_pushed`]).
     pub pushed: i32,
-    /// Columns of drawn cells narrowings cut off the right edge (the sum of [`ResizeReport::cut`]).
+    /// Columns of drawn cells narrowings cut off the right edge ([`ResizeReport::cut`]).
     pub cut: u16,
 }
 
@@ -127,14 +125,14 @@ impl RenderDebt {
         }
     }
 
-    /// The rows owed, `(shift, pushed)`; `(0, 0)` when every row sits where it was drawn.
+    /// The rows owed, `(shift, pushed)`.
     #[inline]
     #[must_use]
     pub const fn rows(self) -> (i32, i32) {
         (self.shift, self.pushed)
     }
 
-    /// Anything is owed: a row sits away from where it was drawn, or a drawn cell is gone.
+    /// Anything is owed.
     #[inline]
     #[must_use]
     pub const fn owed(self) -> bool {
@@ -180,17 +178,15 @@ pub(super) struct ResizeUndoSelection {
 pub(super) struct ResizeJournal {
     /// This engine's lifetime token ([`Terminal::resize_lifetime`]).
     lifetime: u64,
-    /// Resizes recorded for this engine's lifetime; the newest report's ordinal.
+    /// Resizes recorded for this engine's lifetime.
     ordinal: u64,
     /// `ring[(o - 1) % CAP]` holds the report with ordinal `o`.
     ring: [ResizeReport; RESIZE_JOURNAL_CAP],
 }
 
-/// The next lifetime token: a counter, not a clock, starting at 1 so a reader's 0 is never one.
 static NEXT_LIFETIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Default for ResizeJournal {
-    /// An empty journal with a fresh lifetime token: every engine built gets its own.
     fn default() -> Self {
         Self {
             lifetime: NEXT_LIFETIME.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

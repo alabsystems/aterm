@@ -54,9 +54,9 @@ pub(crate) const MIN_WINDOW: Duration = Duration::from_millis(250);
 /// Minimum interval between pane-layout checks between readings.
 pub(crate) const LAYOUT_EVERY: Duration = Duration::from_millis(250);
 const JOB_EVENTS_CAP: usize = 256;
-/// Maximum interval between split-set reads while the bars are shown.
+/// How often, at most, the bars' reading reads the split set.
 pub(crate) const SPLIT_EVERY: Duration = Duration::from_secs(5);
-/// Maximum interval between split-set reads while a lens is open.
+/// How often, at most, the bars' reading reads the split set while a lens is open.
 pub(crate) const SPLIT_EVERY_LENS: Duration = Duration::from_secs(1);
 /// The longest window a split reads.
 pub(crate) const SPLIT_WINDOW_MAX: Duration =
@@ -862,7 +862,9 @@ fn platform_thermal() -> Option<Thermal> {
     #[cfg(target_os = "macos")]
     {
         use aterm_objc::{class, sel};
-        // SAFETY: `+processInfo` is an immortal singleton.
+        // SAFETY: `+processInfo` is an immortal singleton; both getters are
+        // plain scalar properties, documented thread-safe (as `spare.rs`'s
+        // `power_constrained` reads them).
         unsafe {
             let info =
                 aterm_objc::send::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
@@ -1463,8 +1465,8 @@ impl Reader {
             .and_then(|d| u64::try_from(d.as_micros()).ok())
             .unwrap_or(0);
         let now = Instant::now();
-        let armed = crate::occupancy_host::SLOTS_ARMED.armed();
-        let read = self.slots.read(now, now_us, &machine, armed);
+        let period = crate::occupancy_host::slots_period();
+        let read = self.slots.read_within(now, now_us, &machine, period);
         snap.slots = Some(crate::occupancy_host::slots_view(&read));
         snap.slots_age_ms = self.slots.read_at().map(|at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
@@ -2147,6 +2149,8 @@ impl crate::App {
             || self.vitals.delegated_due.is_some_and(|due| due <= now)
         {
             // The engine reads the sweep: a whole reading. Beside a hidden
+            // deck it keeps the deck's cadence for the gap rule; with no deck
+            // it has none, so it starts a new baseline and draws no rate.
             if edge {
                 self.vitals.edge = false;
                 self.vitals.last_edge_read = Some(now);

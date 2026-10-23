@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Accessibility tree scenario corpus and blank-line documents.
-//! Provides [`blank_line_documents`] and [`NodeSpec::build`].
 
 use std::collections::BTreeMap;
 
@@ -48,7 +47,6 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
     all
 }
 
-/// Number of generated scenarios in the corpus.
 const GENERATED: u64 = 40;
 
 /// Everything a node can carry here, built into a model node in one order.
@@ -141,7 +139,6 @@ impl NodeSpec {
         self
     }
 
-    /// Creates a text run of `text` split into characters and word starts.
     fn run(text: &str) -> Self {
         let mut spec = Self::new(Role::TextRun);
         spec.set_text(split(text));
@@ -268,7 +265,6 @@ impl NodeSpec {
     }
 }
 
-/// `text` as selectable characters.
 fn split(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in text.chars() {
@@ -284,7 +280,6 @@ fn split(text: &str) -> Vec<String> {
     out
 }
 
-/// Where words start: the first character, and each one after a space.
 fn word_starts(chars: &[String]) -> Vec<u8> {
     let mut starts = Vec::new();
     let mut after_space = true;
@@ -321,7 +316,6 @@ impl Snapshot {
         self.nodes.get_mut(&id).expect("a node of the snapshot")
     }
 
-    /// Every node, with the tree's data: a window's first update.
     fn full(&self) -> TreeUpdate {
         let mut tree = Tree::new(NodeId(ROOT));
         tree.toolkit_name = Some("aterm".to_owned());
@@ -338,7 +332,6 @@ impl Snapshot {
         }
     }
 
-    /// Only the nodes that differ from `before`, as a toolkit sends them.
     fn since(&self, before: &Snapshot) -> TreeUpdate {
         TreeUpdate {
             nodes: self
@@ -353,7 +346,6 @@ impl Snapshot {
         }
     }
 
-    /// The ids under `id`, `id` included.
     fn subtree(&self, id: u64) -> Vec<u64> {
         let mut out = vec![id];
         let mut i = 0;
@@ -367,7 +359,6 @@ impl Snapshot {
     }
 }
 
-/// Records a scenario as snapshots.
 struct Script {
     name: String,
     steps: Vec<Step>,
@@ -392,7 +383,6 @@ impl Script {
         self.sent.insert(window, snapshot.clone());
     }
 
-    /// The changes since the last update, as a difference.
     fn update(&mut self, window: usize, snapshot: &Snapshot) {
         let update = match self.sent.get(&window) {
             Some(before) => snapshot.since(before),
@@ -402,7 +392,6 @@ impl Script {
         self.sent.insert(window, snapshot.clone());
     }
 
-    /// The whole tree again (unchanged nodes included, the tree data too).
     fn resend(&mut self, window: usize, snapshot: &Snapshot) {
         self.steps.push(Step::Update {
             window,
@@ -441,13 +430,11 @@ const TERMINAL: u64 = 1;
 const TAB_LIST: u64 = 2;
 const FIND: u64 = 3;
 const FIND_RUN: u64 = 4;
-/// aterm-gui's id ranges, so the object paths carry its large numbers.
 const MESSAGE_BASE: u64 = 1 << 20;
 const MENU_BASE: u64 = 1 << 29;
 const TAB_BASE: u64 = 1 << 40;
 const ROW_BASE: u64 = 1 << 48;
 
-/// The grid's geometry: 8 by 16 pixel cells from (12, 36).
 const CELL_W: f64 = 8.0;
 const CELL_H: f64 = 16.0;
 const GRID_X: f64 = 12.0;
@@ -467,7 +454,6 @@ fn fixtures() -> Vec<Scenario> {
     ]
 }
 
-/// A grid row's run, laid out in its cells.
 fn row(index: u64, text: &str) -> (u64, NodeSpec) {
     let y0 = GRID_Y + index as f64 * CELL_H;
     let run = NodeSpec::run(text).laid_out(CELL_W as f32).bounds(
@@ -479,7 +465,6 @@ fn row(index: u64, text: &str) -> (u64, NodeSpec) {
     (ROW_BASE + index * 256, run)
 }
 
-/// Builds a read-only terminal grid document of `lines` with the caret at `caret`.
 fn grid(lines: &[&str], caret: Option<(u64, usize)>, selected_tab: u64) -> Snapshot {
     let mut nodes: Vec<(u64, NodeSpec)> = Vec::new();
     let mut rows = Vec::new();
@@ -680,7 +665,6 @@ fn chrome() -> Scenario {
     s.done()
 }
 
-/// The find field over the grid: a search input with one run.
 fn with_find(mut tree: Snapshot, query: &str, caret: usize, status: &str) -> Snapshot {
     let run = NodeSpec::run(query);
     let mut field = NodeSpec::new(Role::SearchInput)
@@ -1116,7 +1100,6 @@ fn hyperlink_and_dialog_root() -> Scenario {
     s.done()
 }
 
-/// xorshift64*: the same numbers on every machine.
 struct Rng(u64);
 
 impl Rng {
@@ -1250,7 +1233,6 @@ impl Generator {
         chars
     }
 
-    /// Generates a random text run.
     fn run(&mut self, end_line: bool, last: bool) -> NodeSpec {
         let mut spec = NodeSpec::new(Role::TextRun);
         let mut chars = self.chars(end_line);
@@ -1266,7 +1248,6 @@ impl Generator {
         spec
     }
 
-    /// Random properties on `spec`, any role.
     fn decorate(&mut self, spec: &mut NodeSpec) {
         if self.rng.chance(60) {
             spec.label = Some(self.word());
@@ -1333,7 +1314,6 @@ impl Generator {
         }
     }
 
-    /// A random subtree under a new id; its nodes go into `nodes`.
     fn subtree(&mut self, nodes: &mut BTreeMap<u64, NodeSpec>, depth: usize) -> u64 {
         let id = self.id();
         let kind = self.rng.below(if depth >= 2 { 2 } else { 4 });
@@ -1387,7 +1367,6 @@ impl Generator {
         id
     }
 
-    /// A random caret or selection in the text document `spec`, or none.
     fn select(&mut self, nodes: &BTreeMap<u64, NodeSpec>, spec: &mut NodeSpec) {
         let runs: Vec<(u64, usize)> = spec
             .children
@@ -1431,7 +1410,6 @@ impl Generator {
         Snapshot { nodes, focus }
     }
 
-    /// One random change to `tree`.
     fn mutate(&mut self, tree: &mut Snapshot) {
         let ids: Vec<u64> = tree.nodes.keys().copied().collect();
         let id = self.rng.pick(&ids);
@@ -1602,10 +1580,8 @@ fn generated(seed: u64) -> Scenario {
     s.done()
 }
 
-/// Candidate text runs used to build blank-line documents.
 const BLANK_LINE_RUNS: [&str; 4] = ["", "a b", "x\n", "\n"];
 
-/// The text input of a blank-line document's window.
 const BLANK_LINE_INPUT: u64 = 1;
 
 /// A document of the blank-line table.

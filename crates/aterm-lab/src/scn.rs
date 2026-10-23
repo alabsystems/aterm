@@ -17,19 +17,14 @@ use crate::screen::{field, is_card_row, is_idle, is_options_row, status_row};
 use crate::stop::{self, Stopped};
 use crate::util::{keep_tree, now, py_repr, stamp};
 
-/// Claude Code's own words, from the one table of them (`aterm_phase::anchors`).
 const BANNER: &str = aterm_phase::anchors::anchor_text("launch.banner");
-/// The rating's pending step (`Feedback: Bad · Esc to undo`).
 const PENDING: &str = aterm_phase::anchors::anchor_text("survey.pending");
-/// The rating's thanks step.
 const THANKS: &str = aterm_phase::anchors::anchor_text("survey.thanks");
 
 /// Why a scenario stopped short.
 #[derive(Debug)]
 pub enum ScnErr {
-    /// Interrupted.
     Stopped(Stopped),
-    /// It failed (the message goes into the summary).
     Failed(String),
 }
 
@@ -56,7 +51,7 @@ impl From<crate::Fail> for ScnErr {
 
 type R<T = ()> = Result<T, ScnErr>;
 
-/// How a scenario's lab is made (on top of `LAB_TRUST=1`).
+/// Lab launch options on top of `LAB_TRUST=1`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LabKw {
     /// The one-time first-run notice left on the screen.
@@ -65,16 +60,17 @@ pub struct LabKw {
     pub survey: bool,
     /// The pane's rows.
     pub lines: Option<u32>,
+    /// `LAB_INSTANCE_ENV` words the scenario's own lab adds to the caller's (a dev seam its
+    /// instance reads; [`crate::lab::instance_env`] says which).
+    pub instance_env: &'static str,
 }
 
-/// The `summary.json` records.
 const SUMMARY: Style = Style {
     indent: Some(1),
     compact: false,
     ascii: false,
 };
 
-/// The results directory.
 #[must_use]
 pub fn results_dir() -> PathBuf {
     paths().state.join("results")
@@ -106,6 +102,43 @@ pub struct Ctx {
     kw: LabKw,
 }
 
+/// The `up` options a run's own lab is made with: the caller's (`base`) with the folder trust
+/// seeded and a lifeline to this process, the run's `[harness]` lines in place of the caller's,
+/// and its [`LabKw`]: the instance's words after the caller's `LAB_INSTANCE_ENV` ones (a name
+/// both give is refused at `up`, [`crate::lab::instance_env`]).
+fn lab_opts(mut o: UpOpts, harness_keys: &str, kw: LabKw) -> UpOpts {
+    o.trust = true;
+    o.lifeline = true;
+    o.first_run = kw.first_run;
+    o.survey = kw.survey || o.survey;
+    o.harness_keys = harness_keys.to_string();
+    if !kw.instance_env.is_empty() {
+        o.instance_env = format!("{} {}", o.instance_env, kw.instance_env)
+            .trim()
+            .to_string();
+    }
+    if let Some(l) = kw.lines {
+        o.lines = l.to_string();
+    }
+    o
+}
+
+/// Why a run cannot take a lab it attaches to: the lab was made before the run, so the run's
+/// `[harness]` lines and [`LabKw`] ([`lab_opts`]) never reach it. `None` for a run that asks for
+/// neither.
+fn unset_on_attach(harness_keys: &str, kw: LabKw) -> Option<String> {
+    let asks = !harness_keys.is_empty()
+        || kw.first_run
+        || kw.survey
+        || kw.lines.is_some()
+        || !kw.instance_env.is_empty();
+    asks.then(|| {
+        "an attached lab keeps the [harness] lines and the instance it was made with; this run's \
+         are not set"
+            .to_string()
+    })
+}
+
 fn r3(v: f64) -> J {
     J::Float((v * 1000.0).round() / 1000.0)
 }
@@ -114,13 +147,11 @@ fn r2(v: f64) -> J {
     J::Float((v * 100.0).round() / 100.0)
 }
 
-/// Python's `%r` of an optional string.
 fn repr_opt(s: Option<&str>) -> String {
     s.map_or_else(|| "None".into(), py_repr)
 }
 
 impl Ctx {
-    /// A run of `name` number `k` on the lab `tag`.
     #[must_use]
     pub fn new(
         name: &str,
@@ -152,7 +183,7 @@ impl Ctx {
         }
     }
 
-    /// The lab's door.
+    /// Opens the lab's door.
     /// # Errors
     /// No aterm to test.
     pub fn door(&self) -> R<Door<'_>> {
@@ -167,7 +198,6 @@ impl Ctx {
             .unwrap_or_default()
     }
 
-    /// `aterm drive <args>` (the hosted loop's own reader), both streams, trimmed.
     #[must_use]
     pub fn drive(&self, args: &[&str]) -> String {
         self.door()
@@ -182,20 +212,16 @@ impl Ctx {
         let _ = crate::verbs::set_mode(&self.run, m);
     }
 
-    /// Bring the lab up (or attach to it) and start the frame stream and the journal tail.
+    /// Brings the lab up (or attaches to it) and starts the frame stream and journal tail.
     /// # Errors
     /// The lab did not come up, or the stream could not start.
     pub fn start(&mut self) -> R {
-        if !self.attached {
-            let mut o = UpOpts::from_env();
-            o.trust = true;
-            o.lifeline = true;
-            o.first_run = self.kw.first_run;
-            o.survey = self.kw.survey || o.survey;
-            o.harness_keys.clone_from(&self.harness_keys);
-            if let Some(l) = self.kw.lines {
-                o.lines = l.to_string();
+        if self.attached {
+            if let Some(why) = unset_on_attach(&self.harness_keys, self.kw) {
+                return Err(ScnErr::Failed(why));
             }
+        } else {
+            let o = lab_opts(UpOpts::from_env(), &self.harness_keys, self.kw);
             crate::lab::up(&self.tag, &o).map_err(|f| {
                 ScnErr::Failed(format!("lab up failed: {}", f.msg.unwrap_or_default()))
             })?;
@@ -237,7 +263,7 @@ impl Ctx {
         self.mode(&format!("bg:{sleep_s}:{slow_s}"));
     }
 
-    /// Launch Claude Code in the tab and wait for its composer.
+    /// Launches Claude Code in the tab and waits for its composer.
     /// # Errors
     /// The composer never showed.
     pub fn launch(&mut self, timeout: f64, extra: Launch) -> R {
@@ -359,7 +385,8 @@ impl Ctx {
 
     /// Arms `CLAUDE_FORCE_DISPLAY_SURVEY=1` in the running Claude's settings ([`crate::settings_witness`]).
     /// # Errors
-    /// Returns an error if interrupted or if no re-read arrives within [`crate::settings_witness::HANG`].
+    /// Returns an error if the settings could not be written, the run was interrupted, or no
+    /// re-read arrives within [`crate::settings_witness::HANG`].
     pub fn arm(&mut self) -> R {
         self.arm_with_wait(&crate::settings_witness::WallWait::new())
     }
@@ -389,7 +416,7 @@ impl Ctx {
         Ok(())
     }
 
-    /// Type like a person.
+    /// Types `text` character by character with `gap` seconds between keys.
     /// # Errors
     /// Interrupted.
     pub fn type_text(&mut self, text: &str, gap: f64) -> R<f64> {
@@ -405,7 +432,7 @@ impl Ctx {
         Ok(self.mark(&format!("type {} end", py_repr(text)), None))
     }
 
-    /// A prompt and Enter, 0.3 s apart.
+    /// Sends `text` and presses Enter 0.3 s later.
     /// # Errors
     /// Interrupted.
     pub fn turn(&mut self, text: &str) -> R<f64> {
@@ -417,7 +444,7 @@ impl Ctx {
         Ok(t)
     }
 
-    /// The turn's done row with no spinner.
+    /// Waits for the turn's done row with no spinner.
     /// # Errors
     /// Interrupted.
     pub fn wait_idle_row(&mut self, since: usize, timeout: f64) -> R<Option<Frame>> {
@@ -428,7 +455,7 @@ impl Ctx {
         Ok(fr)
     }
 
-    /// The survey card.
+    /// Waits for the survey card.
     /// # Errors
     /// Interrupted.
     pub fn wait_card(&mut self, since: usize, timeout: f64) -> R<Option<Frame>> {
@@ -439,7 +466,7 @@ impl Ctx {
         Ok(fr)
     }
 
-    /// The first frame `pred` holds of, from `since`, within `timeout` seconds.
+    /// Waits for the first frame matching `pred` from `since` within `timeout` seconds.
     /// # Errors
     /// Interrupted.
     pub fn wait_for(
@@ -451,25 +478,21 @@ impl Ctx {
         Ok(self.rec().wait_for(pred, timeout, since)?)
     }
 
-    /// Frames so far.
     #[must_use]
     pub fn n_frames(&self) -> usize {
         self.rec().len()
     }
 
-    /// Every frame so far.
     #[must_use]
     pub fn frames(&self) -> Vec<Frame> {
         self.rec().snapshot().0
     }
 
-    /// Every event so far.
     #[must_use]
     pub fn events(&self) -> Vec<Event> {
         self.rec().snapshot().1
     }
 
-    /// Every journal record so far.
     #[must_use]
     pub fn journal(&self) -> Vec<(f64, J)> {
         self.jr.as_ref().map(Journal::snapshot).unwrap_or_default()
@@ -515,7 +538,7 @@ impl Ctx {
         }
     }
 
-    /// Every frame change, event, journal line and mark on one clock, from `t0`.
+    /// Formats every frame change, event, journal line, and mark on one clock from `t0`.
     #[must_use]
     pub fn timeline(&self, t0: Option<f64>) -> String {
         let (frames, events) = self
@@ -589,7 +612,6 @@ impl Ctx {
     }
 }
 
-/// What a frame says that is worth a line.
 type FrameKey = (bool, Option<String>, Option<String>, Vec<String>);
 
 fn rating_row(r: &str) -> bool {
@@ -615,7 +637,6 @@ fn frame_key(f: &Frame) -> FrameKey {
     )
 }
 
-/// `FRAME seq=… T=… card=… composer=… status=…[ rows=…]`.
 #[must_use]
 pub fn frame_line(f: &Frame) -> String {
     let (card, comp, st, rows) = frame_key(f);
@@ -649,7 +670,6 @@ fn comp_j(c: Option<String>) -> J {
     c.map_or(J::Null, J::Str)
 }
 
-/// The survey cycle measured from the frames: idle.
 #[must_use]
 pub fn cycle_stats(frames: &[Frame], journal: &[(f64, J)], t_turn: f64) -> J {
     let mut d = J::Obj(Vec::new());
@@ -725,7 +745,6 @@ pub fn cycle_stats(frames: &[Frame], journal: &[(f64, J)], t_turn: f64) -> J {
     d
 }
 
-/// What is wrong with a measured survey cycle (empty: it held).
 #[must_use]
 pub fn judge_cycle(d: &J) -> Vec<String> {
     if !d.get("t_card").is_some_and(J::truthy) {
@@ -751,7 +770,6 @@ pub fn judge_cycle(d: &J) -> Vec<String> {
     bad
 }
 
-/// Arm the forced survey, take one stub turn, wait for the card.
 fn card_cycle(ctx: &mut Ctx, text: &str) -> R<(f64, Option<Frame>)> {
     ctx.arm()?;
     let n0 = ctx.n_frames();
@@ -760,7 +778,6 @@ fn card_cycle(ctx: &mut Ctx, text: &str) -> R<(f64, Option<Frame>)> {
     Ok((t, card))
 }
 
-/// THE survey cycle: the card.
 fn plain_cycle(ctx: &mut Ctx, settle: f64) -> R<(f64, Option<Frame>)> {
     let (t, card) = card_cycle(ctx, "hi")?;
     let Some(card) = card else {
@@ -791,7 +808,6 @@ fn merge_into(sumd: &mut J, from: &J) {
     }
 }
 
-/// Sleep until the wall time `t + dt`.
 fn at(t: f64, dt: f64) -> R<f64> {
     stop::until(t + dt)?;
     Ok(now())
@@ -801,7 +817,6 @@ fn secs(s: f64) -> R {
     Ok(stop::sleep(std::time::Duration::from_secs_f64(s))?)
 }
 
-/// Composer/card states seen between two wall times, on change.
 fn comp_states(ctx: &Ctx, t_from: f64, t_to: Option<f64>) -> J {
     let mut out = Vec::new();
     let mut last: Option<(bool, Option<String>)> = None;
@@ -822,7 +837,6 @@ fn comp_states(ctx: &Ctx, t_from: f64, t_to: Option<f64>) -> J {
     J::Arr(out)
 }
 
-/// Journal lines from `t_from - 0.5`.
 fn journal_lines(ctx: &Ctx, t_from: f64) -> J {
     J::Arr(
         ctx.journal()
@@ -839,7 +853,6 @@ fn journal_lines(ctx: &Ctx, t_from: f64) -> J {
     )
 }
 
-/// The journal lines, then whether one of them is the harness's DISMISSED.
 fn put_journal(ctx: &mut Ctx, jl: J) {
     let dismissed = dismissed_in(&jl);
     ctx.put("journal", jl);
@@ -901,76 +914,45 @@ fn status_of(ctx: &Ctx, key: &str) -> J {
     field(&ctx.ctl(&["status"]).stdout, key).map_or(J::Null, J::Str)
 }
 
-/// What a scenario does, typed.
 #[derive(Clone, Copy, Debug)]
 pub enum Plan {
-    /// The plain cycle.
     S1Plain,
-    /// Harness off; a person's 1 at card +1.0 s.
     XRating1,
-    /// A person's text at card + offset.
     PersonText(f64),
-    /// A person's digit at card + offset.
     PersonDigit(f64, char),
-    /// A draft typed 0.4 s after the turn ended, cleared later.
     S3a,
-    /// A draft standing while the survey opens, then submitted as a slow turn.
     S3b,
-    /// A slow turn first.
     S4a,
-    /// A slow turn interrupted with Esc 6 s in.
     S4b,
-    /// Two 0s 50 ms apart at card +0.9 s.
     S5a,
-    /// A 0 at card +0.9 s and a second at +2.2 s.
     S5b,
-    /// A 0 at card + offset (inside the mount window or not).
     EarlyZero(f64),
-    /// Esc on the open card.
     S6b,
-    /// A numbered reply, then a plain one.
     S6c,
-    /// A person's 1, then Esc in the pending step.
     S6e,
-    /// A drive lease stands in for a person's hand.
     S2Lease,
-    /// A person's text at card + offset, short.
     TextSweep(f64),
-    /// A 0 then a guarded Enter at card +0.9 s.
     S7,
-    /// A 0 then a guarded Enter inside the mount window.
     S7Early,
-    /// A person rates, then a slow turn while the rows stand.
     S6f,
-    /// The card forced at launch, observed for 25 s.
     Startup,
-    /// The notice case, asked through `drive phase`.
     StartupProbe,
-    /// What the reader says (at launch, or after a turn).
     ReaderProbe(bool),
-    /// The card on a pane of a height (after a turn, or forced at launch).
     Tall(u32, bool),
-    /// The card parked over a background wake, the harness held.
     S8BusyParked,
-    /// The card over a background shell, no lease.
     S8Static,
-    /// A long reply pushes the card down a pane of a height.
     TallLong(u32),
-    /// The parked card under a lease of a TTL.
     S8Lease(u32),
-    /// What the hosted loop reads while the card is up.
     TailDump(u32),
-    /// THE CORPUS: a Bash box the harness approves.
     CorpusApproval,
-    /// THE CORPUS: an `AskUserQuestion` dialog the harness answers.
     CorpusQuestion,
-    /// THE CORPUS: an API 500 wall the harness waits out and continues past.
     CorpusWall,
-    /// THE CORPUS: a Read box outside the project.
     CorpusRead,
+    /// THE OCCUPANCY DOOR at a workflow's break, under `occupancy = "prompt"`
+    /// ([`crate::occupancy_break`]).
+    OccupancyBreak,
 }
 
-/// A named scenario.
 #[derive(Clone, Debug)]
 pub struct Scenario {
     /// Its name.
@@ -987,7 +969,6 @@ const DISMISS_OFF: &str = "dismiss_surveys = false";
 const QUIET: &str = "continue = false";
 const HELD_QUIET: &str = "human_grace_s = 3\ncontinue = false";
 
-/// Every scenario.
 #[must_use]
 pub fn scenarios() -> Vec<Scenario> {
     let mut v = Vec::new();
@@ -1012,6 +993,7 @@ pub fn scenarios() -> Vec<Scenario> {
         first_run: true,
         survey: true,
         lines: None,
+        instance_env: "",
     };
     let lines = |n: u32| LabKw {
         lines: Some(n),
@@ -1109,6 +1091,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 lines: Some(n),
                 survey: true,
                 first_run: false,
+                instance_env: "",
             },
             Plan::Tall(n, true),
         );
@@ -1149,14 +1132,26 @@ pub fn scenarios() -> Vec<Scenario> {
     add("c2-question".into(), "", none, Plan::CorpusQuestion);
     add("c3-wall".into(), "", none, Plan::CorpusWall);
     add("c4-read".into(), "", none, Plan::CorpusRead);
+    add(
+        crate::occupancy_break::NAME.into(),
+        crate::occupancy_break::HARNESS_KEYS,
+        LabKw {
+            instance_env: crate::occupancy_break::INSTANCE_ENV,
+            ..none
+        },
+        Plan::OccupancyBreak,
+    );
     v
 }
 
-/// THE STUB'S ONE-SHOT API 500 (`c3-wall`).
 const WALL_500: &str = r#"{"status": 500, "headers": {"x-should-retry": "false"}, "json": {"type": "error", "error": {"type": "api_error", "message": "Internal server error"}}, "times": 1}"#;
 
-/// The index of the first journal line past the first `from` that holds `needle`.
-fn journaled_after(ctx: &mut Ctx, from: usize, needle: &str, timeout: f64) -> R<Option<usize>> {
+pub(crate) fn journaled_after(
+    ctx: &mut Ctx,
+    from: usize,
+    needle: &str,
+    timeout: f64,
+) -> R<Option<usize>> {
     let end = now() + timeout;
     loop {
         if let Some(at) = ctx
@@ -1176,7 +1171,6 @@ fn journaled_after(ctx: &mut Ctx, from: usize, needle: &str, timeout: f64) -> R<
     }
 }
 
-/// A corpus scenario's one decision: `start` begins it ([`Ctx::finish`]).
 fn corpus_decision(
     ctx: &mut Ctx,
     start: impl FnOnce(&mut Ctx) -> R,
@@ -2308,11 +2302,11 @@ fn play(ctx: &mut Ctx, plan: Plan) -> R {
             "APPROVED",
             60.0,
         )?,
+        Plan::OccupancyBreak => crate::occupancy_break::play(ctx)?,
     }
     Ok(())
 }
 
-/// The card on a pane of `lines` rows.
 fn tall(ctx: &mut Ctx, lines: u32, startup: bool) -> R {
     let t0 = now();
     let card = if startup {
@@ -2361,7 +2355,7 @@ fn tall(ctx: &mut Ctx, lines: u32, startup: bool) -> R {
     Ok(())
 }
 
-/// Run scenario `s` once, as run number `k`, on a fresh lab.
+/// Runs scenario `s` once as run number `k` on a fresh lab.
 /// # Errors
 /// Interrupted (the lab is taken down first).
 pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
@@ -2396,7 +2390,6 @@ pub fn run_one(s: &Scenario, k: u32, tag: &str) -> Result<Ctx, Stopped> {
     stopped.map_or(Ok(ctx), Err)
 }
 
-/// The fields `run` prints after each run.
 fn brief(ctx: &Ctx) -> J {
     let mut b = J::Obj(Vec::new());
     for k in [
@@ -2500,7 +2493,6 @@ pub fn cmd_scn(args: &[String]) -> crate::Res {
     }
 }
 
-/// min/median/max of the survey cycle over every `<pat>-NN` run.
 fn agg(pat: &str) {
     let keys = [
         "idle_to_card",
@@ -2575,7 +2567,7 @@ fn agg(pat: &str) {
     }
 }
 
-/// `selftest`'s cycle.
+/// Runs `selftest`'s cycle.
 /// # Errors
 /// Interrupted.
 pub fn run_selftest(tag: &str) -> Result<i32, Stopped> {
@@ -2977,5 +2969,60 @@ mod tests {
             frame_line(&f),
             "FRAME seq=7 T=1 card=0 composer=None status='' rows=['Feedback: Bad · Esc to undo']"
         );
+    }
+
+    /// A RUN'S OWN LAB IS MADE WITH THE RUN'S KEYS AND WORDS: its `[harness]` lines in place of the
+    /// caller's, and its instance's words after the caller's `LAB_INSTANCE_ENV`, so the
+    /// occupancy scenario's lab reads `prompt` and the nudge's seam at its minute. NEGATIVE
+    /// CONTROL: a run with no words of its own leaves the caller's instance words as they were.
+    #[test]
+    fn a_runs_own_lab_gets_its_keys_and_its_instance_words() {
+        use aterm_agent::supervise::occupancy::rules::NUDGE_SEAM;
+        let caller = || UpOpts {
+            harness_keys: "continue = false".into(),
+            instance_env: "TMPDIR=/s".into(),
+            ..UpOpts::default()
+        };
+        let listed = scenarios()
+            .into_iter()
+            .find(|s| s.name == crate::occupancy_break::NAME)
+            .expect("the occupancy scenario is listed");
+        let o = lab_opts(caller(), listed.harness_keys, listed.kw);
+        assert!(o.trust && o.lifeline);
+        assert_eq!(o.harness_keys, crate::occupancy_break::HARNESS_KEYS);
+        assert_eq!(
+            crate::lab::instance_env(&o.instance_env),
+            Ok(vec![
+                ("TMPDIR".to_string(), "/s".to_string()),
+                (
+                    NUDGE_SEAM.to_string(),
+                    crate::occupancy_break::NUDGE_S.to_string()
+                ),
+            ])
+        );
+        let alone = lab_opts(UpOpts::default(), listed.harness_keys, listed.kw);
+        assert_eq!(alone.instance_env, crate::occupancy_break::INSTANCE_ENV);
+        let plain = lab_opts(caller(), "", LabKw::default());
+        assert_eq!(plain.instance_env, "TMPDIR=/s");
+        assert_eq!(plain.harness_keys, "");
+    }
+
+    /// A RUN THAT ASKS ITS LAB FOR KEYS OR WORDS REFUSES A LAB IT ATTACHES TO, which was made
+    /// without them. NEGATIVE CONTROL: a run that asks for none (`watch`, `catch`, the nudge
+    /// trials) attaches.
+    #[test]
+    fn a_run_that_asks_its_lab_for_keys_refuses_an_attached_one() {
+        let listed = scenarios()
+            .into_iter()
+            .find(|s| s.name == crate::occupancy_break::NAME)
+            .expect("the occupancy scenario is listed");
+        assert!(unset_on_attach(listed.harness_keys, listed.kw).is_some());
+        let words = LabKw {
+            instance_env: crate::occupancy_break::INSTANCE_ENV,
+            ..LabKw::default()
+        };
+        assert!(unset_on_attach("", words).is_some());
+        assert!(unset_on_attach("continue = false", LabKw::default()).is_some());
+        assert_eq!(unset_on_attach("", LabKw::default()), None);
     }
 }

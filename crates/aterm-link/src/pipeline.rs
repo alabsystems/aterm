@@ -240,7 +240,6 @@ mod tests {
         let (_dir, _server, mut link, mut reader) = served();
         for i in 0..10u32 {
             let subject = if i == 4 {
-                // empty-segment".to_string()
                 "/f/f//empty-segment".to_string()
             } else {
                 format!("/f/f/x/{i}")

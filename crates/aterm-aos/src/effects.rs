@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The effect frontier (plan §3): how a task's external effects are recorded live and compared in
-//! shadow replay.
+//! External effect recording and shadow replay verification.
 
 use core::fmt;
 
 use crate::ident::Digest;
 
-/// The domain under which an effect payload is digested.
+/// Domain tag under which an effect payload is digested.
 pub const EFFECT_PAYLOAD_DOMAIN: &[u8] = b"aterm-aos-effect-payload-v1\0";
 
-/// One external effect a step proposes.
+/// External effect proposed by a task step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectRequest {
     /// The target capability (which door the effect goes through).
@@ -23,7 +22,7 @@ pub struct EffectRequest {
 }
 
 impl EffectRequest {
-    /// The payload's digest, as an [`EffectRecord`] keeps it.
+    /// Returns the payload digest stored in an [`EffectRecord`].
     #[inline]
     #[must_use]
     pub fn payload_digest(&self) -> Digest {
@@ -31,7 +30,7 @@ impl EffectRequest {
     }
 }
 
-/// One recorded effect: what was asked and what the task observed in return.
+/// Recorded external effect request and its observed result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectRecord {
     /// Its place in the recorded sequence.
@@ -46,22 +45,21 @@ pub struct EffectRecord {
     pub result: Vec<u8>,
 }
 
-/// Where a step submits its external effects.
+/// Port to which a step submits its external effects.
 pub trait EffectPort {
-    /// Submits one request and returns the result the task observes, or the divergence that stopped
-    /// it.
+    /// Submits one request and returns the observed result or the divergence that refused it.
     fn submit(&mut self, req: EffectRequest) -> Result<Vec<u8>, EffectDivergence>;
 }
 
-/// Why a run's effects are not the recorded ones.
+/// Reason why a replay's external effects diverged from the recorded sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectDivergence {
-    /// The run asked for an effect past the end of the recording (an insertion).
+    /// Request submitted past the end of the recording.
     Inserted {
         /// The request's position.
         position: u64,
     },
-    /// The request names another target than the record at its position.
+    /// Request target differed from the recorded target at `position`.
     TargetDiverged {
         /// The position.
         position: u64,
@@ -70,7 +68,7 @@ pub enum EffectDivergence {
         /// The target asked for.
         asked: u32,
     },
-    /// The request names another operation than the record at its position.
+    /// Request operation differed from the recorded operation at `position`.
     OpDiverged {
         /// The position.
         position: u64,
@@ -79,7 +77,7 @@ pub enum EffectDivergence {
         /// The op asked for.
         asked: u16,
     },
-    /// The request carries another payload than the record at its position.
+    /// Request payload digest differed from the recorded digest at `position`.
     PayloadDiverged {
         /// The position.
         position: u64,
@@ -88,7 +86,7 @@ pub enum EffectDivergence {
         /// The asked payload's digest.
         asked: Digest,
     },
-    /// The run ended with recorded effects it never asked for, seen at [`ShadowPort::finish`].
+    /// Run ended with unconsumed recorded effects remaining at [`ShadowPort::finish`].
     Unreached {
         /// The first position never asked for.
         position: u64,
@@ -152,8 +150,7 @@ impl fmt::Display for EffectDivergence {
 
 impl std::error::Error for EffectDivergence {}
 
-/// Shadow replay: compares each request with the next recorded one **before** handing back its
-/// recorded result; holds no live sink, so it cannot submit anything.
+/// Shadow replay port that verifies each request against `recorded` before returning the recorded result.
 #[derive(Clone, Debug)]
 pub struct ShadowPort<'a> {
     recorded: &'a [EffectRecord],
@@ -173,22 +170,21 @@ impl<'a> ShadowPort<'a> {
         }
     }
 
-    /// The first divergence, sticky.
+    /// Returns the first sticky divergence, if any.
     #[inline]
     #[must_use]
     pub const fn frontier(&self) -> Option<&EffectDivergence> {
         self.frontier.as_ref()
     }
 
-    /// How many requests matched their records.
+    /// Returns the number of requests that matched their recorded effects.
     #[inline]
     #[must_use]
     pub fn matched(&self) -> u64 {
         crate::ident::len_u64(self.next)
     }
 
-    /// Ends the shadow: the number of matched effects, or the frontier, or
-    /// [`EffectDivergence::Unreached`] if records remain.
+    /// Finishes replay, returning the matched count or an [`EffectDivergence`].
     pub fn finish(self) -> Result<u64, EffectDivergence> {
         if let Some(d) = self.frontier {
             return Err(d);
@@ -252,7 +248,7 @@ impl EffectPort for ShadowPort<'_> {
     }
 }
 
-/// Records live submissions made through a host-supplied closure (the record pass).
+/// Records live effect submissions executed through `sink`.
 pub struct RecordingPort<F: FnMut(&EffectRequest) -> Vec<u8>> {
     sink: F,
     records: Vec<EffectRecord>,
@@ -311,7 +307,7 @@ impl<F: FnMut(&EffectRequest) -> Vec<u8>> EffectPort for RecordingPort<F> {
     }
 }
 
-/// For tasks that declare no external effects: any submission is `Undeclared`.
+/// Rejects every effect submission with [`EffectDivergence::Undeclared`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NoEffects;
 

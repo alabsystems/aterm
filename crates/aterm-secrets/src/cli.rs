@@ -3421,7 +3421,6 @@ mod tests {
                 std::fs::create_dir_all(shared.parent().expect("parent")).expect("dir");
                 shared.to_str().expect("utf-8").to_string()
             } else {
-                //{}/v1/{dir}", server.addr)
                 format!("http://{}/v1/{dir}", server.addr)
             };
             let admin = crate::client::Paths::for_home(&root.path().join(dir).join("ma"));

@@ -1,17 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Security panel's *Move to Trash* for conflicting copies of aterm.
-//!
-//! A copy that claims aterm's bundle id with a different code requirement resets the Full Disk
-//! Access grant for every copy whenever it asks (`aterm_containment::consent`, "The claimant
-//! census"). This is the worker behind the button the panel shows for a copy the census offers
-//! (`consent::TrashOffer`).
-//!
-//! Owner gesture only: an AppKit alert no control verb can answer confirms the press, and no
-//! verb, config key or automatic trigger starts it. Off the main thread it re-checks (a fresh
-//! census, the copy's identity right before the move, whether a process runs from it) and moves
-//! the copy with [`atpkg::copies::trash`], as `aterm doctor` does, so it stays recoverable.
+//! Security panel *Move to Trash* worker for conflicting bundles ([`atpkg::copies::trash`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -21,14 +11,13 @@ use aterm_containment::consent::{self, Claimants, Retired};
 /// The trash tool macOS 15 and later ship.
 pub(crate) const TRASH_TOOL: &str = atpkg::copies::TRASH_TOOL;
 
-/// Whether [`TRASH_TOOL`] is on this Mac, read once: it ships with the OS.
+/// Whether [`TRASH_TOOL`] is on this Mac.
 pub(crate) fn trash_tool_present() -> bool {
     static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PRESENT.get_or_init(|| Path::new(TRASH_TOOL).is_file())
 }
 
-/// The worker's reaches, injected so a headless instance and every unit test
-/// get arms that read nothing and move nothing.
+/// Injected worker reaches.
 #[derive(Clone, Copy)]
 pub(crate) struct RetireArms {
     census: fn(&str) -> Claimants,
@@ -110,15 +99,12 @@ impl RetireState {
         }
     }
 
-    /// The worker's slot, locked. Registered in the lock-order census's `GUARD_HELPERS`
-    /// (identity `shared`, the name the worker thread locks it by), so callers' holds are graphed.
+    /// The worker's slot, locked.
     fn retire_slot(&self) -> std::sync::MutexGuard<'_, Slot> {
         self.shared.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Start the worker for the copies the owner was shown. `false` when one is
-    /// already running or the thread could not be spawned. `wake` runs on the
-    /// worker once the report is stored.
+    /// Start the worker for the copies the owner was shown.
     pub(crate) fn start(
         &self,
         bundle_id: String,
@@ -182,8 +168,7 @@ impl RetireState {
     }
 }
 
-/// The block's status line once a press's moves are done; the per-copy lines in
-/// the block say what happened to each.
+/// The block's status line once a press's moves are done.
 pub(crate) fn summary(moved: usize, of: usize) -> String {
     let copies = if of == 1 { "copy" } else { "copies" };
     match moved {
@@ -243,8 +228,6 @@ mod tests {
         state.report().expect("the worker stored a report")
     }
 
-    /// The worker re-runs the census, moves what it still offers, stores the
-    /// report, and wakes the loop once.
     #[test]
     fn the_worker_moves_what_a_fresh_census_still_offers_and_reports_it() {
         let state = RetireState::with_arms(RetireArms {
@@ -272,7 +255,6 @@ mod tests {
         assert!(!state.take_arrival(), "one arrival per report");
     }
 
-    /// With no census nothing is offered, so the inert arms leave the planned copy in place.
     #[test]
     fn the_inert_arms_move_nothing() {
         let state = RetireState::new(true);
@@ -287,7 +269,6 @@ mod tests {
         );
     }
 
-    /// A second press while a worker runs starts no second worker.
     #[test]
     fn a_second_press_while_live_starts_nothing() {
         fn slow_census(id: &str) -> Claimants {
@@ -305,7 +286,6 @@ mod tests {
         let _ = wait_for_report(&state);
     }
 
-    /// A windowed instance gets the real checks; a headless one gets inert arms.
     #[test]
     fn the_live_arms_are_the_real_checks() {
         fn same(a: &RetireArms, b: &RetireArms) -> bool {

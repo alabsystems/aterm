@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The upgrade's class, table, and words.
-//!
-//! [`aterm_agent::harness::upgrade_drive::Row::attention`] classifies every
-//! upgrade state; this file holds the table of failure modes (41 states by id)
-//! against the real classifier, and
-//! the words each `Digest` becomes as an entry of the exceptions digest
-//! ([`crate::message_reporters::upgrade_exceptions`]) run through the engine's
-//! vocabulary. A state that moves class fails here by id.
-//!
-//! The classes: `Q` a record (the upgrade is working or somebody else's to end), `F:kind`
-//! aterm's own fault (a Warn record and one `aterm.log` line), `D:kind` one line of "To
-//! look at", `I:kind` the one row that stands (the agent the upgrade ended).
+//! Tests for [`aterm_agent::harness::upgrade_drive::Row::attention`] classification across all 41 upgrade states and their [`crate::message_reporters::upgrade_exceptions`] digest entries.
+//! Classes are `Q` (quiet record), `F:kind` (fault), `D:kind` (digest entry), and `I:kind` (standing interrupt).
 
 use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase, Request};
 use aterm_agent::harness::upgrade_drive::{Attention, HeldBy, Row};
@@ -23,8 +13,7 @@ use crate::message_reporters::{UpgradeSpot, upgrade_exceptions};
 
 const NOW: u64 = 1_790_640_000;
 const H: u64 = 3_600;
-/// The three looks of every state: as it first appears, two hours on, and a
-/// day and an hour on (progress kept alive by a notice a minute ago).
+/// Inspection ages for each state: 20 minutes, 2 hours, and 25 hours.
 const AGES: [u64; 3] = [20 * 60, 2 * H, 25 * H];
 
 fn holders(n: usize) -> Vec<HeldBy> {
@@ -50,7 +39,6 @@ fn state(agent: Agent, age: u64, phase: Phase, wait: &str) -> Row {
         wait: wait.into(),
         phase,
         agent,
-        // A session that is being worked on has made progress lately.
         noticed_at: if age > 3 * H { NOW - 60 } else { 0 },
         ..Row::default()
     }
@@ -189,22 +177,9 @@ fn class(row: &Row) -> String {
     }
 }
 
-/// The 41 upgrade states, by id, against the real classifier: what each is at 20
-/// minutes, 2 hours and a day on. 40 are `Row`-backed here; the last, M03
-/// ("the upgrade cannot run at all"), is no row of a tab — the host raises it
-/// (`Need::upgrade_cannot_run`), checked below. The only interrupts in the
-/// whole table are S06, F02 and F04 (and F03 at its expiry becomes S06) — an
-/// agent the upgrade ended; everything else is a record, aterm's own fault
-/// line, or one line of the digest.
-///
-/// What the design's table lists that this classifier answers otherwise, said
-/// where it differs: G03 and G06 (a turn running, a status lagging an idle
-/// screen) are `own-work` at a day like G04 and G13 (an agent too busy to be
-/// asked at all); G01, G14, G15, G17, G19 and G21 (waits that are moments)
-/// are aterm's fault when one stands two hours, as G16 and G20 are.
+/// Verifies the attention classification of all 41 upgrade states across [`AGES`].
 #[test]
 fn every_upgrade_state_has_its_attention() {
-    // (id, 20 min, 2 h, 25 h)
     #[rustfmt::skip]
     let table: [(&str, [&str; 3]); 40] = [
         ("G01", ["Q", "F:harness-stuck", "F:harness-stuck"]),
@@ -258,16 +233,11 @@ fn every_upgrade_state_has_its_attention() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
-    // M03: no tab, so no Row — the host's own fact, in the same words the
-    // digest's vocabulary takes (`every_digest_state_says_why_and_what`).
     let cannot = aterm_agent::harness::upgrade_drive::Need::upgrade_cannot_run("state-unwritable");
     assert_eq!(cannot.kind, "upgrade-cannot-run");
 }
 
-/// F04 and F03 at their expiry: a relaunched agent that has reached no prompt is aterm's
-/// fault line at 15 minutes and an interrupt at 30; a returned prompt the resume line was
-/// not typed at becomes the agent-down interrupt at the stale bound. (`fixture`'s F03/F04
-/// are the early looks.)
+/// Relaunched and exited agents escalate from quiet or fault states to interrupts at their expiry bounds.
 #[test]
 fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
     let relaunched = |waited: u64| {
@@ -295,7 +265,6 @@ fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
     };
     assert_eq!(class(&exited(4 * 60)), "Q", "a person may be typing there");
     assert_eq!(class(&exited(6 * 60)), "I:agent-down");
-    // S06's Codex twins.
     for why in ["no-rollout", "codex-lane-retired"] {
         let mut r = state(Agent::Codex, 7 * H, Phase::Failed(why.into()), "");
         r.exited_at = NOW - 2 * H;
@@ -303,9 +272,7 @@ fn the_relaunch_and_the_returned_prompt_reach_their_interrupts_on_time() {
     }
 }
 
-/// Only an agent the upgrade ended interrupts: across every state of the table and ages
-/// from a minute to a year, no class but `agent-down`, `hung-exit` and `relaunch-stuck` is
-/// an interrupt.
+/// Across all states and ages, only `agent-down`, `hung-exit`, and `relaunch-stuck` produce an interrupt.
 #[test]
 fn no_state_but_an_ended_agent_ever_interrupts() {
     let ids = [
@@ -334,9 +301,7 @@ fn no_state_but_an_ended_agent_ever_interrupts() {
     );
 }
 
-/// An unknown wait is never the owner's: a word this build has never seen is a record and,
-/// once it has stood too long, aterm's own fault line; never a digest line or an
-/// interrupt, whatever its age, phase or agent.
+/// Unknown wait strings classify only as quiet records or faults, never digest entries or interrupts.
 #[test]
 fn an_unknown_wait_is_a_record() {
     for agent in [Agent::Claude, Agent::Codex] {
@@ -406,9 +371,7 @@ const PLACES: [&str; 4] = [
     "in window 12, tab 10",
 ];
 
-/// Every entry the upgrade can hand the digest — each digest state of the
-/// table at each age it is one, named in every form a place takes — with the
-/// digest kind it is.
+/// Builds every `(kind, Entry)` pair across [`DIGEST_IDS`], ages, and [`PLACES`].
 pub(crate) fn every_digest_entry() -> Vec<(&'static str, Entry)> {
     let mut all = Vec::new();
     for id in DIGEST_IDS {
@@ -431,11 +394,7 @@ pub(crate) fn every_digest_entry() -> Vec<(&'static str, Entry)> {
     all
 }
 
-/// Every word the digest gets passes the engine's vocabulary, for every digest state of
-/// the table at every age it can be one, in every form a place takes: the entry builds
-/// (`Entry::message()` is `Ok`: a glass title, a reason that is not "waiting", one action
-/// with no snooze lead) and its key is under the family's prefix. A reporter whose words
-/// fail is logged and never shown, so this is where it fails first.
+/// Every upgrade digest entry builds a valid [`Entry::message`] under the `harness.upgrade.` key prefix.
 #[test]
 fn every_digest_state_says_why_and_what() {
     let all = every_digest_entry();
@@ -455,7 +414,6 @@ fn every_digest_state_says_why_and_what() {
         "the roster covers the states: {}",
         all.len()
     );
-    // The host's own fact (M03) says why and what through the same vocabulary.
     let cannot = aterm_agent::harness::upgrade_drive::Need::upgrade_cannot_run("state-unwritable");
     let entry = Entry::new(
         aterm_messages::exceptions::Family::UpgradeHost,
@@ -468,9 +426,7 @@ fn every_digest_state_says_why_and_what() {
     assert!(entry.message().is_ok(), "{:?}", entry.message());
 }
 
-/// Several tabs are one entry per kind for `own-work`, `typed-draft` and `daemon-busy`,
-/// naming its tabs, and one entry per tab for a kind whose action is done in one tab. The
-/// order the rows come in changes nothing.
+/// Multi-tab kinds collapse into one entry per kind regardless of input order, while per-tab actions emit one entry per tab.
 #[test]
 fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_per_tab() {
     let mut rows = vec![
@@ -482,7 +438,6 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
         day_row("G18", "s-f"),
         day_row("H01", "s-g"),
     ];
-    // Distinct ages, so "the oldest speaks" is a fact and not a tie.
     for (i, row) in rows.iter_mut().enumerate() {
         row.behind_since = NOW - (30 + i as u64) * H;
     }
@@ -510,7 +465,6 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
         own.actions.is_empty(),
         "several tabs: no single tab to show"
     );
-    // The reverse order is the same answer.
     rows.reverse();
     let placed: Vec<(&Row, UpgradeSpot)> = rows.iter().map(|row| (row, spot(1))).collect();
     let again: Vec<String> = upgrade_exceptions(&placed, NOW)
@@ -518,12 +472,10 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
         .map(Entry::key)
         .collect();
     assert_eq!(again, keys);
-    // One tab: named, and shown.
     let one = entries(&[day_row("G13", "s-b")]);
     let msg = one[0].message().expect("passes");
     assert!(msg.title.contains("tab 1"), "{}", msg.title);
     assert_eq!(msg.actions, [Intent::ShowTab { tab: 1, window: 1 }]);
-    // Where the window is named too, the title still fits the rule.
     let far = upgrade_exceptions(
         &[(
             &day_row("G13", "s-b"),
@@ -542,10 +494,7 @@ fn several_tabs_are_one_line_per_kind_and_one_line_per_tab_where_the_action_is_p
     assert!(title.contains("window 12"), "{title}");
 }
 
-/// Nothing but a digest row is an entry: interrupts keep their band row, faults their
-/// record, quiet waits nothing. The words keep the classifier's severity (a repeating stop
-/// is a Warn) and the dismissal span (a choice the owner made holds longer than a wait
-/// somebody could end).
+/// Only digest states emit entries, preserving each kind's severity and resurface span.
 #[test]
 fn only_a_digest_state_is_an_entry_and_its_severity_and_span_follow_its_kind() {
     for id in [
@@ -586,8 +535,6 @@ fn only_a_digest_state_is_an_entry_and_its_severity_and_span_follow_its_kind() {
     for wait in ["G13", "G11", "G18", "S05"] {
         assert_eq!(span(wait), Resurface::WAIT, "{wait}");
     }
-    // A row that gave up (`GAVE_UP`) after a whole round unanswered, with work under it,
-    // is `own-work`.
     let mut gave_up = fixture("G13", 30 * H);
     gave_up.phase = Phase::Failed(GAVE_UP.into());
     gave_up.streak_why = GAVE_UP.into();

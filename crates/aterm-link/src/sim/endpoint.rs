@@ -21,7 +21,7 @@ pub(crate) struct EpRules {
     pub(crate) forgets: bool,
     /// A session holding a generation of the fork's chain AFTER `was` keeps below the fork too.
     pub(crate) chain: bool,
-    /// A replaced log.
+    /// A replaced log (`forgot=1`) forgets every session log's mirror cursor.
     pub(crate) mirror_forgets: bool,
 }
 
@@ -92,7 +92,8 @@ pub(crate) struct Session {
     pub(crate) bus_log: Option<String>,
     /// The highest addressed offset ever delivered on that log.
     addressed_head: Option<u64>,
-    /// The session's log.
+    /// The session's log (`aterm_slog`), while the node mirrors it onto the
+    /// bus (`[fabric] log = "turns"`).
     pub(crate) log: Option<aterm_slog::Log>,
 }
 
@@ -478,7 +479,7 @@ impl EpState {
         self.sessions.values_mut().find(|s| s.sid == sid)
     }
 
-    /// Every queued post.
+    /// Every queued post, then every owed receipt.
     fn outbox_frame(&self) -> String {
         let mut frame = String::new();
         let queued: Vec<Vec<&Post>> = self
@@ -673,7 +674,9 @@ impl EpState {
         format!("OK hold={}\n", u8::from(on))
     }
 
-    /// `link log <id> [continues=<f> was=<old>]`: a change forgets the sessions' offsets.
+    /// `link log <id> [continues=<f> was=<old>]`: a change forgets the
+    /// sessions' offsets; from lane 3 on, a session holding `old` keeps those
+    /// below `f`.
     fn link_log<'a>(&mut self, mut words: impl Iterator<Item = &'a str>) -> String {
         let Some(ident) = words.next().map(str::to_string) else {
             return "ERR usage: link log\n".to_string();
@@ -718,6 +721,7 @@ impl EpState {
         self.log = Some(ident);
         if changed {
             // AND THE MIRROR'S CURSORS, every one: what the bus held of each
+            // log was another log's (aterm-gui's `forget_landed`).
             if self.rules.mirror_forgets {
                 for log in self.sessions.values_mut().filter_map(|s| s.log.as_mut()) {
                     log.forget_mirror();

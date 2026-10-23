@@ -24,6 +24,7 @@ mod native {
         static API: OnceLock<Result<Api, String>> = OnceLock::new();
         API.get_or_init(|| {
             // SAFETY: a static NUL-terminated framework path and Darwin dlfcn flags.
+            // The framework remains loaded while the cached function pointers exist.
             let handle = unsafe { dlopen(FRAMEWORK.as_ptr(), RTLD_LAZY_LOCAL) };
             if handle.is_null() {
                 return Err("macOS's native scroll-direction framework is unavailable".into());

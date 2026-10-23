@@ -155,7 +155,7 @@ impl Env {
     }
 }
 
-/// `std::process::Command`, whose child holds its stdio and nothing else (the module docs list where it differs).
+/// `std::process::Command`, whose child holds its stdio and nothing else.
 pub struct Command {
     program: OsString,
     arg0: Option<OsString>,
@@ -470,7 +470,8 @@ impl Child {
         self.handle.id()
     }
 
-    /// `SIGKILL` the child — never once it is reaped (the module docs).
+    /// `SIGKILL` the child; once it is reaped, signal nothing and answer `Ok` (the pid may
+    /// name another process by then).
     /// # Errors
     /// `kill`'s.
     pub fn kill(&mut self) -> io::Result<()> {

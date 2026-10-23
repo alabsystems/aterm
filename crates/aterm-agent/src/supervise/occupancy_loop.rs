@@ -53,7 +53,10 @@
 //! What it says: one `OCCUPANCY seq=<n> rule=<id> rev=builtin episode=<hex> door=break …` line a
 //! rule a change (`would`, `held:<guard>`, `paced next_s=<n>`, `spent`), and for each would-be
 //! line a `fact-would@v1` row (`waiting`), which counts toward the rule's caps and the session's
-//! pace as a typed line would.
+//! pace as a typed line would. A held verdict is booked as a `fact-held@v1` row (`waiting`; design
+//! §6) on its transition only, and once an episode a guard ([`Session::held_row`]): a guard that
+//! flaps, or one that holds a rule for a whole day, spends a row or two of the ledger's
+//! newest-rows ring, never one a read.
 //!
 //! UNDER `prompt` ([`Session::occupancy_write`]; the red-team's F1, F10, F11 and F12) the due line
 //! is no would-be row: the break's step, once the host's own step is judged, takes it to the
@@ -61,11 +64,17 @@
 //! `status`, parsed apart from the loop's fields; the guards again with that read, a draft in the
 //! composer (an unknown one is a draft) and the host's record of a taskless session; a manager
 //! waiting on the session holds it; then the host's withhold and wind-down, the upgrade's notice
-//! due (a nudge waits for it), and the host's pace (`IdleHost::occupancy_pace`). Then a
-//! `fact-intent@v1` row, the fenced write (`Session::type_fact`: never the guarded submit), and
-//! after it the line's own turn state (`TurnEndState::fact_typed`), the facts state, the books,
-//! the host's `break_taken` and `inform`, and the outcome's `fact-hold@v1` row, `typed` or
-//! `skipped why=<word>`. Its `OCCUPANCY` line says `typed`, `skipped why=…`, `held:<guard>`,
+//! due (a nudge waits for it), and the host's pace (`IdleHost::occupancy_pace`). `hold-room`'s
+//! line types the board's figures, so its pace's answer carries the board the host re-read for
+//! the write (design §3.1; [`PaceGrant::slot_answer`]): the rule's terms are judged again on it,
+//! its figures must have been read no more than `FACT_FRESH_MS` before the break, and the line
+//! typed is made from them; terms no longer met or figures stale hold it (`paced why=unmet` or
+//! `why=stale`) and it stays due, tried again at the next look. Then a `fact-intent@v1` row, the
+//! fenced write (`Session::type_fact`: never the guarded submit), and after it the line's own
+//! turn state (`TurnEndState::fact_typed`), the facts state, the books, the host's
+//! `break_taken` and `inform`, and the outcome's `fact-hold@v1` row, `typed` or
+//! `skipped why=<word>` (`unfenced`, `not-written`, or `not-submitted` for a line written and left
+//! in the composer). Its `OCCUPANCY` line says `typed`, `skipped why=…`, `held:<guard>`,
 //! `told`, `paced why=…` or `refused why=…`, once a change. A typed line is booked as a would-be
 //! line is, and a successor seeds its facts from the door's rows ([`door::seed_rows_in`]): an
 //! intent with no outcome after it is untold, so a crash between them retells it once.
@@ -98,6 +107,7 @@ use super::super::occupancy::{
 };
 use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
+use super::turn_end_loop::Written;
 use super::*;
 
 /// How long a hold stands before it is booked in the ledger.
@@ -159,7 +169,17 @@ struct DoorWatch {
     seen: Option<(bool, Guards, OccupancyReading)>,
     /// What the host was last told ([`Session::occupancy_tell`]): once a change.
     told: Option<OccupancySaid>,
+    /// The open hold's held verdicts booked as `fact-held@v1` rows ([`Session::held_row`]):
+    /// each episode by its rule and its ordinal in the hold, with the guard that held it. Of the
+    /// open hold alone, so keyed by nothing that names the hold: cleared when the hold changes,
+    /// and seeded from the carried hold's own rows ([`Session::door_seed`]), however far the
+    /// successor's wall start for it sits from its predecessor's (`rules::episode`).
+    held: Vec<HeldKey>,
 }
+
+/// A held verdict of the open hold, as [`DoorWatch::held`] keeps it: the rule, the episode's
+/// ordinal in the hold ([`rules::Books::this_hold`]), and the guard that held it.
+type HeldKey = (RuleId, usize, Guard);
 
 /// A due line under `prompt`, between the decider and the write at the same break.
 #[derive(Debug, Clone)]
@@ -167,6 +187,8 @@ struct DueLine {
     rule: RuleId,
     line: FactLine,
     episode: u64,
+    /// The episode's ordinal in the hold ([`rules::Books::this_hold`]).
+    ordinal: usize,
     hold: HoldSeen,
     /// The break's read, on the clock's milliseconds and as an instant.
     now_ms: i64,
@@ -287,8 +309,10 @@ impl<C: Ctl> Session<'_, C> {
         let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
         self.hold.door.facts.seed(&facts, now_ms);
         let would = rules::would_rows_in(body, self.setup.sid.as_deref());
+        let held = rules::held_rows_in(body, self.setup.sid.as_deref());
+        let booked = (&would[..], &held[..]);
         let Some(row) = hold::seed_row_in(body, self.setup.sid.as_deref()) else {
-            self.door_seed(&would, start_ms, now_ms, None);
+            self.door_seed(booked, start_ms, now_ms, None);
             return;
         };
         // The host's launch is asked last, and only of a row nothing else made stale.
@@ -304,7 +328,7 @@ impl<C: Ctl> Session<'_, C> {
             self.hold.seed = Some(Seed::Stale {
                 held_ms: row.held_ms,
             });
-            self.door_seed(&would, start_ms, now_ms, None);
+            self.door_seed(booked, start_ms, now_ms, None);
             return;
         }
         let since_ms = start_ms - now_ms.saturating_sub(row.since_wall_ms());
@@ -314,34 +338,42 @@ impl<C: Ctl> Session<'_, C> {
             seen_ms: start_ms,
         });
         self.door_seed(
-            &would,
+            booked,
             start_ms,
             now_ms,
             Some((since_ms, row.since_wall_ms())),
         );
     }
 
-    /// The door's books from the would-be lines a loop before this one booked (`would`, oldest
-    /// first), placed on the clock by the loop's start (`start_ms`, beside the wall's `now_ms`):
-    /// each of the last day counts toward the nudges' cap and the pace, and where a hold is
-    /// carried (`carried`: its start on the clock and in unix ms) each booked since it began
-    /// counts toward that hold's own caps, however long ago: a hold carried past a day keeps its
-    /// one nudge and its `hold-room` lines (the day's window is the nudges' cap's, which
-    /// [`Books`] judges by age itself).
+    /// The door's books from the would-be lines and the held verdicts a loop before this one
+    /// booked (`would` and `held`, oldest first), placed on the clock by the loop's start
+    /// (`start_ms`, beside the wall's `now_ms`): each line of the last day counts toward the
+    /// nudges' cap and the pace, and where a hold is carried (`carried`: its start on the clock
+    /// and in unix ms) each booked since it began counts toward that hold's own caps, however
+    /// long ago: a hold carried past a day keeps its one nudge and its `hold-room` lines (the
+    /// day's window is the nudges' cap's, which [`Books`] judges by age itself). The held
+    /// verdicts booked since the carried hold began are its own ([`DoorWatch::held`]); any other
+    /// is another hold's, and none is kept where no hold is carried.
     fn door_seed(
         &mut self,
-        would: &[rules::WouldRow],
+        (would, held): (&[rules::WouldRow], &[rules::HeldRow]),
         start_ms: i64,
         now_ms: i64,
         carried: Option<(i64, i64)>,
     ) {
+        let this_hold = |row_ms: i64| carried.is_some_and(|(_, since_wall)| row_ms >= since_wall);
+        self.hold.door.held = held
+            .iter()
+            .filter(|row| this_hold(row.row_ms))
+            .map(|row| (row.rule, row.ordinal, row.guard))
+            .collect();
         let books = &mut self.hold.door.books;
         if let Some((since_ms, _)) = carried {
             books.hold(since_ms);
         }
         for row in would {
             let ago = now_ms.saturating_sub(row.row_ms);
-            let this_hold = carried.is_some_and(|(_, since_wall)| row.row_ms >= since_wall);
+            let this_hold = this_hold(row.row_ms);
             if ago < 0 || (!this_hold && ago >= rules::DAY_MS) {
                 continue;
             }
@@ -467,10 +499,13 @@ impl<C: Ctl> Session<'_, C> {
             since_ms,
             declared: self.hold.clock.declared(),
         };
-        // Another hold's verdicts are not this one's: each is said afresh.
+        // Another hold's verdicts are not this one's: each is said, and booked, afresh.
         if self.hold.door.books.hold_since_ms() != Some(since_ms) {
             self.hold.door.said = [None; 2];
             self.hold.door.said_at = [0; 2];
+            if !armed(Fault::HeldAcrossHolds) {
+                self.hold.door.held.clear();
+            }
         }
         self.hold.door.books.hold(since_ms);
         let reading = if rules::wants_reading(Some(hold), &self.hold.door.books, now_ms) {
@@ -479,7 +514,16 @@ impl<C: Ctl> Session<'_, C> {
             OccupancyReading::default()
         };
         let guards = self.occupancy_guards(now, cfg, &screen.rows);
-        let verdicts = rules::decide(&reading, Some(hold), &self.hold.door.books, &guards, now_ms);
+        let nudge_after_ms =
+            i64::try_from(self.setup.occupancy_nudge_after.as_millis()).unwrap_or(i64::MAX);
+        let verdicts = rules::decide(
+            &reading,
+            Some(hold),
+            &self.hold.door.books,
+            &guards,
+            nudge_after_ms,
+            now_ms,
+        );
         // A tape from a build with no write (no `host.occupancy_pace` door: 1b's, which read
         // `prompt` as `observe`) replays as it was recorded: its due lines are would-be rows.
         let prompt = cfg.occupancy.grant().is_some()
@@ -532,7 +576,7 @@ impl<C: Ctl> Session<'_, C> {
                 },
             }
         });
-        let (ready, guards, reading) = door.seen.clone().map_or(
+        let (ready, guards, reading) = door.seen.map_or(
             (false, None, OccupancyReading::default()),
             |(ready, guards, reading)| (ready, Some(guards), reading),
         );
@@ -569,11 +613,8 @@ impl<C: Ctl> Session<'_, C> {
         hold: HoldSeen,
         (now_ms, now): (i64, Instant),
     ) {
-        let episode = rules::episode(
-            rule,
-            self.hold_wall_ms(hold.since_ms),
-            self.hold.door.books.this_hold(rule),
-        );
+        let ordinal = self.hold.door.books.this_hold(rule);
+        let episode = rules::episode(rule, self.hold_wall_ms(hold.since_ms), ordinal);
         if self
             .hold
             .door
@@ -586,6 +627,7 @@ impl<C: Ctl> Session<'_, C> {
             rule,
             line: line.clone(),
             episode,
+            ordinal,
             hold,
             now_ms,
             now,
@@ -602,8 +644,10 @@ impl<C: Ctl> Session<'_, C> {
     /// loop's own fields; the full guard set again (that read's person, driver, halt and unread
     /// input, a draft in the composer, the host's record of a taskless session); the host's
     /// withhold and its wind-down, then the upgrade's notice due (a nudge waits for it); the
-    /// host's pace; the `fact-intent@v1` row; the fenced write ([`Self::type_fact`]); then the
-    /// bookkeeping and the outcome's `fact-hold@v1` row, and one `OCCUPANCY` line once a change.
+    /// host's pace, with a slot rule's figures re-read in it ([`PaceGrant::slot_answer`]: the
+    /// line typed is made from them); the `fact-intent@v1` row; the fenced write
+    /// ([`Self::type_fact`]); then the bookkeeping and the outcome's `fact-hold@v1` row, and one
+    /// `OCCUPANCY` line once a change.
     /// Whether the line was typed.
     pub(super) fn occupancy_write(
         &mut self,
@@ -612,7 +656,7 @@ impl<C: Ctl> Session<'_, C> {
         cfg: Option<&SupervisorConfig>,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
-        let Some(due) = self.hold.door.due.take() else {
+        let Some(mut due) = self.hold.door.due.take() else {
             return Ok(false);
         };
         let (Some(cfg), Some(host)) = (cfg, self.stall_host.clone()) else {
@@ -643,7 +687,12 @@ impl<C: Ctl> Session<'_, C> {
             let wrote = if let Some(guard) = self.door_holds(screen, &due, cfg, host.as_ref())? {
                 Wrote::Held(guard)
             } else {
-                let pace = host.occupancy_pace(due.rule, self.hold_wall_ms(due.hold.since_ms));
+                let mut pace = host.occupancy_pace(due.rule, self.hold_wall_ms(due.hold.since_ms));
+                if due.rule.slot() {
+                    // The figures typed are those the host re-read for this write (design §3.1).
+                    let at_ms = self.wall_at(due.now);
+                    (pace, due.line) = pace.slot_answer(&due.line, due.hold, due.now_ms, at_ms);
+                }
                 if pace.lets() {
                     self.door_types(&grant, screen, &due, key, cfg, host.as_ref(), review)?
                 } else {
@@ -773,13 +822,13 @@ impl<C: Ctl> Session<'_, C> {
             outcome_row(self, Told::Typed);
         }
         let point = self.turn_of(screen.clone());
-        let written = self.type_fact(grant, &point, text, rule.name(), review)?;
-        if written != Some(true) {
-            let why = if written.is_none() {
-                "unfenced"
-            } else {
-                "not-written"
-            };
+        let why = match self.type_fact(grant, &point, text, rule.name(), review)? {
+            Some(Written::Submitted) => None,
+            None => Some("unfenced"),
+            Some(Written::Not) => Some("not-written"),
+            Some(Written::Left) => Some("not-submitted"),
+        };
+        if let Some(why) = why {
             self.door_skipped(due, why, &outcome_row);
             return Ok(Wrote::Skipped(why));
         }
@@ -849,6 +898,15 @@ impl<C: Ctl> Session<'_, C> {
             due.rule.name(),
             due.episode
         ));
+        if let Wrote::Held(guard) = wrote {
+            self.held_row(
+                due.seq,
+                (due.rule, due.ordinal, guard),
+                due.episode,
+                due.hold,
+                due.now_ms,
+            );
+        }
     }
 
     /// The board's reading for this break: the one asked within the last [`ASK_EVERY_MS`], else
@@ -859,22 +917,27 @@ impl<C: Ctl> Session<'_, C> {
         let reading = if let Some((asked_ms, reading)) = &self.hold.door.asked
             && (0..ASK_EVERY_MS).contains(&now_ms.saturating_sub(*asked_ms))
         {
-            reading.clone()
+            *reading
         } else {
             let reading = self
                 .stall_host
                 .as_ref()
                 .map(|host| host.occupancy())
                 .unwrap_or_default();
-            self.hold.door.asked = Some((now_ms, reading.clone()));
+            self.hold.door.asked = Some((now_ms, reading));
             reading
         };
-        let wall_now = self.clock_marks.map(|(marked_at, wall_ms)| {
+        reading.aged_at(self.wall_at(now))
+    }
+
+    /// The wall clock (unix ms) at `now`, a read this loop made, by the pair its last read
+    /// marked (`clock_marks`); `None` before one did. No clock is read here.
+    fn wall_at(&self, now: Instant) -> Option<i64> {
+        self.clock_marks.map(|(marked_at, wall_ms)| {
             let elapsed = now.checked_duration_since(marked_at).unwrap_or_default();
             let elapsed_ms = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
             wall_ms.saturating_add(elapsed_ms)
-        });
-        reading.aged_at(wall_now)
+        })
     }
 
     /// THE GUARDS, FROM WHAT THE LOOP HOLDS (F1): nothing is read for them. `now` is the break
@@ -935,11 +998,8 @@ impl<C: Ctl> Session<'_, C> {
         now_ms: i64,
         review: &mut dyn Review,
     ) {
-        let episode = rules::episode(
-            rule,
-            self.hold_wall_ms(hold.since_ms),
-            self.hold.door.books.this_hold(rule),
-        );
+        let ordinal = self.hold.door.books.this_hold(rule);
+        let episode = rules::episode(rule, self.hold_wall_ms(hold.since_ms), ordinal);
         let (said, words) = match &verdict {
             Verdict::Quiet => (None, String::new()),
             Verdict::Spent => (Some(Said::Spent), "spent".to_string()),
@@ -966,6 +1026,9 @@ impl<C: Ctl> Session<'_, C> {
             "OCCUPANCY seq={seq} rule={} rev=builtin episode={episode:016x} door=break {words}",
             rule.name()
         ));
+        if let Verdict::Held(guard) = verdict {
+            self.held_row(seq, (rule, ordinal, guard), episode, hold, now_ms);
+        }
         if let Verdict::Due(_) = verdict {
             let held_ms = now_ms.saturating_sub(hold.since_ms);
             self.ledger_row(
@@ -977,6 +1040,32 @@ impl<C: Ctl> Session<'_, C> {
             );
             self.hold.door.books.fired(rule, now_ms, true);
         }
+    }
+
+    /// A HELD VERDICT'S `fact-held@v1` ROW (design §6; `waiting`, so nothing follows it), at the
+    /// change of a rule's word to `held:<guard>` that the caller said: booked the first time the
+    /// guard holds the episode alone (`key`: its rule, its ordinal in the open hold and the
+    /// guard; `episode` its id), at the decider or at the write, so a guard that flaps with
+    /// another or with the machine's terms books it once, and a hold's rows are bounded by its
+    /// episodes and the guards that held each. A successor that carries the hold books none its
+    /// predecessor booked ([`DoorWatch::held`], seeded from the ledger).
+    fn held_row(&mut self, seq: u64, key: HeldKey, episode: u64, hold: HoldSeen, now_ms: i64) {
+        if self.hold.door.held.contains(&key) {
+            if !armed(Fault::HeldEachChange) {
+                return;
+            }
+        } else {
+            self.hold.door.held.push(key);
+        }
+        let (rule, ordinal, guard) = key;
+        let held_ms = now_ms.saturating_sub(hold.since_ms);
+        self.ledger_row(
+            rules::HELD_RULE,
+            Outcome::Waiting,
+            "",
+            &rules::held_reason(rule, episode, ordinal, held_ms, hold.declared, guard),
+            seq,
+        );
     }
 
     /// The hold begun at `since_ms` (the clock's) in unix ms, where the loop placed the wall on
@@ -1065,15 +1154,24 @@ impl<C: Ctl> Session<'_, C> {
     /// `observe` or `prompt` its first break tells the hold again. The word is the last one told
     /// with its hold, its ready proxy, its guards and its rules' words emptied, stamped as that
     /// one was: nothing is read for it and nothing typed. A tape from a build with no such door
-    /// told nothing, so it tells nothing here either.
+    /// told nothing, so it tells nothing here either. A loop that unwinds is told so by
+    /// [`UntoldOnUnwind`].
     pub(super) fn occupancy_untold(&mut self) {
-        let Some(told) = self.hold.door.told.as_ref().filter(|t| t.hold.is_some()) else {
+        let Some(said) = self.untold_word() else {
             return;
         };
         let Some(host) = self.stall_host.clone() else {
             return;
         };
-        let said = OccupancySaid {
+        host.occupancy_said(&said);
+        self.hold.door.told = Some(said);
+    }
+
+    /// The word the loop's end tells its host ([`Self::occupancy_untold`]): the last one told,
+    /// its hold, ready proxy, guards and rules' words emptied; `None` where no open hold was told.
+    fn untold_word(&self) -> Option<OccupancySaid> {
+        let told = self.hold.door.told.as_ref().filter(|t| t.hold.is_some())?;
+        Some(OccupancySaid {
             hold: None,
             ready: false,
             guards: None,
@@ -1083,9 +1181,7 @@ impl<C: Ctl> Session<'_, C> {
                 at_ms: 0,
             }),
             ..told.clone()
-        };
-        host.occupancy_said(&said);
-        self.hold.door.told = Some(said);
+        })
     }
 
     /// One change, said: its journal line, and its row where the hold is booked (a stale seed's
@@ -1149,5 +1245,46 @@ impl<C: Ctl> Session<'_, C> {
             &hold::row_reason(&said),
             seq,
         );
+    }
+}
+
+/// [`Session::drive`]'S EVERY END TOLD, AN UNWIND'S TOO: a loop that panics with an open hold told
+/// its host would leave that hold on the window's board, where `ready=` counts it, until the
+/// tab's next loop told it again. The guard holds the session for `drive`'s body; dropped on an
+/// unwind (and on that alone: a return tells it itself, [`Session::occupancy_untold`]), it
+/// tells `live` — the host the loop's caller handed it, never the tape's door: an unwind crosses
+/// no door, and a replay, whose host is the tape's, has none — the untold word, once. Nothing
+/// is read for it and nothing typed. A host that panics in turn is let be: a second panic out of
+/// a destructor that runs on an unwind aborts the process, and every window with it.
+pub(super) struct UntoldOnUnwind<'g, 's, C: Ctl> {
+    session: &'g mut Session<'s, C>,
+    live: Option<Arc<dyn IdleHost>>,
+}
+
+impl<'g, 's, C: Ctl> UntoldOnUnwind<'g, 's, C> {
+    /// The guard over `session`, telling `live` should it unwind.
+    pub(super) fn over(session: &'g mut Session<'s, C>, live: Option<Arc<dyn IdleHost>>) -> Self {
+        Self { session, live }
+    }
+
+    /// The session it guards.
+    pub(super) fn session(&mut self) -> &mut Session<'s, C> {
+        self.session
+    }
+}
+
+impl<C: Ctl> Drop for UntoldOnUnwind<'_, '_, C> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() || armed(Fault::UntoldOnReturnOnly) {
+            return;
+        }
+        let (Some(live), Some(said)) = (self.live.as_ref(), self.session.untold_word()) else {
+            return;
+        };
+        let told =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| live.occupancy_said(&said)));
+        if told.is_ok() {
+            self.session.hold.door.told = Some(said);
+        }
     }
 }

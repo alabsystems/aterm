@@ -5,8 +5,7 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by the aterm project in 2026; see the repository NOTICE. (A window shows one of the
-// named icons aterm sets: custom cursor images and the hidden cursor, which only the cut
-// `create_custom_cursor` and `set_cursor_visible` reached, left with WC.8. A cursor that cannot
+// named icons aterm sets: custom cursor images and the hidden cursor are cut. A cursor that cannot
 // be set is reported, not a panic: `XConnection::report`; none is loaded once the connection is
 // broken: `set_cursor_icon`. The cursors follow the resource database's theme and size as it
 // changes: `follow_cursor_settings`.)
@@ -22,8 +21,7 @@ use crate::window::CursorIcon;
 
 use super::*;
 
-/// The pointer cursor's theme and size as the resource database gives them (`Xcursor.theme`,
-/// `Xcursor.size`), which libXcursor reads once, at its first cursor.
+/// Pointer cursor theme and size read from the X resource database (`Xcursor.theme`, `Xcursor.size`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CursorSettings {
     theme: Option<String>,
@@ -40,8 +38,7 @@ impl CursorSettings {
     }
 }
 
-/// What a connection has made of the database's cursor settings
-/// ([`XConnection::follow_cursor_settings`]).
+/// Tracks changes to the X resource database's cursor settings ([`XConnection::follow_cursor_settings`]).
 #[derive(Debug)]
 pub(crate) struct CursorFollow {
     /// The settings at the database's last reading, which a change is measured against.
@@ -70,13 +67,7 @@ thread_local! {
 }
 
 impl XConnection {
-    /// Show `cursor` on `window`, its image loaded on first use (Xcursor, through Xlib). Not
-    /// once the connection is broken: Xlib then stops emptying its request buffer (`_XSend`
-    /// returns early once the display has had its IO error), a cursor's load fills it, and past
-    /// its end `_XGetRequest` gives Xcursor a NULL request it writes through. That was a SIGSEGV
-    /// inside libXcursor in the lost-display test (`gone_tests`, the Linux lane, 2026-10-21:
-    /// "Xlib: request 98 length 8 would exceed buffer size."). A display that has gone shows no
-    /// cursor, and the loop's next look ends the run with the loss.
+    /// Show `cursor` on `window`, loading its image on first use unless the connection is broken.
     pub fn set_cursor_icon(&self, window: xproto::Window, cursor: CursorIcon) {
         if self.is_broken() {
             return;
@@ -93,16 +84,7 @@ impl XConnection {
         }
     }
 
-    /// Follow the resource database's cursor settings, once it has been read again
-    /// (`reload_database`); whether they changed, when each window's cursor must be set again
-    /// (`UnownedWindow::reload_cursor`). libXcursor reads `Xcursor.theme` and `Xcursor.size`
-    /// once, at its first cursor, and every shape loaded was kept for the process's life, but
-    /// GNOME's settings daemon rewrites them live (Large Cursor, a theme picked in Settings):
-    /// on the desk (GNOME 46 on Xorg, 2026-10-22) neither showed in aterm until a restart. A
-    /// theme or size that changed is handed to libXcursor (one the database dropped goes back
-    /// to libXcursor's own), and the cursors loaded are freed and forgotten, so the next load of
-    /// each shape takes the new ones. A window keeps showing its old cursor until it is set
-    /// again: the server frees a cursor once nothing uses it.
+    /// Update libXcursor's theme and size from the reloaded resource database and return whether they changed.
     pub fn follow_cursor_settings(&self) -> bool {
         if self.is_broken() {
             return false;

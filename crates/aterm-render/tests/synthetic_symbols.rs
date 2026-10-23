@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The chain's last-resort fontless symbol tier (`font_chain::Tier::Synthetic`,
-//! `procedural::covers_symbol`), bound to the real renderer. It draws a symbol
-//! no installed face covers (U+23F5 `⏵`, the Claude Code / Codex footer, on a
-//! bare Linux host) instead of `.notdef`, and a default-text symbol only the
-//! colour face covers (`⏺`) instead of that face's monochrome silhouette.
-//!
-//! `Renderer::from_bytes` leaves every system-font path list empty, so DejaVu
-//! Sans Mono is the whole chain, except where a test opens runtime discovery on
-//! an unsealed renderer: an installed face that draws the character then wins
-//! over the synthesis, so that one policy accepts either answer (macOS resolves
-//! U+23F5 to `RuntimeFallback`, a host without such a face to `Procedural`).
+//! Tests for the procedural fallback symbol tier across font-discovery policies.
 
 use aterm_render::procedural::{covers_symbol, symbol_coverage};
 use aterm_render::{FaceId, GlyphClass, GlyphImage, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
@@ -33,7 +23,6 @@ fn renderer(runtime: bool, sealed: bool) -> Renderer {
     r
 }
 
-/// Every code point the synthesis claims, from the table itself.
 fn all_symbols() -> Vec<char> {
     (0x2300u32..=0x2BFF)
         .filter_map(char::from_u32)
@@ -60,8 +49,6 @@ fn the_footer_triangle_draws_ink_on_every_policy() {
         let (cw, ch) = r.cell_size();
         let baseline = r.baseline();
         let key = r.glyph_key('\u{23F5}');
-        // Only an open (unsealed) runtime tier may reach an installed face, and
-        // one that draws U+23F5 wins: the synthesis is the last resort.
         let installed_face_may_win = runtime && !sealed;
         assert!(
             key.source == FaceId::Procedural
@@ -75,7 +62,6 @@ fn the_footer_triangle_draws_ink_on_every_policy() {
         if key.source == FaceId::Procedural {
             assert_eq!((w, h), (cw, ch), "one cell exactly");
         } else {
-            // A font's triangle is fitted into the cell box, not drawn as it.
             let top = baseline - h as i32 - img.ymin();
             assert!(
                 img.xmin() >= 0
@@ -91,7 +77,6 @@ fn the_footer_triangle_draws_ink_on_every_policy() {
             ink > 0,
             "runtime={runtime} sealed={sealed}: U+23F5 rasterized empty"
         );
-        // A right-pointing triangle: more ink in the left half than the right.
         let half = |lo: usize, hi: usize| -> u32 {
             (0..h)
                 .flat_map(|y| (lo..hi).map(move |x| (x, y)))
@@ -107,8 +92,6 @@ fn no_symbol_in_the_table_is_ever_tofu() {
     let mut r = renderer(false, false);
     for c in all_symbols() {
         let key = r.glyph_key(c);
-        // `.notdef` is the Primary face addressed by char; a real primary glyph
-        // is addressed by glyph id.
         let notdef = key.source == FaceId::Primary && key.glyph_class == GlyphClass::Mono;
         assert!(
             !notdef,
@@ -132,7 +115,6 @@ fn no_symbol_in_the_table_is_ever_tofu() {
 #[test]
 fn a_font_that_has_the_glyph_always_wins() {
     let mut r = renderer(false, false);
-    // DejaVu Sans Mono carries ▶ ● ■ ✓: the synthesis must not pre-empt them.
     for c in ['▶', '●', '■', '✓'] {
         let key = r.glyph_key(c);
         assert_eq!(
@@ -146,8 +128,6 @@ fn a_font_that_has_the_glyph_always_wins() {
 
 #[test]
 fn a_wide_symbol_spans_both_cells() {
-    // ⏩ is Emoji_Presentation=Yes, so two cells wide; with no colour face in
-    // the chain, the synthesis draws it centred across both.
     let mut r = renderer(false, false);
     let (cw, ch) = r.cell_size();
     let key = r.glyph_key('\u{23E9}');
@@ -164,8 +144,6 @@ fn a_wide_symbol_spans_both_cells() {
 
 #[test]
 fn the_synthesis_still_reports_the_miss_to_a_poll_based_host() {
-    // A synthesized glyph is still a font miss, so a web host still learns to
-    // fetch the real face that would outrank it.
     let mut r = renderer(false, false);
     r.take_missing_font_classes();
     r.glyph_key('\u{23F5}');
@@ -199,7 +177,6 @@ fn the_colour_silhouette_intercept_draws_the_disc_and_reports_the_text_class() {
         "the intercept is still a TEXT-face miss, so a poll host injects one"
     );
     let (w, h, bytes) = mono(r.glyph_image(key));
-    // A disc, not a filled square: the cell's corners carry no ink.
     for &(x, y) in &[(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
         assert_eq!(bytes[y * w + x], 0, "corner ({x},{y}) inked: not a disc");
     }
@@ -250,7 +227,6 @@ fn mirrored_symbols_are_exact_mirrors() {
             .map(|(&x, &y)| x.abs_diff(y))
             .max()
             .unwrap();
-        // The 4x4 subsample grid is symmetric; allow one step of rounding.
         assert!(
             diff <= 16,
             "{a:?} and {b:?} are not mirror images (max diff {diff})"
@@ -258,9 +234,6 @@ fn mirrored_symbols_are_exact_mirrors() {
     }
 }
 
-/// The renderer draws `⎿` procedurally on every policy, even with a face that
-/// covers U+23BF (the bundled Iosevka Term) in the chain: a font's `⎿` can stop
-/// short of the cell top and leave a gap under the `│` above.
 #[test]
 fn the_renderer_draws_the_tree_connector_procedurally_even_when_a_font_covers_it() {
     let check = |r: &mut Renderer, label: &str| {

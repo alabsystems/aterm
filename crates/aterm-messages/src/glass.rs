@@ -492,7 +492,7 @@ pub(crate) struct RowSpec<'a> {
 }
 
 impl RowSpec<'_> {
-    /// The activity cells the fixed head reserves (module doc, step 1).
+    /// The activity cells the fixed head reserves.
     fn activity(&self) -> Activity {
         match (self.fill(), self.busy, self.animated) {
             (Some(_), _, true) => Activity::LiveBar,
@@ -792,7 +792,7 @@ const fn reserves_load(spec: &RowSpec<'_>, activity: Activity) -> bool {
 }
 
 /// The load slot's cells, its two-cell gap included, when the row lays it
-/// out in the fixed head (module doc, step 1); not on a row whose excerpt is
+/// out in the fixed head; not on a row whose excerpt is
 /// an action excerpt ([`action_excerpt`]), where the slot is an extra after
 /// it.
 fn load_cells(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) -> usize) -> usize {
@@ -980,6 +980,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         // again: the `Details ›` the short form sends the reader to where it
         // fits, the capsules' long forms, the title's words (the review of
         // the band, ox4-3: `Claude usag… · Run the command under Details.`
+        // stood beside 25 blank cells and no `Details ›`).
         if let Some(short) = spec.step_short {
             words = ExcerptWords::Short;
             ex = 3 + width(short);
@@ -1141,7 +1142,9 @@ pub(crate) fn layout_row_with(
 }
 
 /// Step 2: the extras from the room the fixed head left, in allocation
-/// order (module doc).
+/// order: the elapsed slot's long form or the ETA slot, the excerpt, an action
+/// excerpt's load slot, the stats; a time slot or excerpt that does not fit
+/// whole starves those after it.
 fn allocate_extras(
     spec: &RowSpec<'_>,
     fit: &Fit,

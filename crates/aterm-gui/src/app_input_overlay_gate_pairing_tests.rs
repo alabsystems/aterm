@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `App::input` overlay gate preserves Kitty press/release pairing across
-//! overlay open/close. With Kitty REPORT_EVENT_TYPES (`CSI > 2 u`) negotiated on
-//! the stub session's invalid (-1) sink, what the seam did with an event is told
-//! apart without a readable PTY on both routes ([`dispatch`]). `Source` is
-//! audit-only, so `Source::Human` exercises the gate a controller event hits.
-//! Every test runs on each route this host can drive
-//! ([`super::paste_order::routes_for_test`]): on Windows the ConPTY route alone,
-//! on unix the inline one and the ConPTY one.
+//! Tests that the `App::input` overlay gate preserves Kitty press/release pairing.
 use crate::input::{InputEvent, InputOutcome, Source};
 use crate::{App, WindowId, term_lock};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
@@ -37,10 +30,6 @@ enum Seam {
     Swallowed,
 }
 
-/// Deliver `ev` and read which [`Seam`] disposition it got. The inline route
-/// answers `WriteFailed` for an encode and the ConPTY route `Ok` with one job
-/// handed to the ordered writer, so an `Ok` alone cannot tell an encode from a
-/// swallow there; the writer's submission count can.
 fn dispatch(app: &mut App, wid: WindowId, ev: InputEvent) -> Seam {
     let before = paste_order::submitted_on_this_thread_for_test();
     let outcome = app.input(wid, ev, Source::Human);
@@ -66,9 +55,6 @@ fn pairing_step(
         );
     }
 }
-/// An app that negotiated Kitty event-type reporting. Functional-key
-/// releases encode bytes (so an encode is never mistaken for a swallow);
-/// plain text releases stay silent unless REPORT_ALL_KEYS is active.
 fn app_with_event_types() -> App {
     let app = App::headless_for_test();
     let term = app
@@ -80,10 +66,6 @@ fn app_with_event_types() -> App {
     app
 }
 
-/// A release whose press predates the overlay (delivered to the PTY, then
-/// the overlay opened mid-hold via menu click / aterm-ctl) falls through the
-/// gate to the seam encoder; swallowing it would leave the app an orphan
-/// press, and every overlay handler ignores releases anyway.
 #[test]
 fn release_of_pre_overlay_press_falls_through_the_gate() {
     for &conpty in paste_order::routes_for_test() {
@@ -102,13 +84,10 @@ fn release_of_pre_overlay_press_falls_through_the_gate() {
         pairing_step(&model, &mut state, "OpenOverlay");
         assert!(app.windows.get(&wid).unwrap().overlay_open());
 
-        // Tier-1 negative control: swallowing this untracked release under the
-        // now-open overlay strands the press the Kitty app already observed.
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let mut swallowed = state.clone();
         assert!(buggy.fire("ReleaseForwardedPress", &mut swallowed));
         assert!(!buggy.check_invariant("UntrackedReleaseNeverSwallowed", &swallowed,));
-        // The in-flight release still reaches the seam, not the gate's swallow.
         assert_eq!(
             dispatch(
                 &mut app,
@@ -127,9 +106,6 @@ fn release_of_pre_overlay_press_falls_through_the_gate() {
     }
 }
 
-/// A controller press consumed by the overlay gate is recorded, and its
-/// release arriving after the overlay closed is swallowed exactly once
-/// (otherwise it encodes an orphan Kitty release report).
 #[test]
 fn press_under_overlay_release_swallowed_after_close() {
     for &conpty in paste_order::routes_for_test() {
@@ -180,8 +156,6 @@ fn press_under_overlay_release_swallowed_after_close() {
                 .is_empty(),
             "swallow-once: the entry is removed"
         );
-        // A later unrelated release of the same key encodes again (no stale
-        // double-swallow).
         assert_eq!(
             dispatch(
                 &mut app,
@@ -194,10 +168,6 @@ fn press_under_overlay_release_swallowed_after_close() {
     }
 }
 
-/// The same pairing while the overlay stays open: press consumed and
-/// recorded, release swallowed and the entry removed. A repeat under the
-/// overlay does not record: a repeat of a pre-overlay press would otherwise
-/// swallow a release the app is owed.
 #[test]
 fn overlay_repeat_does_not_record_and_open_overlay_release_pairs() {
     for &conpty in paste_order::routes_for_test() {
@@ -209,7 +179,6 @@ fn overlay_repeat_does_not_record_and_open_overlay_release_pairs() {
         pairing_step(&model, &mut pre_overlay_hold, "ForwardPress");
         app.palette_enter();
         pairing_step(&model, &mut pre_overlay_hold, "OpenOverlay");
-        // Repeat routed to the overlay: swallowed but not recorded.
         assert_eq!(
             dispatch(
                 &mut app,
@@ -232,7 +201,6 @@ fn overlay_repeat_does_not_record_and_open_overlay_release_pairs() {
                 .is_empty(),
             "a repeat never records a consumed press at the gate"
         );
-        // Its release (press predated the overlay) falls through to the encoder.
         assert_eq!(
             dispatch(
                 &mut app,
@@ -243,7 +211,6 @@ fn overlay_repeat_does_not_record_and_open_overlay_release_pairs() {
             "the repeat did not poison the release disposition (conpty={conpty})"
         );
         pairing_step(&model, &mut pre_overlay_hold, "ReleaseForwardedPress");
-        // Press+release both under the open overlay: consumed, then swallowed.
         let mut under_overlay = model.init_state();
         pairing_step(&model, &mut under_overlay, "OpenOverlay");
         assert_eq!(

@@ -762,7 +762,8 @@ fn a_signal_does_not_end_an_armed_idle_wait() {
             }
         }
     }
-    // SAFETY: initialize sigaction's plain fields and save the previous action.
+    // SAFETY: initialize sigaction's plain fields and save the previous action;
+    // the no-op handler has no non-signal-safe work and SA_RESTART stays off.
     let _handler = unsafe {
         let mut act: libc::sigaction = std::mem::zeroed();
         let mut previous: libc::sigaction = std::mem::zeroed();
@@ -1788,6 +1789,84 @@ fn bogus_exec_command_takes_child_exec_failure_path() {
         err.kind(),
         io::ErrorKind::Other,
         "exec failure before exec must be reported as Other, got: {err}",
+    );
+}
+
+/// A START THAT MUST HAPPEN IS WAITED FOR ([`EXEC_START_HANG`], the one-minute
+/// hang detector): the spawn gives its exec verdict that wait, read back
+/// through `exec_wait_seen` (the 10 s budget it had failed 55 of 96 starved
+/// instance boots), so a child starved between fork and exec still starts: its
+/// master and pid are handed back. The starvation is short because the wait
+/// is read, not outlasted.
+///
+/// NEGATIVE CONTROL: a child that cannot exec, starved the same way, is
+/// reported as the exec failure it is (not a start that never came), without
+/// waiting out the hang detector.
+#[test]
+fn a_child_starved_before_its_exec_still_starts_and_a_failed_exec_is_told_at_once() {
+    use std::time::{Duration, Instant};
+    assert_eq!(
+        EXEC_START_HANG,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the exec verdict's wait is the one-minute hang detector"
+    );
+    // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let starved = Duration::from_millis(250);
+    let spawn = |program: &str| {
+        let command = vec![
+            std::ffi::OsString::from(program),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("exec sleep 600"),
+        ];
+        let began = Instant::now();
+        let result = spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&command),
+            None,
+            None,
+            aterm_sandbox::Limits::shell_default(),
+            None,
+        );
+        (result, began.elapsed())
+    };
+    pre_exec_stall::set(u64::try_from(starved.as_millis()).expect("ms"));
+    let (started, took) = spawn("/bin/sh");
+    let (failed, failed_took) = spawn("/nonexistent/aterm-pty-no-such-shell");
+    pre_exec_stall::set(0);
+    let shell = match started {
+        Ok(shell) => shell,
+        Err(e) => panic!("a child starved {starved:?} before its exec must start: {e}"),
+    };
+    assert_eq!(
+        exec_wait_seen::last(),
+        Some(EXEC_START_HANG),
+        "the spawn's exec verdict waited the hang detector, not a budget of its own"
+    );
+    hangup(shell.pid);
+    // SAFETY: `shell.master` is this test's own master fd, closed once.
+    unsafe {
+        libc::close(shell.master);
+    }
+    reap(shell.pid);
+    assert!(
+        took >= starved,
+        "the child was not starved ({took:?}): the test proves nothing"
+    );
+    let err = failed.expect_err("a child that cannot exec must not hand back a master");
+    assert_eq!(err.kind(), io::ErrorKind::Other, "an exec failure: {err}");
+    assert!(
+        failed_took < EXEC_START_HANG,
+        "the failure waited out the hang detector ({failed_took:?}): {err}"
     );
 }
 

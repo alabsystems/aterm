@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Raw Win32 declarations for the AF_UNIX-over-winsock transport and process
-//! inspection (`ws2_32`, `kernel32`, `advapi32`, `ntdll`, `wtsapi32`, `bcrypt`).
-//!
-//! Process image and PEB parameter reads go through `aterm_sysprobe::peb`; the
-//! remaining 64-bit structures used by `crate::holders` are declared here and
-//! layout-tested below.
+//! Raw Win32 FFI declarations for `AF_UNIX` Winsock transport and process inspection.
 
 #![allow(non_snake_case, reason = "Win32 API names are camel-case by contract")]
 
@@ -22,7 +17,6 @@ pub(crate) const SOCKET_ERROR: i32 = -1;
 pub(crate) const AF_UNIX: i32 = 1;
 pub(crate) const SOCK_STREAM: i32 = 1;
 
-// `shutdown(2)` directions.
 pub(crate) const SD_RECEIVE: i32 = 0;
 pub(crate) const SD_SEND: i32 = 1;
 pub(crate) const SD_BOTH: i32 = 2;
@@ -50,28 +44,22 @@ pub(crate) const WSA_INFINITE: u32 = 0xFFFF_FFFF;
 /// connected peer's pid as afunix recorded it at connect (a `ULONG`).
 pub(crate) const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
 
-// `WSAEventSelect` network-event bits.
 pub(crate) const FD_READ: i32 = 0x01;
 pub(crate) const FD_WRITE: i32 = 0x02;
 pub(crate) const FD_CLOSE: i32 = 0x20;
 
-/// `sockaddr_un`: family + a NUL-terminated path of at most 107 bytes.
 #[repr(C)]
 pub(crate) struct SockaddrUn {
     pub sun_family: u16,
     pub sun_path: [u8; 108],
 }
 
-/// `WSANETWORKEVENTS`: the pending network-event bitmask plus a per-event
-/// error array. Only `lNetworkEvents` is read; the errors surface anyway on
-/// the following `recv`/`send`.
 #[repr(C)]
 pub(crate) struct WsaNetworkEvents {
     pub lNetworkEvents: i32,
     pub _iErrorCode: [i32; 10],
 }
 
-/// `FILETIME`: 100 ns ticks since 1601-01-01 UTC, split in two halves.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct FileTime {
@@ -86,8 +74,6 @@ impl FileTime {
     }
 }
 
-/// Opaque, oversized stand-in for `WSADATA` (408 bytes on x64); `WSAStartup`
-/// only writes into it and we never read it back.
 #[repr(C)]
 pub(crate) struct WsaData {
     pub _opaque: [u8; 512],
@@ -204,7 +190,6 @@ unsafe extern "system" {
     /// `lpv` in `hProcess` — the file the section was made from, its path
     /// as the open resolved it (a junction or link followed), unlike the
     /// loader's record of a module, which keeps the path as it was asked for.
-    /// The characters copied, 0 on failure.
     pub(crate) fn K32GetMappedFileNameW(
         hProcess: RawHandle,
         lpv: *const core::ffi::c_void,
@@ -229,17 +214,12 @@ unsafe extern "system" {
         cchFilePath: u32,
         dwFlags: u32,
     ) -> u32;
-    /// Maps a module into this process (the scan's tests: a child that maps a
-    /// module from under a directory, `DONT_RESOLVE_DLL_REFERENCES` so none of
-    /// its code runs). 0 on failure.
     #[cfg(test)]
     pub(crate) fn LoadLibraryExW(
         lpLibFileName: *const u16,
         hFile: RawHandle,
         dwFlags: u32,
     ) -> isize;
-    /// Waits for a change under the directory `hDirectory` (the scan's tests: a
-    /// child that blocks in a synchronous watch, holding its file object's lock).
     #[cfg(test)]
     pub(crate) fn ReadDirectoryChangesW(
         hDirectory: RawHandle,
@@ -294,8 +274,6 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// `WTS_PROCESS_INFO_EXW`: one process of a `WTSEnumerateProcessesExW` listing
-/// at level 1.
 #[repr(C)]
 pub(crate) struct WtsProcessInfoExW {
     pub SessionId: u32,
@@ -314,9 +292,6 @@ pub(crate) struct WtsProcessInfoExW {
     pub KernelTime: i64,
 }
 
-/// `UNICODE_STRING` (64-bit layout): a counted UTF-16 string, as
-/// `NtQueryObject(ObjectNameInformation)` answers a name (`Length` in bytes,
-/// `Buffer` pointing into the caller's own buffer, after this header).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct UnicodeString {
@@ -325,9 +300,6 @@ pub(crate) struct UnicodeString {
     pub Buffer: usize,
 }
 
-/// `SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX`: one open handle of one process
-/// (`SystemExtendedHandleInformation`); the listing is a two-word header
-/// (`NumberOfHandles`, a reserved word) and then these.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SystemHandleEntryEx {
@@ -358,8 +330,6 @@ unsafe extern "system" {
     pub(crate) fn EqualSid(pSid1: *const core::ffi::c_void, pSid2: *const core::ffi::c_void)
     -> i32;
     pub(crate) fn IsValidSid(pSid: *const core::ffi::c_void) -> i32;
-    /// A security descriptor from its SDDL text (the scan's tests: a child
-    /// that refuses the scan's reads of it), allocated with `LocalAlloc`.
     #[cfg(test)]
     pub(crate) fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
         StringSecurityDescriptor: *const u16,
@@ -367,8 +337,6 @@ unsafe extern "system" {
         SecurityDescriptor: *mut *mut core::ffi::c_void,
         SecurityDescriptorSize: *mut u32,
     ) -> i32;
-    /// Replaces part of an object's security (the scan's tests: the DACL of
-    /// the child's own process object).
     #[cfg(test)]
     pub(crate) fn SetKernelObjectSecurity(
         Handle: RawHandle,
@@ -387,8 +355,6 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// The hand-declared structures the path-user scan reads have the sizes and
-/// field offsets of their SDK definitions on a 64-bit Windows.
 #[cfg(all(test, target_pointer_width = "64"))]
 mod layout_tests {
     use super::{SystemHandleEntryEx, UnicodeString, WtsProcessInfoExW};

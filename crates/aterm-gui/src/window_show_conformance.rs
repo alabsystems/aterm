@@ -2,26 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the window show carry (`crate::window_show`) to
-//! `aterm_models_update::native_update_window_show_model`
-//! (`NativeUpdateWindowShow`).
-//!
-//! Each model schedule is replayed on the shipping App carry: a headless App
-//! with the bootstrap window and two rebuilt windows, the real `CarriedShow`,
-//! and the four seams production drives it through —
-//! `settle_carried_window_show` (after every event batch), the real proof path
-//! `maybe_signal_handoff_ready` (over real ready and Commit pipes; the stack goes
-//! on there), `commit_carried_window_show` (the Commit arm) and
-//! `carried_window_show_focus_event` (the `Focused` arm, after `on_focus`).
-//! The test plays the OS: it reveals windows, activates and deactivates aterm,
-//! moves the keyboard, types, and delivers the focus events a raise produces
-//! while aterm is in front. Each real step is projected onto the model and
-//! checked action by action (interpreter, and `ty` where installed). The code
-//! must be eager: after every step the model may not still allow `Stack` or
-//! `EnterFullScreen`.
-//!
-//! Negative control: the same real steps against `Buggy = 1` (a stack before the
-//! reveal or the proof, full screen at the stack, the reveal order's key, a
-//! Commit that re-keys over typing) must be rejected.
+//! `aterm_models_update::native_update_window_show_model` (`NativeUpdateWindowShow`).
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -36,35 +17,21 @@ use crate::WindowId;
 use crate::restore::WindowShow;
 use crate::window_show::{CarriedShow, ShowLane, ShowOp, plan};
 
-/// One replay: the App, and what the OS and the user did to it.
 struct Rig {
     app: crate::App,
-    /// The bootstrap window and the two the rebuild created.
     windows: [WindowId; 3],
-    /// The carried key window (window 1, carried in full screen).
     key: WindowId,
     lane: i64,
-    /// Ground truth: aterm is the active app.
     front: bool,
-    /// The window AppKit keys when aterm is active: the reveal order left the
-    /// last window revealed (2) there, and every raise moves it.
     holder: WindowId,
-    /// Carried windows typed into while they held the keyboard.
     typed: Vec<WindowId>,
     fs: bool,
     fsfront: bool,
-    /// The carry finished (it was recorded and is gone now).
     done: bool,
-    /// The update lane's two channels, the ends the outgoing process holds:
-    /// the proof is read from the first; the second, never written, is the
-    /// Commit this replay delivers through `commit_carried_window_show`
-    /// instead (the Commit arm needs a live event loop). Closed on drop, which
-    /// ends the real Commit waiter the proof path started with EOF.
     proof_read: Option<std::fs::File>,
     _commit_write: Option<std::fs::File>,
 }
 
-/// A fresh pipe: `(read, write)`, one owner each.
 fn pipe() -> (std::fs::File, std::fs::File) {
     let mut fds = [0i32; 2];
     // SAFETY: pipe(2) into a valid two-slot out-array.
@@ -84,12 +51,8 @@ impl Rig {
         let w0 = WindowId(0);
         let w1 = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
         let w2 = app.insert_logical_window(crate::stub_session(app.next_session_id), 24, 80);
-        // The bootstrap's focus was reported long before the rebuild (the
-        // user is in another app); the two new windows start out recorded as
-        // focused, unreported; the last is still waiting for its first present.
         app.on_focus(w0, false);
         app.windows.get_mut(&w2).expect("w2").pending_reveal = Some(std::time::Instant::now());
-        // Each window's OS identity, which the pre-Commit queue records keys by.
         for (n, window) in [w0, w1, w2].into_iter().enumerate() {
             app.winit_to_window
                 .insert(aterm_window::window::WindowId::from(n as u64), window);
@@ -110,8 +73,6 @@ impl Rig {
         }
     }
 
-    /// The successor owes the adoption proof: install the channels the outgoing
-    /// process launched it with, as `main_entry` does.
     fn owe_the_proof(&mut self) {
         let (proof_read, proof_write) = pipe();
         let (commit_read, commit_write) = pipe();
@@ -129,8 +90,6 @@ impl Rig {
         self._commit_write = Some(commit_write);
     }
 
-    /// The carry a rebuild records: window 0 behind window 1, the key window
-    /// in full screen, window 2 at the back.
     fn record(&mut self, lane: ShowLane) {
         let [w0, w1, w2] = self.windows;
         let shown = |z_order, key, fullscreen| WindowShow {
@@ -147,14 +106,11 @@ impl Rig {
         self.app.carried_window_show = Some(CarriedShow::new(lane, plan(&windows, lane), Some(w0)));
     }
 
-    /// A focus event, the way the `Focused` arm delivers it.
     fn focus(&mut self, window: WindowId, focused: bool) -> Vec<ShowOp<WindowId>> {
         self.app.on_focus(window, focused);
         self.app.carried_window_show_focus_event(window)
     }
 
-    /// AppKit keys `window`: with aterm in front that is a focus change the
-    /// App hears about.
     fn key_to(&mut self, window: WindowId) -> Vec<ShowOp<WindowId>> {
         let previous = std::mem::replace(&mut self.holder, window);
         if !self.front || previous == window {
@@ -165,8 +121,6 @@ impl Rig {
         ops
     }
 
-    /// Drive one schedule step on the shipping code; the model actions it
-    /// performed, in order.
     fn step(&mut self, action: &'static str) -> Vec<&'static str> {
         let was_stacked = self.stacked();
         let mut performed = Vec::new();
@@ -212,8 +166,6 @@ impl Rig {
             "Type" => {
                 performed.push(action);
                 self.typed.push(self.holder);
-                // Into the real pre-Commit queue, by the holder's OS identity,
-                // as the deferral arm queues it — the stack reads it there.
                 let winit_id = *self
                     .app
                     .winit_to_window
@@ -231,10 +183,6 @@ impl Rig {
             }
             "Prove" => {
                 performed.push(action);
-                // The shipping proof path returns nothing, so its stack is read as
-                // the plan's `stacking_ops` (the list `settle_carried_window_show_as`
-                // performs). Read after the proof: the stack keys a window typed
-                // into before it, which re-orders the plan.
                 self.app.maybe_signal_handoff_ready();
                 let stack = self
                     .app
@@ -260,7 +208,6 @@ impl Rig {
             }
             "Commit" => {
                 performed.push(action);
-                // The Commit arm's own reading of the queue.
                 let typed = self.app.pre_commit_typed_windows();
                 assert_eq!(typed, self.typed, "the queue holds what was typed, where");
                 self.app.commit_carried_window_show(&typed)
@@ -268,9 +215,6 @@ impl Rig {
             "Stack" | "EnterFullScreen" => self.app.settle_carried_window_show(),
             other => panic!("no such action {other}"),
         };
-        // What the real code did, as the OS sees it: each raise keys its window
-        // (and, with aterm in front, reports the change — which can let a
-        // waiting full screen go on); each full-screen entry is recorded.
         let mut index = 0;
         while index < ops.len() {
             let op = ops[index];
@@ -311,7 +255,6 @@ impl Rig {
             .map_or(self.done, |carried| carried.stacked)
     }
 
-    /// The model's state, read off the App and the replay.
     fn project(&self) -> State {
         let carried = self.app.carried_window_show.as_ref();
         let revealed = self
@@ -338,11 +281,6 @@ impl Rig {
     }
 }
 
-/// The update, the ways it meets the user: in aterm, in another app, with the
-/// keyboard moved (and typed into, or not) before Commit, typed into before
-/// the stack went on, activated and
-/// deactivated in between, and a focus gain between the reveal and the proof
-/// (which must not stack); and the cold launch in front and away.
 const SCHEDULES: &[&[&str]] = &[
     &["Launch", "Reveal", "Prove", "Activate", "Commit"],
     &["Launch", "Reveal", "Prove", "Commit", "Activate"],
@@ -363,18 +301,14 @@ const SCHEDULES: &[&[&str]] = &[
         "Activate",
     ],
     &["Launch", "Reveal", "Activate", "Prove", "Commit"],
-    // Typed into before the proof: the window the reveal order keyed keeps the
-    // keyboard through the stack and Commit.
     &["Launch", "Reveal", "Type", "Prove", "Commit", "Activate"],
     &["Launch", "Reveal", "Activate", "Type", "Prove", "Commit"],
     &["ColdLaunch", "Activate", "Reveal"],
     &["ColdLaunch", "Reveal", "Activate", "Deactivate"],
 ];
 
-/// The App actions the real code must take the moment the model allows them.
 const EAGER: &[&str] = &["Stack", "EnterFullScreen"];
 
-/// Replay `schedule` against `model`; `(label, conforms)` per step.
 fn replay(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String, bool)> {
     let mut rig = Rig::new();
     let mut state = rig.project();
@@ -387,8 +321,6 @@ fn replay(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String, b
         let performed = rig.step(action);
         let after = rig.project();
         let label = format!("{tag} {schedule:?} step {action} performed {performed:?}");
-        // Every action but the last is replayed on the model (each must be
-        // enabled); the last is checked as a transition onto the real state.
         let mut mid = before.clone();
         let mut conforms = performed.first() == Some(&action);
         if let Some((last, leading)) = performed.split_last() {
@@ -397,7 +329,6 @@ fn replay(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String, b
             }
             conforms &= validate_transition_tiered(model, &[], &mid, &after, Some(last), &label).0;
         }
-        // Eager: nothing the App could still do.
         conforms &= EAGER
             .iter()
             .all(|eager| !model.action_enabled(eager, &after));
@@ -407,8 +338,6 @@ fn replay(model: &Model, schedule: &[&'static str], tag: &str) -> Vec<(String, b
     verdicts
 }
 
-/// The shipping carry refines `NativeUpdateWindowShow` on every schedule, and
-/// every state the schedules reach satisfies every invariant.
 #[test]
 fn the_real_window_show_carry_conforms_to_the_model() {
     let model = native_update_window_show_model();
@@ -438,9 +367,6 @@ fn the_real_window_show_carry_conforms_to_the_model() {
     }
 }
 
-/// Negative control: every `Buggy = 1` variant is rejected by the real steps
-/// (early raise, full screen before the proof, the reveal order's key, re-keying
-/// over typing at Commit).
 #[test]
 fn the_defective_design_rejects_the_real_steps() {
     let buggy = interp::with_buggy(&native_update_window_show_model(), 1);

@@ -368,7 +368,7 @@ printf '\033[4;3H'
 while :; do sleep 1; done
 "#;
 
-/// The same launch under Claude Code's inline ([`FAKE_LAUNCH`]).
+/// [`FAKE_LAUNCH`] under Claude Code's inline (main-screen) renderer; it exits once `quit` exists.
 const FAKE_INLINE_LAUNCH: &str = r#"#!/bin/sh
 go="$1"
 quit="$2"
@@ -478,7 +478,8 @@ fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path
     );
 }
 
-/// With a fake launched and nothing of its REPL drawn.
+/// With a fake launched and nothing of its REPL drawn, `await agent idle` parks; once `go`
+/// exists it latches. Returns the screen it answered on.
 fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> String {
     let named = status_until(inst, sid, HANG, "program=claude, read as an agent", |s| {
         field(s, "program") == Some("claude") && field(s, "agent") != Some("-")

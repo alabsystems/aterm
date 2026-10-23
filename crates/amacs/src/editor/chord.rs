@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A key chord (`C-x`, `M-left`): one key with its modifiers, the unit a
-//! keymap binds and a key sequence is made of.
+//! Key chord representation and parsing (`C-x`, `M-left`).
 
 use aterm_types::keyboard::{Key, Modifiers, NamedKey};
 
@@ -44,10 +43,7 @@ impl KeyChord {
         None
     }
 
-    /// The chord a key press makes: Ctrl is `C-`, Alt or Meta is `M-`, Shift
-    /// is `S-`, and a letter is its lowercase self. `None` for a key the
-    /// keymap has no name for (a function key, Up, Home), which then reaches
-    /// no binding. Both faces spell their keys through this one function.
+    /// Convert a key press and modifiers into a key chord.
     pub fn from_key(key: &Key, mods: Modifiers) -> Option<Self> {
         let key = match key {
             Key::Character(character) => character.to_ascii_lowercase().to_string(),
@@ -58,8 +54,6 @@ impl KeyChord {
                 NamedKey::Enter => "enter",
                 NamedKey::Escape => "escape",
                 NamedKey::Tab => "tab",
-                // Word motion on modified arrows (`M-left` and, off macOS,
-                // `C-left`) is the only binding arrows have.
                 NamedKey::ArrowLeft => "left",
                 NamedKey::ArrowRight => "right",
                 _ => return None,
@@ -75,13 +69,12 @@ impl KeyChord {
         })
     }
 
-    /// ESC alone, the Meta prefix (`ESC x` is `M-x`).
+    /// Whether this chord is `ESC` alone.
     pub(super) fn is_escape(&self) -> bool {
         !self.control && !self.meta && !self.shift && self.key == "escape"
     }
 
-    /// The chord as a keymap spells it (`C-x`, `M-S-,`), and
-    /// [`Self::parse`] reads back.
+    /// Format the chord as a keymap spells it.
     pub fn display(&self) -> String {
         let mut out = String::new();
         if self.control {
@@ -102,11 +95,6 @@ impl KeyChord {
 mod tests {
     use super::*;
 
-    /// How a key is spelled as a chord, pinned to the spelling aterm's native
-    /// Editor built by hand before both faces shared this function: Ctrl is
-    /// `C-`, Alt and Meta are both `M-`, Shift is `S-`, Super and Hyper are
-    /// not spelled, a letter is its lowercase self, and only these named keys
-    /// have a name.
     #[test]
     fn from_key_spells_keys_as_the_gui_host_did() {
         let named = |key| Key::Named(key);
@@ -160,7 +148,6 @@ mod tests {
                 *spelled,
                 "{key:?} {mods:?}"
             );
-            // A spelled chord reads back as itself.
             if let Some(chord) = chord {
                 assert_eq!(KeyChord::parse(&chord.display()), Some(chord));
             }

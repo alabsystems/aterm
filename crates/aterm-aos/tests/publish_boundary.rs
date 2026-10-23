@@ -355,8 +355,6 @@ fn a_candidate_of_another_schema_is_refused() {
     );
 }
 
-/// A boundary constructed with a contract of another artifact than the identity names (the
-/// same judge, relabelled) refuses every prepare, naming both digests.
 #[test]
 fn a_boundary_constructed_with_another_contract_than_the_identity_names_refuses_every_prepare() {
     let mut b = judged_by(Variant::Stranded, ToyState::default(), 4, other_contract());
@@ -375,7 +373,6 @@ fn a_boundary_constructed_with_another_contract_than_the_identity_names_refuses_
     assert!(b.is_paused());
 }
 
-/// What a judge was shown of one run.
 type Shown = (usize, Option<u64>, Option<u64>, Digest, Digest);
 
 /// The corrected contract, keeping what it was shown of every run it judged.
@@ -406,10 +403,6 @@ fn shown(run: &Run<ToySchema>) -> Shown {
     )
 }
 
-/// Prepare judges the live run as soon as it is checked and lets its observations go before
-/// the candidate replays: the contract still sees each complete run exactly once, live first,
-/// and the witness carries the verdicts and chains the straight folds give, for a failing
-/// live run (stranded) and a passing one (good, republished).
 #[test]
 fn prepare_judges_the_complete_live_run_then_the_complete_candidate_run_once_each() {
     let schema = ToySchema::new();
@@ -478,13 +471,6 @@ impl Contract<ToySchema> for Lenient {
     }
 }
 
-/// The boundary judges by the contract it was constructed with, and `prepare` takes only the
-/// candidate, so a caller holding a lenient judge under the identity's own contract id has no
-/// way to hand it over: the stranded candidate fails the corrected contract however often it
-/// is prepared, before and after a reject and a fresh pause, and the commit of the good one
-/// carries a witness naming the boundary's own contract. The lenient judge would have passed
-/// the stranded run (the negative control), and a boundary *constructed* with it publishes
-/// that run: the constructor is the trusted party.
 #[test]
 fn a_candidate_failing_the_boundarys_contract_is_refused_whatever_judge_the_caller_holds() {
     let schema = ToySchema::new();
@@ -602,11 +588,6 @@ fn a_recording_break_refuses_the_repair_across_it_and_the_next_input_reanchors()
     assert_eq!(p.witness().range(), (1, 3));
 }
 
-/// An input admitted while the previous one is pending (stepped, neither advanced nor
-/// withdrawn) breaks the log and captures nothing: the ancestor stays C0, the second input is
-/// not recorded, and a repair across the break refuses. The next input admitted at a true
-/// boundary re-anchors at a checkpoint whose cursor is the head's and whose state holds both
-/// stepped inputs, and a repair from it replays.
 #[test]
 fn an_input_admitted_twice_without_advance_breaks_the_log_without_a_mid_step_capture() {
     let mut b = attached(Variant::Good, 4);
@@ -645,10 +626,6 @@ fn an_input_admitted_twice_without_advance_breaks_the_log_without_a_mid_step_cap
     assert_eq!(p.witness().range(), (1, 2));
 }
 
-/// An attach between an admitted input (already stepped) and its advance is refused as
-/// `MidStep` and changes nothing: no checkpoint is captured and the log is neither replaced
-/// nor broken. After the advance, attach captures a checkpoint whose cursor counts the input
-/// and whose state is the fold, and restoring it lands where uninterrupted execution is.
 #[test]
 fn an_attach_between_an_admitted_input_and_its_advance_is_refused_and_changes_nothing() {
     let mut b = attached(Variant::Good, 4);
@@ -736,10 +713,6 @@ fn a_full_log_reanchors_at_a_fresh_checkpoint_and_repair_replays_from_the_newest
     assert_eq!((p.witness().range(), p.witness().log_epoch()), ((4, 5), 9));
 }
 
-/// Every admit asks whether the log needs a re-anchor, and only a re-anchor takes the parent
-/// checkpoint's digest. Over successive full logs, each fresh checkpoint still names the one
-/// it replaced as its parent, each fresh log names the fresh checkpoint as its ancestor, and
-/// an admit into a log with room re-anchors nothing.
 #[test]
 fn each_full_log_reanchor_names_the_checkpoint_it_replaced_and_an_admit_with_room_names_none() {
     let mut b = boundary_over(Variant::Good, ToyState::default(), 4);
@@ -847,12 +820,6 @@ fn the_contract_judges_the_faulty_code_failing_and_the_repair_passing_on_one_tra
     assert!(contract().judge(&schema, &trace, &fixed).passed());
 }
 
-/// A step that breaks the refusal law (it moves the state, then refuses) delivered by the
-/// boundary itself, through `reject` and through a full queue's overflow: the head's digest is
-/// the moved state's, so `pause` captures it and `prepare` refuses the log that cannot
-/// explain it (`LiveNotReproduced`), exactly as on the live path. Before the boundary marked
-/// its digest stale around its own deliveries, the head kept the old digest, `prepare`'s
-/// replay landed on it and the leak was published away.
 #[test]
 fn a_refused_delivery_that_moved_the_state_is_caught_through_reject_and_through_overflow() {
     for cap in [4usize, 0] {
@@ -900,8 +867,6 @@ fn a_refused_delivery_that_moved_the_state_is_caught_through_reject_and_through_
     }
 }
 
-/// While paused, the last queued input is readable (a skipped one never queues); running,
-/// nothing is queued.
 #[test]
 fn the_last_queued_input_is_the_one_queued_last() {
     let mut b = attached(Variant::Good, 4);
@@ -916,11 +881,6 @@ fn the_last_queued_input_is_the_one_queued_last() {
     assert_eq!(b.last_queued(), None);
 }
 
-/// Two boundaries attached once each, over different states, record headers equal in
-/// identity, log epoch and first cursor: only the ancestor tells their logs apart. Window
-/// B's log read beside window A's checkpoint is refused naming both; held in A's recording
-/// (the fault-injection graft), `prepare` and `commit` refuse it (`AncestorMismatch`), and
-/// each refusal leaves A as it was.
 #[test]
 fn a_log_paired_with_another_windows_checkpoint_is_refused() {
     let mut a = attached(Variant::Good, 4);

@@ -3,18 +3,12 @@
 
 use crate::{App, WindowId, tab_bar};
 
-/// Composing a strip hands the renderer a `ChromeBleed` with the strip's
-/// tones for exactly the strip's rows, so the band and seam reach the window
-/// edges instead of stopping at the padding; turning the strip off hands
-/// back `None`.
 #[test]
 fn composing_a_strip_hands_the_renderer_its_band_and_seam_for_the_padding() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.tab_strip_rows = 1;
     app.splice_tab_strip_with(wid, 1);
-    // The bleed resolves through the same seam as the strip rows
-    // (`chrome_palette_theme`), which is `app.theme` under default config.
     let want = tab_bar::strip_bleed_tones(app.chrome_palette_theme());
     match (app.backend.chrome_bleed(), want) {
         (Some(bleed), Some((color, seam))) => {
@@ -27,23 +21,15 @@ fn composing_a_strip_hands_the_renderer_its_band_and_seam_for_the_padding() {
                 "a band that equals the terminal background is not a band"
             );
         }
-        // macOS: the strip has no surface of its own, so nothing bleeds.
         (got, None) => assert_eq!(got, None, "no band ⇒ no bleed"),
         (None, Some(_)) => panic!("a chrome band was never handed to the renderer"),
     }
 
-    // Turning the strip off returns the padding to the theme background: the setter runs
-    // before the `strip == 0` early-out.
     app.tab_strip_rows = 0;
     app.splice_tab_strip_with(wid, 1);
     assert_eq!(app.backend.chrome_bleed(), None, "no strip ⇒ no bleed");
 }
 
-/// The band's seam on Windows is a rail on the strip's last pixel rows, window
-/// edge to window edge, so it meets the grid and runs through both gutters. It
-/// used to be a cell underline at the face's underline offset, which left a slab
-/// of band under the rule and the cards centred high in the band; no strip cell
-/// carries that underline there any more. Linux keeps the underline seam.
 #[test]
 fn composing_a_strip_rails_its_seam_on_the_bands_last_pixel_rows() {
     let mut app = App::headless_for_test();
@@ -51,13 +37,10 @@ fn composing_a_strip_rails_its_seam_on_the_bands_last_pixel_rows() {
     app.tab_strip_rows = 1;
     app.splice_tab_strip_with(wid, 1);
     let Some((_, Some(seam))) = tab_bar::strip_bleed_tones(app.chrome_palette_theme()) else {
-        // macOS: the strip has no band, so there is no seam to rail.
         return;
     };
     let ws = &app.windows[&wid];
     if !tab_bar::STRIP_WINDOWS_PAINT {
-        // Linux keeps its seam: the strip's last row underlined in the seam tone,
-        // and no rail.
         assert!(
             ws.input_scratch
                 .chrome_rasters
@@ -135,9 +118,6 @@ fn the_build_badge_sits_below_the_strip() {
     assert_eq!(two - one, ch as u32, "…and it follows the strip's rows");
 }
 
-/// A metered band row hands the renderer its own gutter tones at its chrome row, equal to
-/// its first and last cells' backgrounds (the renderer's no-epoch contract), so a full
-/// meter runs through both gutters in the accent; an unmetered row keeps the band tone.
 #[test]
 fn composing_a_metered_band_row_hands_the_renderer_its_edge_tones() {
     use aterm_messages::{Hold, Message, Meter, Severity, tags};
@@ -156,7 +136,6 @@ fn composing_a_metered_band_row_hands_the_renderer_its_edge_tones() {
             .hold(live),
     );
     app.post_message(Message::new(tags::TOOLCHAIN, Severity::Info, "a plain row").hold(live));
-    // `post_message` syncs the band: both rows are already committed.
     assert_eq!(app.message_band_rows, 2);
     app.splice_tab_strip_with(wid, 0);
     let bleed = app.backend.chrome_bleed().expect("band rows are chrome");
@@ -190,8 +169,6 @@ fn composing_a_metered_band_row_hands_the_renderer_its_edge_tones() {
     );
 }
 
-/// Mixed composition reuses the whole-frame scratch instead of extracting
-/// a terminal frame into it. A removed meter must not outlive its cells.
 #[test]
 fn mixed_frame_retires_meter_rasters_when_the_message_band_disappears() {
     use aterm_messages::{Hold, Message, Meter, Severity, tags};
@@ -243,9 +220,6 @@ fn mixed_frame_retires_meter_rasters_when_the_message_band_disappears() {
     assert!(app.windows[&wid].settings_card.is_some());
 }
 
-/// A band spliced over a metered row (the paste banner, after the bleed was
-/// handed over) drops the tones and pixel rasters of every row it covers;
-/// uncovered rows keep theirs.
 #[test]
 fn a_band_spliced_over_a_metered_row_drops_its_gutter_tones_and_raster() {
     use aterm_messages::{Hold, Message, Meter, Severity, tags};
@@ -299,10 +273,6 @@ fn a_band_spliced_over_a_metered_row_drops_its_gutter_tones_and_raster() {
     assert_eq!(input.chrome_raster(kept), Some(&kept_raster));
 }
 
-/// A strip with no band tones of its own (macOS's in-grid strip,
-/// `tab_strip_rows = 1`) still lets the band bleed to the edges from below
-/// the strip (`first`); a strip that has a surface keeps the whole-stack
-/// bleed.
 #[test]
 fn the_band_bleeds_below_a_strip_with_no_surface() {
     use aterm_messages::{Hold, Message, Severity, tags};
@@ -330,8 +300,6 @@ fn the_band_bleeds_below_a_strip_with_no_surface() {
     }
 }
 
-/// The row-edge map: band row `i` lands on chrome row `first + i`, only
-/// committed rows carry an entry, and the tones pack as `0x00RRGGBB`.
 #[test]
 fn band_row_edges_place_each_metered_row_at_its_chrome_row() {
     let edges = [

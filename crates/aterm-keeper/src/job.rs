@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where the keeper lives: its launchd label, its socket, and the job control that starts,
-//! reads and ends it (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.1).
-//!
-//! The installed app's keeper is the transient `launchctl submit` job [`INSTALLED_LABEL`] in
-//! the user's GUI domain: no plist, nothing persisted, no Background Items notice, outside the
-//! app's coalition. A submitted job is KeepAlive unconditionally and throttled to one start per
-//! 10 s; it cannot end itself (exiting is a restart), and `launchctl remove` ends it with
-//! SIGTERM. A dev build's label and socket derive from its executable's path, and a test's label
-//! from [`TEST_LABEL_PREFIX`], so neither collides with the installed keeper. A window never
-//! starts a keeper: [`submit`] is `aterm keeper start`'s.
+//! Keeper launchd label, socket path, and transient `launchctl` job control.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,8 +26,7 @@ pub struct KeeperPlace {
     pub installed: bool,
 }
 
-/// The keeper `exe` belongs to: the installed label for the installed app's
-/// executable, a per-path dev label for anything else.
+/// Returns the keeper label and socket name for executable `exe`.
 #[must_use]
 pub fn place_for(exe: &Path) -> KeeperPlace {
     if exe == Path::new(INSTALLED_EXECUTABLE) {
@@ -65,9 +55,7 @@ pub fn own_place() -> KeeperPlace {
     place_for(&exe)
 }
 
-/// The per-uid private directory the keeper's socket lives in: `$TMPDIR/aterm` when `$TMPDIR` is
-/// an absolute, private (owned, not group/other-writable), non-`/tmp` directory (the rules of
-/// `aterm-gui`'s `handoff_rendezvous`), else the control-socket directory. Creates nothing.
+/// Per-uid private directory holding the keeper socket.
 #[must_use]
 pub fn keeper_dir() -> Option<PathBuf> {
     admitted_temp_base()
@@ -110,9 +98,7 @@ pub fn gui_domain() -> String {
     format!("gui/{}", aterm_uds::peer::our_uid())
 }
 
-/// The file a keeper job's stderr goes to: beside its socket, the socket's
-/// whole name plus `.log`, so it is never the socket itself nor a sibling
-/// such as `server.log` beside a `--sock server.sock`.
+/// Log file path for the keeper job beside `socket` (`<socket>.log`).
 #[must_use]
 pub fn log_path(socket: &Path) -> PathBuf {
     let mut name = socket.as_os_str().to_owned();
@@ -120,8 +106,7 @@ pub fn log_path(socket: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The argv of `launchctl submit` for `label` running `program args…`, its
-/// stderr sent to `stderr` (without it, launchd sends it to `/dev/null`).
+/// Builds the `launchctl submit` argument vector for `label` with stderr redirected to `stderr`.
 #[must_use]
 pub fn submit_argv(label: &str, program: &str, args: &[&str], stderr: &Path) -> Vec<String> {
     let mut argv = vec![
@@ -137,9 +122,7 @@ pub fn submit_argv(label: &str, program: &str, args: &[&str], stderr: &Path) -> 
     argv
 }
 
-/// Submit a transient KeepAlive job (`aterm keeper start`, or a test with a
-/// [`TEST_LABEL_PREFIX`] label), its stderr sent to `stderr`, whose
-/// directory must exist.
+/// Submits a transient KeepAlive job with stderr redirected to `stderr`.
 ///
 /// # Errors
 /// `launchctl` failing to run or refusing.
@@ -201,9 +184,7 @@ fn run_launchctl(argv: &[String]) -> io::Result<()> {
     }
 }
 
-/// The app bundle `exe` runs from (`…/X.app/Contents/MacOS/<exe>` → `…/X.app`),
-/// the only thing a keeper ever relaunches. `None` outside a bundle: a keeper
-/// run from a build tree holds orphans for the next manual launch instead.
+/// Returns the `.app` bundle directory containing `exe`, or `None` outside a bundle.
 #[must_use]
 pub fn own_bundle(exe: &Path) -> Option<PathBuf> {
     let macos = exe.parent()?;
@@ -302,7 +283,6 @@ mod tests {
             &log,
         )
         .expect("submit");
-        // launchd starts the job asynchronously; a minute is a hang detector.
         let started = std::time::Instant::now();
         let pid = loop {
             if let JobState::Loaded { pid: Some(pid) } = state(&label).expect("launchctl") {
@@ -312,7 +292,6 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(aterm_uds::process::pid_alive(pid));
-        // What the job writes to stderr reaches the log, not /dev/null.
         let started = std::time::Instant::now();
         while !std::fs::read_to_string(&log).is_ok_and(|t| t.contains("keeper-job-stderr")) {
             assert!(
@@ -323,8 +302,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         remove(&label).expect("remove");
-        // launchd drops the job asynchronously too: it stays loaded until its process has
-        // answered the SIGTERM. A minute is a hang detector.
         let started = std::time::Instant::now();
         loop {
             let now = state(&label).expect("launchctl");
@@ -335,7 +312,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         std::mem::forget(guard);
-        // The job's process ends with the job (launchd's SIGTERM).
         let started = std::time::Instant::now();
         while aterm_uds::process::pid_alive(pid) {
             assert!(

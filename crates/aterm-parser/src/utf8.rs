@@ -6,10 +6,10 @@
 use crate::Parser;
 use crate::action::ActionSink;
 
-/// The length of the well-formed UTF-8 sequence `lead` begins (Unicode §3.9,
-/// Table 3-7), or `None` for a byte that begins none: ASCII, a continuation
-/// byte, `0xC0`/`0xC1` (every sequence they begin is overlong) and
-/// `0xF5..=0xFF` (every sequence they begin is past U+10FFFF).
+/// The length of the well-formed multi-byte UTF-8 sequence `lead` begins (Unicode
+/// §3.9, Table 3-7), or `None` for a byte that begins none: ASCII, a continuation
+/// byte, `0xC0`/`0xC1` (every sequence they begin is overlong) and `0xF5..=0xFF`
+/// (every sequence they begin is past U+10FFFF).
 #[inline]
 pub(crate) const fn utf8_sequence_len(lead: u8) -> Option<u8> {
     match lead {
@@ -27,16 +27,7 @@ pub(crate) const fn is_utf8_lead(byte: u8) -> bool {
 }
 
 /// Whether `byte` extends the well-formed prefix of `held` bytes (`1..=3`)
-/// that `lead` begins (Unicode §3.9, Table 3-7). The second byte's range
-/// depends on the lead — `E0` takes `A0..=BF` (no overlongs), `ED` `80..=9F`
-/// (no surrogates), `F0` `90..=BF` (no overlongs), `F4` `80..=8F` (nothing past
-/// U+10FFFF) — and every other continuation is `80..=BF`. A lead that begins
-/// no sequence extends nothing.
-///
-/// This is the whole of the decoder's well-formedness: the first byte it
-/// refuses ends a maximal subpart, replaced by one U+FFFD (Unicode §3.9,
-/// "U+FFFD Substitution of Maximal Subparts"; WHATWG's UTF-8 decoder), and
-/// that byte is read afresh.
+/// that `lead` begins (Unicode §3.9, Table 3-7).
 #[inline]
 pub(crate) const fn utf8_continues(lead: u8, held: u8, byte: u8) -> bool {
     if !is_utf8_lead(lead) {
@@ -52,8 +43,7 @@ pub(crate) const fn utf8_continues(lead: u8, held: u8, byte: u8) -> bool {
     low <= byte && byte <= high
 }
 
-/// Whether `continuation` extends `lead` the way the decoder would take it:
-/// each byte checked by [`utf8_continues`] against the prefix before it.
+/// Whether `continuation` extends `lead` the way the decoder would take it ([`utf8_continues`]).
 #[inline]
 pub(crate) fn utf8_prefix_well_formed(lead: u8, continuation: &[u8]) -> bool {
     let mut held = 1u8;
@@ -66,16 +56,8 @@ pub(crate) fn utf8_prefix_well_formed(lead: u8, continuation: &[u8]) -> bool {
     true
 }
 
-/// The head of a split UTF-8 character that a byte stream ends in: the bytes
-/// of a well-formed prefix ([`utf8_continues`]) shorter than the sequence its
-/// lead begins, or nothing when the stream ends on a character boundary or on
-/// a byte that begins no well-formed sequence.
-///
-/// The parser keeps one for a DCS or APC string's payload
-/// (`Parser::string_utf8`): with C1 controls off those strings end at the
-/// 8-bit ST `0x9C`, which is also a continuation byte (U+672C 本 is
-/// `E6 9C AC`), and a `0x9C` that [`Utf8Prefix::continues`] the payload's
-/// head is that character's byte, not ST.
+/// The head of a split UTF-8 character that a byte stream ends in: the bytes of a well-formed
+/// prefix ([`utf8_continues`], [`Utf8Prefix::continues`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Utf8Prefix {
     bytes: [u8; 3],
@@ -101,9 +83,7 @@ impl Utf8Prefix {
         self.len != 0 && utf8_continues(self.bytes[0], self.len, byte)
     }
 
-    /// The prefix the stream ends in once `byte` follows it: one byte longer
-    /// when `byte` extends it (nothing once the character is whole), a new
-    /// prefix when `byte` is a lead, and nothing otherwise.
+    /// The prefix the stream ends in once `byte` follows it.
     #[inline]
     pub(crate) fn step(self, byte: u8) -> Self {
         if self.continues(byte) {
@@ -127,12 +107,7 @@ impl Utf8Prefix {
         }
     }
 
-    /// The prefix the stream ends in once all of `bytes` follow it — the
-    /// same as [`Utf8Prefix::step`] over each, in O(1). A prefix is at most
-    /// three bytes and a lead never continues one, so after any three bytes
-    /// what came before them no longer matters: a run of three or more is
-    /// read from its last three alone
-    /// (`tests::utf8_errors::a_prefix_after_a_run_is_the_prefix_after_each_byte`).
+    /// The prefix the stream ends in once all of `bytes` follow it ([`Utf8Prefix::step`]).
     #[inline]
     pub(crate) fn after(self, bytes: &[u8]) -> Self {
         let (start, tail) = match bytes.len().checked_sub(3) {
@@ -142,10 +117,8 @@ impl Utf8Prefix {
         tail.iter().fold(start, |prefix, &byte| prefix.step(byte))
     }
 
-    /// The prefix that is exactly `bytes`, or `None` when no stream ends in
-    /// them: a lead that begins a well-formed sequence, then the continuation
-    /// bytes a well-formed prefix of it allows, shorter than that sequence.
-    /// Empty bytes are [`Utf8Prefix::NONE`].
+    /// The prefix that is exactly `bytes` ([`Utf8Prefix::NONE`] when empty), or `None` when no
+    /// stream ends in them.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let Some((&lead, continuation)) = bytes.split_first() else {
             return Some(Self::NONE);
@@ -175,9 +148,7 @@ impl Utf8Prefix {
 }
 
 impl Parser {
-    /// Decode a codepoint from bytes [`utf8_continues`] already checked, by
-    /// bit arithmetic. U+FFFD for an overlong, a surrogate or an unexpected
-    /// `len`.
+    /// Decode a codepoint from bytes [`utf8_continues`] already checked, by bit arithmetic.
     #[inline]
     pub(crate) fn decode_utf8_validated(buf: [u8; 4], len: u8) -> char {
         let cp = match len {
@@ -185,7 +156,6 @@ impl Parser {
                 let b0 = u32::from(buf[0] & 0x1F);
                 let b1 = u32::from(buf[1] & 0x3F);
                 let v = (b0 << 6) | b1;
-                // Reject overlong: 2-byte must encode >= 0x80
                 if v < 0x80 {
                     return char::REPLACEMENT_CHARACTER;
                 }
@@ -196,7 +166,6 @@ impl Parser {
                 let b1 = u32::from(buf[1] & 0x3F);
                 let b2 = u32::from(buf[2] & 0x3F);
                 let v = (b0 << 12) | (b1 << 6) | b2;
-                // Reject overlong: 3-byte must encode >= 0x800
                 if v < 0x800 {
                     return char::REPLACEMENT_CHARACTER;
                 }
@@ -208,7 +177,6 @@ impl Parser {
                 let b2 = u32::from(buf[2] & 0x3F);
                 let b3 = u32::from(buf[3] & 0x3F);
                 let v = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-                // Reject overlong: 4-byte must encode >= 0x10000
                 if v < 0x10000 {
                     return char::REPLACEMENT_CHARACTER;
                 }
@@ -216,19 +184,14 @@ impl Parser {
             }
             _ => return char::REPLACEMENT_CHARACTER,
         };
-        // char::from_u32 rejects surrogates (0xD800..0xDFFF) and values > 0x10FFFF
         char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER)
     }
 
-    /// Start a UTF-8 multi-byte sequence on `byte`, which every caller has
-    /// checked with [`is_utf8_lead`].
+    /// Start a UTF-8 multi-byte sequence on `byte` ([`is_utf8_lead`]).
     #[inline]
     pub(crate) fn start_utf8(&mut self, byte: u8) {
         self.utf8_buffer[0] = byte;
         self.utf8_len = 1;
-        // A byte that begins no sequence (no caller passes one) is held as a
-        // two-byte lead that `utf8_continues` lets nothing extend: the next
-        // byte replaces it with one U+FFFD, as a lone ill-formed byte is.
         self.utf8_expected = utf8_sequence_len(byte).unwrap_or(2);
     }
 
@@ -236,24 +199,19 @@ impl Parser {
     #[inline]
     pub(crate) fn process_utf8_byte<S: ActionSink>(&mut self, byte: u8, sink: &mut S) {
         if utf8_continues(self.utf8_buffer[0], self.utf8_len, byte) {
-            // `utf8_len < 4` while collecting, so `get_mut` is always `Some`;
-            // the spelling keeps the write provably in bounds.
+            // `utf8_len < 4` while collecting, so `get_mut` is always `Some`.
             if let Some(slot) = self.utf8_buffer.get_mut(usize::from(self.utf8_len)) {
                 *slot = byte;
             }
             self.utf8_len = self.utf8_len.saturating_add(1);
 
             if self.utf8_len == self.utf8_expected {
-                // Every byte was range-checked for its position, so the
-                // sequence is well-formed: plain bit math, no `from_utf8` scan.
                 let c = Self::decode_utf8_validated(self.utf8_buffer, self.utf8_len);
                 sink.print(c);
                 self.utf8_len = 0;
                 self.utf8_expected = 0;
             }
         } else {
-            // The bytes held are a maximal subpart of an ill-formed sequence:
-            // one replacement for all of them, then this byte is read afresh.
             sink.print(char::REPLACEMENT_CHARACTER);
             self.utf8_len = 0;
             self.utf8_expected = 0;
@@ -261,10 +219,8 @@ impl Parser {
             if is_utf8_lead(byte) {
                 self.start_utf8(byte);
             } else if byte >= 0x80 {
-                // Another invalid byte
                 sink.print(char::REPLACEMENT_CHARACTER);
             } else {
-                // ASCII or control - process normally
                 self.process_byte_inner(byte, sink);
             }
         }

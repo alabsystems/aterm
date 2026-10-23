@@ -14,7 +14,7 @@ use std::time::Duration;
 use super::{HALO_ROW_DIV, HALO_SEGMENTS, MomentumGlowConfig};
 use crate::cursor_glow::{Geom, LIGHT_MARK_QUADS};
 
-/// The limits hosted momentum inputs are admitted under (the module docs' table).
+/// The limits hosted momentum inputs are admitted under.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MomentumProfile {
     /// The largest window-pixel coordinate the grid may reach, on each axis.
@@ -370,7 +370,7 @@ const LIGHT_ELLIPSE_SEGMENTS: i64 = 24;
 /// knot pair.
 const DARK_CALLS_PER_ROW: usize = 2 * HALO_SEGMENTS;
 
-/// `emit_halo`'s worst case over every amplitude (the module docs): the
+/// `emit_halo`'s worst case over every amplitude: the
 /// engine's row grid at `s = 1`, eight calls per working row, one quad per
 /// `ch`-band each call's clipped row meets.
 fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {
@@ -417,7 +417,7 @@ fn dark_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) ->
     Some(total)
 }
 
-/// `emit_light_halo`'s worst case over every amplitude (the module docs): the
+/// `emit_light_halo`'s worst case over every amplitude: the
 /// slabs that can meet the clip at `s = 1` times the rows a slab can cover,
 /// capped by `ribbon_beam`'s own budget.
 fn light_halo_budget((cr, cc): (u16, u16), geom: &Geom, g: &Grid, radius: f32) -> Option<usize> {

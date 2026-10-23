@@ -255,7 +255,7 @@ fn running_build(pid: u32) -> Option<String> {
     aterm_agent::harness::codex_alab::alab_build(&exe)
 }
 
-/// ONE ASK (module docs): arm, read on, apply, and then, in a hold of its
+/// ONE ASK: arm, read on, apply, and then, in a hold of its
 /// own, count the ask answered with its word
 /// (`SessionLog::rollout_answered`, `status rollout= rollout_asks=`): every
 /// record the ask wrote is in the log before the count moves.

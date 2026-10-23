@@ -590,6 +590,7 @@ impl TerminalHandler<'_> {
         for &mode in params {
             if let Some(&saved_value) = self.transient.xtsave_modes.get(&mode) {
                 // Skip a mode already at its saved value: modes share state (mouse
+                // tracking), and resetting an inactive one can disable an active other.
                 if self.query_dec_mode(mode) != Some(saved_value) {
                     self.handle_dec_mode(&[mode], saved_value);
                 }

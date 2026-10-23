@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! HarnessModelPriority, Tier-1: the live upgrade's model priority list, its writers
-//! (`Priority::admit`, the owner's `models set`) and its reader (`list_target` over
-//! `offered`), driven over every reachable model state. Negative controls: a defective
-//! writer and a head-of-list reader.
+//! Conformance tests for `HarnessModelPriority` writers and reader.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -24,7 +21,6 @@ const B1: &str = "claude-fable-5-1";
 const B2: &str = "claude-fable-5-2";
 const C1: &str = "claude-sonnet-6";
 
-/// Model position variable ↔ model id.
 const POSITIONS: [(&str, &str); 8] = [
     ("p_a0", A0),
     ("p_a1", A1),
@@ -36,7 +32,6 @@ const POSITIONS: [(&str, &str); 8] = [
     ("p_c1", C1),
 ];
 
-/// Availability variable ↔ id (the reader's input).
 const AVAIL: [(&str, &str); 5] = [
     ("av_a1", A1),
     ("av_a2", A2),
@@ -45,15 +40,12 @@ const AVAIL: [(&str, &str); 5] = [
     ("av_b2", B2),
 ];
 
-/// The owner's three orders, as `models set` writes them.
 const HUMAN: [(&str, [&str; 3]); 3] = [
     ("HumanSetsTheSeed", [A2, B1, A1]),
     ("HumanSetsOlderOpusFirst", [A1, A2, B1]),
     ("HumanSetsFableFirst", [B1, A1, A2]),
 ];
 
-/// The list a model state describes, best first. The positions must be
-/// exactly `1..=n`: the model's list is a list.
 fn list_of(s: &Vars) -> Vec<String> {
     let mut placed: Vec<(i64, &str)> = POSITIONS
         .iter()
@@ -67,7 +59,6 @@ fn list_of(s: &Vars) -> Vec<String> {
     placed.into_iter().map(|(_, id)| id.to_string()).collect()
 }
 
-/// `ids` projected back onto the position variables of `s`.
 fn with_list(s: &Vars, ids: &[String]) -> Vars {
     let mut v = s.clone();
     for (k, id) in POSITIONS {
@@ -80,7 +71,6 @@ fn with_list(s: &Vars, ids: &[String]) -> Vars {
     v
 }
 
-/// Every state the model reaches at `Buggy = 0`.
 fn reachable(model: &Model) -> Vec<Vars> {
     let mut seen: BTreeSet<Vec<(&'static str, i64)>> = BTreeSet::new();
     let mut out = Vec::new();
@@ -97,8 +87,6 @@ fn reachable(model: &Model) -> Vec<Vars> {
     out
 }
 
-/// The build's catalog as the state says: the owner's ids and the three
-/// never-admitted ones known, the two newcomers per `k_a3` / `k_b2`.
 fn known_in(s: &Vars) -> impl Fn(&str) -> bool + '_ {
     move |id: &str| match id {
         A3 => s["k_a3"] == 1,
@@ -109,8 +97,6 @@ fn known_in(s: &Vars) -> impl Fn(&str) -> bool + '_ {
 
 type Admit = dyn Fn(&mut Priority, &str, &dyn Fn(&str) -> bool) -> Option<Change>;
 
-/// The writer bind: every candidate through `admit` from every reachable state,
-/// checked against the model's action for it. Returns every disagreement.
 fn writer_disagreements(model: &Model, states: &[Vars], admit: &Admit) -> Vec<String> {
     let candidates = [
         (A3, "AdmitNewerOpus"),
@@ -135,11 +121,7 @@ fn writer_disagreements(model: &Model, states: &[Vars], admit: &Admit) -> Vec<St
             }
             let admitted = model.successors(action, s).contains(&after);
             let fine = match (&change, model.action_enabled(action, s)) {
-                // The writer wrote: the model's action for that candidate
-                // must produce exactly that list.
                 (Some(_), _) => admitted,
-                // The writer refused: the model's action is disabled, or is
-                // the healthy no-op of a mutant action.
                 (None, enabled) => after == *s && (!enabled || admitted),
             };
             if !fine {
@@ -149,7 +131,6 @@ fn writer_disagreements(model: &Model, states: &[Vars], admit: &Admit) -> Vec<St
                 ));
             }
             if let Some(ch) = change {
-                // The journalled placement names the id it went above.
                 let at = after_list
                     .ids
                     .iter()
@@ -168,8 +149,6 @@ fn shipped_admit(p: &mut Priority, id: &str, known: &dyn Fn(&str) -> bool) -> Op
     p.admit(id, "conformance", known, 0)
 }
 
-/// A writer without the newest-listed check: strictly newer than the family's
-/// best-ranked member only.
 fn pre_fix_admit(p: &mut Priority, id: &str, known: &dyn Fn(&str) -> bool) -> Option<Change> {
     let (family, version) = models::family_version(id)?;
     if p.rank(id).is_some() || !known(id) {
@@ -193,9 +172,6 @@ fn pre_fix_admit(p: &mut Priority, id: &str, known: &dyn Fn(&str) -> bool) -> Op
     })
 }
 
-/// Evidence under which exactly the ids the state marks available are usable, each
-/// unavailable one refused by a different path of `availability`: not served,
-/// deprecated, needs a newer Claude Code, denied, or a disabled option.
 fn evidence_for(s: &Vars) -> Evidence {
     let mut ev = Evidence {
         served: Some(Vec::new()),
@@ -243,9 +219,6 @@ fn baked_all() -> Baked {
 
 type Reader = dyn Fn(&Priority, &Evidence) -> Option<String>;
 
-/// The reader bind: from every reachable state, the reader's pick projected
-/// onto `pick`, checked against the model's `Select` (or, where the model
-/// already holds a pick, against it).
 fn reader_disagreements(model: &Model, states: &[Vars], reader: &Reader) -> Vec<String> {
     let mut bad = Vec::new();
     for s in states {
@@ -274,8 +247,6 @@ fn reader_disagreements(model: &Model, states: &[Vars], reader: &Reader) -> Vec<
 }
 
 fn shipped_reader(list: &Priority, ev: &Evidence) -> Option<String> {
-    // What the live upgrade asks once per sweep (`upgrade_drive`'s `ModelCtx::offer`;
-    // `None`: no `availableModels`).
     let offered = models::offered(list, "2.1.300", ev, Some(&baked_all()), None);
     models::list_target(list, &offered).map(str::to_string)
 }
@@ -290,7 +261,6 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
         states.len()
     );
 
-    // The file both halves share: every reachable list round-trips.
     for s in &states {
         let p = Priority {
             ids: list_of(s),
@@ -318,8 +288,6 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
         wrong.first()
     );
 
-    // The owner's `models set`: the whole list, through the file, from every
-    // reachable state.
     for s in &states {
         for (i, (action, order)) in HUMAN.iter().enumerate() {
             let written = Priority {
@@ -338,7 +306,6 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
         }
     }
 
-    // One of each kind through every installed tier (`ty trace validate`).
     let seed = model.init_state();
     let mut known = seed.clone();
     known.insert("k_a3", 1);
@@ -378,7 +345,6 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
         "select the first available",
     );
 
-    // Negative controls: a forged downgrade and a forged cross-family write are refused.
     let mut down = with_list(
         &known,
         &[
@@ -416,9 +382,6 @@ fn upgrade_priority_writers_and_reader_are_the_models_on_every_reachable_state()
     assert!(!model.check_invariant("AutoInsertIsNewerThanTheFamilysBest", &down));
 }
 
-/// Negative controls: a writer without the newest-listed check, and a reader that
-/// answers the head of the list, are each caught by the enumeration that passes the
-/// shipped code.
 #[test]
 fn upgrade_priority_binds_catch_a_pre_fix_writer_and_a_head_reader() {
     let model = harness_model_priority_model();
@@ -439,8 +402,6 @@ fn upgrade_priority_binds_catch_a_pre_fix_writer_and_a_head_reader() {
     );
 }
 
-/// `ingest` (the pass's path into `admit`) admits from recommendations only what the
-/// model's writer admits.
 #[test]
 fn upgrade_priority_ingest_admits_only_what_the_model_admits() {
     let model = harness_model_priority_model();

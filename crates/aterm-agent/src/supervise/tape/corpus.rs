@@ -159,7 +159,8 @@ struct Rule {
     word: bool,
 }
 
-/// THE RECORDING MACHINE'S NAMES, EACH AS A FIXED TOKEN ([module docs](self)).
+/// THE RECORDING MACHINE'S NAMES, EACH AS A FIXED TOKEN ([`token`]): what makes a lab's tape
+/// portable before a corpus keeps it.
 #[derive(Debug, Clone, Default)]
 pub struct Scrub {
     rules: Vec<Rule>,
@@ -290,7 +291,9 @@ impl Scrub {
         String::from_utf8_lossy(&self.bytes(input.as_bytes())).into_owned()
     }
 
-    /// The tape `header` and `items` with every name taken: the header's text, and each item's ([module docs](self)).
+    /// The tape `header` and `items` with every name taken: the header's text, and each item's (a
+    /// control round trip's words and reply read and written again, every other body rewritten
+    /// where it stands).
     /// # Errors
     /// A control round trip whose request or reply does not read: its words cannot be rewritten without its lengths.
     pub fn tape(
@@ -411,7 +414,9 @@ fn found(text: &str, needle: &[u8], word: bool) -> Vec<usize> {
     lines
 }
 
-/// What the tape text `text` holds that a corpus may not ([module docs](self)): `/Users/`, the recording machine's `home`, any name `scrub` takes, each with the line it is first on and how often; and a text over [`TEXT_MAX`].
+/// What the tape text `text` holds that a corpus may not: `/Users/`, the recording machine's
+/// `home`, any name `scrub` takes, each with the line it is first on and how often; and a text over
+/// [`TEXT_MAX`].
 #[must_use]
 pub fn lint(text: &str, scrub: &Scrub, home: Option<&Path>) -> Vec<String> {
     let mut problems = Vec::new();
@@ -463,7 +468,8 @@ pub fn acts(items: &[Item]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// What a tape holds that a corpus is kept for ([module docs](self)).
+/// What a tape holds that a corpus is kept for, so the corpus test can refuse a corpus that
+/// exercises nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Census {
     /// Decisions on an approval box.
@@ -554,7 +560,11 @@ fn acts_asked(report: &Report, map: impl Fn(&str) -> String) -> Vec<Vec<String>>
         .collect()
 }
 
-/// THE TAPE `bytes` MADE A CORPUS TAPE, or refused ([module docs](self)): whole and ended, and REPRODUCED by a strict replay on this build as it was recorded; scrubbed by `scrub` into its text form; that text passing [`lint`] (`home`: the recording machine's), replaying strictly REPRODUCED, replaying in acts mode under its own policy REPRODUCED with every act on it taken, and its replay asking the very acts the original's replay asked, each in the scrub's words.
+/// THE TAPE `bytes` MADE A CORPUS TAPE, or refused: whole and ended, and REPRODUCED by a strict
+/// replay on this build as it was recorded; scrubbed by `scrub` into its text form; that text
+/// passing [`lint`] (`home`: the recording machine's), replaying strictly REPRODUCED, replaying in
+/// acts mode under its own policy REPRODUCED with every act on it taken, and its replay asking the
+/// very acts the original's replay asked, each in the scrub's words.
 /// # Errors
 /// Why the tape is not a corpus tape — each failed condition named, with the replay's report where a replay said so.
 pub fn promote(bytes: &[u8], scrub: &Scrub, home: Option<&Path>) -> Result<Promoted, String> {

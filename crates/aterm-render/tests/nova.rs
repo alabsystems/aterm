@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Supernova additive light (`RenderInput.nova_add`) on the CPU renderer. Empty
-// nova is the `nova_add` row of `tests/empty_channels.rs`.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{
@@ -14,8 +11,6 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// A single-row nova quad over cell `(row, col)`: the emitter splits every
-/// quad at row boundaries.
 fn quad_at(cw: usize, ch: usize, row: u16, col: usize, color: u32) -> GlowQuad {
     GlowQuad {
         row,
@@ -25,15 +20,12 @@ fn quad_at(cw: usize, ch: usize, row: u16, col: usize, color: u32) -> GlowQuad {
         h: ch as u16,
         color,
 
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: color,
         alpha2: 0,
     }
 }
 
-/// A premultiplied quad over a flat background lands exactly
-/// `min(255, bg + premul)` per channel (`add_sat`).
 #[test]
 fn nova_adds_exact_premultiplied_light_over_background() {
     let mut rend = renderer();
@@ -58,15 +50,12 @@ fn nova_adds_exact_premultiplied_light_over_background() {
     );
 }
 
-/// A settled nova (both frames empty) gate-hits; a changed nova marks exactly
-/// the prev∪cur quad rows and never gate-hits.
 #[test]
 fn nova_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     let mut term = Terminal::new(6, 8);
     term.process(b"\x1b[?25l"); // hidden cursor: no cursor rows in the dirty set
     let (cw, ch) = (10usize, 20usize); // any consistent pixel geometry works here
 
-    // Settled: both empty, so a gate hit with nothing marked.
     let prev = term.cell_frame(6, 8);
     let mut cur = term.cell_frame(6, 8);
     let mut dirty = Vec::new();
@@ -89,7 +78,6 @@ fn nova_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     assert!(d.is_gate_hit(), "a settled nova (empty vec) must gate-hit");
     assert!(dirty.iter().all(|&b| !b), "settled nova must mark no rows");
 
-    // Changed: the ring moves from row 2 to row 4, so exactly rows {2, 4}.
     let mut prev = term.cell_frame(6, 8);
     prev.nova_add
         .push(quad_at(cw, ch, 2, 1, premul_rgb(0x00FF_5C3C, 200)));
@@ -121,8 +109,6 @@ fn nova_dirty_gate_settled_hits_changed_marks_prev_union_cur_rows() {
     );
 }
 
-/// On the cached path, re-presenting the same nova is byte-stable and clearing
-/// it restores the exact base bytes.
 #[test]
 fn cached_path_nova_never_accumulates_and_clears_without_ghosting() {
     let mut rend = renderer();
@@ -132,13 +118,11 @@ fn cached_path_nova_never_accumulates_and_clears_without_ghosting() {
     term.process(b"\x1b[?25lit failed: fuck");
     let base_input = term.cell_frame(4, 16);
 
-    // Frame 0: no nova (primes the damage cache with the base frame).
     let base = rend
         .render_input_cached(&mut win, &base_input)
         .pixels()
         .to_vec();
 
-    // Frame 1: the ring appears across rows 1..=2.
     let mut lit = base_input.clone();
     for r in 1..=2u16 {
         lit.nova_add
@@ -147,11 +131,9 @@ fn cached_path_nova_never_accumulates_and_clears_without_ghosting() {
     let f1 = rend.render_input_cached(&mut win, &lit).pixels().to_vec();
     assert_ne!(base, f1, "the nova must actually brighten the frame");
 
-    // Frame 2: the same quads again must not double-add.
     let f2 = rend.render_input_cached(&mut win, &lit).pixels().to_vec();
     assert_eq!(f1, f2, "re-presenting equal nova quads must be byte-stable");
 
-    // Frame 3: the nova settles; the frame returns to the exact base bytes.
     let f3 = rend
         .render_input_cached(&mut win, &base_input)
         .pixels()

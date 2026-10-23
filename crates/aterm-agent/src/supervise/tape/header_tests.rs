@@ -650,8 +650,8 @@ fn relative_file_paths_are_rooted_and_move_with_a_remap() {
 /// agent's switch, the two setup knobs a shipped build did not write
 /// before every build carried them, the three timings that came after the
 /// format (the host's wait step, the box call's lag step and the refusal's
-/// back-off rungs), the hand the loop types under, the tasks directory and
-/// the recording build's host doors. It
+/// back-off rungs), the occupancy nudge's wait, the hand the loop types
+/// under, the tasks directory and the recording build's host doors. It
 /// decodes: each policy key at its full-power default, each knob at this
 /// build's shipped value, everything the tape said as it said it, and every
 /// key supplied named.
@@ -679,6 +679,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
                 "codex.enabled=",
                 "person_hold_wait",
                 "beside_idle_min=",
+                "occupancy.nudge_after=",
                 "wait_step=",
                 "box_call_step=",
                 "turn_end.refused_backoff=",
@@ -701,6 +702,7 @@ fn a_tape_an_older_build_wrote_decodes_with_what_it_lacked_named() {
             "[setup] turn_end.refused_backoff",
             "[setup] person_hold_wait",
             "[setup] beside_idle_min",
+            "[setup] occupancy.nudge_after",
             "[opts] tasks",
             "[opts] host_doors",
             "[policy] land_at",

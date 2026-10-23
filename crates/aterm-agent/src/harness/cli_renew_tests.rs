@@ -49,6 +49,7 @@ struct RenewHost {
     exe: Option<PathBuf>,
     flow: i32,
     signs_in_as: Option<&'static str>,
+    obstruct_checkpoint: bool,
     ssh_exit: i32,
     flows: RefCell<Vec<(String, String, RenewBrowser)>>,
     checked: RefCell<Vec<String>>,
@@ -63,6 +64,7 @@ impl RenewHost {
             exe: Some(PathBuf::from("/opt/aterm/bin/aterm")),
             flow: 0,
             signs_in_as: None,
+            obstruct_checkpoint: false,
             ssh_exit: 0,
             flows: RefCell::new(Vec::new()),
             checked: RefCell::new(Vec::new()),
@@ -121,6 +123,13 @@ impl AccountsHost for RenewHost {
             format!(r#"{{"oauthAccount":{{"emailAddress":"{account}"}}}}"#),
         )
         .expect("the flow writes its home");
+        if self.obstruct_checkpoint {
+            std::fs::write(
+                Path::new(home).join(accounts::RENEWAL_CHECKPOINT_FILE),
+                b"unrecognized private work",
+            )
+            .unwrap();
+        }
         Ok(self.flow)
     }
 
@@ -282,6 +291,24 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     assert_eq!(main.dir.as_deref(), Some(staging.as_str()));
     assert_eq!(main.was, vec![None], "the default login it replaced");
     assert_eq!(main.subscription.as_deref(), Some("max"));
+    let proof = accounts::read_renewal_checkpoint(
+        Path::new(&staging),
+        &std::fs::canonicalize(&staging).unwrap(),
+        env.now,
+    )
+    .expect("the verified CLI check leaves recovery evidence before binding");
+    assert_eq!(proof.label, "main");
+    assert_eq!(proof.email, OWNER);
+    assert_eq!(proof.checked_at, main.renewed_at.unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(Path::new(&staging).join(accounts::RENEWAL_CHECKPOINT_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     let (state, _) = store.load(env.now).expect("state");
     assert_eq!(state.account("main").auth, Auth::Ok);
     let kinds: Vec<_> = store
@@ -489,6 +516,32 @@ fn a_cancelled_renewal_runs_no_check_and_records_nothing() {
     }
 }
 
+#[test]
+fn a_verified_renewal_keeps_staging_and_records_nothing_when_checkpoint_is_obstructed() {
+    let (_tmp, env) = renew_env("renew-checkpoint-obstructed");
+    let mut host = RenewHost::new();
+    host.obstruct_checkpoint = true;
+    let (code, out, err) = acc(renew(&["main"], false, None), &env, &host);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert_eq!(host.flows.borrow().len(), 1);
+    assert_eq!(host.checked.borrow().len(), 1);
+    let store = env.accounts_store();
+    let staging = store.logins_dir().join("main+1");
+    assert!(staging.join(".claude.json").is_file());
+    assert_eq!(
+        std::fs::read(staging.join(accounts::RENEWAL_CHECKPOINT_FILE)).unwrap(),
+        b"unrecognized private work",
+    );
+    assert!(!store.logins_file().exists() && !store.state_file().exists());
+    assert!(store.tail(10).unwrap().is_empty());
+    assert!(
+        err.contains("completion checkpoint could not be saved"),
+        "{err}"
+    );
+    assert!(err.contains("its home is kept"), "{err}");
+    no_address(&env, &[&out, &err]);
+}
+
 /// A recording failure is not a rollback: the binding and auth word can
 /// already be durable when appending the ledger fails.
 #[test]
@@ -591,6 +644,51 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     assert_eq!(code, exit(0));
     assert_eq!(out, "due here: main\n");
     assert!(quiet.flows.borrow().is_empty());
+
+    let (code, out, err) = acc(
+        AccountsCmd::Add {
+            label: "work-3".into(),
+            class: Class::Dedicated,
+            email: Some("w3@example.test".into()),
+            browser: None,
+        },
+        &env,
+        &host,
+    );
+    assert_eq!(code, exit(0), "{out}{err}");
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            let mut ev = Vec::new();
+            for label in ["main", "work-2"] {
+                ev.extend(accounts::note_wall(
+                    state,
+                    label,
+                    "seven_day",
+                    Some(env.now + 86_400),
+                    env.now,
+                    env.now,
+                ));
+            }
+            Ok(ev)
+        })
+        .expect("walls recorded");
+    let wall_host = RenewHost::new();
+    let (code, out, err) = acc(renew(&[], true, None), &env, &wall_host);
+    assert_eq!(code, exit(0), "{out}{err}");
+    let wall_renewed: Vec<_> = wall_host
+        .flows
+        .borrow()
+        .iter()
+        .map(|(_, e, _)| e.clone())
+        .collect();
+    assert_eq!(
+        wall_renewed,
+        ["w3@example.test"],
+        "--due selects the un-enrolled successor when all enrolled rows are at a wall"
+    );
+    assert!(out.contains("work-3: renewed"), "{out}");
+    no_address(&env, &[&out, &err]);
 }
 
 /// Due selection needs the auth observations. A state this build cannot

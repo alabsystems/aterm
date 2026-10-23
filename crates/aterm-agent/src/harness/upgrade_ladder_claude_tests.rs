@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The live upgrade's ladder bound to Claude Code's lane.
+//! Live upgrade ladder conformance tests for Claude Code's lane.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -13,17 +13,13 @@ use crate::supervise::screen::HumanInput;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// `[harness] human_grace_s` at its default.
 const GRACE: u32 = 120;
 
-/// A look's clock.
 const NOW: u64 = 1_790_607_857;
 
-/// The Claude Code process the looks are of, and its tab.
 const PID: u32 = 4_242;
 const TAB: &str = "7";
 
-/// Every `Buggy` member of the model, each caught alone below.
 const MUTANTS: [&str; 6] = [
     "AttendedWithoutLadder",
     "MoveMidTurn",
@@ -33,7 +29,6 @@ const MUTANTS: [&str; 6] = [
     "SeqSettle",
 ];
 
-/// Every state `m` reaches from its `Init`, by the model's own successor function.
 fn reach(m: &Model) -> BTreeSet<State> {
     let mut seen = BTreeSet::from([m.init_state()]);
     let mut queue = VecDeque::from([m.init_state()]);
@@ -49,9 +44,6 @@ fn reach(m: &Model) -> BTreeSet<State> {
     seen
 }
 
-/// A Claude Code tab at the last words `words`: the transcript, the spinner row when `busy`,
-/// the composer (its caret row holding `draft`), and a footer whose clock reads `tick` — what
-/// repaints between two looks while the words stand still.
 fn tab_rows(words: &str, busy: bool, draft: &str, tick: u32) -> Vec<String> {
     let rule = "─".repeat(40);
     let mut rows = vec![
@@ -75,8 +67,6 @@ fn tab_rows(words: &str, busy: bool, draft: &str, tick: u32) -> Vec<String> {
     rows
 }
 
-/// One read of a tab: `rows`, the cursor after the composer's text, `seq`, and the person's
-/// stamp `human`.
 fn read(rows: Vec<String>, seq: u64, human: HumanInput) -> Screen {
     let cursor = aterm_phase::phase::composer_draft(&rows)
         .map(|(caret, lines)| (caret, 2 + lines.first().map_or(0, |l| l.chars().count())));
@@ -90,8 +80,6 @@ fn read(rows: Vec<String>, seq: u64, human: HumanInput) -> Screen {
     }
 }
 
-/// The tab's rows a look of `s` reads at `tick`: a box, a running turn, a draft, or the idle
-/// composer under the same last words.
 fn look_rows(s: &State, tick: u32) -> Vec<String> {
     if s["dialog"] == 1 {
         aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::BOX_BASH_TOUCH)
@@ -114,7 +102,6 @@ enum History {
 
 const HISTORIES: [History; 3] = [History::Seq, History::Verdict, History::File];
 
-/// The `status` reply a look at `s` under `h` reads.
 fn status_of(s: &State, h: History) -> String {
     let (agent, since_ms) = if s["work"] == 1 {
         ("busy", 4_000)
@@ -128,8 +115,6 @@ fn status_of(s: &State, h: History) -> String {
     format!("OK schema=1 agent={agent} agent_since_ms={since_ms} hold=0 hand=-")
 }
 
-/// The lane's options: the default quiet flow (`[harness] upgrade_ask = false`), no state
-/// root, nothing on disk to read.
 fn opts() -> Opts {
     let none = PathBuf::from("/nonexistent/aterm-ladder-claude");
     Opts {
@@ -153,7 +138,6 @@ fn opts() -> Opts {
     }
 }
 
-/// Claude Code's record of the process at `t`, as `s` under `h` has it.
 fn session_file(s: &State, h: History, t: u64) -> SessionFile {
     let changed_s = if h == History::File && s["quiet"] == 0 {
         1
@@ -175,8 +159,6 @@ fn session_file(s: &State, h: History, t: u64) -> SessionFile {
     }
 }
 
-/// One real Claude Code look at `t` (the lane's own [`look_facts`] over the tab read `scr` and
-/// the status `status`, the placeholder cell not dim).
 fn look_at(st: &mut St, sf: &SessionFile, scr: &Screen, status: &str, t: u64) -> Facts {
     let read = TabRead {
         scr,
@@ -186,11 +168,6 @@ fn look_at(st: &mut St, sf: &SessionFile, scr: &Screen, status: &str, t: u64) ->
     look_facts(&opts(), sf, st, TAB, &read, &[], t).0
 }
 
-/// A model state as real looks under `h`: the rung as how long the session has been behind;
-/// the screen first seen `2 * QUIET_S` before the last look; for `seen` 2 a look `QUIET_S`
-/// earlier at the same words with the footer's clock repainted; the last at NOW, its `seq`
-/// moved where `h` is `Seq` and the state not quiet. Returns the last look's facts and whether
-/// the reader read it idle as evidence (where a run of looks counts).
 fn facts_of(s: &State, h: History) -> (Facts, bool) {
     const BEHIND: [u64; 4] = [
         60,
@@ -228,8 +205,6 @@ fn facts_of(s: &State, h: History) -> (Facts, bool) {
     (f, idle_read)
 }
 
-/// The real step at a pending upgrade over those facts, under the owner's `--now` where `now`:
-/// the move is the restart ([`upgrade::Step::Terminate`]) the quiet flow takes.
 fn real_moves(f: &Facts, now: bool) -> bool {
     let f = Facts {
         owner_now: now,
@@ -238,13 +213,6 @@ fn real_moves(f: &Facts, now: bool) -> bool {
     upgrade::next_step(&Phase::Pending, &f, false, NOW) == upgrade::Step::Terminate
 }
 
-/// Tier-1 on Claude Code's lane: the derived `HarnessUpgradeLadder` against the real step over
-/// every state the model reaches, under each way its quiet reaches a look ([`History`]). The
-/// model's `Move` is enabled exactly where the real quiet flow restarts (the rung, the screen's
-/// and the status's quiet, the still run, the person, the draft, the box, the running turn, each
-/// built from real looks by `look_facts`), and the real facts project back onto their state
-/// (`upgrade_drive::ladder_projection`) wherever the reader read the look idle. The `Advance`,
-/// `Look` and `Move` anchors are entered.
 #[test]
 fn the_real_ladder_is_the_derived_machine_on_the_claude_lane() {
     use aterm_spec::xref;
@@ -343,10 +311,6 @@ fn the_real_ladder_is_the_derived_machine_on_the_claude_lane() {
     }
 }
 
-/// The repaint-proof settle on a Claude Code screen (`ladder_look`, `St::still`): two looks
-/// QUIET_S apart at the same last words stand QUIET_S however the footer repainted; new words, a
-/// look not idle, or a look past `IDLE_RUN_GAP_S` restart the run. Negative control: the
-/// screen's own quiet (`quiet_s` with no verdict) restarts at each repaint.
 #[test]
 fn the_still_run_counts_claude_looks_at_the_same_words_and_not_repaints() {
     let status = "OK schema=1 agent=unknown agent_since_ms=5";

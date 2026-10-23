@@ -5,9 +5,7 @@
 
 use super::*;
 
-/// Water must stay in ocean hues: every emitted quad (comet, crown, ripple
-/// ring, droplets) keeps blue at least as strong as red, across spawn and
-/// mid-flight frames.
+/// Every emitted Water quad keeps blue at least as strong as red across spawn and flight.
 #[test]
 fn water_stays_in_ocean_hues() {
     let g = geom();
@@ -42,8 +40,7 @@ fn water_stays_in_ocean_hues() {
     }
 }
 
-/// Water's dynamic range: relaxed typing is a trickle, a sustained fast run a torpedo with far
-/// more light and far more droplet quads at the same config.
+/// Sustained fast typing emits far more light and droplet quads than relaxed typing.
 #[test]
 fn water_scales_from_trickle_to_torpedo() {
     let g = geom();
@@ -51,7 +48,6 @@ fn water_scales_from_trickle_to_torpedo() {
     let t0 = Instant::now();
     let mut out = Vec::new();
 
-    // Relaxed: one single-cell advance every 500 ms.
     let mut slow = CursorGlow::default();
     let mut t = t0;
     slow.tick(Some((2, 0)), t, &c, g, &mut out);
@@ -64,7 +60,6 @@ fn water_scales_from_trickle_to_torpedo() {
     let slow_lum = lum(&out) + lum(slow.under_quads());
     assert!(slow_lum > 0, "a trickle still glows");
 
-    // Sustained fast: one advance every 50 ms.
     let mut fast = CursorGlow::default();
     let mut t = t0;
     fast.tick(Some((2, 0)), t, &c, g, &mut out);
@@ -85,9 +80,7 @@ fn water_scales_from_trickle_to_torpedo() {
     );
 }
 
-/// Water owns a connected, travelling curve even though its shared laser beam
-/// stays disabled. Sustained typing raises heat, bends the wake, and keeps a
-/// long contiguous pixel run without turning it into a full-cell slab.
+/// Sustained typing raises heat and emits a contiguous curved wake with the shared beam disabled.
 #[test]
 fn water_emits_a_smooth_wavy_wake() {
     let g = geom();
@@ -107,7 +100,6 @@ fn water_emits_a_smooth_wavy_wake() {
         glow.tick(Some((2, col)), t, &c, g, &mut out);
     }
     assert!(glow.heat > 0.9, "fast run reaches torpedo momentum");
-    // Isolate the wake geometry from its supporting droplets.
     glow.particles.clear();
     glow.tick(Some((2, 18)), t, &c, g, &mut out);
     let wake_out = glow.under_quads();
@@ -150,11 +142,7 @@ fn water_emits_a_smooth_wavy_wake() {
     }
 }
 
-/// Typed at a human rhythm (156 ms a key, about 75 words a minute, the
-/// Settings preview's own pace), the wake trails at least three cells behind
-/// the caret, one contiguous run: the row's promise of a blue wake behind the
-/// drop holds below torpedo speed. A lone key after a pause still leaves no
-/// long wake (the chain only spans a rhythm).
+/// At a 156 ms typing cadence, the wake trails at least three cells behind the caret as one contiguous run.
 #[test]
 fn water_wake_trails_behind_the_caret_at_human_cadence() {
     let g = geom();
@@ -164,7 +152,6 @@ fn water_wake_trails_behind_the_caret_at_human_cadence() {
     let mut t = Instant::now();
     glow.tick(Some((2, 1)), t, &c, g, &mut out);
     for col in 2..=20u16 {
-        // The preview's 52 ms frames between keys.
         for _ in 0..2 {
             t += ms(52);
             glow.tick(Some((2, col - 1)), t, &c, g, &mut out);
@@ -198,8 +185,6 @@ fn water_wake_trails_behind_the_caret_at_human_cadence() {
         .filter(|(a, b)| **b != **a + 1);
     assert_eq!(gaps.count(), 0, "the wake is one contiguous run");
 
-    // Negative control: a lone key after a one-second pause, seen 250 ms
-    // later, lays no wake past its own cell.
     let mut lone = CursorGlow::default();
     let mut t = Instant::now();
     lone.tick(Some((2, 1)), t, &c, g, &mut out);
@@ -223,10 +208,7 @@ fn luma_of(color: u32) -> u32 {
     (2126 * r + 7152 * g + 722 * b) / 10_000
 }
 
-/// A causally licensed Home/End-sized move gets Water's own full-vector
-/// crest even when the configured typing tail is one cell. Navigation is
-/// still calm: no heat, splash particles, or landing ring; a one-cell arrow
-/// remains dark because this is jump feedback rather than an arrow smear.
+/// A licensed navigation jump spans the full vector without adding heat, splash particles, or a landing ring.
 #[test]
 fn water_navigation_jump_spans_the_vector_without_celebration() {
     let g = geom();
@@ -284,10 +266,7 @@ fn water_navigation_jump_spans_the_vector_without_celebration() {
     );
 }
 
-/// Codex-style whole-row repaint choreography can revisit the same corridor
-/// many times before Water's previous jump life expires. The renderer must
-/// see one newest owner per cell, not hundreds of additive reflections, and
-/// the broad wake must remain below opaque glyph ink in the real paint order.
+/// Repeated crossings of the same corridor deduplicate to the newest owner per cell and stay under glyph ink.
 #[test]
 fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
     let g = geom();
@@ -316,9 +295,6 @@ fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
         glow.water_samples.len(),
         "each visible coordinate has exactly one Water owner"
     );
-    // Uniqueness alone would also accept an oldest-owner traversal. Pick a coordinate whose
-    // alternating passes carry visibly different path positions and prove the selected color
-    // belongs to its newest resident.
     let owner_cell = (2, 10);
     let selected = glow
         .water_samples
@@ -360,7 +336,6 @@ fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
         glow.under_quads().len()
     );
 
-    // Non-vacuous overlap: undertow + crest AA really do hit common pixels.
     let mut hits = vec![0u16; usize::from(g.win_w) * usize::from(g.win_h)];
     for q in glow.under_quads() {
         for y in usize::from(q.y)..usize::from(q.y + q.h) {
@@ -371,8 +346,6 @@ fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
     }
     assert!(hits.into_iter().max().unwrap_or(0) >= 2);
 
-    // Renderer-exact order: under light first, then ink replacement. Every
-    // stamped glyph byte must therefore remain exactly the theme's byte.
     let mut frame = Glass::new(g, c.theme_bg);
     let mut bare = Glass::new(g, c.theme_bg);
     frame.add_quads(glow.under_quads());
@@ -395,9 +368,7 @@ fn water_repaint_corridor_deduplicates_and_cannot_cover_text() {
     assert!(lit_ground > 100, "the protected frame still visibly glows");
 }
 
-/// A jump's reflection does not remain a rigid strip until one mass expiry:
-/// it transfers into sparse beads, those beads accelerate downward, and the
-/// remaining light is already faint before exact idle-zero cleanup.
+/// A jump reflection transfers into downward-accelerating beads and fades smoothly to idle zero.
 #[test]
 fn water_jump_reflection_drips_then_fades_smoothly_to_zero() {
     let g = geom();
@@ -494,16 +465,7 @@ fn water_jump_reflection_drips_then_fades_smoothly_to_zero() {
     );
 }
 
-/// Water on a light ground is ink under the letters: a hot typing run and a
-/// jump with `dark_theme: false`, at the default intensity, emit no additive
-/// quad or halo in any stream; the wake is source-over paint in the
-/// under-ink stream and keeps its travelling wave; and the landing lays its
-/// ripple train in conservative ink. Legibility is read the way the gallery probe reads a
-/// cell: every cell's x-height ground, which the letters' strokes are drawn
-/// over, keeps a dark foreground 4.5:1 on average; and along a typed run,
-/// where the wave has no corners, so does its darkest pixel (crest over
-/// undertow). A diagonal jump's staircase corners paint a stroke's join twice,
-/// as they light it twice on a dark ground, so its pixels are judged by cell.
+/// On a light theme, Water emits source-over ink under the glyphs while preserving 4.5:1 foreground contrast.
 #[test]
 fn water_on_light_is_ink_under_the_letters() {
     let g = geom();
@@ -526,7 +488,6 @@ fn water_on_light_is_ink_under_the_letters() {
         for h in glow.halos() {
             assert_eq!(h.mode, HaloMode::Over, "an additive halo on light: {h:?}");
         }
-        // Water lands its ripple train as ink quads over the text.
         ripple |= ring && out.iter().any(|q| q.alpha > 0);
         let mut glass = Glass::new(g, c.theme_bg);
         glass.add_quads(glow.under_quads());
@@ -619,13 +580,7 @@ fn sharpest_turn(points: &[(f32, f32)]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-/// THE WATER'S SURFACE IS A SWELL, NOT A POLYLINE: along a hot typed run the
-/// crest is drawn through the swell between its cells, so no knot turns it
-/// sharply (a chord's corner at a crest stood between two words as a typed
-/// `^`); a leap's surface across rows is one straight line from its first
-/// cell to its last (the cells' stair drew a zigzag through the lines it
-/// crossed). Negative control: the chords between the same cells turn
-/// sharply at the crests.
+/// A hot typed run draws a smooth swell through cell crests, while a cross-row leap forms a straight line.
 #[test]
 fn the_water_surface_is_a_swell_and_a_leap_is_straight() {
     let g = tall_geom();
@@ -661,7 +616,6 @@ fn the_water_surface_is_a_swell_and_a_leap_is_straight() {
         "the crest turns {smooth:.1}° at a knot (its chords {chords:.1}°)"
     );
     assert!(chords >= 20.0, "control: the chords turn only {chords:.1}°");
-    // A leap: the same samples carried down a stair of rows.
     let stair: Vec<WaterSample> = samples
         .iter()
         .enumerate()
@@ -686,10 +640,7 @@ fn the_water_surface_is_a_swell_and_a_leap_is_straight() {
     );
 }
 
-/// ON PAPER A WATER DROP IS CLEAR BLUE AND ROUND: a falling drop over the
-/// white page is laid as a round bead whose ink is a saturated water blue
-/// (a slate mote read as grit). Negative control: the dark ground's drop of
-/// the same grain is light, not ink.
+/// On a light theme, a falling drop renders as a round, saturated blue ink bead.
 #[test]
 fn a_light_water_drop_is_clear_blue() {
     let g = tall_geom();

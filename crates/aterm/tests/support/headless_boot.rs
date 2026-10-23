@@ -148,7 +148,7 @@ fn window_server_refused(log: &str) -> bool {
 }
 
 /// A dead or never-ready child whose log shows it ASKED for a WindowServer
-/// connection fails the boot, naming the door (module doc): a headless
+/// connection fails the boot, naming the door: a headless
 /// instance never asks, so the refusal is the product's, not the login's.
 fn fail_if_it_asked_for_the_window_server(log: &Path, tail: &str) {
     let whole = std::fs::read_to_string(log).unwrap_or_default();
@@ -297,7 +297,8 @@ std::thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The opening words of the refusal [`boot_with`] ends a test with when the instance's login shell names a stand-in by another path (module doc).
+/// The opening words of the refusal [`boot_with`] ends a test with when the instance's login
+/// shell names a stand-in by another path.
 pub const STANDIN_UNRESOLVED: &str = "the instance's login shell names a stand-in by another path";
 
 /// The PATH `cmd` launches with: the one set on it, none where it was removed,
@@ -338,7 +339,7 @@ fn reached_by_name(standins: Vec<PathBuf>, path: Option<&std::ffi::OsStr>) -> Ve
     out
 }
 
-/// THE GUARD ([`boot_with`], module doc): the instance's own login shell names
+/// THE GUARD ([`boot_with`]): the instance's own login shell names
 /// each of `standins` by the stand-in's path, or the test ends COULD NOT RUN
 /// ([`STANDIN_UNRESOLVED`]) with what it named instead — before the test can
 /// type anything: nothing has been typed but `command -v`.

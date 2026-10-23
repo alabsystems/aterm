@@ -8,7 +8,8 @@ use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
 use crate::cat_baker::{
     CatColorKey, MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS, ResolvedFills,
-    paint_dark_masked_disc, paint_outline_halo, path_bounds, resolve_layer,
+    paint_dark_masked_disc, paint_outline_halo, path_bounds, prepare_scratch_tile, resolve_layer,
+    take_or_new_tile,
 };
 use crate::cat_glyphs_gen::{GlyphRole, Layer};
 use crate::pet_glyphs_gen::{PET_GLYPHS, PetGlyphId};
@@ -130,6 +131,7 @@ fn paint_eye_dots(
     alpha: f32,
     xform: PathTransform,
     reflections: bool,
+    eye_mask: &mut Option<Tile>,
 ) {
     let mut inline_bounds = [None; 8];
     let heap_bounds = (layer.paths.len() > inline_bounds.len()).then(|| {
@@ -160,7 +162,6 @@ fn paint_eye_dots(
         .flatten()
         .max_by(|a, b| (a.2 - a.0).total_cmp(&(b.2 - b.0)))
         .map_or(0.5, |&(x0, _, x1, _)| (x0 + x1) * 0.5);
-    let mut eye_mask: Option<Tile> = None;
     let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
     let core_min_w_px = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y;
     let sx_eps = xform.scale_x.max(f32::EPSILON);
@@ -231,13 +232,7 @@ fn paint_eye_dots(
             reflections && !shallow && (w_px * kx).min(h_px * ky) >= EYE_REFLECTION_MIN_PX;
         fill_path_fixed(tile, std::slice::from_ref(path), col, alpha, dot_xform);
         if paint_gloss {
-            let mask = match eye_mask.as_mut() {
-                Some(mask) => {
-                    mask.pixels_mut().fill(0);
-                    mask
-                }
-                None => eye_mask.insert(Tile::new(tile.width(), tile.height())),
-            };
+            let mask = prepare_scratch_tile(eye_mask, tile.width(), tile.height());
             fill_path_fixed(
                 mask,
                 std::slice::from_ref(path),
@@ -364,8 +359,20 @@ fn bake_pose_with_reflections(
     reflections: bool,
 ) -> Tile {
     let mut tile = Tile::new(w, h);
+    paint_pose_onto(&mut tile, pose, fills, (w, h), reflections, &mut None);
+    tile
+}
+
+fn paint_pose_onto(
+    tile: &mut Tile,
+    pose: PetGlyphId,
+    fills: &ResolvedFills,
+    (w, h): (u32, u32),
+    reflections: bool,
+    eye_mask: &mut Option<Tile>,
+) {
     if w == 0 || h == 0 {
-        return tile;
+        return;
     }
     let xform = PathTransform::fit(w, h);
     let face_lod = h < FACE_DETAIL_MIN_H;
@@ -390,15 +397,14 @@ fn bake_pose_with_reflections(
         }
         let (col, alpha) = resolve_layer(layer, fills);
         if face_lod && layer.role == GlyphRole::Eye {
-            paint_eye_dots(&mut tile, layer, col, alpha, xform, reflections);
+            paint_eye_dots(tile, layer, col, alpha, xform, reflections, eye_mask);
             continue;
         }
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
-            paint_outline_halo(&mut tile, layer, fills, alpha, xform);
+            paint_outline_halo(tile, layer, fills, alpha, xform);
         }
-        fill_path_fixed(&mut tile, layer.paths, col, alpha, xform);
+        fill_path_fixed(tile, layer.paths, col, alpha, xform);
     }
-    tile
 }
 
 /// A bake-cache key for an [`ExactTileBaker`]: everything that can change a texel of one exact-size tile, and nothing else.
@@ -407,6 +413,14 @@ pub trait ExactTileKey: Copy + PartialEq {
     fn size(&self) -> (u16, u16);
     /// Rasterize the tile this key describes (the cache-miss path).
     fn bake_tile(&self) -> Tile;
+    /// Rasterize the tile this key describes, reusing `recycled` when its
+    /// `(width, height)` matches [`Self::size`] and `mask_scratch` for any
+    /// intermediate mask pass.
+    #[inline]
+    fn bake_tile_with(&self, recycled: Option<Tile>, _mask_scratch: &mut Option<Tile>) -> Tile {
+        let _ = recycled;
+        self.bake_tile()
+    }
 }
 
 impl ExactTileKey for PetBakeKey {
@@ -419,6 +433,21 @@ impl ExactTileKey for PetBakeKey {
     fn bake_tile(&self) -> Tile {
         self.bake()
     }
+
+    #[inline]
+    fn bake_tile_with(&self, recycled: Option<Tile>, mask_scratch: &mut Option<Tile>) -> Tile {
+        let (w, h) = (u32::from(self.w), u32::from(self.h));
+        let mut tile = take_or_new_tile(recycled, w, h);
+        paint_pose_onto(
+            &mut tile,
+            self.pose,
+            &self.fills(),
+            (w, h),
+            true,
+            mask_scratch,
+        );
+        tile
+    }
 }
 
 /// One resident tile: its key, its texels, and the frame it was last touched on.
@@ -428,9 +457,17 @@ struct ExactSlot<K> {
     last_used: u64,
 }
 
-/// Host-side LRU of exact-size tiles (see the module docs for the budgets): the structure behind every exact-size roster, [`PetBaker`], [`DogBaker`](crate::dog_baker::DogBaker) and [`AnimalBaker`](crate::animal_baker::AnimalBaker).
+/// Host-side LRU of exact-size tiles, within [`MAX_SLOTS`] tiles, [`MAX_ATLAS_BYTES`] of texels
+/// and [`MAX_BAKES_PER_FRAME`] cold bakes a frame: the structure behind every exact-size roster,
+/// [`PetBaker`], [`DogBaker`](crate::dog_baker::DogBaker) and
+/// [`AnimalBaker`](crate::animal_baker::AnimalBaker).
 pub struct ExactTileBaker<K> {
     slots: Vec<ExactSlot<K>>,
+    /// One recently evicted or cleared tile buffer, kept for reuse when the next cold bake
+    /// requests the same dimensions.
+    tile_scratch: Option<Tile>,
+    /// Reusable LOD eye-reflection mask across cold bakes.
+    eye_mask_scratch: Option<Tile>,
     /// Sum of resident tile bytes, kept incrementally so the [`MAX_ATLAS_BYTES`] bound is O(1)
     /// per admission.
     bytes: usize,
@@ -450,6 +487,8 @@ impl<K> Default for ExactTileBaker<K> {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
+            tile_scratch: None,
+            eye_mask_scratch: None,
             bytes: 0,
             cell_w: 0,
             cell_h: 0,
@@ -479,9 +518,12 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
     /// Drop every resident tile and bump the version.
     #[inline]
     pub fn clear(&mut self) {
+        self.eye_mask_scratch = None;
         if self.slots.is_empty() {
+            self.tile_scratch = None;
             return;
         }
+        self.tile_scratch = self.slots.pop().map(|s| s.tile);
         self.slots.clear();
         self.bytes = 0;
         self.version = self.version.wrapping_add(1);
@@ -531,12 +573,28 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
             return None;
         }
         self.bakes_left -= 1;
-        let tile = key.bake_tile();
+        let mut recycled = self.tile_scratch.take();
         while !self.slots.is_empty()
             && (self.slots.len() >= MAX_SLOTS || self.bytes + want > MAX_ATLAS_BYTES)
         {
-            self.evict_lru();
+            if let Some(evicted) = self.evict_lru() {
+                match &mut recycled {
+                    None => recycled = Some(evicted),
+                    Some(prev) if evicted.pixels().len() > prev.pixels().len() => {
+                        let smaller = std::mem::replace(prev, evicted);
+                        if self.tile_scratch.is_none() {
+                            self.tile_scratch = Some(smaller);
+                        }
+                    }
+                    Some(_) => {
+                        if self.tile_scratch.is_none() {
+                            self.tile_scratch = Some(evicted);
+                        }
+                    }
+                }
+            }
         }
+        let tile = key.bake_tile_with(recycled, &mut self.eye_mask_scratch);
         self.bytes += tile.pixels().len();
         self.slots.push(ExactSlot {
             key: *key,
@@ -549,18 +607,16 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
 
     /// Drop the least-recently-used slot, lowest index breaking ties, so eviction is a
     /// deterministic function of the request sequence.
-    fn evict_lru(&mut self) {
-        let Some(victim) = self
+    fn evict_lru(&mut self) -> Option<Tile> {
+        let victim = self
             .slots
             .iter()
             .enumerate()
             .min_by_key(|(idx, s)| (s.last_used, *idx))
-            .map(|(idx, _)| idx)
-        else {
-            return;
-        };
-        self.bytes -= self.slots[victim].tile.pixels().len();
-        self.slots.remove(victim);
+            .map(|(idx, _)| idx)?;
+        let evicted = self.slots.remove(victim);
+        self.bytes -= evicted.tile.pixels().len();
+        Some(evicted.tile)
     }
 }
 
@@ -996,6 +1052,66 @@ mod tests {
         assert!(
             !has_authored_catch_light(FACE_DETAIL_MIN_H - 1),
             "one pixel under the threshold must still bake the LOD face"
+        );
+    }
+
+    #[test]
+    fn lru_eviction_recycles_tile_and_mask_scratch() {
+        let mut b = PetBaker::default();
+        for c in 0..MAX_SLOTS as u8 {
+            b.begin_frame(10, 20);
+            let k = PetBakeKey {
+                pose: pose(if c % 2 == 0 { "stand" } else { "walk_0" }),
+                coat: c,
+                ..key(c)
+            };
+            assert!(b.tile(&k).is_some());
+        }
+        let mask_ptr = b
+            .eye_mask_scratch
+            .as_ref()
+            .expect("LOD bake retains eye mask scratch")
+            .pixels()
+            .as_ptr();
+        let victim_ptr = b.slots[0].tile.pixels().as_ptr();
+
+        b.begin_frame(10, 20);
+        let next = PetBakeKey {
+            pose: pose("sit"),
+            coat: 99,
+            ..key(99)
+        };
+        let baked = b.tile(&next).expect("evicting bake succeeds").to_vec();
+        assert_eq!(
+            b.slots.last().unwrap().tile.pixels().as_ptr(),
+            victim_ptr,
+            "same-size LRU eviction must recycle the evicted slot's Tile buffer"
+        );
+        assert_eq!(
+            b.eye_mask_scratch.as_ref().unwrap().pixels().as_ptr(),
+            mask_ptr,
+            "LOD bake must reuse eye_mask_scratch across cold bakes"
+        );
+        assert_eq!(
+            baked.as_slice(),
+            next.bake().pixels(),
+            "recycled Tile bake must be byte-identical to a fresh bake"
+        );
+        b.clear();
+        assert!(b.eye_mask_scratch.is_none());
+        let parked_ptr = b
+            .tile_scratch
+            .as_ref()
+            .expect("clear parks one Tile buffer for post-clear rebake")
+            .pixels()
+            .as_ptr();
+        assert_eq!(parked_ptr, victim_ptr);
+        b.begin_frame(10, 20);
+        assert!(b.tile(&next).is_some());
+        assert_eq!(
+            b.slots[0].tile.pixels().as_ptr(),
+            parked_ptr,
+            "first post-clear bake at the same size must reuse the parked Tile buffer"
         );
     }
 }

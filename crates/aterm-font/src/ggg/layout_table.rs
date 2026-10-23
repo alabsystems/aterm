@@ -13,8 +13,7 @@ use crate::Tag;
 use crate::parser::Offset32;
 use crate::parser::{FromData, LazyArray16, Offset, Offset16, Stream};
 
-/// A [Layout
-/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#table-organization).
+/// An OpenType Layout Table.
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutTable<'a> {
     /// A list of all supported scripts.
@@ -23,8 +22,7 @@ pub struct LayoutTable<'a> {
     pub features: FeatureList<'a>,
     /// A list of all lookups.
     pub lookups: LookupList<'a>,
-    /// Used to substitute an alternate set of lookup tables to use for any given feature under
-    /// specified conditions.
+    /// Optional feature variations table.
     pub variations: Option<FeatureVariations<'a>>,
 }
 
@@ -210,8 +208,7 @@ impl FromData for TagRecord {
     }
 }
 
-/// A [Script
-/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#script-table-and-language-system-record).
+/// An OpenType Script Table.
 #[derive(Clone, Copy, Debug)]
 pub struct Script<'a> {
     /// Script tag.
@@ -240,8 +237,7 @@ impl<'a> RecordListItem<'a> for Script<'a> {
     }
 }
 
-/// A [Language System
-/// Table](https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#language-system-table).
+/// An OpenType Language System Table.
 #[derive(Clone, Copy, Debug)]
 pub struct LanguageSystem<'a> {
     /// Language tag.

@@ -98,6 +98,8 @@ fn every_pace_answer_reads_back_by_its_word() {
         PaceGrant::Granted,
         PaceGrant::Machine,
         PaceGrant::Reserved,
+        PaceGrant::Stale,
+        PaceGrant::Unmet,
     ]
     .into_iter()
     .chain(PaceRefusal::ALL.map(PaceGrant::Refused));
@@ -111,6 +113,121 @@ fn every_pace_answer_reads_back_by_its_word() {
     }
     assert_eq!(PaceGrant::of_word("refused:tired"), None);
     assert_eq!(PaceGrant::of_word("off"), None, "a refusal's word alone");
+    // A re-read board's answer lets its line; its word alone is no answer (a tape carries the
+    // reading beside it).
+    let room = PaceGrant::Room(OccupancyReading::default());
+    assert!(room.lets());
+    assert_eq!(room.word(), "room");
+    assert_eq!(PaceGrant::of_word("room"), None);
+}
+
+const T0: i64 = 1_760_000_000_000;
+const MIN: i64 = 60_000;
+
+/// A board on which `hold-room`'s terms hold, its figures read at `taken_ms`: `usable` of 3
+/// slots free for `free_ms`, `avail_mib` available, the session's tab holding a slot a minute
+/// before.
+fn room(taken_ms: i64, usable: u16, free_ms: Option<u64>, avail_mib: u64) -> OccupancyReading {
+    OccupancyReading {
+        taken_ms,
+        stale: false,
+        avail_mib: Some(avail_mib),
+        pressure: Some(crate::supervise::memory::Pressure::Normal),
+        disk: Some(crate::harness::disk::Level::Ok),
+        slots: Some(crate::supervise::occupancy::SlotsSeen { usable, n: 3 }),
+        slots_free_ms: free_ms,
+        room: Some(true),
+        held_slot_last_ms: Some(taken_ms - MIN),
+    }
+}
+
+/// A SLOT RULE'S LINE TYPES THE FIGURES ITS HOST RE-READ (design §3.1;
+/// [`PaceGrant::slot_answer`]): on a re-read board read within `FACT_FRESH_MS` of the break,
+/// whose terms still hold, the line is made from its figures, not the decided ones; a slot taken
+/// since (none usable, or the twenty minutes broken), the machine's terms or the disk no longer
+/// met hold it `unmet`; figures read longer before the break, a stale board, a break with no wall
+/// clock and a host with no board hold it `stale`; an older build's bare grant types the line as
+/// decided, and any other answer passes with it. NEGATIVE CONTROLS: a re-read at the edge of
+/// `FACT_FRESH_MS`, or stamped after the break, types its own figures.
+#[test]
+fn a_slot_rules_line_types_the_figures_its_host_reread() {
+    use crate::supervise::facts::FACT_FRESH_MS;
+    use crate::supervise::occupancy::templates::hold_room;
+
+    let hold = HoldSeen {
+        since_ms: T0,
+        declared: false,
+    };
+    let now = T0 + 120 * MIN;
+    let decided = hold_room(120 * MIN, 1, 3, 20 * 60_000, 96 * 1024);
+    let answer = |pace: PaceGrant, at_ms: Option<i64>| pace.slot_answer(&decided, hold, now, at_ms);
+
+    let reread = room(now, 2, Some(25 * 60_000), 64 * 1024);
+    let typed = hold_room(120 * MIN, 2, 3, 25 * 60_000, 64 * 1024);
+    assert_ne!(
+        typed, decided,
+        "the control: the re-read says other figures"
+    );
+    assert_eq!(
+        answer(PaceGrant::Room(reread), Some(now)),
+        (PaceGrant::Room(reread), typed.clone())
+    );
+    for read_ms in [now - FACT_FRESH_MS, now + 1_000] {
+        let edge = room(read_ms, 2, Some(25 * 60_000), 64 * 1024);
+        let (pace, line) = answer(PaceGrant::Room(edge), Some(now));
+        assert_eq!(
+            (pace, line.text()),
+            (PaceGrant::Room(edge), typed.text()),
+            "{read_ms}"
+        );
+    }
+
+    let taken = room(now, 0, Some(25 * 60_000), 64 * 1024);
+    let broken = room(now, 1, None, 64 * 1024);
+    let short = OccupancyReading {
+        room: Some(false),
+        ..reread
+    };
+    let full = OccupancyReading {
+        disk: Some(crate::harness::disk::Level::Low),
+        ..reread
+    };
+    for unmet in [taken, broken, short, full] {
+        assert_eq!(
+            answer(PaceGrant::Room(unmet), Some(now)),
+            (PaceGrant::Unmet, decided.clone()),
+            "{unmet:?}"
+        );
+    }
+
+    let old = room(now - FACT_FRESH_MS - 1, 2, Some(25 * 60_000), 64 * 1024);
+    let stale = OccupancyReading {
+        stale: true,
+        ..reread
+    };
+    for (pace, at_ms) in [
+        (PaceGrant::Room(old), Some(now)),
+        (PaceGrant::Room(stale), Some(now)),
+        (PaceGrant::Room(reread), None),
+        (PaceGrant::Local, Some(now)),
+    ] {
+        assert_eq!(
+            answer(pace, at_ms),
+            (PaceGrant::Stale, decided.clone()),
+            "{pace:?} at {at_ms:?}"
+        );
+    }
+
+    for pace in [
+        PaceGrant::Granted,
+        PaceGrant::Machine,
+        PaceGrant::Reserved,
+        PaceGrant::Stale,
+        PaceGrant::Unmet,
+        PaceGrant::Refused(PaceRefusal::Owns),
+    ] {
+        assert_eq!(answer(pace, Some(now)), (pace, decided.clone()), "{pace:?}");
+    }
 }
 
 #[test]

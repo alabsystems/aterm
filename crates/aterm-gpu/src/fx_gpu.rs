@@ -13,7 +13,8 @@ use aterm_render::{FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, GlowQuad};
 pub(crate) struct FxInstance {
     /// The slice: x, y, w, h in window pixels.
     pub(crate) rect: [u16; 4],
-    /// The item's window-pixel origin `O` modulo 2¹⁶ (the module header).
+    /// The item's window-pixel origin `O` modulo 2¹⁶: the fragment stage needs only the
+    /// item-local pixel `(p − O) mod 2¹⁶` (`fx_local`).
     pub(crate) origin: [i16; 2],
     /// A sprite's destination size `(dw, dh)`.
     pub(crate) dst: [u16; 2],

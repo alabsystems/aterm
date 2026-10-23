@@ -688,7 +688,11 @@ impl AwaitSys {
     /// Parse the arguments after `await` (`sys <predicate> …`).
     ///
     /// # Errors
-    /// The reply refusing it.
+    ///
+    /// The reply refusing it: [`USAGE`], [`MIXED`], `ERR usage: <word> is a
+    /// class; …` for a class given as a job's verdict, or `ERR unavailable
+    /// <metric> why=not_sampled` for `eta`, `growth` or `walk`, which this
+    /// build does not measure.
     pub fn parse(rest: &str) -> Result<Parsed, String> {
         let mut toks = rest.split_whitespace().peekable();
         if toks.next() != Some("sys") {

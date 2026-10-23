@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's handoff fixtures ([`crate::fixtures`]): staged once per reserved identity by
-//! the generator (a fake runner here), refused when it refuses or leaves a required desk out,
-//! and landed on origin/main with their `PINNED_DESKS` rows by a compare-and-swap push. Real
-//! git against a local bare origin; a rival's push between fetch and push makes the race
-//! deterministic.
+//! Handoff fixture staging and landing integration tests.
 
 use aterm_uds::spawnfd::Command;
 use std::cell::{Cell, RefCell};
@@ -22,10 +18,8 @@ const GUARD: &str = "// the guard\nconst PINNED_DESKS: &[(&str, &str)] = &[\n   
 
 const RELEASE: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
-/// The shipped-state corpus's header, as the serde corpus writes it (four comment lines).
 const HEADER: &str = "# serde corpus `shipped-state`: one case per line.\n# ok: the value.\n# escapes.\n# FNV-1a digest and length.\n";
 
-/// Main's shipped-state corpus: v0.5.0's one desk, then the negative control.
 fn corpus() -> String {
     format!(
         "{HEADER}v0.5.0/history/manifest\tok\tfnv1a64:5 len=5\n\
@@ -66,8 +60,6 @@ fn identity(repo: &Path) {
     );
 }
 
-/// A bare origin whose main holds the guard and v0.5.0's one desk; the cut tree
-/// (`work`) and a rival clone of it.
 struct Origin {
     dir: aterm_tempfile::TempDir,
     work: PathBuf,
@@ -107,7 +99,6 @@ impl Origin {
         self.dir.path().join("cache/handoff-fixtures")
     }
 
-    /// `origin/main:<path>` as the bare origin holds it.
     fn on_main(&self, path: &str) -> Vec<u8> {
         crate::ledger::testing::git()
             .current_dir(self.dir.path().join("origin.git"))
@@ -129,7 +120,6 @@ fn env_of(cmd: &Command, key: &str) -> Option<String> {
         .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
 }
 
-/// The generator's tests as libtest reports them, both passing.
 fn passed() -> String {
     format!(
         "test result: ok. {} passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n",
@@ -137,8 +127,6 @@ fn passed() -> String {
     )
 }
 
-/// The shipped-state answers the generator writes for `desks`: main's corpus as the cut's
-/// tree reads it, with v0.6.0's cases after v0.5.0's.
 fn staged_answers(desks: &[&str]) -> String {
     let cases: String = desks
         .iter()
@@ -147,8 +135,6 @@ fn staged_answers(desks: &[&str]) -> String {
     corpus().replacen("negative-control/", &format!("{cases}negative-control/"), 1)
 }
 
-/// A runner that does what the generator does: the desks `desks`, the rendezvous record and
-/// the shipped-state answers, each written as the pins in its environment say.
 fn generator<'a>(
     desks: &'a [&'a str],
     runs: &'a Cell<usize>,
@@ -209,11 +195,9 @@ fn the_generator_runs_once_per_reserved_identity() {
     assert!(first.fresh && first.rendezvous, "{first:?}");
     assert_eq!(first.desks, ["history"]);
     assert_eq!(first.dir, pins(7).staged_in(&root).join("v0.6.0"));
-    // staged: a re-run runs nothing
     let again = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut run).unwrap();
     assert!(!again.fresh);
     assert_eq!(runs.get(), 1);
-    // a reservation passed and reserved anew: written afresh, the old one gone
     let next = fixtures::stage(Path::new("targo"), &o.work, &root, &pins(8), &mut run).unwrap();
     assert!(next.fresh);
     assert_eq!(runs.get(), 2);
@@ -247,7 +231,6 @@ fn a_generator_that_refuses_or_leaves_a_required_desk_out_stages_nothing() {
     fixtures::stage(Path::new("targo"), &o.work, &root, &pins(7), &mut partial).unwrap_err();
     assert!(fixtures::staged(&root, &pins(7)).is_none());
 
-    // a generator that wrote the desks and no answers for them (an older tree's)
     let mut unanswered = |cmd: &mut Command| {
         let out = generator(&["history"], &runs)(cmd);
         let answers = PathBuf::from(env_of(cmd, fixtures::ANSWERS_OUT).unwrap());
@@ -294,8 +277,6 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
     };
     assert_eq!(*attempt, 1);
     assert_eq!(*answers, Answers::Recorded(2));
-    // the release's cases recorded where main's sweep reads them: after v0.5.0's, before the
-    // negative control
     assert_eq!(
         String::from_utf8(o.on_main(fixtures::SHIPPED_STATE_CORPUS)).unwrap(),
         staged_answers(&["history", "twelve-panes"])
@@ -321,7 +302,6 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         ),
         "{guard}"
     );
-    // one commit on the tip, moving nothing but the fixtures, the rows and the answers
     git(&o.work, &["fetch", "-q", "origin", "main"]);
     assert_eq!(
         git(&o.work, &["rev-parse", "origin/main"]).trim(),
@@ -351,7 +331,6 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         Some(vec!["history".to_string(), "twelve-panes".to_string()])
     );
 
-    // already on main: a re-run pushes nothing
     let again = fixtures::land(&work, &staged, &pins(7), 5).unwrap();
     assert!(matches!(again, Landed::Already { .. }), "{again:?}");
     git(&o.work, &["fetch", "-q", "origin", "main"]);
@@ -361,8 +340,6 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
     );
 }
 
-/// The landing's runner, with a rival's push to main landed between its fetch and
-/// its first push: the race window, made deterministic.
 struct Raced<'a> {
     inner: Git,
     rival: &'a Path,
@@ -438,8 +415,6 @@ fn the_rows_are_appended_to_the_table_and_a_pinned_release_is_refused() {
     fixtures::with_pinned_rows(&out, "0.6.0", &["history".to_string()]).unwrap_err();
 }
 
-/// A tip that holds the release's directory without its rows is someone's half-done
-/// landing: never overwritten, named.
 #[test]
 fn a_fixture_directory_on_main_the_gate_refuses_is_never_overwritten() {
     let o = Origin::new();
@@ -468,9 +443,6 @@ fn a_fixture_directory_on_main_the_gate_refuses_is_never_overwritten() {
     );
 }
 
-/// The release's cases go after the case they follow in the cut's answers, found by its id in
-/// main's corpus, so an answer main re-recorded since the cut stays as main holds it; a corpus
-/// that cannot take them, or answers that are not one block after a line, are named.
 #[test]
 fn the_release_answers_go_after_the_case_they_follow_and_a_corpus_that_cannot_take_them_is_named() {
     let staged = staged_answers(&["history", "twelve-panes"]);
@@ -506,9 +478,6 @@ fn the_release_answers_go_after_the_case_they_follow_and_a_corpus_that_cannot_ta
     assert!(refused(&corpus(), &first).contains("before the file's header"));
 }
 
-/// A tip whose corpus cannot take the release's answers (here it lost the case they follow)
-/// still gets the desks and their rows: the commit leaves the corpus as main holds it, and
-/// the landing says the answers are not recorded.
 #[test]
 fn a_landing_whose_corpus_cannot_take_the_answers_lands_the_desks_and_says_so() {
     let o = Origin::new();

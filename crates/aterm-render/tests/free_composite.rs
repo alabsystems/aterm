@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Free-floating overlay layer, CPU side (FREE_OVERLAY_LAYER_DESIGN.md §3.2.2/§5). The
-// shared `composite_free` phase runner (A bg → B1 legacy per-row sprites → B2 under-text
-// free sprites → C fg) runs on both the damaged (`render_core`) and full (`full_render`)
-// paths; over-text free sprites stamp last before the cursor (the GPU `FreeOver` slot).
-// Pinned: a free rect spanning >= 3 row bands equals its legacy per-row `cat_quads` slices
-// on both paths (§5.2); moved sprites, including signed off-grid origins spilling into the
-// pad strips, leave cached == fresh (§5.5); a settled translucent sprite is never
-// double-stamped when a row repaints; z order (§5.6).
+
+//! CPU free-floating overlay layer compositing tests.
 
 use std::sync::Arc;
 
@@ -24,8 +17,6 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// A patterned RGBA atlas tall enough to span several row bands: distinct per-texel colours
-/// (a wrong NEAREST index shows) and mixed alpha below the top strip.
 fn free_atlas(version: u64) -> SceneAtlas {
     let (w, h) = (64u32, 128u32);
     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -52,7 +43,6 @@ fn free_atlas(version: u64) -> SceneAtlas {
     }
 }
 
-/// A NEAREST 1:1 free sprite (`aw/ah == w/h`), under text, with a signed dest origin.
 fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
     let [ax, ay] = src_xy;
     FreeSprite {
@@ -72,8 +62,6 @@ fn free_1to1(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2]) -> FreeSprite {
     }
 }
 
-/// The legacy emission of the same art: one `SpriteQuad` per row band the rect overlaps,
-/// each sub-windowing the same atlas region.
 fn legacy_slices(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], ch: usize) -> Vec<SpriteQuad> {
     let [ax, ay] = src_xy;
     let (y0, y1) = (y as usize, y as usize + h as usize);
@@ -99,20 +87,15 @@ fn legacy_slices(x: i32, y: i32, w: u16, h: u16, src_xy: [u16; 2], ch: usize) ->
     slices
 }
 
-/// §5.2: a >= 3-band free rect equals the legacy per-row slices byte for byte, on the full
-/// path (`render_input`) and the damaged path (`render_input_cached` after priming at
-/// another position, so every prev∪cur band repaints through the same phase runner).
 #[test]
 fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
     let mut rend = renderer();
     let (_, ch) = rend.cell_size();
     let (rows, cols) = (6usize, 12usize);
-    // Glyph-free terminal: the comparison is sprite-only.
     let mut term = Terminal::new(rows as u16, cols as u16);
     term.process(b"\x1b[?25l");
     let atlas = Arc::new(free_atlas(1));
 
-    // Sub-cell origin mid-band of row 1, spanning into band 3 (>= 2 crossings).
     let (x, w) = (4i32, 40u16);
     let h = (2 * ch + ch / 2) as u16;
     let (y_a, y_b) = ((ch + ch / 2) as i32, (2 * ch + ch / 2) as i32);
@@ -135,7 +118,6 @@ fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
         input
     };
 
-    // Full path: identical, and non-vacuous.
     let base = rend
         .render_input(&term.cell_frame(rows, cols))
         .pixels
@@ -155,7 +137,6 @@ fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
          slices byte-for-byte on the CPU (NEAREST 1:1 has no seam)"
     );
 
-    // Damaged path: prime each cache at y_a, then move to y_b.
     let mut wc_free = WindowCpu::new();
     let mut wc_legacy = WindowCpu::new();
     let _ = rend.render_input_cached(&mut wc_free, &make_free(&mut term, y_a));
@@ -180,9 +161,6 @@ fn free_multirow_rect_matches_legacy_perrow_slices_on_both_paths() {
     );
 }
 
-/// §5.5: with a non-zero pad, a sprite peeking in above the grid, moving on-grid with a
-/// negative x, rising from below the bottom edge, then gone: every cached repaint equals a
-/// fresh full render (vacated bands and pad strips are re-cleared).
 #[test]
 fn free_no_ghosting_cached_equals_fresh_including_off_grid_pad_spill() {
     let mut rend = renderer();
@@ -230,9 +208,6 @@ fn free_no_ghosting_cached_equals_fresh_including_off_grid_pad_spill() {
     }
 }
 
-/// A settled translucent multi-row sprite is never double-stamped: a text edit in a row it
-/// does not overlap leaves it untouched, and one in a row it overlaps restamps only that
-/// band's slice. Both cached frames equal a fresh full render.
 #[test]
 fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
     let mut rend = renderer();
@@ -243,7 +218,6 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
     term.process(b"\x1b[3;1Hmiddle row");
 
     let atlas = Arc::new(free_atlas(5));
-    // Translucent (alpha 140) rect over bands 1..=3 — double-stamping is visible.
     let sprite = FreeSprite {
         alpha: 140,
         ..free_1to1(6, (ch + ch / 2) as i32, 48, (2 * ch) as u16, [1, 2])
@@ -258,7 +232,6 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
     let mut wc = WindowCpu::new();
     let _ = rend.render_input_cached(&mut wc, &make(&mut term));
 
-    // (a) Text edit in row 5 — far below the sprite's bands.
     term.process(b"\x1b[6;1Hunrelated edit");
     let in_a = make(&mut term);
     let cached_a = rend.render_input_cached(&mut wc, &in_a).pixels().to_vec();
@@ -269,7 +242,6 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
          the settled sprite"
     );
 
-    // (b) Text edit in row 3 — a band the sprite overlaps.
     term.process(b"\x1b[3;1Hburrowed row");
     let in_b = make(&mut term);
     let cached_b = rend.render_input_cached(&mut wc, &in_b).pixels().to_vec();
@@ -281,9 +253,6 @@ fn settled_translucent_sprite_survives_text_edits_without_double_stamp() {
     );
 }
 
-/// §5.6 z order: an `UnderText` sprite sits under glyphs (a full block stays pure fg) but
-/// over a legacy cat quad (B1 then B2); an `OverText` sprite draws over everything except
-/// the cursor: glyphs, a wdeco `Over` stamp and the additive glow/nova light.
 #[test]
 fn free_z_under_text_over_legacy_and_over_text() {
     let mut rend = renderer();
@@ -300,8 +269,6 @@ fn free_z_under_text_over_legacy_and_over_text() {
     };
     let red = 0x00C8_2020u32;
 
-    // A multi-row red free sprite over cells (0,0)..(1,1); a blue cat quad under it at
-    // row 0, cell 1.
     let mut input = term.cell_frame(rows, cols);
     input.free_atlas = Some(Arc::new(solid([0xC8, 0x20, 0x20, 255], 1)));
     input.free_sprites = vec![FreeSprite {
@@ -349,12 +316,10 @@ fn free_z_under_text_over_legacy_and_over_text() {
         "the sprite's second band must not be clobbered by that row's bg"
     );
 
-    // OverText: the same sprite in the over-text slot.
     let mut input_over = input.clone();
     input_over.cat_quads.clear();
     input_over.cat_atlas = None;
     input_over.free_sprites[0].z = FreeZ::OverText;
-    // A wdeco stamp plus glow and nova light under the sprite's footprint.
     input_over.word_decorations.push(WordDecoration {
         row: 0,
         col: 1,
@@ -372,7 +337,6 @@ fn free_z_under_text_over_legacy_and_over_text() {
         w: (2 * cw) as u16,
         h: ch as u16,
         color: premul_rgb(0x0040_80FF, 200),
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: premul_rgb(0x0040_80FF, 200),
         alpha2: 0,
@@ -384,12 +348,10 @@ fn free_z_under_text_over_legacy_and_over_text() {
         w: cw as u16,
         h: ch as u16,
         color: premul_rgb(0x00FF_C040, 200),
-        // Additive light (see `GlowQuad::alpha`).
         alpha: 0,
         color2: premul_rgb(0x00FF_C040, 200),
         alpha2: 0,
     });
-    // Non-vacuity: without the sprite, the stamp and the light paint.
     let mut input_bare = input_over.clone();
     input_bare.free_sprites.clear();
     input_bare.free_atlas = None;

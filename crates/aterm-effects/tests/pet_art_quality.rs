@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pet roster's art gate, the twin of `cat_art_quality.rs` for the full-body
-//! companion under `art/pet/`.
-//!
-//! The renderer swaps poses in place at gait rate, so the checks are mostly that
-//! the roster is internally consistent, plus the pipeline's two silent traps: the
-//! codegen's `quant` clamps coordinates outside the viewbox, and a mismatched
-//! viewbox or anchor jolts the cat between frames.
+//! Geometry, viewbox, ground-line, and silhouette checks for the full-body pet poses under `art/pet/`.
 
 use std::path::{Path, PathBuf};
 
@@ -17,19 +11,10 @@ use aterm_effects::pet_baker::{MOUTH_DETAIL_MIN_H, PetBakeKey, PetBaker};
 use aterm_effects::pet_glyphs_gen::PetGlyphId;
 use aterm_scene::{PathCmd, Tile, parse_path};
 
-/// Authored viewbox shared by every pose.
 const VIEWBOX: (f32, f32) = (244.0, 148.0);
-/// Where the lowest ink of a planted pose lands (`examples/art_rig.rs`: `pet::rig::GROUND_INK`).
 const GROUND_INK: f32 = 143.0;
-/// How far a pose's lowest ink may sit from the ground line and still count as
-/// planted: one outline width.
 const PLANT_TOL: f32 = 4.5;
-/// Poses that are off the floor, listed rather than derived so the test checks the
-/// authored data independently. Not `pet_leap`: the brain arcs a pounce with
-/// [`aterm_effects::kitty_pet::PetFrame::lift`], which starts and ends at zero. A
-/// gallop gets no lift from the brain, so its suspension frames carry their own;
-/// the rise/descend frames are mid-arc and the hop's tuck mid-flight. Not
-/// `pet_launch` or `pet_skid`, which are planted within the tolerance.
+/// Poses authored above `GROUND_INK` rather than planted on the baseline.
 const AIRBORNE: &[&str] = &[
     "pet_apex",
     "pet_hop",
@@ -37,7 +22,6 @@ const AIRBORNE: &[&str] = &[
     "pet_leap_rise",
     "pet_run_1",
     "pet_run_3",
-    // The dog roster re-skins the same pose sheet (`examples/art_rig.rs`: `pet::poses`).
     "pet_dog_apex",
     "pet_dog_hop",
     "pet_dog_leap_descend",
@@ -96,7 +80,6 @@ fn num(v: &aterm_toml::Value) -> f32 {
         .unwrap_or(f32::NAN)
 }
 
-/// The ink bounding box of every parsed command of every layer.
 fn parsed(p: &Pose) -> (f32, f32, f32, f32) {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for layer in layers(p) {
@@ -126,8 +109,6 @@ fn parsed(p: &Pose) -> (f32, f32, f32, f32) {
     (x0, y0, x1, y1)
 }
 
-/// The renderer swaps poses in place, so they share one box and anchor set or the
-/// cat jolts.
 #[test]
 fn every_pose_shares_one_viewbox_and_one_anchor_set() {
     for p in poses() {
@@ -165,8 +146,7 @@ fn every_pose_shares_one_viewbox_and_one_anchor_set() {
     }
 }
 
-/// The codegen (`cat_glyphs_codegen::quant`) clamps out-of-viewbox coordinates to
-/// the edge without a diagnostic, deforming the art.
+/// Ensures no control point falls outside `VIEWBOX`, where `cat_glyphs_codegen::quant` would clamp it.
 #[test]
 fn no_pose_escapes_its_viewbox() {
     for p in poses() {
@@ -180,8 +160,6 @@ fn no_pose_escapes_its_viewbox() {
     }
 }
 
-/// The emitter stands the sprite's bottom edge on the row's baseline, so planted
-/// poses share one ground line or the settle chain sinks and pops as it plays.
 #[test]
 fn every_planted_pose_stands_on_one_ground_line() {
     for p in poses() {
@@ -203,8 +181,6 @@ fn every_planted_pose_stands_on_one_ground_line() {
     }
 }
 
-/// Bake one pose through the real path on the dark ground band, the gallery's
-/// reference coat and iris.
 fn bake_dark(pose: PetGlyphId, h: u32) -> Tile {
     bake_ground(pose, h, 0)
 }
@@ -225,7 +201,6 @@ fn bake_ground(pose: PetGlyphId, h: u32, background: u8) -> Tile {
     .bake()
 }
 
-/// Opaque pixels of `tile` that satisfy `pred` on their RGB.
 fn count_px(tile: &Tile, pred: impl Fn(u8, u8, u8) -> bool) -> usize {
     tile.pixels()
         .as_chunks::<4>()
@@ -235,23 +210,17 @@ fn count_px(tile: &Tile, pred: impl Fn(u8, u8, u8) -> bool) -> usize {
         .count()
 }
 
-/// The nose's rose: warm, red-led, well clear of the coat's browns.
 fn rose(tile: &Tile) -> usize {
     count_px(tile, |r, g, b| r > 180 && g < 150 && b < 170)
 }
 
-/// Near-black ink: eyes, nose button, mouth. On the dark ground the outline is
-/// pale, so this is face ink only.
 fn ink(tile: &Tile) -> usize {
     count_px(tile, |r, g, b| {
         (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000 < 70
     })
 }
 
-/// The yawn's gape survives the ship tile. `pet_baker` culls the `mouth` role below
-/// [`MOUTH_DETAIL_MIN_H`] (40 px) and the ship bake is 34 px, so the rig
-/// (`examples/art_rig.rs`: `nose_paths`) paints the gape again in the never-culled `nose`
-/// layer. The purr (same seat and eyes) is the control.
+/// Verifies that the yawn gape remains visible below [`MOUTH_DETAIL_MIN_H`] via the uncullable `nose` layer.
 #[test]
 fn a_yawn_keeps_its_gape_below_the_mouth_cull() {
     let ship = (ART_ROWS * 20.0).round() as u32;
@@ -271,7 +240,6 @@ fn a_yawn_keeps_its_gape_below_the_mouth_cull() {
         dog >= 4,
         "at {ship} px the dog's yawn must carry a dark gape the purr lacks (measured +{dog} px)"
     );
-    // Above the cull the mouth role is back and the gape is dark ink.
     let big = ship * 2;
     assert!(big >= MOUTH_DETAIL_MIN_H);
     let over = ink(&bake_dark(PetGlyphId::PetYawn, big)) as i64
@@ -282,14 +250,9 @@ fn a_yawn_keeps_its_gape_below_the_mouth_cull() {
     );
 }
 
-/// The gait's vertical lives in the art, not in `PetFrame::lift`: the host lands
-/// lift through `body_px`'s `(lift·cell_h).round()`, a whole-pixel quantiser that
-/// zeroes a small bob at small cells, while `examples/art_rig.rs`'s `registration` plants
-/// a pose by its lowest ink minus `airborne`, so art clearance arrives sub-pixel.
-/// Rule: every airborne frame clears a whole pixel at every reviewed cell height.
+/// Verifies that every airborne frame clears at least 1 pixel above `GROUND_INK` at reviewed cell heights.
 #[test]
 fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
-    // The cell heights `docs/CAT_ART.md` reviews at, plus the 20 px ship cell.
     for cell_h in [16.0f32, 20.0, 24.0, 32.0] {
         let px_per_unit = ART_ROWS * cell_h / VIEWBOX.1;
         for p in poses() {
@@ -308,8 +271,6 @@ fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
             );
         }
     }
-    // The gallop's suspension frames clear the ground visibly at the 20 px ship
-    // cell, or the cycle reads as a shuffle.
     let ship = ART_ROWS * 20.0 / VIEWBOX.1;
     for id in ["pet_run_1", "pet_run_3", "pet_dog_run_1", "pet_dog_run_3"] {
         let p = poses()
@@ -326,9 +287,6 @@ fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
     }
 }
 
-/// Contact beats change the body contour at terminal sizes, against the pose each
-/// replaces and between the paired reach/withdraw and perch/lean beats, for both
-/// species; a change only to a mouth culled by LOD would not count.
 #[test]
 fn contact_beats_have_distinct_silhouettes_at_terminal_sizes() {
     use PetGlyphId::*;
@@ -375,15 +333,12 @@ fn contact_beats_have_distinct_silhouettes_at_terminal_sizes() {
                     "{pose:?} vs {prior:?} at {h}px, ground {background}: only \
                      {difference} changed silhouette pixels; the contact beat disappeared"
                 );
-                // Negative control: the prior pose against itself.
                 assert_eq!(changed_silhouette(&old, &old), 0);
             }
         }
     }
 }
 
-/// Reading moves the head and keeps the body still, checked on the registered asset
-/// strings so a change to registration or the Python sheet cannot move the body.
 #[test]
 fn reading_gaze_keeps_the_perch_body_geometry_fixed() {
     fn role_paths<'a>(p: &'a Pose, role: &str) -> Vec<&'a str> {
@@ -404,9 +359,6 @@ fn reading_gaze_keeps_the_perch_body_geometry_fixed() {
             .into_iter()
             .flat_map(|role| {
                 let paths = role_paths(p, role);
-                // The edge rig paints tail, far foreleg, haunch, torso, near
-                // foreleg, two ears, skull; pinning the count keeps an omitted
-                // limb from making the prefix compare vacuous.
                 assert_eq!(paths.len(), 8, "{}: {role} part count", p.id);
                 paths.into_iter().take(5)
             })
@@ -442,7 +394,6 @@ fn reading_gaze_keeps_the_perch_body_geometry_fixed() {
                 gaze.id
             );
         }
-        // Negative control: a forward lean moves the shoulder and supporting paw.
         assert_ne!(body(get("edge_lean")), body(perch));
     }
 }

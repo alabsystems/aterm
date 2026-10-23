@@ -38,7 +38,6 @@ fn jump_spawns_light_and_fades_to_empty() {
     assert!(!out.is_empty());
     assert!(glow.is_active());
     assert_invariants(&out, g);
-    // Past the duration + ring + crown windows → fully empty, idle.
     let gone = glow.tick(
         Some((2, 30)),
         t0 + Duration::from_millis(600),
@@ -51,10 +50,7 @@ fn jump_spawns_light_and_fades_to_empty() {
     assert!(!glow.is_active());
 }
 
-/// Typing continuity: single-cell advances at a 300 ms cadence chain, so
-/// mid-gap the glow is still emitting and active; the streak never goes dark
-/// between keys, and the renderer's SDR attack envelope does not reset per
-/// key.
+/// Single-cell advances at a 300 ms cadence chain without going dark mid-gap.
 #[test]
 fn typing_chain_never_goes_dark() {
     let mut glow = CursorGlow::default();
@@ -63,14 +59,11 @@ fn typing_chain_never_goes_dark() {
     let c = cfg(GlowStyle::Lumen, true);
     let g = geom();
     glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed position
-    // Three keystroke advances 300ms apart (keys at +0.3s, +0.6s, +0.9s).
     for k in 1..=3u64 {
         let at = t0 + Duration::from_millis(300 * k);
         glow.note_synthetic_typed(at, 1);
         glow.tick(Some((2, k as u16)), at, &c, g, &mut out);
     }
-    // Mid-gap probe, 280 ms after the third key: the chained spark
-    // (gap+margin = 400 ms) and the 350 ms typing crown still shine.
     let fp = glow.tick(
         Some((2, 3)),
         t0 + Duration::from_millis(300 * 3 + 280),
@@ -86,10 +79,7 @@ fn typing_chain_never_goes_dark() {
     assert_invariants(&out, g);
 }
 
-/// ConPTY hide-bridge law: conhost hides the cursor for ~20-35 ms on every
-/// keystroke echo (hide → advance → show). A presented hidden frame between
-/// two adjacent positions must not eat the spark: the glow bridges the hide
-/// and spawns from the last visible cell.
+/// ConPTY hide-bridge law: a brief hidden frame during keystroke echo still spawns the spark.
 #[test]
 fn conpty_hide_gap_still_spawns_the_typing_spark() {
     let mut glow = CursorGlow::default();
@@ -98,9 +88,7 @@ fn conpty_hide_gap_still_spawns_the_typing_spark() {
     let c = cfg(GlowStyle::Lumen, true);
     let g = geom();
     glow.tick(Some((2, 5)), t0, &c, g, &mut out); // visible at col 5
-    // ConPTY echo choreography: a ~30 ms hidden frame presents…
     glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
-    // …then the cursor reappears one cell right (the echoed character).
     glow.note_synthetic_typed(t0 + Duration::from_millis(30), 1);
     let fp = glow.tick(
         Some((2, 6)),
@@ -115,8 +103,7 @@ fn conpty_hide_gap_still_spawns_the_typing_spark() {
     );
 }
 
-/// The bridge is conservative: a far teleport mid-hide (a full-screen app
-/// repainting with the cursor hidden) spawns nothing.
+/// A far teleport or long hide suppresses the hide bridge.
 #[test]
 fn hidden_far_teleport_stays_suppressed() {
     let mut glow = CursorGlow::default();
@@ -126,7 +113,6 @@ fn hidden_far_teleport_stays_suppressed() {
     let g = geom();
     glow.tick(Some((2, 5)), t0, &c, g, &mut out);
     glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
-    // Reappears far away (row 5, col 30): not a typing move, so no spark.
     let fp = glow.tick(
         Some((5, 30)),
         t0 + Duration::from_millis(45),
@@ -136,7 +122,6 @@ fn hidden_far_teleport_stays_suppressed() {
     );
     assert_eq!(fp, 0, "a far teleport out of a hide must not spawn");
     assert!(out.is_empty());
-    // A long hide (alt-screen app) suppresses even an adjacent reappear.
     let mut glow2 = CursorGlow::default();
     glow2.tick(Some((2, 5)), t0, &c, g, &mut out);
     glow2.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
@@ -162,9 +147,6 @@ fn every_style_keeps_the_invariants() {
         GlowStyle::Laser,
         GlowStyle::Beam,
         GlowStyle::Water,
-        // Classic emits through the same `push_fx_rect` / `comet_glow_quads`
-        // seams but via its own engine, so it is checked here for the same
-        // single-cell-row banding and effects-box clamp.
         GlowStyle::Classic,
     ] {
         let mut glow = CursorGlow::default();
@@ -172,7 +154,6 @@ fn every_style_keeps_the_invariants() {
         let mut out = Vec::new();
         let c = cfg(style, true);
         glow.tick(Some((3, 5)), t0, &c, g, &mut out);
-        // A big multi-row jump exercises comet + crown + ring + particles.
         glow.note_synthetic_move(t0);
         glow.tick(Some((1, 38)), t0, &c, g, &mut out);
         assert!(
@@ -193,10 +174,6 @@ fn every_style_keeps_the_invariants() {
     }
 }
 
-// ---- the classic wake at the host seam ---------------------------------
-
-/// A classic jump at `(2, 4) → (4, 34)` from `t0`, asserting it lit (the
-/// non-vacuity control for the settle tests below).
 fn classic_jump(glow: &mut CursorGlow, t0: Instant, g: Geom, out: &mut Vec<GlowQuad>) {
     let c = cfg(GlowStyle::Classic, true);
     glow.tick(Some((2, 4)), t0, &c, g, out);
@@ -205,12 +182,8 @@ fn classic_jump(glow: &mut CursorGlow, t0: Instant, g: Geom, out: &mut Vec<GlowQ
     assert!(glow.is_active(), "fixture: classic light is live");
 }
 
-/// The classic engine decays only in its own tick, so whatever takes the
-/// frame from it (another style, the master switch) must settle it: past
-/// every classic lifetime the engine is idle and asks the host for nothing,
-/// and the first tick back in Classic with the caret moved draws no comet
-/// from where the caret stood. Three orders: a session that starts in
-/// Classic, Lumen → Classic → Lumen, and the master switch.
+/// Classic light settles when another style or the master switch takes the frame,
+/// and the first tick back in Classic only re-observes the caret.
 #[test]
 fn classic_settles_when_another_style_or_the_master_switch_takes_the_frame() {
     let g = geom();
@@ -258,12 +231,7 @@ fn classic_settles_when_another_style_or_the_master_switch_takes_the_frame() {
     }
 }
 
-/// The mirror: light another style left on glass when classic takes the
-/// frame decays only in that style's own tick, so classic must settle it, or
-/// it holds the host awake (and `trail status` counts its frozen sparks) for
-/// as long as classic draws. Every engine family, each lit before the switch
-/// (the fixture's control); past every lifetime in classic with the caret
-/// still, nothing is live.
+/// Light left by another style settles when Classic takes the frame.
 #[test]
 fn light_another_style_left_settles_when_classic_takes_the_frame() {
     let g = geom();
@@ -311,11 +279,7 @@ fn light_another_style_left_settles_when_classic_takes_the_frame() {
     }
 }
 
-/// While classic draws, this engine's cursor memory follows the caret (as on
-/// the dark path), so the first licensed move back in another style sweeps
-/// from where the caret last stood, not from where it stood before classic.
-/// The control is the same licensed move from the stale cell, which sweeps
-/// from the rows above.
+/// While Classic draws, cursor memory follows the caret so the next style sweeps from its last cell.
 #[test]
 fn a_style_after_classic_sweeps_from_the_caret_classic_last_saw() {
     let g = geom();
@@ -352,9 +316,7 @@ fn a_style_after_classic_sweeps_from_the_caret_classic_last_saw() {
     );
 }
 
-/// While classic light is on glass the host is told: `trail status` counts
-/// its sparks, and the frame train runs until it has decayed (the native
-/// scheduler paces only on `needs_frame_cadence` / `next_change_deadline`).
+/// Classic light reports live sparks and frame cadence until decayed.
 #[test]
 fn classic_light_is_reported_and_paced() {
     let g = geom();
@@ -380,10 +342,7 @@ fn classic_light_is_reported_and_paced() {
     assert_eq!(glow.live_sparks(), 0);
 }
 
-/// On a light ground the classic wake reaches the host as ink in the
-/// under-ink stream and its landing ring as a veil in the halo stream, the
-/// streams the host splices for every style: nothing additive, and a frame of
-/// ink and veils alone still fingerprints so it redraws.
+/// On a light theme, Classic emits under-ink quads and source-over halo veils with a non-zero fingerprint.
 #[test]
 fn classic_on_a_light_ground_reaches_the_host_as_ink_and_veils() {
     let g = geom();
@@ -419,10 +378,7 @@ fn classic_on_a_light_ground_reaches_the_host_as_ink_and_veils() {
     assert_ne!(fp, 0, "a frame of ink and veils fingerprints");
 }
 
-/// The classic wake rides the host's scroll and band-move seams: an Enter at
-/// the bottom of a full screen (the command scrolls up two rows, the caret
-/// lands at the new prompt's start) sweeps the content-true diagonal, not a
-/// comet along the new prompt row. The control is the same move untold.
+/// Classic rides `note_scroll` and `note_band_move` along the content-true diagonal.
 #[test]
 fn classic_rides_note_scroll_and_note_band_move() {
     let g = geom_codex();

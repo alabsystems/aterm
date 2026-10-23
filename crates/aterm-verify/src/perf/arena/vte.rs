@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `vte` lane (ARENA-VTE): vtebench's default suite inside each terminal,
-//! aterm against the pinned ghostty tip, interleaved A/B, on vtebench's own
-//! per-benchmark samples (each is how long one write of the payload blocks on
-//! the PTY). No hyperfine: there is nothing it would time that vtebench does
-//! not.
-//!
-//! Both terminals run one grid: the benchmarks size their payload to it, so a
-//! trial at another grid is another workload and is refused, kept under
-//! `.refused`, and left out of the medians. So is a trial that ran fewer than
-//! every benchmark (vtebench drops one that fails to load without a word).
+//! `vte` arena benchmark lane comparing `aterm` against pinned `ghostty` on `vtebench`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,14 +18,11 @@ use crate::perf::stats::median;
 use crate::perf::trend::utc_date;
 use crate::perf::{LaneRun, arena::Args};
 
-/// The stock benchmarks' tty lookup, and the trimmed one. macOS `ps` pads the
-/// tty column (`ttys003 `), so the stock lookup names no device, the payloads
-/// stop depending on the grid, and two benchmarks come out empty.
+/// The stock benchmarks' tty lookup, and the trimmed one.
 const STOCK_TTY: &str = "tty=\"/dev/$(ps -o tty= -p $$)\"";
 const TRIMMED_TTY: &str = "tty=\"/dev/$(ps -o tty= -p $$ | tr -d ' ')\"";
 
-/// Trim the tty lookup in one benchmark script. `Ok(true)` when it changed,
-/// an error when the script looks its tty up some other way.
+/// Trim the tty lookup in one benchmark script.
 pub(crate) fn trim_tty(text: &str) -> Result<(String, bool), String> {
     let changed = text.contains(STOCK_TTY);
     let out = text.replace(STOCK_TTY, TRIMMED_TTY);
@@ -44,7 +32,7 @@ pub(crate) fn trim_tty(text: &str) -> Result<(String, bool), String> {
     Ok((out, changed))
 }
 
-/// Copy the pinned benchmarks and trim their tty lookup; the number trimmed.
+/// Copy the pinned benchmarks and trim their tty lookup.
 fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, String> {
     let _ = std::fs::remove_dir_all(copy);
     run_ok(command("cp").arg("-R").arg(stock).arg(copy), "cp")?;
@@ -80,7 +68,7 @@ fn benchmark_dirs(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(v)
 }
 
-/// One vtebench `--dat` file: benchmark name -> its samples (`_` is a gap).
+/// One vtebench `--dat` file.
 pub(crate) fn parse_dat(text: &str) -> BTreeMap<String, Vec<f64>> {
     let mut lines = text.lines();
     let names: Vec<&str> = lines
@@ -102,8 +90,7 @@ pub(crate) fn parse_dat(text: &str) -> BTreeMap<String, Vec<f64>> {
     cols
 }
 
-/// Every counted trial's samples pooled per (terminal, benchmark), and each
-/// trial's own median beside them; one ledger row per benchmark.
+/// Every counted trial's samples pooled per `(benchmark, terminal)` pair.
 pub(crate) fn rows(trials: &[(Term, BTreeMap<String, Vec<f64>>)]) -> Vec<String> {
     let mut pooled: BTreeMap<(String, &str), Vec<f64>> = BTreeMap::new();
     let mut per_trial: BTreeMap<(String, &str), Vec<f64>> = BTreeMap::new();
@@ -187,8 +174,6 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let ghostty = ghostty_tip(&pins, args.dmg.as_deref())?;
     let aterm = build_aterm()?;
 
-    // vtebench at the pin, stock, built once — in the arena cache, outside
-    // this workspace, so cargo builds it as the stand-alone package it is.
     let arena = arena_dir()?;
     let pin = &pins.harness.vtebench;
     let vte_dir = arena.join(format!("vtebench-{}", pin.commit));
@@ -229,8 +214,6 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let bench_dir = arena.join(format!("vtebench-{}-benchmarks", pin.commit));
     let trimmed = trimmed_benchmarks(&vte_dir.join("benchmarks"), &bench_dir)?;
     let n_bench = benchmark_dirs(&bench_dir)?.len();
-    // Each benchmark samples for --max-secs after a warmup; twice that plus
-    // 30 s each is the most a trial waits before it is called hung.
     let ceiling = Duration::from_secs(n_bench as u64 * (2 * u64::from(max_secs) + 30));
     eprintln!(
         "vtebench {}: {n_bench} benchmarks ({trimmed} tty lookups trimmed), grid {cols}x{grid_rows}, \
@@ -327,8 +310,7 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     Ok(format!("ledger entry {}", entry.display()))
 }
 
-/// Count a trial only at the asked grid and with every benchmark; a refused
-/// trial's file is kept under `.refused`, out of the medians' reach.
+/// Count a trial only at the asked grid and with every benchmark.
 fn judge_trial(
     report: &str,
     prefix: &Path,

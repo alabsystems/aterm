@@ -277,7 +277,8 @@ fn build_token(build: &str) -> String {
         .collect()
 }
 
-/// `frame` as one line, without its LF.
+/// `frame` as one line, without its LF; `None` for a record over the byte bound (the ring refuses
+/// those) or [`Frame::Unknown`].
 #[must_use]
 pub fn encode_frame(frame: &Frame) -> Option<String> {
     let mut s = String::with_capacity(128);
@@ -682,7 +683,8 @@ pub struct ViewRules {
     pub crash_closes: bool,
     /// Every seq accounted for and not held said as a loss.
     pub say_losses: bool,
-    /// A restatement counts only right after its snap and at or below the snap's head.
+    /// A restatement counts only right after its snap and at or below the snap's head, and never
+    /// toward the journal's head.
     pub restated_heads: bool,
     /// A later snap of the session voids its `#handed`.
     pub snap_voids_handed: bool,
@@ -804,7 +806,6 @@ fn space_numbers(
                         restated,
                     } if s == sid => {
                         if let Some(b) = space {
-                            // Only a row the view admits may distinguish spaces.
                             if *restated
                                 && (!snap_open || (rules.restated_heads && rec.seq > snap_head))
                             {
@@ -880,7 +881,7 @@ fn space_numbers(
     out
 }
 
-/// The view of session `sid` over the chains a read gathered (module docs).
+/// The view of session `sid` over the chains a read gathered.
 #[must_use]
 pub fn view_of(
     sid: &ShortId,
@@ -939,7 +940,6 @@ pub fn view_of(
                             continue;
                         };
                         if *restated {
-                            // A restatement is its snap's alone, as of the
                             if !snap_open || (rules.restated_heads && rec.seq > snap_head) {
                                 continue;
                             }

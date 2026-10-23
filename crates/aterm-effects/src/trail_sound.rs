@@ -1082,7 +1082,8 @@ const fn bed_kick(kind: SoundKind) -> f32 {
     }
 }
 
-/// See the module docs.
+/// The procedural synthesizer: [`push`](Self::push) [`SoundEvent`]s in, and
+/// [`render`](Self::render) interleaved stereo `f32` frames out.
 #[derive(Clone, Debug)]
 pub struct TrailSynth {
     #[cfg(test)]

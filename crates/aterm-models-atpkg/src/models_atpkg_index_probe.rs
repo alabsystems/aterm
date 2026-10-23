@@ -5,11 +5,7 @@
 
 use aterm_spec::derive::*;
 
-/// One GUI index-hint worker takes a network tick before it writes the shared
-/// 30-second cooldown stamp. The next local worker must be paced from that
-/// completion, not its earlier start: otherwise its first due check falls
-/// inside the shared cooldown and the real HEADs run a second interval later.
-/// Tier-1 drives the GUI's owned worker and its completion timestamp.
+/// Paces the next local index-hint worker from the previous probe's shared-stamp completion rather than its start.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_probe_completion_cadence_model() -> Model {
@@ -20,7 +16,6 @@ pub fn atpkg_index_probe_completion_cadence_model() -> Model {
             const MaxAge = 7;
             // 0 idle, 1 network in flight, 2 stamped and waiting, 3 next probe.
             var phase = 0;
-            // Five-second ticks since worker start and shared-stamp completion.
             var start_age = 0;
             var stamp_age = 0;
             var checked_early = 0;
@@ -55,11 +50,7 @@ pub fn atpkg_index_probe_completion_cadence_model() -> Model {
     }
 }
 
-/// A host arriving before another host's shared stamp expires must schedule
-/// its next local look at that expiry. Starting a fresh thirty-second local
-/// interval at the suppressed look can leave every host idle for another
-/// interval after the shared stamp is ready. `Buggy=1` replays that extra wait;
-/// Tier-1 binds the returned remaining duration to both host schedulers.
+/// Schedules the next local index probe at an active shared stamp's remaining expiry instead of starting a fresh local interval.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_shared_handoff_model() -> Model {
@@ -67,10 +58,8 @@ pub fn atpkg_index_shared_handoff_model() -> Model {
         AtpkgIndexSharedHandoff {
             const Buggy = 0;
             const Interval = 6;
-            // Five-second ticks since the prior host completed a HEAD pair.
             var stamp_age = 0;
-            // 0 no stamp, 1 shared stamp live, 2 second host waiting,
-            // 3 shared stamp expired and second host checked.
+            // 0 no stamp, 1 shared stamp live, 2 second host waiting, 3 expired and checked.
             var phase = 0;
             var local_wait = 0;
             var requests = 0;
@@ -101,34 +90,19 @@ pub fn atpkg_index_shared_handoff_model() -> Model {
     }
 }
 
-/// The GUI package lane owns at most one asynchronous index probe across park slices. A
-/// positive HEAD may be offered while the other HEAD is still out, and the final answer cannot
-/// offer that build twice. A vendor completion may be chosen while the probe runs; an index
-/// answer already offered at the decision point wins over the vendor. A vendor answer harvested
-/// in the same slice survives the index, bump or full-pass choice until the next park can
-/// deliver or recheck it. A bump and an expired full-pass deadline win before either hint.
-/// `NextPark` keeps an unfinished worker owned after a targeted pass. A full seed/update pass
-/// invalidates the in-flight final answer without releasing its worker slot; a higher near HEAD
-/// arriving after that pass may wake another signed pass. Thread pressure cannot turn a failed
-/// vendor helper spawn into a blocking GET. Tier 1 drives the real worker handle, package park
-/// and vendor spawn-failure path.
+/// Models single-worker ownership, priority ordering (bump > full-pass > index > vendor), generation invalidation, and non-blocking vendor fallback across GUI package park slices.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_pending_park_model() -> Model {
     aterm_spec::ty_model! {
         AtpkgIndexPendingPark {
             const Buggy = 0;
-            // 0 idle, 1 running, 2 finished but owned, 3 harvested,
-            // 4 an illegal second worker.
+            // 0 idle, 1 running, 2 finished, 3 harvested, 4 illegal second worker.
             var phase = 0;
-            // An actionable published answer is available after either a near
-            // positive or the final harvest.
             var published = 0;
             var near_offered = 0;
-            // A higher near HEAD arrived after the pass began; unlike the
-            // worker's final answer, this is a fresh hint.
             var late_near = 0;
-            // 0 no answer, 1 published, 2 missing. A finished worker stays owned.
+            // 0 no answer, 1 published, 2 missing.
             var answer = 0;
             var pass_generation = 0;
             var probe_generation = 0;
@@ -142,9 +116,6 @@ pub fn atpkg_index_pending_park_model() -> Model {
             var chosen = 0;
             var delivered = 0;
             var skipped_ready_index = 0;
-            // A second start call while one worker is owned is a real, rejected
-            // transition in the GUI. Record that attempt at the committed dial;
-            // the Buggy dial instead admits an illegal second owner.
             var extra_spawn_attempts = 0;
             var lost_vendor = 0;
             var stale_index_chosen = 0;
@@ -282,30 +253,19 @@ pub fn atpkg_index_pending_park_model() -> Model {
     }
 }
 
-/// One `Probe*` action is one locked attempt — the pair of HEADs, `floor + 1` and
-/// `floor + 2` — before its single stamp is written. `age` advances in 30-second ticks
-/// (`atpkg::index_probe::INTERVAL`); a missing pair and a published hint cool for one
-/// tick, an error (the download host's 429 included) for two. A changed durable floor
-/// bypasses an old stamp immediately. Tier-1 drives `atpkg::index_probe::probe_next` and
-/// its real lock/stamp file.
-///
-/// `Buggy = 1` admits a second lock owner and a second attempt inside its cooldown, lengthens
-/// the published cooldown to five minutes and shortens the error cooldown to one tick. Each
-/// invariant has its own counterexample: mutual exclusion alone does not prevent duplicate work
-/// after the first owner releases the lock.
+/// Models single-owner locking, per-outcome cooldown TTLs (1 tick for missing/published, 2 for error), and floor-advance bypass for `atpkg::index_probe::probe_next`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_probe_cooldown_model() -> Model {
     aterm_spec::ty_model! {
         AtpkgIndexProbeCooldown {
             const Buggy = 0;
-            // Saturates past the longest cooldown (an error's two ticks).
             const MaxAge = 3;
-            // 0 unlocked, 1 lock held before stamp decision, 2 decided/written.
+            // 0 unlocked, 1 lock held, 2 decided/written, 3 second owner.
             var phase = 0;
             var floor = 1;
             var stamp_floor = 0;
-            // marker: 0 absent, 1 missing, 2 error, 3 published.
+            // 0 absent, 1 missing, 2 error, 3 published.
             var marker = 0;
             var ttl = 0;
             var age = 3;
@@ -321,8 +281,6 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
             ) {
                 phase = 2;
             }
-            // An owner dying before it writes a stamp releases the OS lock;
-            // the next process may retry because no decision was published.
             action Abort when (phase == 1) {
                 phase = 0;
             }
@@ -391,11 +349,7 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
     }
 }
 
-/// The probe's two HEADs, `floor + 1` (Low) and `floor + 2` (High), are aggregated after both
-/// have had their chance to run. A published higher build wins over an earlier lower one and
-/// over uncertainty; `Missing` only when both HEADs answered missing. `Buggy = 1` takes the
-/// first hit and answers missing over uncertainty. Tier 1 drives
-/// `atpkg::index_probe::successor_with` over real HEAD answers.
+/// Selects the highest published build from the two-HEAD probe (`floor + 1`, `floor + 2`), preferring uncertainty (`Deferred`) over `Missing`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_successor_selection_model() -> Model {
@@ -406,7 +360,7 @@ pub fn atpkg_index_successor_selection_model() -> Model {
             var first = 0;
             var highest = 0;
             var uncertain = 0;
-            // 0 undecided, 1 missing, 2 deferred, 3/5 published ranks (floor+1, floor+2).
+            // 0 undecided, 1 missing, 2 deferred, 3/5 published (floor+1, floor+2).
             var chosen = 0;
 
             action ObserveMissing when (seen <= 1) {
@@ -448,17 +402,13 @@ pub fn atpkg_index_successor_selection_model() -> Model {
     }
 }
 
-/// The GUI keeps the highest index a full pass did not land. A lower hint from an unstamped
-/// near range cannot replay an older pass while the farther range is stamped. The caller's
-/// minute cadence is projected by Tier 1, not modeled. `Buggy = 1` suppresses on equality only
-/// and lowers the mark on a late failed pass.
+/// Tracks the highest unlanded index high-water mark so lower hints cannot replay an older failed pass or downgrade the mark.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn atpkg_index_wake_highwater_model() -> Model {
     aterm_spec::ty_model! {
         AtpkgIndexWakeHighwater {
             const Buggy = 0;
-            // Ranks 1, 2, 3 map to test builds 45, 49, 50.
             var unlanded = 0;
             var wake = 0;
             var replay = 0;

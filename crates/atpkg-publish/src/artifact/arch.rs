@@ -1,13 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The arch gate: a pack's binaries must match its claimed target, read from each one's
-//! own header (ELF `e_machine`, Mach-O thin and fat `cputype`, PE COFF `Machine`).
-//!
-//! [`expect`] is total: [`crate::triple::Triple`] names only targets the client ships. A
-//! `#!` script in a tree is named and not gated; an unreadable object, a format or
-//! architecture mismatch, and a tree with no object are refusals. The reader is
-//! in-process, so no publisher skips the gate for lack of a tool.
+//! The arch gate: verifies that a pack's object binaries match its claimed target
+//! (ELF `e_machine`, Mach-O `cputype`, PE COFF `Machine`).
 
 use std::fmt;
 use std::io::Read as _;
@@ -37,15 +32,14 @@ impl fmt::Display for Format {
     }
 }
 
-/// One architecture an object carries, in `lipo`'s vocabulary. One the reader does not
-/// name keeps what it read, so a refusal still says what the file is.
+/// One architecture an object carries, in `lipo`'s vocabulary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cpu {
     /// x86-64.
     X86_64,
     /// AArch64 (`arm64`, `arm64e`).
     Arm64,
-    /// Anything else, as read (`e_machine=243`, `cputype=7`, `class=1 data=1`).
+    /// Anything else, as read.
     Other(String),
 }
 
@@ -59,8 +53,7 @@ impl fmt::Display for Cpu {
     }
 }
 
-/// What a file's header says it is: its format and every architecture it carries
-/// (more than one only for a fat Mach-O).
+/// Format and architectures read from an object file's header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Object {
     /// The format.
@@ -94,13 +87,10 @@ pub fn expect(triple: Triple) -> (Format, Cpu) {
     (format, cpu)
 }
 
-/// The most a header read needs: a fat Mach-O's 16 slices of 32 bytes after its 8-byte
-/// head, and a PE's 64-byte DOS header.
+/// Maximum bytes needed to read an object header (up to 16 fat Mach-O slices).
 const HEAD: usize = 8 + 16 * 32;
 
-/// Read what `path` is out of its own header. `None` for anything that is not an object
-/// this reader knows: a script, text, an `ar` archive, a Java class, an empty, short,
-/// missing or unreadable file — each of which the gate refuses.
+/// Read `path`'s object format and architectures from its header.
 #[must_use]
 pub fn read(path: &Path) -> Option<Object> {
     let mut f = std::fs::File::open(path).ok()?;
@@ -129,7 +119,6 @@ pub fn read(path: &Path) -> Option<Object> {
 }
 
 fn read_elf(b: &[u8]) -> Object {
-    // Not 64-bit little-endian: never an aterm target, named so the refusal says so.
     let cpu = if b[4] != 2 || b[5] != 1 {
         Cpu::Other(format!("class={} data={}", b[4], b[5]))
     } else {
@@ -155,12 +144,9 @@ fn macho_cpu(cputype: u32) -> Cpu {
     }
 }
 
-/// FAT_MAGIC / FAT_MAGIC_64, big-endian by definition: `nfat_arch` at 4, then one
-/// `fat_arch` (20 bytes) or `fat_arch_64` (32) per slice, each led by its cputype.
 fn read_fat(b: &[u8]) -> Option<Object> {
     let esz = if b[3] == 0xbf { 32 } else { 20 };
     let n = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as usize;
-    // 0xcafebabe is also a Java class file; a sane slice count tells them apart.
     if !(1..=16).contains(&n) || b.len() < 8 + n * esz {
         return None;
     }
@@ -176,7 +162,6 @@ fn read_fat(b: &[u8]) -> Option<Object> {
     })
 }
 
-/// `MZ`, `e_lfanew` (u32 LE at 0x3c) → `PE\0\0`, then the COFF `Machine` u16.
 fn read_pe(f: &mut std::fs::File, b: &[u8]) -> Option<Object> {
     use std::io::{Seek as _, SeekFrom};
     if b.len() < 64 {
@@ -296,8 +281,7 @@ impl From<Refusal> for Error {
     }
 }
 
-/// Every one of `files` must be an object of `triple`'s format and architecture; a fat
-/// Mach-O passes when it carries the claimed slice. Returns how many were read.
+/// Verify that every file in `files` matches `triple`'s format and architecture.
 ///
 /// # Errors
 ///
@@ -341,9 +325,7 @@ pub struct TreeGate {
     pub scripts: Vec<String>,
 }
 
-/// [`gate`] over every regular file under `dir` (no symlink followed), for a pre-built
-/// tree with no `--target` to rely on. A `#!` script is named and not gated; anything else
-/// that is not a readable object is a refusal.
+/// Run [`gate`] over every non-script regular file under `dir`.
 ///
 /// # Errors
 ///

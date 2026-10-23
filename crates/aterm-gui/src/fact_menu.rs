@@ -16,7 +16,7 @@ use crate::claude_lights::{Clock, Fact, FactNotice, GlassAt};
 use crate::claude_slash::Slash;
 use crate::{App, WindowId};
 
-/// An admitted roster label kept with a menu action.
+/// Admitted roster label kept with a menu action.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AccountLabel {
     bytes: [u8; aterm_agent::harness::accounts::LABEL_MAX],
@@ -93,7 +93,7 @@ impl FactAct {
     }
 }
 
-/// One account row in [`Fact::Account`]'s pulldown menu.
+/// Account row in [`Fact::Account`]'s pulldown menu.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccountMenuRow {
     /// The canonical identity, independent of the formatted label and row order.

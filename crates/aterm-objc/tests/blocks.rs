@@ -44,7 +44,8 @@ fn queue() -> *mut c_void {
 fn libdispatch_invokes_an_arity_zero_block() {
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&hits);
-    // SAFETY: `dispatch_sync` calls a `void (^)(void)` block.
+    // SAFETY: `dispatch_sync` calls a `void (^)(void)` block, which is exactly the `Fn() -> ()`
+    // prototype declared here.
     let block = unsafe {
         RcBlock::new0(move || {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -52,7 +53,8 @@ fn libdispatch_invokes_an_arity_zero_block() {
     }
     .expect("_Block_copy produced a heap block");
     let q = queue();
-    // SAFETY: `q` is a live queue and `block` a live heap block of the right signature.
+    // SAFETY: `q` is a live queue and `block` a live heap block of the right
+    // signature; `dispatch_sync` runs it to completion before returning.
     unsafe {
         dispatch_sync(q, block.as_ptr());
         dispatch_sync(q, block.as_ptr());
@@ -65,7 +67,8 @@ fn libdispatch_invokes_an_arity_zero_block() {
 fn libdispatch_invokes_an_arity_one_block_with_its_argument() {
     let sum = Arc::new(AtomicUsize::new(0));
     let acc = Arc::clone(&sum);
-    // SAFETY: `dispatch_apply` calls a `void (^)(size_t)` block.
+    // SAFETY: `dispatch_apply` calls a `void (^)(size_t)` block, the `Fn(usize)` prototype declared
+    // here.
     let block = unsafe {
         RcBlock::new1(move |i: usize| {
             acc.fetch_add(i, Ordering::SeqCst);
@@ -85,9 +88,12 @@ fn libdispatch_invokes_an_arity_one_block_with_its_argument() {
 fn foundation_invokes_an_arity_two_block() {
     let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
-    // SAFETY: prototype matches Foundation's `enumerateLinesUsingBlock:`.
+    // SAFETY: prototype matches Foundation's `enumerateLinesUsingBlock:`, which passes a live
+    // NSString `line` for the call.
     let block = unsafe {
         RcBlock::new2(move |line: Id, _stop: *mut aterm_objc::Bool| {
+            // SAFETY (inherited from the enclosing block): Foundation passes a live, autoreleased
+            // NSString for the duration of the call; the bytes are copied out before returning.
             sink.lock()
                 .expect("uncontended")
                 .push(aterm_objc::ns_string_to_rust(line));
@@ -96,7 +102,8 @@ fn foundation_invokes_an_arity_two_block() {
     .expect("_Block_copy produced a heap block");
 
     let text = ns_string("alpha\nbeta\ngamma").expect("NSString");
-    // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block argument.
+    // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block argument; `text` is a
+    // live NSString.
     unsafe {
         let enumerate: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
         enumerate(text.id(), sel!(enumerateLinesUsingBlock:), block.as_ptr());
@@ -121,7 +128,8 @@ fn a_returning_block_hands_its_value_back() {
         reserved: i32,
         invoke: unsafe extern "C" fn(*mut c_void, Id) -> Id,
     }
-    // SAFETY: the first four fields of every block are fixed ABI.
+    // SAFETY: the first four fields of every block are fixed ABI, and `block` is a live heap
+    // block built with an `id (^)(id)` invoke.
     let out = unsafe {
         let hdr = &*block.as_ptr().cast::<HeaderPrefix>();
         (hdr.invoke)(block.as_ptr(), expect)

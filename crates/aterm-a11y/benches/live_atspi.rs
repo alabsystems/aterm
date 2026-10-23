@@ -30,7 +30,6 @@ mod live {
     };
     use aterm_dbus::{Connection, Kind, Message, Value, address};
 
-    /// A wait for something that must happen: a hang detector, not a budget.
     const HANG: Duration = Duration::from_secs(60);
 
     const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
@@ -157,7 +156,6 @@ mod live {
         .expect("org.a11y.Status.IsEnabled can be set");
     }
 
-    /// `(so)` references.
     fn refs(body: &[Value]) -> Vec<(String, String)> {
         body.first()
             .and_then(Value::as_array)
@@ -176,7 +174,6 @@ mod live {
             .unwrap_or_default()
     }
 
-    /// An assistive technology on the accessibility bus at-spi2-core names now.
     fn at(session: &mut Connection) -> Connection {
         let body = call(
             session,
@@ -198,14 +195,10 @@ mod live {
         conn
     }
 
-    /// The application the registry lists under `name`: its bus name. The
-    /// registry lists an application when it answers its `Embed`, which the
-    /// publisher awaits before it asks a window for its tree.
     fn find(conn: &mut Connection, name: &str) -> String {
         listed(conn, name).unwrap_or_else(|e| panic!("{e}"))
     }
 
-    /// [`find`], or what the registry listed and each application answered.
     fn listed(conn: &mut Connection, name: &str) -> Result<String, String> {
         let apps = call(conn, REGISTRY, ROOT, ACCESSIBLE, "GetChildren", vec![])
             .map_err(|e| format!("the registry's GetChildren: {e}"))?;
@@ -235,7 +228,6 @@ mod live {
         ))
     }
 
-    /// The next signal `member` the publisher at `bus` sends.
     fn signal(conn: &mut Connection, bus: &str, member: &str) -> Message {
         let deadline = Instant::now() + HANG;
         loop {
@@ -251,8 +243,6 @@ mod live {
         }
     }
 
-    /// The accessibility bus's daemon: the `dbus-daemon` this user runs on
-    /// at-spi2-core's `accessibility.conf`.
     fn accessibility_daemon() -> Option<u32> {
         let uid = aterm_dbus::conn::effective_uid();
         std::fs::read_dir("/proc")
@@ -281,7 +271,6 @@ mod live {
         rx.recv_timeout(HANG).expect("the window heard nothing")
     }
 
-    /// Sends `signal` to `pid` with kill(1).
     fn signal_pid(signal: &str, pid: u32) {
         let sent = aterm_uds::spawnfd::command("kill")
             .arg(format!("-{signal}"))
@@ -291,9 +280,6 @@ mod live {
         assert!(sent.success(), "kill -{signal} {pid}");
     }
 
-    /// The accessibility bus's daemon, stopped until this is dropped, however
-    /// the row ends: a daemon left frozen would hold every later client of
-    /// the session's accessibility bus.
     struct Frozen(u32);
 
     impl Frozen {
@@ -312,7 +298,6 @@ mod live {
         }
     }
 
-    /// The desktop's buses with [`SessionBuses`]'s write deadline, or none.
     struct Deadline(Option<Duration>);
 
     impl Buses for Deadline {
@@ -333,15 +318,12 @@ mod live {
         }
     }
 
-    /// `org.a11y.Status.IsEnabled` on for the row's life, put back after.
     struct Enabled {
         session: Connection,
         was: bool,
     }
 
     impl Enabled {
-        /// Or why the session cannot run the row: no session bus, or no
-        /// at-spi2-core on it.
         fn on() -> Result<Enabled, String> {
             let mut session =
                 Connection::session().map_err(|why| format!("a session bus is required: {why}"))?;
@@ -384,13 +366,10 @@ mod live {
         }
     }
 
-    /// The text of the terminal in `name`'s one window, as an AT on the
-    /// accessibility bus at-spi2-core names now reads it.
     fn terminal_text(session: &mut Connection, name: &str) -> Vec<Value> {
         read_text(session, name).unwrap_or_else(|e| panic!("{e}"))
     }
 
-    /// [`terminal_text`], or the step that failed and why.
     fn read_text(session: &mut Connection, name: &str) -> Result<Vec<Value>, String> {
         let mut reader = at(session);
         let app = listed(&mut reader, name)?;
@@ -428,7 +407,6 @@ mod live {
         .map_err(|e| format!("{app}'s text: {e}"))
     }
 
-    /// What one frozen-bus row saw.
     struct Thawed {
         /// The window heard it was let go within the row's `told_within`.
         told: bool,
@@ -440,13 +418,6 @@ mod live {
         changes: usize,
     }
 
-    /// A publisher whose writes wait `write_timeout`, its window published
-    /// and read; then the accessibility bus's daemon frozen while the
-    /// window's text changes `changes` times, or until the window hears it
-    /// was let go (`changes` is `None`). Records whether the window heard
-    /// that within `told_within`, then thaws the daemon and reads the
-    /// window's terminal text as an AT then does. Errs only when the session
-    /// cannot run the row.
     fn frozen_under_changes(
         write_timeout: Option<Duration>,
         changes: Option<usize>,
@@ -551,7 +522,6 @@ mod live {
         ))
     }
 
-    /// The publisher's log, on stderr.
     struct Stderr;
 
     impl aterm_log::Log for Stderr {
@@ -566,7 +536,6 @@ mod live {
         fn flush(&self) {}
     }
 
-    /// Waits until `org.a11y.Bus` leaves its owner `was`.
     fn launcher_gone(session: &mut Connection, was: &str) {
         let deadline = Instant::now() + HANG;
         while owner(session, "org.a11y.Bus") == was {
@@ -576,7 +545,6 @@ mod live {
         }
     }
 
-    /// The unique name that owns `name`, or `""`.
     fn owner(session: &mut Connection, name: &str) -> String {
         call(
             session,

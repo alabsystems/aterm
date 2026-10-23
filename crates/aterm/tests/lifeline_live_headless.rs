@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A headless instance armed with a lifeline ends with the process that started it, and
-//! `aterm doctor` names an instance no control socket reaches.
-//!
-//! Every instance here is the real binary (`launch_isolation::aterm_executable`) under a scratch
-//! world (`support/launch_isolation.rs`) and is itself armed with a lifeline, so a
-//! failing assertion — or this test process being killed — cannot leak one. None
-//! of these tests skips: an instance that does not boot is a failure, with its log.
-//! Every wait is for its causal event (a socket listening, a reply, an exit, a pid
-//! gone); the deadlines are ceilings for a broken build, never what a pass waits on.
+//! Live headless tests for `--lifeline-fd` teardown and `aterm doctor` unreachable-instance reporting.
 
 #![cfg(unix)]
 #![allow(
@@ -24,8 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// The ceiling on any one wait: a debug binary booting on a loaded machine. A met wait ends
-/// at once.
+/// Hang-detector ceiling for waiting on a debug binary.
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(20);
 
@@ -38,8 +29,7 @@ impl Drop for World {
     }
 }
 
-/// A private world for the test tagged `tag` (the tests in this binary run in
-/// parallel): the first temp base whose socket paths fit.
+/// Creates an isolated scratch world for `tag` in the first temp base whose socket paths fit.
 fn world(tag: &str) -> World {
     let name = format!("atll{tag}-{}", std::process::id());
     for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
@@ -72,8 +62,7 @@ fn alive(pid: u32) -> bool {
     delivered || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Wait until `done` holds, polling; panic naming `what` (and `context()`) at the
-/// ceiling.
+/// Polls until `done()` returns true or panics after [`CEILING`].
 fn wait_until(what: &str, mut done: impl FnMut() -> bool, context: impl Fn() -> String) {
     let seen = aterm_spec::wait::within(CEILING, POLL, || done().then_some(()));
     assert!(
@@ -87,9 +76,7 @@ fn read_log(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
 }
 
-/// The headless launch every test here makes, into `root`, its output in `log`.
-/// `sock` is the explicit control socket, or `None` for the per-instance default
-/// (`<root>/run/aterm/aterm-<pid>.sock`).
+/// Builds a headless `aterm` command isolated under `root` logging to `log`.
 fn headless(root: &Path, sock: Option<&Path>, log: &Path) -> Command {
     let out = std::fs::File::create(log).expect("the instance log");
     let err = out.try_clone().expect("the instance log, twice");
@@ -104,17 +91,12 @@ fn headless(root: &Path, sock: Option<&Path>, log: &Path) -> Command {
     cmd
 }
 
-/// Wait for the instance to say its socket LISTENS (`--ready-fd`, armed with
-/// [`headless_boot::arm_ready`]), failing with its log if the instance exits
-/// first or says nothing.
+/// Waits for `child` to signal readiness on `ready` or fails with `log`.
 fn wait_listening(child: &mut Child, ready: &mut aterm_agent::ready::Ready, log: &Path) {
     headless_boot::await_ready(child, |c| c, ready, log, |_| true);
 }
 
-/// One `aterm ctl --sock <sock> <args…>` call, `stdin` piped in; its output.
-/// Asked again, a fresh client each time, while the instance has not yet
-/// accepted it or answers it busy ([`ctl_accept::until_served`]): the client's
-/// own 10 s accept budget is a person's, and a loaded machine can miss it.
+/// Runs `aterm ctl --sock <sock> <args…>` with `stdin` until served.
 fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
     ctl_accept::until_served(|| {
         let mut cmd = Command::new(launch_isolation::aterm_executable());
@@ -127,23 +109,18 @@ fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn aterm ctl");
-        // Written and closed in one statement: the client reads its stdin to the end.
         child
             .stdin
             .take()
             .expect("ctl stdin")
             .write_all(stdin)
             .expect("write ctl stdin");
-        // A hang detector, and a read that ends at the client's exit
-        // (`support/child_output.rs`: a sibling's spawn can hold its pipes open).
         child_output::wait_and_read(child, Instant::now() + Duration::from_secs(60))
             .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
     })
 }
 
-/// While the lifeline is held the instance serves (a shell answers a typed command through
-/// the socket); once it is cut the instance quits the ordinary way: exit 0, its socket file
-/// unlinked by the teardown (the backstop would leave it), and its shell hung up.
+/// A held lifeline keeps the headless instance serving, and dropping it quits cleanly and unlinks the socket.
 #[test]
 fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     let world = world("cut");
@@ -156,7 +133,6 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     let mut instance = Started(cmd.spawn().expect("launch aterm --headless"));
     wait_listening(&mut instance.0, &mut ready, &log);
 
-    // Held: the instance runs a shell and answers through its socket.
     let sent = ctl(&root, &sock, &["send", "--stdin"], b"echo SHPID=$$\n");
     assert!(sent.status.success(), "send: {sent:?}");
     let matched = ctl(
@@ -183,7 +159,6 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     );
     assert!(alive(shell), "the shell {shell} is running while held");
 
-    // Cut: the ordinary quit, not the backstop.
     drop(lifeline);
     let mut status = None;
     wait_until(
@@ -211,26 +186,13 @@ fn a_held_lifeline_keeps_the_instance_and_a_cut_one_ends_it_cleanly() {
     );
 }
 
-/// THE GAP'S OWN SHAPE: the launcher is a bash script holding the lifeline's
-/// FIFO, and it is SIGKILLed — no trap, no cleanup, no `Drop`. Its instance goes
-/// anyway, because the kernel closes a dead process's descriptors and that is the
-/// end-of-file the instance waits for.
-///
-/// The launch is `( exec prog <fifo 9>&- )` on
-/// purpose: bash 3.2 (macOS's `/bin/bash`) leaks a copy of fd 9 into `prog` at fd
-/// 11 there (measured 2026-09-26), and an instance holding its own launcher's end
-/// never read end-of-file. It passes only because the instance closes inherited
-/// copies of its lifeline (`aterm_uds::lifeline::close_inherited_copies`).
+/// SIGKILLing a shell launcher holding the lifeline FIFO terminates its headless instance via kernel descriptor closure.
 #[test]
 fn a_killed_launcher_takes_its_instance_with_it() {
     let world = world("kill");
     let root = world.0.clone();
     let sock = root.join("run/aterm/aterm.sock");
     let log = root.join("gui.log");
-    // The script holds the FIFO read-write on fd 9 (the one writer), the instance reads it as
-    // stdin, and the script prints the instance's pid and waits on it. The FIFO's name stays
-    // until the world is removed: the subshell opens it after the fork, so an `rm` here would
-    // race that open.
     let script = r#"
         mkfifo "$1/lifeline" || exit 1
         exec 9<>"$1/lifeline"
@@ -266,7 +228,6 @@ fn a_killed_launcher_takes_its_instance_with_it() {
         .trim()
         .parse()
         .unwrap_or_else(|_| panic!("not a pid: {line:?}"));
-    // Whatever the assertions below find, the instance this test started ends.
     struct KillOnDrop(u32);
     impl Drop for KillOnDrop {
         fn drop(&mut self) {
@@ -291,13 +252,10 @@ fn a_killed_launcher_takes_its_instance_with_it() {
         || !alive(pid),
         || read_log(&log),
     );
-    // Gone and reaped: the pid is free for any process now, so the guard must not signal it.
     std::mem::forget(guard);
 }
 
-/// On real processes, `aterm doctor` run in B's world names A, whose socket lives where B's
-/// rendezvous directory never looks, and not B, whose per-instance socket it publishes. Both
-/// are only reported: each still runs after the doctor has spoken.
+/// `aterm doctor` reports an instance whose control socket is outside the rendezvous directory without stopping either instance.
 #[test]
 fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     let world_a = world("ca");
@@ -337,8 +295,6 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
         "an unreachable instance is a note, not a failure:\n{report}"
     );
     let (pid_a, pid_b) = (a.0.id(), b.0.id());
-    // Each unreached instance is a line of its own under the row's fact column
-    // (doctor prints one row per check: label, mark, fact).
     assert!(
         report.lines().any(|l| l.starts_with(' ')
             && l.trim_start().starts_with(&format!("pid {pid_a} "))

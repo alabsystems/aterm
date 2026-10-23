@@ -346,8 +346,8 @@ aterm_objc::declare_class! {
                     let live = self.read(|cx, handle| handle.is_none() ||
                         handle.and_then(|handle| cx.publication.node(handle)).is_some()).unwrap_or(false);
                     if !live { return Bool::NO; }
-                    // SAFETY: ask the inherited NSAccessibilityElement policy for remaining read
-                    // selectors.
+                    // SAFETY: ask the inherited NSAccessibilityElement policy for
+                    // remaining read selectors. The exact prototype is -(BOOL)(SEL).
                     unsafe {
                         let send: unsafe extern "C-unwind" fn(*mut aterm_objc::ObjcSuper, Sel, Sel) -> Bool = aterm_objc::msg_super();
                         send(&mut self.super_receiver(), sel!(isAccessibilitySelectorAllowed:), selector)
@@ -449,8 +449,10 @@ pub struct Adapter {
 
 impl Adapter {
     /// Attach to a real NSView.
+    ///
     /// # Safety
-    /// A supplied non-null `view` must be a live NSView on this thread.
+    /// A supplied non-null `view` must be a live NSView on this thread. The publisher keeps a
+    /// zeroing weak reference, so it cannot extend its life.
     pub unsafe fn new(
         view: Option<Id>,
         scale: f64,
@@ -712,7 +714,8 @@ fn string(value: &str) -> Id {
 }
 
 fn array(items: impl IntoIterator<Item = Id>) -> Id {
-    // SAFETY: NSMutableArray's +new returns +1; addObject: retains live, non-null objects.
+    // SAFETY: NSMutableArray's +new returns +1; addObject: retains live, non-null
+    // objects. The array is returned autoreleased, as an ObjC getter requires.
     unsafe {
         let new: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = checked_msg();
         let Some(array) = Obj::from_owned(new(class(c"NSMutableArray"), sel!(new))) else {

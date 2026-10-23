@@ -1,23 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A sealed generation never builds or queries the font-coverage index.
-//!
-//! `font_coverage_index` reads every system font whole (~373 files, ~700 MB on
-//! a Mac) to serve `runtime_fallback_scan_candidates`, the
-//! `Tier::RuntimeDecisions` lane `font_chain` removes from every sealed policy.
-//! Every GUI renderer is sealed before its first pixel, so nothing pre-warms
-//! the index; a sealed generation reaching it would be a pathname scan on the
-//! render thread, the freeze the seal exists to prevent.
-//!
-//! The test drives a sealed system generation through one code point per
-//! fallback lane, rasterizing each, then reads the process-global counters. It
-//! runs in its own process (`common/alone.rs`: the suite binary re-run on this
-//! one test) so no sibling's unsealed renderer moves them.
+//! Verifies that a sealed renderer generation never builds or queries the font-coverage index.
 
 use aterm_render::{Renderer, Theme};
 
-/// One code point per lane the unsealed resolver would scan for.
 const PROBES: &[char] = &[
     '\u{4F60}',  // 你 — CJK Unified Ideograph (broad chain / native-CJK tier)
     '\u{D55C}',  // 한 — Hangul syllable
@@ -49,10 +36,8 @@ fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
     for &ch in PROBES {
         let key = r.glyph_key(ch);
         let img = r.glyph_image(key);
-        // Touch the raster so the whole resolve → rasterize path runs.
         let _ = (img.width(), img.height(), key.source);
     }
-    // And the bold/italic routing, which has its own memo and its own probe.
     for &ch in PROBES {
         let key = r.glyph_key_styled(ch, aterm_render::StyleBits::BOLD);
         let _ = r.glyph_image(key);
@@ -70,9 +55,6 @@ fn a_sealed_system_generation_never_builds_or_queries_the_coverage_index() {
          reads on the render thread that the seal is supposed to make impossible"
     );
 
-    // Non-vacuity control, after the sealed half so the counters above read
-    // zero: an unsealed generation asked for a code point no face covers must
-    // reach the scan. It reads the whole font tree, so it runs once, last.
     let mut unsealed = Renderer::from_system(18.0, Theme::default()).expect("resolved once");
     unsealed.debug_block_on_lazy_fallbacks();
     let key = unsealed.glyph_key('\u{FFFF}');

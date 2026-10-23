@@ -5,8 +5,7 @@
 // src/blocks/block.rs and src/decoding/scratch.rs, modified by the aterm
 // project in 2026. See ../../LICENSE-MIT for the upstream MIT license.
 
-//! Blocks (RFC 8878 §3.1.1.2): a 3-byte header, then raw bytes, one byte to
-//! repeat, or a compressed block's literals and sequences sections.
+//! Zstandard block decoder (RFC 8878 §3.1.1.2).
 
 use std::io::{self, Read};
 
@@ -16,8 +15,7 @@ use super::literals;
 use super::sequences::{self, Exec, INITIAL_OFFSETS, Tables};
 use super::window::{BlockBuf, SLACK, Window};
 
-/// The per-frame decoding state that outlives one block: the entropy tables
-/// a later block may repeat, the repeat offsets, and reusable buffers.
+/// Per-frame block decoding state and reusable buffers.
 pub(crate) struct BlockDecoder {
     /// A compressed block's bytes.
     content: Vec<u8>,
@@ -46,9 +44,7 @@ impl BlockDecoder {
         self.offsets = INITIAL_OFFSETS;
     }
 
-    /// Reads one block from `input` and decodes it into `out` (emptied
-    /// first), never past `block_max` bytes. Returns whether it was the
-    /// frame's last block.
+    /// Reads and decodes one block from `input` into `out`, returning whether it is the last.
     pub(crate) fn decode(
         &mut self,
         input: &mut impl Read,
@@ -66,16 +62,12 @@ impl BlockDecoder {
         }
         out.start(block_max);
         match (word >> 1) & 3 {
-            // Raw_Block.
             0 => input.read_exact(out.fill_with(size)?)?,
-            // RLE_Block: one byte, repeated `size` times.
             1 => {
                 let mut byte = [0u8; 1];
                 input.read_exact(&mut byte)?;
                 out.fill_with(size)?.fill(byte[0]);
             }
-            // Compressed_Block; zeroed slack past its bytes for chunked
-            // copies out of raw literals.
             2 => {
                 self.content.clear();
                 self.content.resize(size + SLACK, 0);
@@ -87,8 +79,6 @@ impl BlockDecoder {
         Ok(last)
     }
 
-    /// A compressed block of `size` bytes: the literals section, then the
-    /// sequences.
     fn decompress(
         &mut self,
         size: usize,

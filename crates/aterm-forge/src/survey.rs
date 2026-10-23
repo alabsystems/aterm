@@ -161,7 +161,8 @@ fn cell_section(out: &mut String, s: &CellSurvey, top: usize) {
     zero_cost_section(out, s, &ranked);
 }
 
-/// The ranked table, plus the two things that make it honest.
+/// The ranked table, plus the two things that make it honest: the live
+/// subtree-vs-dominator comparison, and the partition check.
 fn ranked_table(out: &mut String, s: &CellSurvey, ranked: &[(PkgId, DomCost)], top: usize) {
     let _ = writeln!(
         out,
@@ -530,7 +531,7 @@ pub(crate) fn fit(s: &str, width: usize) -> String {
     out
 }
 
-/// Bounds a filesystem path to `width` characters while keeping its tail ([`fit`]).
+/// Bounds a filesystem path to `width` characters by dropping leading components, else [`fit`].
 pub(crate) fn fit_path(path: &str, width: usize) -> String {
     if path.chars().count() <= width {
         return path.to_string();

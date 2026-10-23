@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A selection made with the pointer on a BiDi row highlights the cells it copies.
-//!
-//! The frame paints an RTL run reversed in place, while the selection, the
-//! copy, the word rules and find read the grid in logical order. The pointer
-//! path anchors at the logical cell under the pointer (`pointer_anchor`) and
-//! the renderer's predicate tests each painted cell at its logical column
-//! (`RenderInput::selection_hit`), so a sweep over the painted cells of one
-//! run selects exactly those cells, and any selection highlights exactly what
-//! it copies. The link probes (the hand, the caption, a Cmd-click) read the
-//! same logical cell, so they name the link painted under the pointer.
+//! Tests for pointer selection, word/shift-click selection, and link hover/click mapping on BiDi and double-width rows.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
@@ -18,8 +9,7 @@ use aterm_core::terminal::Terminal;
 use super::path_link_app_tests::{hover, link_modifier};
 use crate::{App, WindowId, term_lock};
 
-/// `abc שלום עולם def`, painted `abc םלוע םולש def`: visual cells 4..=7 show
-/// עולם (logical 9..=12) and 9..=12 show שלום (logical 4..=7).
+/// Mixed LTR/RTL sample (`abc שלום עולם def`, painted `abc םלוע םולש def`).
 const MIXED: &str = "abc \u{05E9}\u{05DC}\u{05D5}\u{05DD} \u{05E2}\u{05D5}\u{05DC}\u{05DD} def";
 const OLAM: &str = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}";
 
@@ -36,8 +26,7 @@ fn window_with(text: &str) -> (App, WindowId, std::sync::Arc<std::sync::Mutex<Te
     (app, wid, term)
 }
 
-/// Press on painted cell `from` (row 0), sweep to the `side` half of painted
-/// cell `to`, release (no clipboard: the release is fenced).
+/// Drags a selection on row 0 from painted cell `from` to the `side` half of painted cell `to`.
 fn sweep(app: &mut App, wid: WindowId, from: u16, to: u16, side: SelectionSide) {
     sweep_on(app, wid, 0, from, to, side);
 }
@@ -55,8 +44,7 @@ fn sweep_on(app: &mut App, wid: WindowId, row: u16, from: u16, to: u16, side: Se
     app.finish_selection(wid, true);
 }
 
-/// The painted columns of row 0 the renderer's predicate highlights, and the
-/// text they hold read in logical order (the order a copy reads).
+/// Returns the highlighted painted columns of row 0 and their text in logical copy order.
 fn highlight(term: &mut Terminal) -> (Vec<usize>, String) {
     highlight_on(term, 0)
 }
@@ -81,8 +69,7 @@ fn highlight_on(term: &mut Terminal, r: usize) -> (Vec<usize>, String) {
     (lit, logical.into_iter().map(|(_, ch)| ch).collect())
 }
 
-/// Shift-click on the `side` half of painted cell `col` of selection row
-/// `sel_row` (viewport row minus `display_offset`), as `on_mouse_input` does.
+/// Shift-clicks the `side` half of painted cell `col` on selection row `sel_row`.
 fn shift_click(app: &mut App, wid: WindowId, sel_row: i32, col: u16, side: SelectionSide) {
     app.windows.get_mut(&wid).expect("window").last_mouse_side = side;
     assert!(
@@ -91,9 +78,7 @@ fn shift_click(app: &mut App, wid: WindowId, sel_row: i32, col: u16, side: Selec
     );
 }
 
-/// A sweep over the painted cells of one RTL word, in either direction, selects exactly the
-/// cells it crossed: the press anchors at the left edge of the pressed cell, so a leftward sweep
-/// leaves the pressed cell out, as on an LTR row.
+/// A pointer sweep over an RTL word highlights and copies the swept cells in both directions.
 #[test]
 fn a_sweep_over_an_rtl_word_highlights_and_copies_the_same_word() {
     let (mut app, wid, term) = window_with(MIXED);
@@ -104,8 +89,6 @@ fn a_sweep_over_an_rtl_word_highlights_and_copies_the_same_word() {
     assert_eq!(lit, vec![4, 5, 6, 7], "the swept cells are lit");
     assert_eq!(text, OLAM, "and they hold what was copied");
 
-    // Leftward, from the left edge of ע's painted cell over ל and ו: the
-    // pressed cell stays out.
     sweep(&mut app, wid, 7, 5, SelectionSide::Left);
     let copied = term_lock(&term).selection_to_string().unwrap_or_default();
     let (lit, text) = highlight(&mut term_lock(&term));
@@ -114,8 +97,7 @@ fn a_sweep_over_an_rtl_word_highlights_and_copies_the_same_word() {
     assert_eq!(copied, "\u{05D5}\u{05DC}");
 }
 
-/// A sweep that crosses from LTR text into an RTL run is one logical range, so its highlight need
-/// not be contiguous on screen, but it lights exactly the text the copy takes.
+/// A sweep across an LTR/RTL boundary highlights the exact logical characters copied.
 #[test]
 fn a_sweep_across_the_run_boundary_highlights_what_it_copies() {
     let (mut app, wid, term) = window_with("abc \u{05D0}\u{05D1}\u{05D2} def");
@@ -136,9 +118,7 @@ fn a_sweep_across_the_run_boundary_highlights_what_it_copies() {
     }
 }
 
-/// A double-click on a painted RTL word selects that word (the word rules run at the logical
-/// cell under the pointer), not the word at the same logical columns, and the highlight covers
-/// its painted cells.
+/// Double-clicking a painted RTL word selects and highlights that word at its painted cells.
 #[test]
 fn a_double_click_on_an_rtl_word_copies_that_word() {
     let (mut app, wid, term) = window_with(MIXED);
@@ -150,8 +130,6 @@ fn a_double_click_on_an_rtl_word_copies_that_word() {
     let (lit, text) = highlight(&mut term_lock(&term));
     assert_eq!(lit, vec![4, 5, 6, 7]);
     assert_eq!(text, OLAM);
-    // A still release keeps the word: the gesture arms its drag on the press
-    // (`arm_gesture_drag`), so this release completes, whatever the press cell.
     app.finish_selection(wid, true);
     assert_eq!(
         term_lock(&term).selection_to_string().as_deref(),
@@ -159,10 +137,7 @@ fn a_double_click_on_an_rtl_word_copies_that_word() {
     );
 }
 
-/// A shift-click extends to the logical cell under the pointer, with the half-cell side flipped
-/// on an RTL cell: after sweeping visual 4..=5 (the last two letters of עולם, painted at its left
-/// end), a shift-click on the right half of visual 7 (its first letter) takes the whole word,
-/// and the highlight is the word's painted cells.
+/// Shift-clicking an RTL cell extends the selection to that logical cell with RTL half-cell side semantics.
 #[test]
 fn a_shift_click_on_an_rtl_cell_extends_to_that_cell() {
     let (mut app, wid, term) = window_with(MIXED);
@@ -179,11 +154,7 @@ fn a_shift_click_on_an_rtl_cell_extends_to_that_cell() {
     assert_eq!(text, OLAM);
 }
 
-/// The same gestures on a row scrolled back into history: the pointer's
-/// viewport row is `sel_row + display_offset`, and its map is that row's, so
-/// a double-click and a shift-click land on the painted RTL word there too.
-/// The row sits on viewport row 1 under a line of filler, so a lookup that
-/// forgot the offset would read another row (or none).
+/// Double-clicking and shift-clicking an RTL row scrolled into history map through `sel_row + display_offset`.
 #[test]
 fn a_scrolled_back_rtl_row_double_clicks_and_shift_clicks_its_painted_word() {
     let mut text = String::from("filler\r\n");
@@ -229,9 +200,7 @@ fn a_scrolled_back_rtl_row_double_clicks_and_shift_clicks_its_painted_word() {
     assert_eq!(text, OLAM);
 }
 
-/// A click that stays on its cell deselects, whichever half the release is on, on an RTL cell as
-/// on an LTR one: the press and the drag compare logical cells (`sel_press_cell` is stored
-/// logical), so jitter across the middle of the pressed RTL cell is not a drag.
+/// A click and release within a single RTL or LTR cell clears the selection without treating half-cell motion as a drag.
 #[test]
 fn a_still_click_on_an_rtl_cell_deselects_as_on_an_ltr_cell() {
     for (row, pressed) in [(MIXED, 4), ("abc hello world def", 4)] {
@@ -249,36 +218,24 @@ fn osc8(url: &str, text: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
-/// The hand, the caption and a Cmd-click name the link whose text is painted
-/// under the pointer, at every painted cell: on a BiDi row the painted column
-/// is not the logical one, and on a DEC double-width line grid column `c`
-/// covers painted cells `2c` and `2c + 1`. Before the fix all three read the
-/// painted column as a grid column: over link B's painted text they named
-/// link A, over an RTL link's text nothing, and over plain RTL text the link
-/// stored at its painted columns. An LTR single-width row, where painted is
-/// logical, is the control.
+/// Pointer hand cursor, hover caption, and Cmd-click resolve links by painted cell across BiDi, `DECDWL`, and LTR rows.
 #[test]
 fn the_hand_the_caption_and_the_click_name_the_link_painted_under_the_pointer() {
     let (a, b) = ("https://a.example/", "https://b.example/");
     let (alef, dalet) = ("\u{05D0}\u{05D1}\u{05D2}", "\u{05D3}\u{05D4}\u{05D5}");
-    // (the row, each link's painted cells)
     let rows = [
-        // Painted `see והד גבא end`.
         (
             format!("see {} {} end", osc8(a, alef), osc8(b, dalet)),
             vec![(8..=10, a), (4..=6, b)],
         ),
-        // Painted `see והד גבא end`, only גבא linked.
         (
             format!("see {} {dalet} end", osc8(a, alef)),
             vec![(8..=10, a)],
         ),
-        // DECDWL: `abXY ZW` at twice the advance.
         (
             format!("\x1b#6ab{} {}", osc8(a, "XY"), osc8(b, "ZW")),
             vec![(4..=7, a), (10..=13, b)],
         ),
-        // The control.
         (
             format!("see {} {} end", osc8(a, "abc"), osc8(b, "def")),
             vec![(4..=6, a), (8..=10, b)],

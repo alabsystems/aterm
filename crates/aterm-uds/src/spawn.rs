@@ -41,7 +41,9 @@ pub const fn creation_flags(console: Console, extra: u32, have_console: bool) ->
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn have_console() -> bool {
     let mut first = 0u32;
-    // SAFETY: `first` is a valid 1-element out-buffer for `GetConsoleProcessList`.
+    // SAFETY: `first` is a one-element out-buffer that outlives the call, with its length
+    // passed as 1; the API writes at most that many pids and returns the console's whole
+    // count (0 on failure).
     unsafe { crate::win::ffi::GetConsoleProcessList(&mut first, 1) != 0 }
 }
 

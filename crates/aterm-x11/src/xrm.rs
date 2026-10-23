@@ -2,15 +2,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from x11rb-protocol 0.13.2 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/resource_manager/parser.rs (`parse_database`,
-// `parse_entry`, `parse_query`) and src/resource_manager/matcher.rs
-// (`check_match`, `compare_matches`, `match_entry`), and src/resource_manager/
-// mod.rs (`parse_data_with_base_directory`), rewritten by the aterm project in
-// 2026: one module, `#include` followed only in a resource file (a database
-// read from the RESOURCE_MANAGER property is xrdb's output, which xrdb's cpp
-// has already expanded), only into regular files and within a byte budget,
-// and a bound on the matcher's states.
+// Derived from x11rb-protocol 0.13.2 (MIT OR Apache-2.0, used under Apache-2.0).
 
 //! X resource manager (Xrm) database parser and query matcher.
 
@@ -124,10 +116,6 @@ impl Database {
     }
 }
 
-/// Parse `data`'s lines into `entries`; `include` is handed the file of each
-/// well-formed `#include "file"` line (x11rb's `parse_database`: `#`, spaces,
-/// `include`, spaces, then the name between quotes on that line) and appends
-/// what it reads in the directive's place.
 fn parse_into(
     mut data: &[u8],
     entries: &mut Vec<Entry>,
@@ -159,10 +147,6 @@ fn parse_into(
     }
 }
 
-/// [`parse_into`] for a file in `dir` reached through `depth` includes (at
-/// most [`MAX_INCLUDE_DEPTH`]), its includes read by `read` from what `budget`
-/// has left (x11rb's `parse_data_with_base_directory`): a name that is not
-/// UTF-8 is skipped, as x11rb skipped it.
 fn parse_file_into(
     data: &[u8],
     dir: &Path,
@@ -321,7 +305,6 @@ fn parse_entry(data: &[u8]) -> (Option<Entry>, &[u8]) {
     (Some(Entry { components, value }), rest)
 }
 
-/// A dotted query: components of quark bytes; `None` for anything else.
 fn parse_query(mut data: &[u8]) -> Option<Vec<&[u8]>> {
     let mut out = Vec::new();
     loop {
@@ -351,8 +334,6 @@ enum Step {
     Matched(Binding, How),
 }
 
-/// Every way `entry` matches the whole query: a nondeterministic walk where a
-/// loose binding may also swallow a query component.
 fn check_match(entry: &Entry, name: &[&[u8]], class: &[&[u8]]) -> Vec<Vec<Step>> {
     let mut states: Vec<(usize, Vec<Step>)> = vec![(0, Vec::new())];
     for i in 0..name.len().max(class.len()) {
@@ -390,9 +371,6 @@ fn check_match(entry: &Entry, name: &[&[u8]], class: &[&[u8]]) -> Vec<Vec<Step>>
         .collect()
 }
 
-/// Xrm's precedence, component by component from the left: a match beats a
-/// skip; an instance beats a class, which beats `?`; a tight binding beats a
-/// loose one.
 fn compare(a: &[Step], b: &[Step]) -> Ordering {
     const fn rule1(a: Step, b: Step) -> bool {
         matches!((a, b), (Step::Matched(..), Step::Skipped))

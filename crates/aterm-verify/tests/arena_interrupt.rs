@@ -59,7 +59,8 @@ fn stand_in(dir: &Path, fifo: &Path) -> PathBuf {
 /// `cmd` with `signo` at its default disposition in the child alone.
 fn with_default(cmd: &mut std::process::Command, signo: i32) -> &mut std::process::Command {
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: runs between fork and exec, calling only async-signal-safe `sigaction`.
+    // SAFETY: the hook runs between fork and exec and calls only `sigaction`,
+    // which is async-signal-safe; the struct it reads is on the child's stack.
     unsafe {
         cmd.pre_exec(move || {
             let mut dfl: libc::sigaction = std::mem::zeroed();

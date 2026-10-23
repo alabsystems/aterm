@@ -239,7 +239,7 @@ fn fig(pct_x10: u32, reset: i64, at: i64, by: &str, source: &str) -> WindowFig {
     }
 }
 
-/// THE ONE FIGURE OF A WINDOW FROM ALL ITS SOURCES (module docs): current
+/// THE ONE FIGURE OF A WINDOW FROM ALL ITS SOURCES: current
 /// figures merged by [`merge_fig`]; with none current, the newest void one.
 fn one_figure(
     sources: impl IntoIterator<Item = WindowFig>,

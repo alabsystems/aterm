@@ -206,7 +206,9 @@ impl TestWindow {
         need_a_desktop();
         let desk = DESK.lock().unwrap_or_else(PoisonError::into_inner);
         let class: Vec<u16> = CLASS.encode_utf16().chain([0]).collect();
-        // SAFETY: plain calls with live arguments.
+        // SAFETY: plain calls with live arguments; the class names
+        // `DefWindowProcW`, which handles every message (with no background
+        // brush, painting nothing).
         unsafe {
             w::SetThreadDpiAwarenessContext(w::PER_MONITOR_AWARE_V2);
             let instance = w::GetModuleHandleW(std::ptr::null());
@@ -311,7 +313,8 @@ impl TestWindow {
         self.pump();
         let (width, height) = self.client();
         let mut out = vec![0u32; (width * height) as usize];
-        // SAFETY: the window's DC, a bitmap and a DC made, used and freed here.
+        // SAFETY: the window's DC, a bitmap and a DC made, used and freed
+        // here; `out` holds `height` rows of `width` 32-bit words.
         unsafe {
             let window_dc = w::GetDC(self.hwnd);
             assert_ne!(window_dc, 0, "GetDC");

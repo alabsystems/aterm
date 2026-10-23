@@ -173,12 +173,10 @@ pub(crate) fn until_reread(
     }
 }
 
-/// Set (or, with no value, remove) `key` in the scratch settings' env block
-/// of a lab whose Claude Code is running, and return once Claude Code
-/// re-read the file ([`until_reread`] on the witness's log), written again
-/// every [`REWRITE_EVERY`] and given up [`HANG`] after the first write.
+/// Set or remove `key` in the scratch settings' env block and wait until Claude Code re-reads the file.
+///
 /// # Errors
-/// The settings could not be written.
+/// The settings could not be written, the run was interrupted, or nothing answered within [`HANG`].
 pub fn set_env_reread(run: &Run, key: &str, value: Option<&str>) -> Result<Reread, Fail> {
     set_env_reread_with_wait(run, key, value, &WallWait::new())
 }
@@ -215,8 +213,6 @@ mod tests {
         )
     }
 
-    /// A line counts when it is a `ConfigChange` naming the lab's settings
-    /// file.
     #[test]
     fn a_reread_is_a_config_change_line_naming_the_settings_file() {
         let ok = line("ConfigChange", SETTINGS);
@@ -238,19 +234,10 @@ mod tests {
         }
     }
 
-    /// The wait's clock steps a third of `every` at each pause, so a rewrite
-    /// due a step or more sooner than `every` after the last write ends, or
-    /// due any time later, comes at another step than the one at `every`.
     fn stepped() -> SteppedWait<impl Fn()> {
         SteppedWait::new(REWRITE_EVERY / 3, || {})
     }
 
-    /// The first write is never answered (the watcher missed it), a rewrite
-    /// is: the wait writes again `every` after the first write and returns on
-    /// the line that came after it, whether the line lands after the wait read
-    /// the log again (one step later) or is already there at the first read
-    /// after the rewrite (it landed while the rewrite was being made, the
-    /// moment a baseline read after each write swallowed).
     #[test]
     fn an_unanswered_write_is_made_again_until_a_line_answers() {
         let after_a_read = REWRITE_EVERY + REWRITE_EVERY / 3;
@@ -280,9 +267,6 @@ mod tests {
         }
     }
 
-    /// NEGATIVE CONTROLS: a line that lands during the first write, an older
-    /// change's, is no answer when no later line comes, and neither is a log
-    /// that never grows.
     #[test]
     fn a_line_from_before_the_write_ends_or_none_at_all_is_no_reread() {
         let made = u32::try_from(HANG.as_millis() / REWRITE_EVERY.as_millis()).unwrap();
@@ -310,8 +294,6 @@ mod tests {
         }
     }
 
-    /// A clock that moves by `tick` at every reading and never at a pause,
-    /// as `WallWait`'s does when the thread is held up between two reads.
     struct Ticking {
         next: Cell<Duration>,
         last: Cell<Duration>,
@@ -330,9 +312,6 @@ mod tests {
         }
     }
 
-    /// No write follows a reading at or past `hang`, even on a clock that
-    /// moves between reads: a round reads the clock once, and that reading
-    /// decides both the hang detector and the rewrite.
     #[test]
     fn no_write_follows_a_reading_at_or_past_hang() {
         let late: Vec<_> = [1, 1000, 7000]
@@ -364,9 +343,6 @@ mod tests {
         );
     }
 
-    /// The hook as the scratch settings carry it: `ConfigChange` runs the
-    /// script by its quoted path; the script appends its input and a newline to
-    /// the log and exits 0.
     #[test]
     fn the_hook_runs_the_script_which_appends_its_input_and_never_fails() {
         let root = aterm_tempfile::tempdir().unwrap();

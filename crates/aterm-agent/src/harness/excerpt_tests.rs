@@ -41,9 +41,7 @@ fn texts(e: &Excerpts) -> Vec<&str> {
     e.prompts.iter().map(|p| p.text.as_str()).collect()
 }
 
-/// A turn as Claude Code writes it: the prompt, a narration, a call, its
-/// result, the answer. Mid-call the tool is in flight BY NAME (its input is
-/// nowhere in the excerpts); once its result is written, nothing is.
+/// Mid-call a tool is in flight by name (never its input), and once its result is written nothing is.
 #[test]
 fn a_call_is_in_flight_until_its_result_is_written() {
     let mut rows = vec![
@@ -65,15 +63,13 @@ fn a_call_is_in_flight_until_its_result_is_written() {
     let done = excerpts(&rows);
     assert_eq!(done.doing, None);
     assert_eq!(done.said.as_deref(), Some("The footer is fixed."));
-    // A new prompt after the answer: nothing is in flight while it thinks.
     rows.push(user("now the tests"));
     let next = excerpts(&rows);
     assert_eq!(texts(&next), ["now the tests", "fix the footer"]);
     assert_eq!(next.doing, None);
 }
 
-/// Parallel calls of one message: each answered call leaves the others in
-/// flight, the newest first.
+/// Parallel calls stay in flight newest-first until each is answered.
 #[test]
 fn parallel_calls_stay_in_flight_until_each_is_answered() {
     let rows = vec![
@@ -93,9 +89,7 @@ fn parallel_calls_stay_in_flight_until_each_is_answered() {
     assert_eq!(excerpts(&both).doing, None);
 }
 
-/// The fold is exact: rows read as runs — an append over what was read, a
-/// window walk's newest window over each older one in turn — say what the
-/// whole says, at every row boundary.
+/// Folding scanned runs in any 2-way or 3-way split matches scanning the whole slice.
 #[test]
 fn any_split_reads_as_the_whole() {
     let rows = vec![
@@ -123,8 +117,6 @@ fn any_split_reads_as_the_whole() {
                 whole,
                 "rows ..{end} split at {split}"
             );
-            // Three runs, folded as the walk back folds them: the newest
-            // over the middle, then that over the oldest.
             for first in 0..=split {
                 let oldest = scan(&rows[..first]);
                 let middle = scan(&rows[first..split]);
@@ -139,10 +131,7 @@ fn any_split_reads_as_the_whole() {
     }
 }
 
-/// None of the rows Claude Code writes itself is a prompt or an answer: a
-/// sidechain, a `<synthetic>` or API-error answer, meta and compaction rows,
-/// an Esc, a command and its output, the harness's own lines. A person's `!`
-/// command is theirs.
+/// Sidechains, synthetic/API-error replies, meta/compaction rows, interruptions, slash commands, and harness lines are ignored; `!` bash inputs count as prompts.
 #[test]
 fn only_typed_words_and_the_agents_own_text_count() {
     let rows = vec![
@@ -167,9 +156,7 @@ fn only_typed_words_and_the_agents_own_text_count() {
     assert_eq!(texts(&excerpts(&bang)), ["! git status", "the real prompt"]);
 }
 
-/// Prompts are kept distinct by key and newest first, so the harness's one
-/// repeated line costs one slot and the prompt under it is still there; a
-/// paste is keyed by what was pasted, as the turn that typed it is.
+/// Prompts are deduplicated by normalized content key and kept newest-first up to `PROMPTS_KEPT`.
 #[test]
 fn prompts_are_distinct_newest_first_and_keyed_by_their_words() {
     let mut rows = vec![user("ship the survey")];
@@ -189,8 +176,7 @@ fn prompts_are_distinct_newest_first_and_keyed_by_their_words() {
     assert_eq!(e.prompts[0].text, "prompt 19");
 }
 
-/// Every excerpt is one line and at most [`EXCERPT_BYTES`], cut on a
-/// character boundary with `…`; the key reads the whole prompt's head.
+/// Every excerpt is folded to one line and capped at [`EXCERPT_BYTES`] on a character boundary with `…`.
 #[test]
 fn excerpts_are_one_line_and_capped() {
     let long = "été ".repeat(400);
@@ -205,11 +191,7 @@ fn excerpts_are_one_line_and_capped() {
     assert_eq!(fold("  a \n\t b  "), "a b");
 }
 
-/// THE CAP NEVER ENDS INSIDE A WORD: a cut inside a run of ASCII letters,
-/// digits and punctuation backs up to its start, so no token leaves cut
-/// short; a run longer than the cap is `…` alone; a cut inside a run of CJK
-/// stays where it falls. CONTROL: a cut that falls on a space keeps every
-/// word before it.
+/// [`cap`] backs up out of a split ASCII word, yields `…` when one word exceeds the cap, and cuts CJK runs in place.
 #[test]
 fn the_cap_never_ends_inside_a_word() {
     assert_eq!(cap("alpha beta gamma", 12), "alpha…");
@@ -222,11 +204,7 @@ fn the_cap_never_ends_inside_a_word() {
     assert!(cjk.starts_with(cut.trim_end_matches('…')), "{cut}");
 }
 
-/// THE END'S CAP NEVER STARTS INSIDE A WORD ([`cap_end`], [`cap`]'s rule from
-/// the other end): a cut inside a run of ASCII letters, digits and punctuation
-/// moves on to the run's end, so no token is quoted cut short; a run longer than
-/// the cap is `…` alone; a cut inside a run of CJK stays where it falls.
-/// CONTROL: a cut that falls on a space keeps every word after it.
+/// [`cap_end`] advances past a split leading ASCII word, yields `…` when one word exceeds the cap, and cuts CJK runs in place.
 #[test]
 fn the_end_cap_never_starts_inside_a_word() {
     assert_eq!(cap_end("alpha beta gamma", 12), "…gamma");
@@ -240,17 +218,7 @@ fn the_end_cap_never_starts_inside_a_word() {
     assert!(cjk.ends_with(cut.trim_start_matches('…')), "{cut}");
 }
 
-/// A CUT NEVER FALLS INSIDE A FLEET JOIN CODE: a code typed with spaces
-/// between its groups is nine words, and a cut between them would keep the
-/// groups before it (or after it, from the end), each too short for the
-/// survey's redaction to know as a code. Wherever the cut falls on the code,
-/// its two edges included, and whatever is around it — spaces, or the
-/// punctuation a report puts there (`` `…` ``, a `.`, `(…)`, `"…"`), which a
-/// cut on an edge would back into the code by the never-inside-a-word rule —
-/// what either excerpt keeps holds the code whole, where the redaction finds
-/// it ([`code_spans`]), or none of its groups. NEGATIVE CONTROL: the same
-/// groups with their check group changed are no code, and the cut keeps
-/// every whole word before it, groups included, outside any code.
+/// Neither [`cap`] nor [`cap_end`] splits a valid spaced fleet join code across the excerpt boundary, regardless of surrounding punctuation.
 #[cfg(unix)]
 #[test]
 fn a_cut_never_falls_inside_a_join_code() {
@@ -270,10 +238,7 @@ fn a_cut_never_falls_inside_a_join_code() {
         .collect();
     let spaced = |groups: &[String]| format!("ATF1- {}", groups.join(" "));
     let room = EXCERPT_BYTES - '…'.len_utf8();
-    // `len` bytes of text, a space last.
     let filler = |len: usize| format!("{} ", "x".repeat(len - 1));
-    // Whether what the redaction leaves of `text` — its words outside every
-    // code it finds — holds the prefix or a group.
     let holds_a_group = |text: &str, groups: &[String]| {
         let mut left = String::new();
         let mut at = 0;
@@ -289,7 +254,6 @@ fn a_cut_never_falls_inside_a_join_code() {
     let typed = spaced(&groups);
     for (open, close) in [("", ""), ("`", "`"), ("", "."), ("(", ")."), ("\"", "\",")] {
         for shift in 0..=typed.len() {
-            // The head's cut falls `shift` bytes into the code.
             let text = format!(
                 "{}{open}{typed}{close} and more",
                 filler(room - shift - open.len())
@@ -297,7 +261,6 @@ fn a_cut_never_falls_inside_a_join_code() {
             assert_eq!(code_spans(&text).len(), 1, "{text}");
             let head = cap(&text, EXCERPT_BYTES);
             assert!(!holds_a_group(&head, &groups), "{open}{shift}: {head}");
-            // The end's cut falls `shift` bytes into the code.
             let text = format!(
                 "more and {open}{typed}{close} {}",
                 "x".repeat(room + shift - typed.len() - close.len() - 1)
@@ -307,8 +270,6 @@ fn a_cut_never_falls_inside_a_join_code() {
             assert!(!holds_a_group(&end, &groups), "{open}{shift}: {end}");
         }
     }
-    // A cut on an edge with a space beside it keeps the code whole, and the
-    // redaction finds it there.
     let text = format!("{}{typed} and more", filler(room - typed.len()));
     assert_eq!(code_spans(&cap(&text, EXCERPT_BYTES)).len(), 1);
     let text = format!("more and {typed} {}", "x".repeat(room - typed.len() - 1));
@@ -323,10 +284,7 @@ fn a_cut_never_falls_inside_a_join_code() {
     assert!(holds_a_group(&head, &other), "{head}");
 }
 
-/// A REPORT PAST THE CAP IS KEPT BOTH WAYS: by its head
-/// ([`Excerpts::said`]) and by its end ([`Excerpts::said_end`]), each within
-/// [`EXCERPT_BYTES`]; only the end carries the result the head cut off.
-/// CONTROL: a report within the cap is the same text both ways.
+/// An answer longer than [`EXCERPT_BYTES`] keeps both its capped head ([`Excerpts::said`]) and tail ([`Excerpts::said_end`]).
 #[test]
 fn a_long_said_is_kept_by_its_head_and_by_its_end() {
     let report = format!(
@@ -352,10 +310,7 @@ fn a_long_said_is_kept_by_its_head_and_by_its_end() {
     assert_eq!(short.said.as_deref(), Some("The footer is fixed."));
 }
 
-/// SAID WITHOUT THE DONE TOKEN, as the task's result reads a report: a line
-/// that is `ATERM-TASK-DONE` alone (Markdown punctuation allowed) is dropped,
-/// and a message that is the token alone gives the newest one with words —
-/// in one read and across a read that ended between the two rows.
+/// Standalone `ATERM-TASK-DONE` lines are stripped from `said`, falling back to the previous assistant message when nothing else remains.
 #[test]
 fn said_drops_the_done_tokens_lines_as_the_result_does() {
     let ended = excerpts(&[
@@ -376,7 +331,6 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
         excerpts(&rows).said.as_deref(),
         Some("Finished the review: one real issue.")
     );
-    // The token's row alone in the newer read: the older read says it.
     let newer = scan(&rows[2..]);
     assert_eq!(newer.excerpts().said, None);
     let joined = newer.over(scan(&rows[..2]));
@@ -385,7 +339,6 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
         Some("Finished the review: one real issue.")
     );
 
-    // The CONTROL: the token inside a sentence is words, kept whole.
     let quoted = excerpts(&[
         user("how do workers end?"),
         said(
@@ -399,13 +352,7 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
     );
 }
 
-/// THE HARNESS'S OWN ACTS ARE NO PROMPT (Autopilot Cruise / Land):
-/// Cruise's continuation (`CONTINUE_TEXT`, the default `continue_text`), its
-/// prompt at a done claim (`DONE_CHECK`), Land's instruction and nudge, and a
-/// restart's carry-on each open with the harness's mark, so the survey's
-/// newest prompt stays the one a person or a manager typed. NEGATIVE
-/// CONTROL: the owner's own unmarked `continue_text` (`keep going`) is a
-/// prompt, which the survey skips only by the host's turn ledger.
+/// Marked Autopilot continuation, done-check, land, and relaunch prompts are excluded from `prompts`, while unmarked user text is kept.
 #[test]
 fn the_harnesss_own_acts_are_no_prompt() {
     use crate::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_NUDGE};

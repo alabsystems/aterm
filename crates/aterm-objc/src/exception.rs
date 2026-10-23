@@ -67,7 +67,8 @@ impl<R, B, H> Drop for Slot<R, B, H> {
 /// only if it returns; an exception unwinds through this `"C-unwind"` frame
 /// (dropping the closure) into the wrapper's catch.
 unsafe extern "C-unwind" fn run_body<R, B: FnOnce() -> R, H>(data: *mut u8) {
-    // SAFETY: `data` points to a live `Slot<R, B, H>` and `run_body` is called once.
+    // SAFETY: `data` points to a live `Slot<R, B, H>` that `objc_try` holds no reference to while
+    // this runs, and `run_body` is called once.
     let slot = unsafe { &mut *data.cast::<Slot<R, B, H>>() };
     let body = unsafe { ManuallyDrop::take(&mut slot.body) };
     slot.out.write(body());
@@ -84,6 +85,13 @@ unsafe extern "C-unwind" fn run_on_exc<R, B, H: FnOnce(Id)>(data: *mut u8, excep
 }
 
 /// Runs `body`, invoking `on_exc` and returning `Err(Contained)` if an Objective-C exception escapes.
+///
+/// The exception `Id` passed to `on_exc` is borrowed and valid only during that call. A Rust panic
+/// in `body` is not caught: it unwinds to the caller, and `on_exc` is dropped unrun.
+///
+/// # Unwind safety
+/// Whatever `body` borrowed may be mid-update after an exception, as after a panic. No
+/// `UnwindSafe` bound is demanded; callers assert it at their guard.
 #[inline]
 pub fn objc_try<R, B, H>(body: B, on_exc: H) -> Result<R, Contained>
 where
@@ -158,7 +166,8 @@ fn sink() -> fn(&ContainedException<'_>) {
     if raw.is_null() {
         default_sink
     } else {
-        // SAFETY: `set_sink` only stores `fn(&ContainedException<'_>)` cast to `*mut ()`.
+        // SAFETY: `set_sink` only stores `fn(&ContainedException<'_>)` cast to `*mut ()`; function
+        // and data pointers have the same width on 64-bit Apple targets.
         unsafe { std::mem::transmute::<*mut (), fn(&ContainedException<'_>)>(raw) }
     }
 }

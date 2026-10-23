@@ -1,5 +1,8 @@
 // Copyright The winit contributors
 // SPDX-License-Identifier: Apache-2.0
+//
+// Derived from winit 0.30.13 src/platform_impl/linux/x11/event_processor.rs,
+// modified by the aterm project in 2026 (see the repository NOTICE).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -38,6 +41,12 @@ use crate::platform_impl::x11::{
     mkdid, mkwid, util, CookieResultExt, Device, DeviceId, DeviceInfo, Dnd, DndState, ImeReceiver,
     ReportExt, ScrollOrientation, UnownedWindow, WindowId,
 };
+
+// LOCAL PATCH (aterm): events are read through aterm-x11's Xlib and XInput 2 declarations and the
+// requests are its encoders, where upstream used x11-dl and x11rb. No device events: the raw XInput
+// 2 events are not selected on the root, and `WindowEvent::AxisMotion` is not reported. A window
+// manager's `_NET_WM_SYNC_REQUEST` is noted on its window (`sync_request.rs`). A failed request is
+// reported (`XConnection::report`), where upstream's `expect`s panicked.
 
 /// The core protocol's modifier bits in a key event's state (`KeyButMask`).
 mod mod_mask {
@@ -216,6 +225,7 @@ impl EventProcessor {
             return;
         }
 
+        // SAFETY (each arm's union read): Xlib wrote the member that `event_type` names.
         match event_type {
             event_type::CLIENT_MESSAGE => {
                 self.client_message(unsafe { &xev.client_message }, &mut callback)
@@ -327,7 +337,7 @@ impl EventProcessor {
             },
             _ => {
                 if event_type == self.xkbext.first_event as _ {
-                    // SAFETY: an XKB event.
+                    // SAFETY: an XKB event; `XEvent`'s padding covers every XKB event struct.
                     let xev: &XkbAnyEvent =
                         unsafe { &*(xev as *const XEvent).cast::<XkbAnyEvent>() };
                     self.xkb_event(xev, &mut callback);
@@ -930,7 +940,10 @@ impl EventProcessor {
 
         if atom == atoms[_NET_WM_STATE] {
             let window = xev.window as xproto::Window;
-            if let Some(hidden) = self.with_window(window, |shown| shown.is_minimized()) {
+            if let Some(hidden) = self.with_window(window, |shown| {
+                shown.wm_state_changed();
+                shown.is_minimized()
+            }) {
                 let hidden = hidden == Some(true);
                 self.change_occlusion(window, |occlusion| occlusion.hidden = hidden, &mut callback);
             }
@@ -1138,6 +1151,9 @@ impl EventProcessor {
 
             BUTTON3 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Right },
 
+            // LOCAL PATCH (aterm): a wheel button with no scroll valuator (XTEST: xdotool, x11vnc,
+            // Barrier/Synergy) sends a press and a release per notch; one notch is one step, so the
+            // release is dropped.
             4..=7 if state == ElementState::Released => return,
             4..=7 => WindowEvent::MouseWheel {
                 device_id,
@@ -1789,7 +1805,8 @@ fn is_first_touch(first: &mut Option<u64>, num: &mut u32, id: u64, phase: TouchP
 
 /// The `i`th of a format-32 client message's five values.
 fn client_long(xev: &XClientMessageEvent, i: usize) -> c_long {
-    // SAFETY: every member of the data union is plain bytes.
+    // SAFETY: every member of the data union is plain bytes; a format-32 message's are
+    // five longs, and any other format's are read as Xlib would.
     unsafe { xev.data.l[i] }
 }
 

@@ -1,5 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
+//
+// Added by the aterm project in 2026 to its copy of winit 0.30.13
+// (see the repository NOTICE).
 
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::VecDeque;
@@ -20,18 +23,16 @@ unsafe extern "C" {
     fn os_unfair_lock_unlock(lock: *mut OsUnfairLock);
 }
 
-/// A value only the holder of its `os_unfair_lock` reaches. It is shared
-/// only from inside an `Arc`, so the lock's word never moves while in use.
 struct UnfairMutex<T> {
     word: UnsafeCell<OsUnfairLock>,
     value: UnsafeCell<T>,
 }
 
-// SAFETY: the value is reached only through a `Guard`, and a guard exists only while its thread holds the lock, so one thread at a time touches it.
+// SAFETY: the value is reached only through a `Guard`, and a guard exists only
+// while its thread holds the lock, so one thread at a time touches it; `T:
+// Send` lets that thread be any thread.
 unsafe impl<T: Send> Sync for UnfairMutex<T> {}
 
-/// The lock, held. It unlocks on drop, on the thread that locked it: it is
-/// `!Send`, since an unlock from any other thread aborts the process.
 struct Guard<'a, T> {
     mutex: &'a UnfairMutex<T>,
     _locked_here: PhantomData<*const ()>,
@@ -42,15 +43,14 @@ impl<T> UnfairMutex<T> {
         UnfairMutex { word: UnsafeCell::new(OsUnfairLock(0)), value: UnsafeCell::new(value) }
     }
 
-    /// Wait for the lock, lending this thread's priority to its holder
-    /// (module notes).
     fn lock(&self) -> Guard<'_, T> {
-        // SAFETY: `word` is an initialised `os_unfair_lock` that stays put while shared.
+        // SAFETY: `word` is an initialised `os_unfair_lock` that stays put while
+        // shared. No thread locks it twice: a guard's holder runs no code that
+        // could send, and drops it before returning.
         unsafe { os_unfair_lock_lock(self.word.get()) };
         Guard { mutex: self, _locked_here: PhantomData }
     }
 
-    /// The lock, if nobody holds it; never waits.
     fn try_lock(&self) -> Option<Guard<'_, T>> {
         // SAFETY: as in `lock`.
         let locked = unsafe { os_unfair_lock_trylock(self.word.get()) };
@@ -81,9 +81,6 @@ impl<T> Drop for Guard<'_, T> {
     }
 }
 
-/// The shared state: the events not taken yet, and whether the receiver is
-/// gone (a send after that hands its event back, as `mpsc::Sender::send`
-/// does).
 struct Queue<T> {
     events: VecDeque<T>,
     closed: bool,
@@ -99,13 +96,10 @@ impl Armed {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Arm the wake; `true` when this call armed it, and so owes the signal.
     fn arm(&self) -> bool {
         !self.0.swap(true, Ordering::AcqRel)
     }
 
-    /// Clear it, before a take. A read-modify-write, so it reads the last
-    /// arm and sees every push made before it.
     fn clear(&self) {
         self.0.swap(false, Ordering::AcqRel);
     }
@@ -175,9 +169,6 @@ impl<T> Receiver<T> {
         self.armed.clone()
     }
 
-    /// Once every taken event is handed out, clear the wake flag and take
-    /// every queued one, oldest first; nothing while a sender holds the lock,
-    /// whose arm then signals.
     fn refill(&self, taken: &mut VecDeque<T>) {
         if !taken.is_empty() {
             return;
@@ -207,7 +198,6 @@ mod tests {
 
     use super::*;
 
-    /// A hang detector for something that must happen, not a latency budget.
     const MUST_HAPPEN: Duration = Duration::from_secs(60);
 
     fn drain(rx: &Receiver<u32>) -> Vec<u32> {
@@ -229,9 +219,6 @@ mod tests {
         assert_eq!(drain(&rx), [4]);
     }
 
-    /// COALESCED WAKES: the first send after a take arms the wake and owes
-    /// the signal; the sends behind it, from any sender, do not, until a
-    /// drain takes again.
     #[test]
     fn only_the_send_that_arms_the_wake_owes_a_signal() {
         let (tx, rx) = channel();
@@ -248,10 +235,6 @@ mod tests {
         assert_eq!(drain(&rx), [4]);
     }
 
-    /// A DRAIN THAT TAKES NOTHING STILL CLEARS THE FLAG: with the lock held,
-    /// as by a sender part-way through its push, the drain finds nothing, and
-    /// the next arm still owes a signal, so the events queued behind the lock
-    /// are drained.
     #[test]
     fn a_drain_that_finds_the_lock_held_still_clears_the_flag() {
         let (tx, rx) = channel::<u32>();
@@ -281,9 +264,6 @@ mod tests {
         assert_eq!(tx.send(2), Err(2));
     }
 
-    /// THE DRAIN NEVER WAITS ON A SENDER PART-WAY THROUGH A PUSH: another
-    /// thread holds the queue's lock, as a sender preempted inside `send`
-    /// does, and the drain returns with nothing, at once.
     #[test]
     fn a_drain_returns_at_once_while_a_sender_holds_the_lock() {
         let (tx, rx) = channel::<u32>();

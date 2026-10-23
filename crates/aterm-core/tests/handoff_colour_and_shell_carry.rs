@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An in-session update carries the colours an application set and its shell
-//! integration, not just the cells: the OSC 4 palette, OSC 10/11 theme, OSC 133
-//! command blocks, and a command running across the update, which must still
-//! complete (`completed_command_seq` moves) when its `D` arrives.
-//!
-//! These drive the GUI's seamless path (`checkpoint_carry` on the outgoing engine,
-//! `restore_checkpoint` into a configured successor). Negative control: a successor that
-//! adopts only the cells loses all of it.
+//! Tests that in-session handoff carries application colours, shell integration, and history numbering.
 
 use aterm_core::config::TerminalConfig;
 use aterm_core::terminal::{Rgb, Terminal};
@@ -17,9 +10,6 @@ const ROWS: u16 = 12;
 const COLS: u16 = 60;
 const CARRY: usize = 256;
 
-/// A host theme from a host that allows palette reconfigure, as the aterm app
-/// does by default (the engine library's own default stays off), so
-/// applications may recolour it.
 fn theme(fg: Rgb) -> TerminalConfig {
     TerminalConfig {
         default_foreground: fg,
@@ -28,8 +18,6 @@ fn theme(fg: Rgb) -> TerminalConfig {
     }
 }
 
-/// A configured engine with a base16-style OSC 4 override, an OSC 11
-/// background, one finished command and one still running.
 fn outgoing() -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
     t.apply_config(&theme(Rgb {
@@ -44,8 +32,6 @@ fn outgoing() -> Terminal {
     t
 }
 
-/// The successor: a fresh engine configured by this process — whose theme
-/// foreground differs from the outgoing one's.
 fn successor() -> Terminal {
     let mut t = Terminal::new(ROWS, COLS);
     t.apply_config(&theme(Rgb {
@@ -97,7 +83,6 @@ fn colours_the_application_set_survive_over_the_new_theme() {
         "an un-overridden palette entry is the successor's"
     );
 
-    // Negative control: a cells-only adopt.
     let mut cells_only = cp.clone();
     cells_only.color = Default::default();
     let mut old = successor();
@@ -113,7 +98,6 @@ fn a_command_running_across_the_handoff_completes_after_it() {
     let mut next = successor();
     next.restore_checkpoint(&cp);
 
-    // The finished command's block is still addressable, on the same line.
     let finished: Vec<_> = next.all_blocks().filter(|b| b.is_complete()).collect();
     assert_eq!(finished.len(), 1, "the finished block survives");
     assert_eq!(next.command_marks().len(), 1, "its prompt mark survives");
@@ -127,7 +111,6 @@ fn a_command_running_across_the_handoff_completes_after_it() {
         "the carried absolute row names the same line on the successor"
     );
 
-    // The running command ends after the update, and it counts.
     next.process(b"done\r\n\x1b]133;D;0\x07");
     assert_eq!(
         next.completed_command_seq(),
@@ -136,7 +119,6 @@ fn a_command_running_across_the_handoff_completes_after_it() {
     );
     assert!(next.current_block().is_some_and(|b| b.is_complete()));
 
-    // Negative control: without the shell carry the same D is ignored.
     let mut cells_only = cp.clone();
     cells_only.shell = Default::default();
     let mut old = successor();
@@ -149,17 +131,9 @@ fn a_command_running_across_the_handoff_completes_after_it() {
     );
 }
 
-// The shell carry meets the history carry. The seamless adopt restores the checkpoint
-// (continuing the source's absolute numbering, marks at the source's rows), reserves keys
-// for the history sidecar the import brings after Commit, then attaches it. The carried
-// marks must keep naming their lines, so a command running across the update completes
-// with exactly the source's output span.
-
 use aterm_core::grid::OlderHistory;
 use aterm_core::scrollback::Line;
 
-/// A 5x40 engine with 30 lines of history, one finished command whose rows
-/// the checkpoint carries, and one command still running.
 fn outgoing_with_history() -> Terminal {
     let mut t = Terminal::new(5, 40);
     for i in 0..30 {
@@ -171,7 +145,6 @@ fn outgoing_with_history() -> Terminal {
     t
 }
 
-/// The whole history, oldest first — what the history export reads.
 fn exported(t: &Terminal) -> Vec<Line> {
     let fence = t.history_fence();
     t.history_lines_since_fence(&fence, fence.oldest, usize::MAX)
@@ -205,7 +178,6 @@ fn carried_blocks_name_the_same_lines_after_the_history_import() {
     let take = lines.len() - CARRIED;
     assert!(take > 0, "the sidecar holds what the checkpoint does not");
     let source_finished = finished_output(&source, "pwd");
-    // A block's output runs to the next prompt.
     assert_eq!(source_finished.as_deref(), Some("SECOND-OUT\ntail0\ntail1"));
 
     let mut next = Terminal::new(5, 40);
@@ -228,8 +200,6 @@ fn carried_blocks_name_the_same_lines_after_the_history_import() {
         "a finished block reads its own output after the import"
     );
 
-    // The command running across the update ends after it (the next prompt closes its
-    // span): its output is exactly the source's, not the imported history above it.
     for t in [&mut source, &mut next] {
         t.process(b"done\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
     }
@@ -243,9 +213,6 @@ fn carried_blocks_name_the_same_lines_after_the_history_import() {
     );
 }
 
-/// A parent that predates the numbering carry names no counter: the restored
-/// grid numbers from zero, and the reserve still raises the counter by the
-/// whole import so no live or retained row's key moves when it lands.
 #[test]
 fn a_fresh_numbered_restore_still_reserves_the_whole_import() {
     const CARRIED: usize = 6;

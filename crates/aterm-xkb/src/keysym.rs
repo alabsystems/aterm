@@ -4,8 +4,7 @@
 //
 // Derived from xkeysym 0.2.1 (MIT OR Apache-2.0 OR Zlib, used under Apache-2.0).
 
-//! X11 keysyms used by aterm's key handling, with xkeysym 0.2.1 Rust names
-//! and [`NAMES`] mapping each constant to its `xkb_keysym_from_name` C name.
+//! X11 keysym constants and [`NAMES`] lookup table.
 
 #![allow(
     non_upper_case_globals,

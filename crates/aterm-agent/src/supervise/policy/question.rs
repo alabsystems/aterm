@@ -627,8 +627,11 @@ struct TextChosen {
     unproven: String,
 }
 
-/// The policy text's decision on one tab (module header) under `priority`,
-/// whose fixed text is `text`, the loop remembering `own` in the field:
+/// The policy text's decision on one tab under `priority`, whose fixed text is
+/// `text`, the loop remembering `own` in the field: `text` written into a
+/// pristine free-text row where it fits, then Enter once the field holds exactly
+/// that text (on a review, its submit); else the recommended option, said, where
+/// the text may not go, and `Err` (handed over) for anything else.
 fn choose_text(
     prompt: &PromptV2,
     dialog: &QuestionDialog,
@@ -1050,7 +1053,7 @@ pub fn note_step(
 }
 
 /// A question read by its answers' roles (Muse Code's) under a text priority
-/// (module header): the word's text as a note under `None of the above`
+/// (`long-term` or `short-term`): the word's text as a note under `None of the above`
 /// ([`Choice::Note`], carried out one keystroke at a time by the loop on
 /// [`note_step`]).
 fn note_answer(

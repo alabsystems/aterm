@@ -4,9 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/window_property.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (GetProperty and
-// ChangeProperty are aterm-x11's encoders, and a property's items `PropertyItem`s, where
-// upstream used x11rb's requests and bytemuck's `Pod`.)
+// Modified by the aterm project in 2026; see the repository NOTICE. (GetProperty and ChangeProperty
+// are aterm-x11's encoders, and a property's items `PropertyItem`s, where upstream used x11rb's
+// requests and bytemuck's `Pod`.)
 
 use std::error::Error;
 use std::fmt;
@@ -19,10 +19,7 @@ pub const CARDINAL_SIZE: usize = mem::size_of::<u32>();
 
 pub type Cardinal = u32;
 
-/// An item of a property's value: 8-bit (`u8`) or 32-bit (`u32`, an atom, window or
-/// cardinal), in this client's byte order on the wire, as libxcb sends and receives it.
-/// Upstream bounded these by bytemuck's `Pod`; these are the two the backend reads and
-/// writes.
+/// An 8-bit (`u8`) or 32-bit (`u32`) property item in wire byte order.
 pub trait PropertyItem: Copy {
     /// The property format, in bits.
     const FORMAT: u8;
@@ -93,8 +90,6 @@ impl fmt::Display for GetPropertyError {
 
 impl Error for GetPropertyError {}
 
-// Number of 32-bit chunks to retrieve per iteration of get_property's inner loop.
-// To test if `get_property` works correctly, set this to 1.
 const PROPERTY_BUFFER_SIZE: u32 = 1024; // 4k of RAM ought to be enough for anyone!
 
 impl XConnection {
@@ -107,7 +102,6 @@ impl XConnection {
         let mut data = vec![];
         let mut offset = 0;
         loop {
-            // Send the request and wait for the reply.
             let reply: GetPropertyReply = self
                 .xcb_connection()
                 .send(xproto::get_property(
@@ -120,20 +114,16 @@ impl XConnection {
                 ))?
                 .reply()?;
 
-            // Make sure that the reply is of the correct type.
             if reply.type_ != property_type {
                 return Err(GetPropertyError::TypeMismatch(reply.type_));
             }
 
-            // Make sure that the reply is of the correct format.
             if reply.format != T::FORMAT {
                 return Err(GetPropertyError::FormatMismatch(reply.format.into()));
             }
 
-            // Append the data to the output.
             T::extend_from(&reply.value, &mut data);
 
-            // Check `bytes_after` to see if there are more windows to fetch.
             if reply.bytes_after == 0 {
                 break;
             }

@@ -195,7 +195,7 @@ fn super_env(cpu: &Renderer, rows: usize, cols: usize) -> SuperEnv {
 }
 
 /// Fold one super nova frame at `t_ms` into `input` as the engine does: additive quads into
-/// `nova_add`.
+/// `nova_add`, deco stamps into `word_decorations`.
 fn push_super(input: &mut aterm_core::render::RenderInput, env: &SuperEnv, t_ms: u64) {
     supernova::emit_super(
         t_ms,

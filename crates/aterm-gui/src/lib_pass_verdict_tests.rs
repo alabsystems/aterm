@@ -4,14 +4,12 @@
 use super::{PassRun, PassVerdict, SeedMarkers, classify_pass_exit};
 use std::time::Duration;
 
-/// Every verdict `classify_pass_exit` can reach, one labelled row each:
-/// (label, exit code, card opened, marker seen) → verdict. Offline is its own ending,
-/// short of an unanswered card.
+/// Verifies `classify_pass_exit` on labelled `(exit_code, card_opened, marker_seen)` rows that
+/// reach each of its verdicts.
 #[test]
 fn every_pass_exit_classifies_to_its_verdict() {
     let busy = Some(i32::from(atpkg::lock::CONTENDED_EXIT));
     let offline = Some(i32::from(aterm_update_core::pkg_check::PASS_OFFLINE_EXIT));
-    // atpkg's exit codes, read from the crates both sides share.
     assert_eq!(busy, Some(75));
     assert_eq!(offline, Some(69));
     type Row = (&'static str, Option<i32>, bool, bool, PassVerdict);
@@ -22,21 +20,15 @@ fn every_pass_exit_classifies_to_its_verdict() {
         ("an io refusal (1) is still refused", Some(1), false, false, PassVerdict::Refused),
         ("an io refusal (2) is still refused", Some(2), false, false, PassVerdict::Refused),
         ("a signalled child is refused", None, false, false, PassVerdict::Refused),
-        // An opened card is answered whatever the exit.
         ("an opened card, exit 0", Some(0), true, false, PassVerdict::AnnouncedThenDied),
         ("an opened card, exit 1", Some(1), true, false, PassVerdict::AnnouncedThenDied),
         ("an opened card, exit 75", busy, true, false, PassVerdict::AnnouncedThenDied),
         ("an opened card, signalled", None, true, false, PassVerdict::AnnouncedThenDied),
-        // A marker outranks the code…
         ("a marker outranks a failing code", Some(1), false, true, PassVerdict::Answered),
         ("a marker answers an opened card", Some(0), true, true, PassVerdict::Answered),
-        // …except beside exit 75: only the dispatch edge's refusal exits 75, printing
-        // its own `seed-busy:` terminal, so the pass is still deferred.
         ("the contention refusal's own terminal is not a pass that ran", busy, false, true, PassVerdict::Busy),
-        // Offline is offline whatever marker answered…
         ("offline, no marker", offline, false, false, PassVerdict::Offline),
         ("offline, a marker beside an opened card", offline, true, true, PassVerdict::Offline),
-        // …short of an unanswered card, which is still answered.
         ("offline under an opened, unanswered card", offline, true, false, PassVerdict::AnnouncedThenDied),
     ];
     for (label, code, card, marker, verdict) in rows {
@@ -58,9 +50,7 @@ fn run(code: Option<i32>, seen: SeedMarkers, said: &str) -> PassRun {
     }
 }
 
-/// A waited pass that then ran or died retires the lane's bar
-/// (`PkgProgress { snapshot: None }`) exactly once; only a `Busy` exit leaves it for
-/// the next queued child (`carry_wait_row`).
+/// `carry_wait_row` clears the progress bar once after a pass runs or dies, and keeps it open on `PassVerdict::Busy`.
 #[test]
 fn a_waited_pass_that_ran_retires_its_row_and_busy_carries_it() {
     for verdict in [
@@ -80,7 +70,6 @@ fn a_waited_pass_that_ran_retires_its_row_and_busy_carries_it() {
             ),
             "{verdict:?}: exactly the clear is posted: {posted:?}"
         );
-        // Carried from an earlier child, no wait line of its own: the same.
         let mut posted = Vec::new();
         assert!(!carry_wait_row(true, false, verdict, |e| posted.push(e)));
         assert_eq!(posted.len(), 1, "{verdict:?}: {posted:?}");
@@ -99,9 +88,7 @@ fn a_waited_pass_that_ran_retires_its_row_and_busy_carries_it() {
     assert!(posted.is_empty(), "{posted:?}");
 }
 
-/// A markerless refusal of a seed or whole update is reported as a failure with the
-/// child's stderr; a targeted `update <program>` stays a log line (its row is the
-/// record). A quiet healthy launch posts nothing.
+/// Markerless refusals report `Wake::PkgSeedFailed` for whole-store passes and log-only for single-program updates.
 #[test]
 fn a_refused_whole_pass_is_a_failure_and_a_targeted_one_is_its_row() {
     let refused = run(
@@ -130,7 +117,6 @@ fn a_refused_whole_pass_is_a_failure_and_a_targeted_one_is_its_row() {
             assert!(posted.is_empty(), "{verb}: a log line only: {posted:?}");
         }
     }
-    // Killed mid-download (a signal: no code), no marker: a failure too.
     let killed = run(None, SeedMarkers::default(), "");
     assert_eq!(killed.verdict(), PassVerdict::Refused);
     let mut posted = Vec::new();
@@ -152,10 +138,7 @@ fn a_refused_whole_pass_is_a_failure_and_a_targeted_one_is_its_row() {
     );
 }
 
-/// A pass on the cached index is not a failure: exit 1, empty stderr, and this pass's
-/// own record (its `pass_seq` moved) naming the cached index is said as a stale index
-/// and posts nothing. Controls through the same arm: an unmoved `pass_seq`, a failed
-/// live-index pass, and a cached-index pass with stderr are still failures.
+/// An exit-1 pass with empty stderr whose new status record names a cached index posts no failure.
 #[test]
 fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
     use super::cached_index_cause;
@@ -189,7 +172,6 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
         posted
     };
 
-    // Exit 1, empty stderr, this pass's record says the cached index.
     let this_pass = record(8, "failed", cached);
     assert_eq!(before(7).verdict(), PassVerdict::Refused);
     assert_eq!(
@@ -201,7 +183,6 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
         posted_by(&before(7)).is_empty(),
         "a stale-index pass posts no failure"
     );
-    // No record before the spawn (a first pass): the one it ended is its own.
     assert!(
         posted_by(&PassRun {
             pass_seq_before: None,
@@ -210,8 +191,6 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
         .is_empty()
     );
 
-    // Control: the record is the last pass's (`pass_seq` unmoved) — a refusal at the
-    // dispatch edge writes nothing — so this markerless exit is a failure.
     assert_eq!(cached_index_cause(Some(8), &this_pass), None);
     assert!(
         matches!(
@@ -220,7 +199,6 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
         ),
         "an unmoved record is not this pass's"
     );
-    // Control: a pass on the live index that failed carries no cached clause.
     let live = record(
         9,
         "failed",
@@ -231,10 +209,8 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
         posted_by(&before(8)).as_slice(),
         [Wake::PkgSeedFailed { .. }]
     ));
-    // Control: an ok pass is not "failed", whatever its outcome says.
     let ok = record(10, "ok", cached);
     assert_eq!(cached_index_cause(Some(9), &ok), None);
-    // Control: a cached-index pass whose stderr said something is that failure.
     record(11, "failed", cached);
     let said = PassRun {
         pass_seq_before: Some(10),
@@ -251,7 +227,6 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
         ),
         "stderr outranks the record"
     );
-    // An empty recorded cause still names one.
     let bare = record(12, "failed", "up to date (index from cache \u{2014} )");
     assert_eq!(
         cached_index_cause(Some(11), &bare).as_deref(),
@@ -260,10 +235,7 @@ fn a_cached_index_pass_is_quiet_and_names_its_cause_regression_2026_09_24() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A pass that stood down behind a sibling's cached-index pass is not a failure either.
-/// atpkg's real stand-down (`atpkg::cli::stand_down_exit` over `stale_index_only_end`)
-/// builds the child's streams, binding both halves. Control: a sibling pass that also
-/// failed a member stands down on stderr and is still posted.
+/// Standing down behind a sibling pass that failed only due to a cached index posts no failure.
 #[test]
 fn a_stand_down_behind_a_siblings_cached_index_pass_is_quiet_regression_2026_09_26() {
     use aterm_update_core::pkg_check::PassOutcome;
@@ -278,8 +250,6 @@ fn a_stand_down_behind_a_siblings_cached_index_pass_is_quiet_regression_2026_09_
     std::fs::create_dir_all(&layout.prefix).unwrap();
     let cached = "up to date (index build 46) (index from cache \u{2014} GitHub rate limit \
                   hit (HTTP 403))";
-    // The sibling's pass end, as atpkg records it: seq 8, failed, the cache clause —
-    // and whether it failed for its index alone.
     let sibling_ended = |stale_only: bool| {
         let status = atpkg::status::Status {
             schema: 1,
@@ -293,8 +263,6 @@ fn a_stand_down_behind_a_siblings_cached_index_pass_is_quiet_regression_2026_09_
         atpkg::status::write(&layout, &status).unwrap();
         status
     };
-    // The window's child: read seq 7 before the spawn, queued, stood down — its
-    // streams and exit exactly as atpkg's stand-down decides them.
     let stood_down = |record: &atpkg::status::Status| {
         let exit = atpkg::cli::stand_down_exit(
             PassOutcome::Failed,
@@ -333,7 +301,6 @@ fn a_stand_down_behind_a_siblings_cached_index_pass_is_quiet_regression_2026_09_
         stale.said
     );
 
-    // Control: the sibling's cached-index pass failed a member too — a failure, said.
     let failed = stood_down(&sibling_ended(false));
     assert!(!failed.said.is_empty(), "the stand-down speaks on stderr");
     assert!(
@@ -347,9 +314,7 @@ fn a_stand_down_behind_a_siblings_cached_index_pass_is_quiet_regression_2026_09_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A pass ran unless the child stood aside at the lock (exit 75, with or
-/// without its `seed-busy:` terminal): that child wrote no rows. Every other
-/// ending — quiet, answered, refused, signalled — is a pass that ran.
+/// `PassRun::ran` is false only when the child exited `75` (`CONTENDED_EXIT`).
 #[test]
 fn a_pass_ran_unless_the_child_stood_aside_at_the_lock() {
     let run = |code: Option<i32>, seen: SeedMarkers| PassRun {
@@ -410,8 +375,7 @@ fn a_pass_ran_unless_the_child_stood_aside_at_the_lock() {
 use super::{CONTENTION_WEDGE_PARK, ContentionBackoff, PkgLane};
 use std::sync::{Arc, Mutex};
 
-/// A lane over a `Vec<Wake>` sink, with the waiting row open as a `Busy` child
-/// leaves it.
+/// Builds a [`PkgLane`] backed by `posted` with `wait_row_open` set.
 fn busy_lane(
     posted: &Arc<Mutex<Vec<Wake>>>,
 ) -> PkgLane<'static, impl Fn(Wake) + Clone + Send + 'static + use<>> {
@@ -450,9 +414,7 @@ fn one_routine_deferral(posted: &Arc<Mutex<Vec<Wake>>>) {
     assert!(!stands_down, "a deferral that retries is routine: {detail}");
 }
 
-/// The park after a pass whose wait timed out: the backoff (30 s, then 60 s), then
-/// the wedge — an hour; each posts one deferred row, and the child's answer closes the
-/// row it left open.
+/// Timed-out lock waits back off through 30s, 60s, and the 1-hour wedge while closing `wait_row_open`.
 #[test]
 fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
     let busy = run(Some(75), SeedMarkers::default(), "");
@@ -473,8 +435,6 @@ fn a_timed_out_wait_parks_on_the_backoff_then_the_wedge() {
     assert_eq!(park, Duration::from_secs(3600), "the wedge: an hour");
     assert!(lane.backoff.wedged());
     one_routine_deferral(&posted);
-    // A seed at the wedge parks the same hour and retries: a routine row, not the
-    // Settings ▸ Packages badge.
     let mut lane = busy_lane(&posted);
     lane.park_after_timed_out_wait(PassVerb::Seed, &busy);
     lane.park_after_timed_out_wait(PassVerb::Seed, &busy);

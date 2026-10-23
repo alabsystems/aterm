@@ -145,6 +145,13 @@ impl Resolved {
     }
 
     /// What runs, for the first line of the signpost — `tool` is the name typed:
+    ///
+    /// * `Trust 7d5533b2, via rustup trust (the rustup default)`
+    /// * `STOCK rustc 1.97.1 (8bab26f4f), via rustup 1.97.1-aarch64-apple-darwin (pinned by
+    ///   /r/rust-toolchain.toml); not Trust`
+    /// * `` cargo 1.99.0-dev (e9ca49080), which prints `trust-repo-commit-hash: e9ca49080f0f`
+    ///   but no `trust:` version; not known to be Trust ``
+    /// * `an unidentified cargo (/x/cargo -vV exited 3); not known to be Trust`
     #[must_use]
     pub fn verdict(&self, tool: &str) -> String {
         let mut out = self.identity.name(tool);

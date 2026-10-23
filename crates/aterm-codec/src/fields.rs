@@ -198,9 +198,6 @@ impl FieldSink for TextSink {
     }
 }
 
-/// A pair key in the text form: [`crate::pct`]'s escape, plus `%2C` for `,`
-/// and `%3A` for `:`, the separators of `k:v,k:v`. A label keeps a bare `,`
-/// (a comma-joined list is one label), so this applies to pair keys alone.
 fn encode_pair_key(out: &mut String, key: &str) {
     let mut buf = [0; 4];
     for c in key.chars() {
@@ -342,10 +339,8 @@ mod tests {
         sink.finish()
     }
 
-    /// One emit and the text and JSON bytes it must produce.
     type Case<'a> = (&'a dyn Fn(&mut dyn FieldSink), &'a str, &'a str);
 
-    /// Each method's exact bytes in each syntax, one field per call.
     #[test]
     fn each_kind_spells_its_documented_bytes() {
         let rec = [("arms", Cell::Count(3)), ("past", Cell::Count(1))];
@@ -404,7 +399,6 @@ mod tests {
         }
     }
 
-    /// Fields join with one space in text and one comma in JSON, in call order.
     #[test]
     fn fields_keep_their_call_order() {
         let emit = |s: &mut dyn FieldSink| {
@@ -418,7 +412,6 @@ mod tests {
         assert_eq!(JsonSink::new().finish(), "{}");
     }
 
-    /// The record picks its text flag words; JSON is always a boolean.
     #[test]
     fn the_text_flag_words_are_the_records_choice() {
         for (flags, yes, no) in [
@@ -435,13 +428,6 @@ mod tests {
         }
     }
 
-    /// A runtime string is escaped by each syntax's own rule: a quote and a
-    /// backslash are escaped in JSON and pass through the text form bare (they
-    /// are graphic), while a space or a control byte is `%XX` in text, so the
-    /// value stays one token, and `\u00XX` in JSON. A pair key's `,` and `:`
-    /// are `%2C` and `%3A` in text, so its ledger splits back into the keys
-    /// written, while a label keeps its `,` and `:` bare. The control: a plain
-    /// identifier is the same bytes in both.
     #[test]
     fn labels_and_pair_keys_are_escaped_per_syntax() {
         let emit = |s: &mut dyn FieldSink| {
@@ -472,9 +458,6 @@ mod tests {
         assert_eq!(keys, ["a b", "a:b", "c,d"], "{ledger}");
     }
 
-    /// JSON has no spelling for a non-finite number, so it writes `null`; the
-    /// text form writes what `{:.N}` writes. The control: a finite value is
-    /// the same digits in both.
     #[test]
     fn a_non_finite_decimal_is_null_in_json() {
         let emit = |s: &mut dyn FieldSink| {

@@ -1,39 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-font held to the TF.1 reader corpus
-//! (`crates/aterm-render/tests/fixtures/font-oracle/reader.txt`): the answers
-//! ttf-parser 0.25.1 recorded, per face and variation instance, for every
-//! query the reader answers (TF.3 and TF.5 of
-//! docs/AUDIT-third-party-2026-10-15.md).
-//!
-//! - `head`, `os2`, `name`: units per em, glyph count, global box, the table
-//!   directory, the OS/2 classes, flags and Unicode ranges, every name record;
-//! - `fvar`, `coords`: the axes, and the `fvar`+`avar` normalized instance;
-//! - `cmap.sub<i>`, `cmap.index`, `cmap.vs`: each subtable's enumeration and
-//!   lookups, the face-level lookup, and variation sequences;
-//! - `metrics`: the `hhea`/OS/2/`vhea`/`post` line metrics with `MVAR` deltas;
-//! - `hmtx`, `vmtx`: advances and side bearings with `HVAR`/`VVAR`/`gvar`
-//!   deltas, and `VORG`;
-//! - `bbox`, `outline.<start>`: every glyph's outline as an exact point
-//!   stream digest (`glyf`, `gvar`, CFF, CFF2), and its bounding box;
-//! - `kern.<i>`, `gsub`, `gpos`, `gsub.lookups`, `gdef`: legacy kerning, the
-//!   layout lists, every `GSUB` lookup's subtables whole, glyph classes;
-//! - `sbix.strike<i>`, `raster.<ppem>`, `cpal`, `colr.<start>`: bitmap
-//!   strikes and the face-level image lookup, and every COLR glyph's paint
-//!   graph at each recorded instance.
-//!
-//! The answers are written by `reader.rs` (aterm-render's
-//! `tests/font_oracle/reader.rs`), the same code the out-of-workspace
-//! recorder runs on ttf-parser, so a line here is the line it recorded. A
-//! system face this host lacks is skipped, never failed; a committed face
-//! must answer every line.
-//!
-//! `reader.txt` is ttf-parser as `-p aterm-render` resolved it, without its
-//! `gvar-alloc` feature; no face there has a glyph past 32 `gvar` tuples,
-//! where that feature matters. The faces that do (`GVAR_ALLOC_FACES`) are
-//! held to `reader-gvar-alloc.txt`, which ttf-parser recorded with the
-//! feature, as aterm's Linux build ships it (`gvar_tuples.rs`).
+//! Compares `aterm-font` against the `ttf-parser` 0.25.1 reader corpus (`reader.txt` and `reader-gvar-alloc.txt` in `aterm-render/tests/fixtures/font-oracle/`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,8 +9,7 @@ use aterm_font::{Face, GlyphId, OutlineSink, Rect, ScaledSink};
 
 use crate::corpus::{self, BLOCK, FACES, FaceFile, GVAR_ALLOC_FACES, Line, Origin};
 
-/// The reader `reader.rs` answers with here: aterm-font, under ttf-parser's
-/// names (its outline sink trait is `OutlineSink`).
+/// Re-exports `aterm_font` under `ttf-parser` names for the shared `reader.rs` harness.
 mod font {
     pub(crate) use aterm_font::OutlineSink as OutlineBuilder;
     pub(crate) use aterm_font::*;
@@ -50,7 +17,7 @@ mod font {
 #[path = "../../aterm-render/tests/font_oracle/reader.rs"]
 pub(crate) mod reader;
 
-/// One face file this host has, and its corpus key.
+/// Loaded font face bytes and corpus key.
 struct Loaded {
     label: &'static str,
     committed: bool,
@@ -78,11 +45,10 @@ fn load(face: &corpus::FaceFile) -> Option<Loaded> {
     })
 }
 
-/// The recorded `read` lines, by face key, then by `(index, instance)`, then
-/// by query.
+/// Recorded `read` lines indexed by face key, `(index, instance)`, and query.
 type Recorded = BTreeMap<String, BTreeMap<(u32, String), BTreeMap<String, String>>>;
 
-/// The recorded lines of `tests/fixtures/font-oracle/<file>` in aterm-render.
+/// Parses recorded `read` lines from `tests/fixtures/font-oracle/<file>` in `aterm-render`.
 fn recorded(file: &str) -> Recorded {
     let path = format!(
         "{}/../aterm-render/tests/fixtures/font-oracle/{file}",
@@ -109,8 +75,7 @@ fn recorded(file: &str) -> Recorded {
     out
 }
 
-/// What one replay compared: by outline source, and by query family (the
-/// case name before its first `.`).
+/// Summary counts and mismatches from one corpus replay.
 #[derive(Default, Debug)]
 struct Tally {
     compared: usize,
@@ -118,11 +83,11 @@ struct Tally {
     families: BTreeMap<String, usize>,
     moved: Vec<String>,
     faces: BTreeSet<&'static str>,
-    /// The faces with a compared `colr.*` answer that paints something.
+    /// Faces with a compared `colr.*` answer that paints something.
     painted: BTreeSet<&'static str>,
 }
 
-/// The table a face's outlines come from, as [`Face::outline_glyph`] picks it.
+/// Outline table source selected by [`Face::outline_glyph`].
 fn outline_source(face: &Face, varied: bool) -> &'static str {
     let t = face.tables();
     if t.gvar.is_some() && t.glyf.is_some() {
@@ -138,7 +103,7 @@ fn outline_source(face: &Face, varied: bool) -> &'static str {
     }
 }
 
-/// Replay `file`'s lines for `faces` against aterm-font.
+/// Replays `file`'s lines for `faces` against `aterm-font`.
 fn replay(faces: &[FaceFile], file: &str) -> Tally {
     let recorded = recorded(file);
     let mut tally = Tally::default();
@@ -208,8 +173,7 @@ fn replay(faces: &[FaceFile], file: &str) -> Tally {
     tally
 }
 
-/// Every answer the reader gives matches what ttf-parser recorded, on every
-/// face this host has and every instance the corpus recorded it at.
+/// Every reader answer on available faces matches the recorded `reader.txt` corpus.
 #[test]
 fn reader_corpus_answers_hold() {
     let tally = replay(FACES, "reader.txt");
@@ -226,8 +190,6 @@ fn reader_corpus_answers_hold() {
         tally.moved.len(),
         tally.moved.join("\n")
     );
-    // Not vacuous: the committed faces alone answer hundreds of lines, and
-    // they cover plain glyf, glyf at a gvar instance, and CFF.
     assert!(
         tally.compared >= 300,
         "only {} answers compared",
@@ -240,8 +202,6 @@ fn reader_corpus_answers_hold() {
             tally.outline_lines
         );
     }
-    // And every query family the committed faces carry: the COLR fixtures
-    // paint, Chewy and Luckiest Guy kern, every face has OS/2 and `name`.
     for family in [
         "head", "os2", "name", "metrics", "cmap", "hmtx", "gsub", "gdef", "kern", "cpal", "colr",
     ] {
@@ -251,7 +211,6 @@ fn reader_corpus_answers_hold() {
             tally.families
         );
     }
-    // A bless that recorded empty paint graphs would compare `colr` lines too.
     assert!(
         tally.painted.contains("fixture-colr_1"),
         "the COLR fixture paints no colour glyph: {:?}",
@@ -259,9 +218,7 @@ fn reader_corpus_answers_hold() {
     );
 }
 
-/// NEGATIVE CONTROL: the outline digest sees a one-unit shift. The same
-/// committed-face block, rerouted through a [`ScaledSink`], matches the
-/// recorded answer at the identity and moves when the sink translates by 1.
+/// Negative control: translating an outline by 1 unit through [`ScaledSink`] changes its digest.
 #[test]
 fn a_shifted_outline_does_not_match() {
     let recorded = recorded("reader.txt");
@@ -291,10 +248,7 @@ fn a_shifted_outline_does_not_match() {
     );
 }
 
-/// The faces with glyphs past 32 `gvar` tuples answer what ttf-parser with
-/// `gvar-alloc` recorded: every glyph draws, at every recorded instance. A
-/// host without them (they are macOS system faces) compares nothing here;
-/// `gvar_tuples.rs` covers the same path on every host.
+/// Faces with glyphs past 32 `gvar` tuples match `reader-gvar-alloc.txt` when present on this host.
 #[test]
 fn gvar_alloc_answers_hold() {
     let tally = replay(GVAR_ALLOC_FACES, "reader-gvar-alloc.txt");

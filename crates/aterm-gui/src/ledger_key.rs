@@ -1,30 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The ledger key: with a session focused, ⇧⌘L (`cmd+shift+l`; `ctrl+shift+l` off
-//! macOS; the `open_ledger` action in `[keybindings]`) runs
-//! `aterm drive ledger @<sid> --format html --out <file>` and opens the file.
-//!
-//! The ledger is the watcher's timeline (the long form of the presence band's
-//! `◇ quiet` summary). It runs as a child process because it gathers over the
-//! control socket, which on the main thread would block the event loop on its own
-//! socket. The child gets `drive --socket <this instance's socket>` ([`with_socket`]);
-//! the CLI creates the file `0600`.
-//!
-//! A headless instance composes the plan and launches nothing.
+//! Keybinding and menu action to export and open a session's harness ledger as HTML.
 
 use std::path::{Path, PathBuf};
 
-/// The command a ledger keystroke composes and where the file goes; kept on the
-/// `App` (`last_ledger_plan`) so tests can read what the key did.
+/// Command plan and output path for a session ledger export.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LedgerPlan {
     /// The focused session's stable id (`s-…`), as `@<sid>` names it.
     pub(crate) sid: String,
     /// The HTML file the CLI writes.
     pub(crate) out: PathBuf,
-    /// The CLI's argv after the program: `drive ledger @<sid> --format html
-    /// --out <file>`.
+    /// The CLI's argv after the program name.
     pub(crate) argv: Vec<String>,
 }
 
@@ -41,8 +29,7 @@ pub(crate) fn ledger_argv(sid: &str, out: &Path) -> Vec<String> {
     ]
 }
 
-/// Output path for `sid`'s ledger: `aterm-ledger-<sid>-<unix seconds>.html` in the
-/// temp dir, one per keystroke, so a ledger open in a browser is never rewritten.
+/// Output path for `sid`'s ledger in the system temp directory.
 pub(crate) fn ledger_out_path(sid: &str, unix_s: u64) -> PathBuf {
     let safe: String = sid
         .chars()
@@ -62,8 +49,7 @@ pub(crate) fn plan_for(sid: &str) -> LedgerPlan {
     }
 }
 
-/// The `aterm` CLI the key runs: the one beside this executable (`Contents/MacOS`
-/// in the `.app`, `target/<profile>/` in a dev tree), else `aterm` on `PATH`.
+/// Resolve the `aterm` CLI executable path.
 pub(crate) fn aterm_cli() -> PathBuf {
     let name = format!("aterm{}", std::env::consts::EXE_SUFFIX);
     std::env::current_exe()
@@ -73,8 +59,7 @@ pub(crate) fn aterm_cli() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-/// `argv` (a `drive …` command line) pointed at the instance at `sock`:
-/// `drive --socket <sock> …`. The socket is chosen by flag, not environment.
+/// Prepend `--socket <sock>` after `drive` when `sock` is present.
 pub(crate) fn with_socket(argv: &[String], sock: Option<&str>) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len() + 2);
     out.extend(argv.first().cloned());
@@ -86,19 +71,13 @@ pub(crate) fn with_socket(argv: &[String], sock: Option<&str>) -> Vec<String> {
     out
 }
 
-/// Run `plan` on its own thread (gathering can take seconds), then open the file.
-/// `sock` is this instance's control socket. Failures are logged, never raised.
+/// Run `plan` on a background thread and open the resulting HTML file.
 pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
     let spawned = crate::qos::spawn_lane_thread(
         "aterm-ledger-key".to_string(),
         crate::qos::Role::Background,
         move || {
-            // Waits on a CLI child the human is not blocked on.
             let cli = aterm_cli();
-            // `aterm.exe` is a console image: started bare from the window it
-            // opens a visible console on Windows; `spawnfd::command` gives it a
-            // windowless one. Not `qos::command`: an aterm child must not
-            // inherit a clamp.
             let mut cmd = aterm_uds::spawnfd::command(&cli);
             cmd.args(with_socket(&plan.argv, sock.as_deref()));
             match cmd.output() {
@@ -122,25 +101,20 @@ pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
     }
 }
 
-/// Open `path` with the OS default handler for `.html`, via the same helper as the
-/// terminal's link open.
 fn open_file(path: &Path) {
     let url = format!("file://{}", path.display());
     crate::app_mouse::open_url_external(&url);
 }
 
 impl crate::App {
-    /// Compose the ledger plan for the focused session, remember it, and run it when
-    /// this window is a real OS window (headless stops at the plan).
+    /// Compose the ledger plan for the focused session and launch it on real windows.
     pub(crate) fn open_session_ledger(&mut self, wid: crate::WindowId) {
         if let Some(session) = self.focused_session_id(wid) {
             self.open_session_ledger_for(wid, session);
         }
     }
 
-    /// [`Self::open_session_ledger`] for one session by local id — the tab
-    /// menu's Harness Log for the CLICKED tab, which need not be the focused
-    /// one.
+    /// Compose the ledger plan for `session` and launch it on real windows.
     pub(crate) fn open_session_ledger_for(&mut self, wid: crate::WindowId, session: u64) {
         let Some(sid) = self
             .pool
@@ -165,7 +139,6 @@ impl crate::App {
 mod tests {
     use super::*;
 
-    /// The argv is the documented command, `@<sid>` first, HTML to the file.
     #[test]
     fn the_key_runs_drive_ledger_for_the_session_as_html_into_a_private_file() {
         let out = Path::new("/tmp/aterm-ledger-s-1e91-1.html");
@@ -193,13 +166,11 @@ mod tests {
         assert_eq!(plan.sid, "s-1");
         assert_eq!(plan.argv[2], "@s-1");
         assert_eq!(plan.argv[6], plan.out.to_string_lossy());
-        // This instance's socket rides the argv as a `drive` flag.
         assert_eq!(
             with_socket(&plan.argv, Some("/run/aterm/aterm-7.sock"))[..4],
             ["drive", "--socket", "/run/aterm/aterm-7.sock", "ledger"]
         );
         assert_eq!(with_socket(&plan.argv, None), plan.argv);
-        // The front door, never the GUI binary.
         assert!(!aterm_cli().to_string_lossy().contains("aterm-gui"));
     }
 }

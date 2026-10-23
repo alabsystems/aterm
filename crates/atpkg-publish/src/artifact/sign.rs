@@ -257,7 +257,8 @@ pub fn check_signable(parsed: &atpkg::PkgManifest) -> Result<()> {
 /// Sign every manifest named — the ceremony ([`authority`]).
 ///
 /// # Errors
-/// Returns the first manifest refusal, leaving that manifest's directory unchanged.
+/// The first manifest refused; the ones before it stay signed, and the refused one's
+/// directory is left as it was.
 pub fn sign_all(ctx: &Ctx, pkgs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let key = MachineKey::load(ctx, &ctx.identity.key)?;
     let authority = authority(ctx)?;

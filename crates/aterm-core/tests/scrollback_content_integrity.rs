@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Scrollback content integrity: emit many lines, scroll them into history, read them back
-//! by index and across resizes, and assert the exact text survived.
+
+//! Scrollback content integrity across history reads and resizes.
 
 use aterm_core::terminal::Terminal;
 
-/// The logical (pre-wrap) history lines: a row whose `wrapped` flag is set continues the
-/// previous one.
 fn logical_history_lines(term: &Terminal) -> Vec<String> {
     let grid = term.grid();
     let h = grid.scrollback_lines();
@@ -28,8 +25,6 @@ fn logical_history_lines(term: &Terminal) -> Vec<String> {
 
 #[test]
 fn resize_preserves_scrollback_logical_lines_both_directions() {
-    // 190 distinct near-full-width lines at 38x184: a resize must not collapse
-    // scrollback or drop early lines.
     let mut term = Terminal::new(38, 184);
     let mut input = Vec::new();
     for i in 0..190u32 {
@@ -50,8 +45,6 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
     );
     let before_count = before.len();
 
-    // Shrink: wide logical lines rewrap into more physical scrollback rows, so
-    // scrollback_lines() must grow, but no logical line may be lost.
     term.resize(38, 140);
     let after_narrow = logical_history_lines(&term);
     assert!(
@@ -65,7 +58,6 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
         );
     }
 
-    // Widen past the original: lines unwrap; all logical content still present.
     term.resize(38, 200);
     let after_wide = logical_history_lines(&term);
     for line in &before {
@@ -78,7 +70,6 @@ fn resize_preserves_scrollback_logical_lines_both_directions() {
 
 #[test]
 fn resize_preserves_scrollback_with_tiered_storage() {
-    // Same invariant with a tiered store attached, as hosts build one.
     use aterm_core::scrollback::Scrollback;
     let sb = Scrollback::new(1000, 10_000, 100_000_000);
     let mut term = Terminal::with_scrollback(30, 120, 1000, sb);
@@ -118,8 +109,6 @@ fn resize_preserves_scrollback_with_tiered_storage() {
 
 #[test]
 fn scrollback_preserves_line_content_in_order() {
-    // Self-identifying lines. `Terminal::new`'s 10,000-line ring retains all 5000, so
-    // history index 0 is the first line emitted.
     let mut term = Terminal::new(24, 80);
     const N: usize = 5000;
     let mut input = Vec::with_capacity(N * 8);
@@ -129,10 +118,8 @@ fn scrollback_preserves_line_content_in_order() {
     term.process(&input);
 
     let h = term.grid().scrollback_lines();
-    // Nearly all of them scrolled off the 24-row screen into history.
     assert!(h >= N - 40, "expected ~{} history lines, got {h}", N - 24);
 
-    // A spread of indices, the oldest (0) and the newest (h-1) included.
     for k in [0usize, 1, 100, 2500, h - 1] {
         let line = term
             .grid()
@@ -148,9 +135,6 @@ fn scrollback_preserves_line_content_in_order() {
 
 #[test]
 fn synchronized_update_scrolls_nonblank_lines_into_scrollback() {
-    // A tall batch emitted inside a DEC-2026 synchronized-update frame scrolls
-    // the same lines into scrollback as the unsynchronized path: mode 2026
-    // defers rendering only and never gates scroll_up.
     let scrolled = |sync: bool| {
         let mut term = Terminal::new(24, 80);
         let mut input = Vec::new();
@@ -177,7 +161,6 @@ fn synchronized_update_scrolls_nonblank_lines_into_scrollback() {
             "{want} missing from scrollback under DEC-2026 synchronized update"
         );
     }
-    // Sync mode is irrelevant to scrolling: identical history either way.
     assert_eq!(
         with_sync, without_sync,
         "DEC-2026 synchronized update changed which lines scrolled into scrollback"

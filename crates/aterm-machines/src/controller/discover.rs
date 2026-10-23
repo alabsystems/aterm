@@ -93,7 +93,9 @@ pub struct Browse {
 /// Browse `_ssh._tcp`, `_sftp-ssh._tcp` and `_rfb._tcp` for `wait`, then resolve each instance.
 ///
 /// # Errors
-/// One line when `dns-sd` could not run, or quit on its own with an error.
+/// One line when the `_ssh._tcp` or `_rfb._tcp` browse's `dns-sd` could not run, quit on
+/// its own with an error, or printed Bonjour's refusal of this process (that error names
+/// Local Network privacy).
 pub fn browse(sys: &dyn System, wait: Duration) -> Result<Browse, String> {
     let services = [SSH_SERVICE, RFB_SERVICE, SFTP_SERVICE];
     let mut seen = fan_out(&services, services.len(), |service| {
@@ -392,7 +394,9 @@ pub fn hosts_of(cidr: &str) -> Result<Vec<Ipv4Addr>, String> {
 /// Sweep `cidr`'s port 22 with `knock` and return the addresses that accepted.
 ///
 /// # Errors
-/// One line: a bad or too wide `cidr`, or every address of a local subnet answering `NoRoute`.
+/// One line: a bad or too wide `cidr`, or every address of a local subnet answering
+/// `No route to host`, which is Local Network privacy refusing this process, not a
+/// subnet of Macs that are all missing.
 pub fn subnet(knock: &dyn Knock, cidr: &str, timeout: Duration) -> Result<Vec<Found>, String> {
     let hosts = hosts_of(cidr)?;
     let answers = fan_out(&hosts, KNOCK_PARALLEL, |ip| {

@@ -2,19 +2,13 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Line numbers past `u32::MAX`.
-//!
-//! Terminal callers key the index by absolute row, a counter that only grows and
-//! outlives live upgrades. These pin the base-relative posting keys: whatever the
-//! rows are numbered, every path a line number enters or leaves the index by gives
-//! back the line it was fed.
+//! Base-relative posting keys for line numbers past `u32::MAX`.
 
 use super::*;
 use crate::TerminalSearch;
 
 const TWO_32: usize = 1 << 32;
 
-/// The four rows the probes index, and which of them each query finds.
 const ROWS: [&str; 4] = ["first line", "hello world", "other text", "hello again"];
 
 fn lines_of(matches: &[SearchMatch]) -> Vec<usize> {
@@ -23,19 +17,9 @@ fn lines_of(matches: &[SearchMatch]) -> Vec<usize> {
     lines
 }
 
-/// Every query shape, at windows below, straddling and far past `u32::MAX`,
-/// through the terminal-facing API the find bar and `ctl search` use.
 #[test]
 fn rows_past_u32_max_are_found_at_their_own_line_numbers() {
-    for base in [
-        0,
-        TWO_32 - 100,
-        // Straddles: rows 2^32-2, 2^32-1 (= u32::MAX), 2^32 and 2^32+1.
-        TWO_32 - 2,
-        TWO_32,
-        TWO_32 + 1_000,
-        1 << 40,
-    ] {
+    for base in [0, TWO_32 - 100, TWO_32 - 2, TWO_32, TWO_32 + 1_000, 1 << 40] {
         let mut search = TerminalSearch::new();
         search.index_visible_content(base, ROWS);
         let hello = vec![base + 1, base + 3];
@@ -45,7 +29,6 @@ fn rows_past_u32_max_are_found_at_their_own_line_numbers() {
                 ("HELLO", false, false, hello.clone()),
                 ("hel+o", true, true, hello.clone()),
                 ("^hello", false, true, hello.clone()),
-                // Two bytes: the range scan, not the trigram postings.
                 ("h", false, false, vec![base + 1, base + 2, base + 3]),
                 ("lo", true, false, hello.clone()),
             ] {
@@ -65,7 +48,6 @@ fn rows_past_u32_max_are_found_at_their_own_line_numbers() {
         }
         assert_eq!(lines_of(&search.search("hello")), hello, "base={base}");
 
-        // Point navigation, both modes and both directions, wrap included.
         for is_regex in [false, true] {
             let next = search
                 .find_direction_opts(
@@ -103,7 +85,6 @@ fn rows_past_u32_max_are_found_at_their_own_line_numbers() {
             );
         }
 
-        // A narrowing frame carries the lines out and back in.
         let seed = search.search_literal_narrowed("hel", false, None);
         let frame = seed.occurrence_lines.expect("uncapped walk yields a frame");
         assert_eq!(frame.lines().collect::<Vec<_>>(), hello, "base={base}");
@@ -113,8 +94,6 @@ fn rows_past_u32_max_are_found_at_their_own_line_numbers() {
     }
 }
 
-/// A frame names lines, not keys: one handed out before the index re-keyed
-/// itself still finds the same lines afterwards.
 #[test]
 fn a_frame_survives_the_index_rekeying_under_it() {
     let base = TWO_32 + 7;
@@ -125,7 +104,6 @@ fn a_frame_survives_the_index_rekeying_under_it() {
         .search_literal_narrowed("need", true, None)
         .occurrence_lines
         .expect("frame");
-    // An older line moves the window down: every key changes.
     index.index_line(base, "needle zero");
     assert_ne!(index.key_base, base + 10, "the window moved");
     let narrowed = index.search_literal_narrowed("needle", true, Some(&frame));
@@ -134,17 +112,12 @@ fn a_frame_survives_the_index_rekeying_under_it() {
     assert_eq!(lines_of(&all.results.matches), vec![base, base + 10]);
 }
 
-/// The window follows output that runs on past `MAX_KEY_SPAN` rows: the
-/// cached lines still inside the moved window keep being found, nothing is
-/// reported lost, and the next rows append without moving it again.
 #[test]
 fn an_index_kept_across_four_billion_rows_rekeys_and_stays_complete() {
     let start = 10usize;
     let top = start + MAX_KEY_SPAN;
     let mut index = SearchIndex::new();
     index.index_line(start, "old row");
-    // The top of the window, then the terminal stops retaining the old row
-    // (an incremental refresh): a dense window, keyed from far below it.
     for line in top - 2..=top {
         index.index_line(line, &format!("kept needle {line}"));
     }
@@ -173,12 +146,6 @@ fn an_index_kept_across_four_billion_rows_rekeys_and_stays_complete() {
     }
 }
 
-/// Lines the moved window cannot hold are evicted the way the cache cap
-/// evicts: gone, and the results say so from exactly the window's floor.
-///
-/// Literal (trigram) queries only: these windows are sparse on purpose, and
-/// the regex and two-byte paths walk the whole numeric range between the
-/// oldest and newest cached line.
 #[test]
 fn lines_that_cannot_share_the_newest_lines_window_are_reported_evicted() {
     let mut index = SearchIndex::new();
@@ -196,8 +163,6 @@ fn lines_that_cannot_share_the_newest_lines_window_are_reported_evicted() {
     );
     assert_eq!(got.lowest_retained_line, floor);
 
-    // An older line than the window can reach is refused the same way, and a
-    // line inside it moves the window down rather than being lost.
     index.index_line(floor - 1, "too old needle");
     index.index_line(floor + 1, "old enough needle");
     for case_sensitive in [true, false] {
@@ -209,7 +174,6 @@ fn lines_that_cannot_share_the_newest_lines_window_are_reported_evicted() {
     }
 }
 
-/// Lines indexed newest-first move the window once, not once per line.
 #[test]
 fn a_descending_run_of_lines_moves_the_window_once() {
     let top = TWO_32 + 50;

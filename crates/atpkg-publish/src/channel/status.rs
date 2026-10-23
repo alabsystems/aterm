@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish status`: the channel as clients see it, read live and verified: the
-//! head's number, horizon, roster generation, every pin and per-target overlay, the yanks
-//! and floors, and any drift between the head's program metadata and
-//! [`crate::programs::PROGRAMS`].
-//!
-//! A head past its horizon is still described, marked LAPSED: the status of a channel
-//! every client refuses is what an operator needs most.
+//! Channel status inspection and verification against [`crate::programs::PROGRAMS`].
 
 use std::path::{Path, PathBuf};
 
@@ -141,12 +135,10 @@ pub fn describe(quad: &VerifiedQuad, now_unix: i64) -> Vec<String> {
     out
 }
 
-/// `atpkg-publish status [--quad DIR]`: the channel head (or a quad on disk), verified.
-///
+/// `atpkg-publish status [--quad DIR]`.
 /// # Errors
-///
-/// A usage error for a bad command line; a refusal when the quad does not verify; a
-/// could-not-run when the channel cannot be read.
+/// A usage error for a bad command line; a refusal when the quad does not verify; a could-not-run
+/// when the channel cannot be read.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut dir: Option<PathBuf> = None;
     let mut i = 0;
@@ -168,13 +160,9 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The status of the channel head (or of the quad in `dir`), verified but for its own
-/// horizon, which [`describe`] reports.
-///
+/// The status of the channel head ([`describe`]).
 /// # Errors
-///
-/// A refusal when the quad does not verify; a could-not-run when the channel cannot be
-/// read.
+/// A refusal when the quad does not verify; a could-not-run when the channel cannot be read.
 pub fn lines(ctx: &Ctx, dir: Option<&Path>) -> Result<Vec<String>> {
     let quad = match dir {
         Some(d) => quad::verify_dir_with(ctx, d, Freshness::Ignore)?,

@@ -46,7 +46,8 @@ pub fn marker_at(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Marke
 ///
 /// # Errors
 ///
-/// The [`Refusal`] `dir` earned before anything was opened, or the open's or a `stat`'s.
+/// The [`Refusal`] `dir` earned before anything was opened, or the open's or a `stat`'s
+/// (other than `ENOENT`, which is `None` for that name).
 pub fn markers_at<const N: usize>(
     dir: &Path,
     names: [&str; N],

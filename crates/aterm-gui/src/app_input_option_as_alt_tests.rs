@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who gets Option as an Alt. In Meta mode a press bound for
-//! the terminal goes out as ESC + the key, so AppKit must not compose it; a GUI
-//! text field (the find bar, the inline rename, the palette, a native page)
-//! types what Option composes (German Option+L is '@', Option+e e is 'é'), as
-//! every field did before Meta mode made Option an Alt.
+//! Option-as-Alt routing tests across terminal grid, native editor, and GUI text fields.
 
 use crate::{App, WindowId};
 
-/// Option is an Alt only while the window's typing reaches its terminal grid:
-/// every field that types takes Option's composition back while it owns the
-/// keyboard, and Meta mode off leaves Option composing everywhere.
 #[test]
 fn option_is_an_alt_only_while_the_typing_reaches_the_terminal() {
     let mut app = App::headless_for_test();
@@ -60,13 +53,6 @@ fn option_is_an_alt_only_while_the_typing_reaches_the_terminal() {
     assert!(!app.option_is_alt(wid), "Meta mode off: Option composes");
 }
 
-/// OPTION IS META IN THE NATIVE EDITOR (amacs, slice N4): in Meta mode a
-/// window whose front view is an Editor buffer gets Option as an Alt, as its
-/// terminal does, so every M- chord reaches the editor's keymap (on macOS no
-/// Option dead key composes there). The palette over it and another native
-/// page (Settings) still compose; Meta mode off composes everywhere. Then the
-/// press itself, through the shipping `on_key`: with the caret at the end of
-/// `one two`, Option+b moves it back a word, to `two`.
 #[test]
 fn option_is_meta_in_native_editor_when_option_as_meta() {
     let dir = aterm_tempfile::Builder::new()
@@ -84,7 +70,6 @@ fn option_is_meta_in_native_editor_when_option_as_meta() {
     let (_, view) = app
         .active_native_view(wid)
         .expect("fixture: the Editor in front");
-    // Only the macOS key path below reads the view.
     #[cfg(not(target_os = "macos"))]
     let _ = view;
     let editor_tab = app.windows[&wid].tab_set.active_id().unwrap();
@@ -135,8 +120,6 @@ fn option_is_meta_in_native_editor_when_option_as_meta() {
         use aterm_window::keyboard::{
             Key, KeyCode, KeyLocation, ModifiersState, PhysicalKey, SmolStr,
         };
-        // What AppKit hands a window whose Option is an Alt: the key event's
-        // characters are the layout's own, `b`, never `∫`.
         let press = |code: KeyCode, letter: &str| {
             KeyEvent::synthetic_for_test_with_base(
                 PhysicalKey::Code(code),
@@ -172,9 +155,6 @@ fn option_is_meta_in_native_editor_when_option_as_meta() {
     }
 }
 
-/// The sync (what the event loop runs as every callback ends) carries each
-/// change of who takes the typing to the window's setting, and its record is
-/// what a press reads.
 #[test]
 fn the_sync_carries_each_change_to_the_window() {
     let mut app = App::headless_for_test();
@@ -252,7 +232,6 @@ fn an_option_chord_carries_the_layouts_character_only_while_option_is_an_alt() {
 /// the plain character, while Option+U (no such character) is still ESC u and a
 /// chord with Control keeps its ESC and control byte. The control is the inert
 /// source every headless App holds, the U.S. layout's answer: Option+L is ESC l.
-/// With Meta mode off Option composes and nothing here is asked.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_option_chord_whose_character_only_option_reaches_types_it() {
@@ -267,7 +246,6 @@ fn an_option_chord_whose_character_only_option_reaches_types_it() {
             _ => None,
         }
     }
-    // What AppKit hands a window whose Option is an Alt: the key's own character.
     let key = |code: KeyCode, base: &str, text: &str, state: ElementState| {
         KeyEvent::synthetic_for_test_with_base(
             PhysicalKey::Code(code),

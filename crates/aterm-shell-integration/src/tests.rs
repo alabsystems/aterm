@@ -2428,7 +2428,8 @@ impl LiveShell {
         use aterm_uds::spawnfd::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
         cmd.inherit_nothing();
-        // SAFETY: Between fork and exec, `signal` alone, which is async-signal-safe.
+        // SAFETY: between fork and exec, `signal` alone, which is
+        // async-signal-safe: no allocation, no lock.
         unsafe {
             cmd.pre_exec(|| {
                 for sig in [libc::SIGINT, libc::SIGQUIT] {
@@ -2478,7 +2479,9 @@ impl LiveShell {
         let until = std::time::Instant::now() + Self::TIMEOUT;
         let result = (|| {
             let owned = job.owned()?;
-            // SAFETY: Positive PID of this still-current child's descendant, with its kernel start.
+            // SAFETY: positive PID of this still-current child's descendant,
+            // with its kernel start checked immediately before this signal.
+            // No group/zero/negative PID or pathname-derived executable is signalled.
             if !owned.current() || unsafe { libc::kill(owned.pid, libc::SIGKILL) } != 0 {
                 return Err("owned job could not be killed".to_owned());
             }

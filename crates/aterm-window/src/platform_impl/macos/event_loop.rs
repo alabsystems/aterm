@@ -18,6 +18,9 @@ use aterm_objc::cf::{
     CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal,
     CFRunLoopWakeUp,
 };
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use aterm_objc::send::{
     send_bool_sel, send_id, send_id_usize, send_usize, send_v, send_v_id, send_v_id_bool,
 };
@@ -134,7 +137,8 @@ impl ActiveEventLoop {
             return None;
         }
         let _ = self.mtm;
-        // SAFETY: `-respondsToSelector:` (`B24@0:8:16`) and `-effectiveAppearance` (`@16@0:8`) are valid on `NSApplication`.
+        // SAFETY: `-respondsToSelector:` (`B24@0:8:16`) and `-effectiveAppearance` (`@16@0:8`) are
+        // valid on `NSApplication`, which answers a live `NSAppearance` borrowed for the statement.
         unsafe {
             let app = app();
             if send_bool_sel(app, sel!(respondsToSelector:), sel!(effectiveAppearance)) {
@@ -187,6 +191,8 @@ fn map_user_event<T: 'static>(
     mut handler: impl FnMut(Event<T>, &RootWindowTarget),
     receiver: Rc<wake_queue::Receiver<T>>,
 ) -> impl FnMut(Event<HandlePendingUserEvents>, &RootWindowTarget) {
+    // LOCAL PATCH (aterm): the drain never waits on a sender (`wake_queue.rs`); events the handler
+    // posts during it are handed out in it, as `try_iter` did.
     move |event, window_target| match event.map_nonuser_event() {
         Ok(event) => (handler)(event, window_target),
         Err(_) => {
@@ -198,6 +204,9 @@ fn map_user_event<T: 'static>(
 }
 
 /// macOS event loop backed by AppKit or the headless run loop (`headless.rs`).
+///
+/// LOCAL PATCH (aterm): the AppKit loop or the display-free one, chosen at `new` by the builder's
+/// `with_headless`.
 pub enum EventLoop<T: 'static> {
     AppKit(AppKitEventLoop<T>),
     Headless(super::headless::EventLoop<T>),
@@ -275,6 +284,8 @@ pub(crate) struct PlatformSpecificEventLoopAttributes {
     pub(crate) activation_policy: Option<ActivationPolicy>,
     pub(crate) activate_ignoring_other_apps: bool,
     /// Selects the display-free headless event loop (`headless.rs`).
+    ///
+    /// LOCAL PATCH (aterm): set only by `with_headless`; the AppKit knobs above mean nothing to it.
     pub(crate) headless: bool,
 }
 
@@ -307,7 +318,8 @@ impl<T> AppKitEventLoop<T> {
         );
 
         autoreleasepool(|_| {
-            // SAFETY: `-setDelegate:` (`v24@0:8@16`) is called with a retained `NSApplicationDelegate`.
+            // SAFETY: `-setDelegate:` (`v24@0:8@16`) takes a weak reference, so `EventLoop` keeps
+            // its own handle to the retained `NSApplicationDelegate`.
             unsafe { send_v_id(app.id(), sel!(setDelegate:), delegate.as_delegate_id()) };
         });
 
@@ -315,6 +327,8 @@ impl<T> AppKitEventLoop<T> {
         unsafe { override_send_event(app.id(), mtm) };
 
         let panic_info: Rc<PanicInfo> = Default::default();
+        // LOCAL PATCH (aterm): the `sendEvent:` override's panic guard is `stop_app_on_panic`, so
+        // it gets the observers' slot.
         set_send_event_panic_info(mtm, Rc::downgrade(&panic_info));
         setup_control_flow_observers(mtm, Rc::downgrade(&panic_info));
 
@@ -447,8 +461,11 @@ pub(super) unsafe fn stop_app_immediately(app: Id) {
 /// # Safety
 /// `app` must be the live shared `NSApplication`.
 pub(super) unsafe fn notify_windows_of_exit(app: Id) {
+    // LOCAL PATCH (aterm): the array is walked by index, in an explicit pool: `-windows` is +0
+    // autoreleased and `-close` runs a whole teardown inside it.
     autoreleasepool(|_| {
-        // SAFETY: `-windows`, `-count`, `-objectAtIndex:`, and `-close` match AppKit signatures on `app`.
+        // SAFETY: `-windows`, `-count`, `-objectAtIndex:` and `-close` match AppKit signatures on
+        // `app`; `-windows` answers a snapshot, so a `-close` cannot shift the indices.
         unsafe {
             let windows = send_id(app, sel!(windows));
             let n = send_usize(windows, sel!(count));
@@ -470,6 +487,9 @@ pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
     match catch_unwind(f) {
         Ok(r) => Some(r),
         Err(e) => {
+            // LOCAL PATCH (aterm): no `unwrap`. This guard is the outer half of the `"C-unwind"`
+            // `sendEvent:` override, so a second panic would unwind into AppKit; a gone `PanicInfo`
+            // is a named abort.
             match panic_info.upgrade() {
                 Some(panic_info) => panic_info.set_panic(e),
                 None => aterm_objc::abort_on_unwind("stop_app_on_panic (event loop gone)"),
@@ -518,6 +538,11 @@ impl<T> Clone for EventLoopProxy<T> {
 
 impl<T> EventLoopProxy<T> {
     /// Creates a proxy sharing the headless loop's wake `source`.
+    ///
+    /// LOCAL PATCH (aterm): not [`Self::new`]'s own source. CoreFoundation calls two version-0
+    /// sources equal when order, callbacks and `info` match, so a clone's source is never in the
+    /// run loop, and the display-free loop wakes only for a handled source.
+    ///
     /// # Safety
     /// `source` must be a live version-0 source in the main run loop.
     pub(super) unsafe fn sharing(

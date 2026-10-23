@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The no-op law, one row per effect channel of `RenderInput` (CPU path): an empty
-// channel (untouched, explicitly emptied, pushed-then-cleared, or an atlas with nothing
-// drawn from it) renders byte-identically to the bare frame, and `clear_overlays` (the
-// `image plain` capture) strips a populated channel back to it, clearing every Vec and
-// nulling every atlas Arc.
 
 use std::sync::Arc;
 
@@ -17,7 +11,6 @@ use aterm_core::render::{
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme, premul_rgb};
 
-/// Sets a channel state on a fresh 3x12 snapshot, given the cell size.
 type Setter = fn(&mut RenderInput, usize, usize);
 
 struct Channel {
@@ -56,7 +49,6 @@ fn patterned_atlas(w: u32, h: u32, version: u64) -> SceneAtlas {
     }
 }
 
-/// Opaque untinted sprite quad: `dest = [x, y, w, h]`, `src = [ax, ay, aw, ah]`.
 fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
     SpriteQuad {
         row,
@@ -74,7 +66,6 @@ fn quad(row: u16, dest: [u16; 4], src: [u16; 4]) -> SpriteQuad {
     }
 }
 
-/// An additive (`HaloMode::Add`, the default) radial halo filling its rect.
 fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
     RainHalo {
         row,
@@ -91,7 +82,6 @@ fn halo(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> RainHalo {
     }
 }
 
-/// An additive glow quad (see `GlowQuad::alpha`).
 fn glow(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> GlowQuad {
     GlowQuad {
         row,
@@ -213,7 +203,6 @@ const CHANNELS: &[Channel] = &[
                 i.char_fg.clear();
             }),
         ],
-        // A char_fg override recolours its glyph.
         populate: Some(|i, _, _| {
             i.char_fg = vec![CharFg {
                 row: 0,
@@ -227,7 +216,6 @@ const CHANNELS: &[Channel] = &[
     Channel {
         name: "ink",
         text: b"\x1b[?25lultra think",
-        // Feature on, nothing matched / everything truncated.
         empties: &[("explicitly cleared", |i, _, _| i.ink.clear())],
         populate: Some(|i, _, _| {
             i.ink = vec![InkCell {
@@ -242,7 +230,6 @@ const CHANNELS: &[Channel] = &[
     Channel {
         name: "nova_add",
         text: b"\x1b[?25lbuild: fuck",
-        // Feature on, every nova Settled: the steady state emits nothing.
         empties: &[("explicitly cleared", |i, _, _| i.nova_add.clear())],
         populate: Some(|i, cw, ch| {
             i.nova_add.push(glow(
@@ -273,7 +260,6 @@ const CHANNELS: &[Channel] = &[
         populate: Some(|i, cw, ch| {
             i.rain_atlas = Some(Arc::new(patterned_atlas(32, 32, 1)));
             let h = ch.min(32) as u16;
-            // One cell of its row's band, sourced 1:1 (bake == dest).
             i.rain_quads = vec![quad(1, [0, h, cw as u16, h], [0, 0, cw as u16, h])];
             i.rain_add = vec![halo(1, 0, ch as u16, cw as u16, 2, 0x0020_4020)];
         }),
@@ -336,7 +322,6 @@ const CHANNELS: &[Channel] = &[
     Channel {
         name: "word_decorations",
         text: b"i love cats",
-        // Host feature on, no match.
         empties: &[("explicitly cleared", |i, _, _| i.word_decorations.clear())],
         populate: None,
         must_paint: false,
@@ -348,15 +333,12 @@ const CHANNELS: &[Channel] = &[
 fn every_empty_channel_is_byte_identical_and_clear_overlays_restores_the_bare_frame() {
     let mut rend = Renderer::from_system(18.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
-    // Deterministic pixels: a lazy fallback parse landing between two renders
-    // could recolour a "must not change" frame.
     rend.debug_block_on_lazy_fallbacks();
     let (cw, ch) = rend.cell_size();
     for c in CHANNELS {
         let name = c.name;
         let mut term = Terminal::new(3, 12);
         term.process(c.text);
-        // The pre-feature frame: the snapshot as built, the channel never set.
         let as_built = term.cell_frame(3, 12);
         assert!(
             (c.is_empty)(&as_built),

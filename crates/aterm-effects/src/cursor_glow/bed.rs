@@ -12,9 +12,8 @@ pub(super) const DARK_BED_BAR: f32 = 4.8;
 /// The bed's opacity over a fresh cell.
 pub(super) const DARK_BED_ALPHA_CAP: f32 = 236.0;
 
-/// The bed's luminance budget's clamp, the rainbow bed's.
+/// Luminance budget clamp bounds for the dark bed.
 const DARK_BED_LUMA_MIN: f32 = 0.020;
-/// See [`DARK_BED_LUMA_MIN`].
 const DARK_BED_LUMA_MAX: f32 = 0.150;
 
 /// The bed's luminance budget for the theme's ink `ink`.
@@ -211,7 +210,7 @@ const SPARKLE_RAIL_RISE: f32 = 0.5;
 /// How far a typed run's bed takes to rise from nothing at its tail, in cells.
 const DARK_BED_TAIL_CELLS: f32 = 1.0;
 
-/// How far back from its last letter's outer edge the bed ([`BedScratch::caret`]).
+/// Head feather length in cells when the caret has moved past the run.
 pub(crate) const DARK_BED_HEAD_FEATHER_CELLS: f32 = 0.9;
 
 /// The knots a head feather is laid in ([`DARK_BED_HEAD_FEATHER_CELLS`]).
@@ -220,10 +219,9 @@ const DARK_BED_HEAD_FEATHER_KNOTS: usize = 6;
 /// The rail's full-strength plateau as a share of its reach.
 const DARK_RAIL_CORE: f32 = 0.5;
 
-/// The nested passes a leap's tube is laid in, widest first, so its cross section falls off from
-/// the spine to nothing instead of standing as a flat slab of one opacity.
+/// Number of nested passes used to lay a leap's tube.
 const LEAP_LAYERS: usize = 6;
-/// The longest stretch of air ([`lay_dark_bed`]).
+/// Maximum air gap in cells bridged within a leap run.
 const LEAP_GAP_CELLS: usize = 3;
 /// How much wider than the bed's own girth a leap's outermost pass reaches.
 const LEAP_SPREAD: f32 = 1.4;
@@ -271,8 +269,7 @@ pub(crate) struct BedScratch {
     taper: Vec<f32>,
     /// Each run's wedge length in cells ([`wedge_runs`]).
     pub(crate) wedges: Vec<f32>,
-    /// The caret's cell `(row, col)`, when the caller lays the bed round a live caret
-    /// ([`DARK_BED_HEAD_FEATHER_CELLS`]).
+    /// Caret cell `(row, col)` when laying the bed around a live caret.
     pub(crate) caret: Option<(i32, i32)>,
 }
 
@@ -565,7 +562,8 @@ pub(crate) fn lay_dark_bed(
     under.truncate(quad_budget);
 }
 
-/// A wedge's runs ([`BedShape::wedge`]).
+/// A wedge's runs ([`BedShape::wedge`]) into the pool `out`, returning how
+/// many are live.
 fn wedge_runs(
     runs: &[Vec<CometSample>],
     typing: &[Vec<bool>],
@@ -706,8 +704,7 @@ pub(crate) fn clip_quads_to(
     out.truncate(kept);
 }
 
-/// Split the swept `runs` into the runs the dark beam draws ([`TextView::over_text`],
-/// [`BedShape::leap_air`]).
+/// Split swept `runs` into the air segments drawn by the dark beam.
 pub(crate) fn split_air_runs(
     runs: &[Vec<CometSample>],
     geom: Geom,
@@ -784,8 +781,7 @@ pub(crate) fn split_air_runs(
 }
 
 impl CursorGlow {
-    /// Lay the dark bed under the runs `self.comet_runs[..runs_len]` ([`lay_dark_bed`],
-    /// [`dark_bed_ink`]).
+    /// Lay the dark bed under `self.comet_runs[..runs_len]`.
     #[allow(
         clippy::too_many_arguments,
         reason = "config, geometry, the runs, their shape, colour and caret, and the stream"
@@ -897,8 +893,7 @@ impl CursorGlow {
         }
     }
 
-    /// [`split_air_runs`] of `self.comet_runs[..runs_len]` into `self.air_runs`
-    /// ([`Self::text_view`], [`BedShape::leap_air`]).
+    /// Split `self.comet_runs[..runs_len]` into `self.air_runs`.
     pub(super) fn split_air_runs(
         &mut self,
         geom: Geom,
@@ -938,8 +933,7 @@ impl CursorGlow {
         TextView::new(self.probed_text_spans(), Some(&self.frame_text))
     }
 
-    /// The caret row's letters as columns `first..end`
-    /// ([`crate::cursor_momentum::MomentumGlowConfig::glyph_span`]).
+    /// The caret row's glyph column span `first..end`.
     pub(crate) fn caret_row_glyphs(&self, (row, col): (u16, u16)) -> Option<(i32, i32)> {
         let row = i32::from(row);
         let view = self.text_view();

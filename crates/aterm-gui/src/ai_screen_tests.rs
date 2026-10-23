@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's AI CLIs (`ai_screen.rs`): the projection Settings ▸ Harness ▸
-//! AI CLIs renders, the `ai.` lines of Messages, the typed sign-in line and the
-//! look worker's triggers — pure, over readings built here.
+//! Tests for the AI CLIs screen (`ai_screen.rs`): projection, Messages entries,
+//! shell launch-line quoting, and worker triggers.
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +12,6 @@ use aterm_messages::Intent;
 
 use super::*;
 
-/// One CLI as a look would judge it, wanted.
 fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
     let row = connector::connector(id).expect("a connection");
     AiCli {
@@ -29,8 +27,6 @@ fn cli(id: &'static str, state: State, mark: Mark, fact: &str) -> AiCli {
     }
 }
 
-/// A reading: Claude Code fine, Codex CLI signed out (the preferred one),
-/// Antigravity CLI's keyring unknown (a note), Muse Code off.
 fn reading() -> AiReading {
     AiReading {
         as_of: 1_000_000,
@@ -65,8 +61,6 @@ fn reading() -> AiReading {
     }
 }
 
-/// The choices `aterm.toml`'s `[ai]` text and a fleet document (`fleet`, at
-/// `/dotfiles/ai-fleet.toml`) resolve.
 fn choices(text: &str, fleet: Option<&str>) -> AiChoices {
     let (local, notes) = config::read(text);
     let path = config::FleetSource::Path("/dotfiles/ai-fleet.toml".into());
@@ -79,13 +73,8 @@ fn choices(text: &str, fleet: Option<&str>) -> AiChoices {
     AiChoices::of(&settings)
 }
 
-/// THE PAGE'S PROJECTION (§10): who needs you, then one row per CLI in
-/// `VENDORS` order — its name and version, the preferred one marked, its
-/// state and fact, Sign in only where a wanted CLI definitely needs a person —
-/// the choices the fleet document made said as its, and the reviews grant and
-/// the fleet document as facts. NEGATIVE CONTROLS: an unknown login
-/// offers no Sign in, the look switched off shows no stale
-/// state and no button, and an unpublished snapshot says it is reading.
+/// Projection renders health summary, per-CLI rows in `VENDORS` order with actions,
+/// and provenance for local vs. fleet choices.
 #[test]
 fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
     let state = AiState {
@@ -120,8 +109,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         "{}",
         row("muse").detail
     );
-    // The fleet document chose the preferred CLI and Muse's use; this
-    // machine's table chose the reviewers' order.
     assert!(p.preferred_from_fleet);
     assert!(row("muse").use_from_fleet);
     assert!(!row("codex").use_from_fleet);
@@ -151,7 +138,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         "read; it has a row for this machine"
     );
 
-    // An install a person must ask for: the row offers Install.
     let mut missing = state.clone();
     if let Some(reading) = missing.reading.as_mut() {
         reading.clis[1] = cli("codex", State::NotInstalled, Mark::Fail, "not installed");
@@ -165,8 +151,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         Some(AiAct::Install)
     );
 
-    // Missing installs and definite missing logins offer the same actions
-    // before a vendor lab has run. Unknown login evidence stays quiet.
     if let Some(reading) = missing.reading.as_mut() {
         reading.clis[2] = cli("agy", State::NotInstalled, Mark::Fail, "not installed");
         reading.clis[3] = cli("muse", State::SignedOut, Mark::Fail, "no login is stored");
@@ -184,7 +168,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         );
     }
 
-    // No one needs you.
     let mut fine = state.clone();
     if let Some(reading) = fine.reading.as_mut() {
         reading.clis[1] = cli("codex", State::Idle, Mark::Ok, "signed in");
@@ -194,8 +177,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         "No AI CLI needs you \u{b7} looked at 13:46"
     );
 
-    // A later failed or pending refresh keeps the captured versions, but
-    // their old successful summary must not speak for the new observation.
     let captured = state.projection(true);
     let failed = AiState {
         unavailable: Some("captured\ncollector\tfailure".to_string()),
@@ -224,7 +205,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
         );
     }
 
-    // The look switched off: no stale state, no button, and why.
     let off = AiState {
         enabled: false,
         ..state.clone()
@@ -236,7 +216,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
             && row.detail == "not looked at: Look for AI CLI problems is off")
     );
 
-    // The defaults: batteries included, every CLI used here reviews; no fleet.
     let bare = AiState {
         choices: choices("", None),
         ..state.clone()
@@ -248,7 +227,6 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
     );
     assert_eq!(fact(&p.fleet_rows, "Document"), "none");
     assert!(!p.fleet_from_url);
-    // Switched off, said so.
     let off = AiState {
         choices: choices("[ai]\nreviews = false\n", None),
         ..state.clone()
@@ -259,24 +237,16 @@ fn the_projection_says_who_needs_you_and_where_each_choice_came_from() {
     );
     assert!(!p.preferred_from_fleet);
 
-    // Before the host publishes.
     let unread = AiState::default().projection(false);
     assert_eq!(unread.health, "Reading\u{2026}");
 }
 
-/// The keys `entries` raise.
 fn keys(entries: &[Entry]) -> Vec<String> {
     entries.iter().map(Entry::key).collect()
 }
 
-/// WHICH STATES RAISE WHICH LINES (§7.3): a wanted CLI that is
-/// signed out, not installed or due raises `ai.<cli>.<state>`, Warn for the
-/// preferred CLI and Info otherwise, whose one button opens Settings ▸ Harness
-/// ▸ AI CLIs and whose detail names `aterm ai doctor`; every line passes the
-/// door's word rules. For Claude Code, accounts v2's own: none while its
-/// roster lists rows, and otherwise only signed out and not installed.
-/// NEGATIVE CONTROLS: an unknown login raises nothing, an
-/// unwanted CLI nothing, a working or limited one nothing.
+/// Wanted CLIs that are signed out, not installed, or due raise `ai.<cli>.<state>`
+/// (Warn for preferred, Info otherwise), while accounts v2 handles Claude when populated.
 #[test]
 fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
     let entries = ai_entries(&reading(), false);
@@ -304,8 +274,6 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
         msg.detail
     );
 
-    // Each state a person must act on, for a CLI that is not the preferred
-    // one: Info, its own key, its own words.
     let mut r = reading();
     r.preferred = "claude";
     for (state, mark, key, step) in [
@@ -339,7 +307,6 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
             msg.detail
         );
     }
-    // States that need nobody raise nothing.
     for (state, mark) in [
         (State::Ok, Mark::Ok),
         (State::Idle, Mark::Ok),
@@ -350,8 +317,6 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
         r.clis[1] = cli("codex", state, mark, "fine");
         assert!(ai_entries(&r, false).is_empty(), "{state:?}");
     }
-    // A definite missing install remains actionable before a vendor lab;
-    // an unknown login and an unwanted CLI raise nothing.
     r.clis[1] = cli("codex", State::Ok, Mark::Ok, "fine");
     r.clis[2] = cli("agy", State::NotInstalled, Mark::Fail, "not installed");
     assert_eq!(keys(&ai_entries(&r, false)), ["ai.agy.not-installed"]);
@@ -364,9 +329,6 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
     };
     assert!(ai_entries(&r, false).is_empty(), "codex is not wanted here");
 
-    // CLAUDE: signed out or not installed is raised while accounts v2's
-    // roster lists nothing, and never while it does; a due login is accounts
-    // v2's to say either way.
     let mut r = reading();
     r.clis[1] = cli("codex", State::Idle, Mark::Ok, "signed in");
     for state in [State::SignedOut, State::NotInstalled] {
@@ -387,11 +349,7 @@ fn the_lines_name_each_cli_that_needs_you_and_leave_claude_to_accounts() {
     );
 }
 
-/// THE TYPED LINE: the program's path quoted for the shell (a quote in it
-/// survives), then the verb; a path with a control character in it is never
-/// typed (a newline would run whatever follows it). Windows uses the actual
-/// cmd or PowerShell dialect; expansions, other shells and untypable paths
-/// are refused rather than guessed.
+/// Shell launch lines quote the executable path and refuse control characters or unsafe expansions.
 #[test]
 fn the_sign_in_line_quotes_the_program_and_refuses_a_control_character() {
     assert_eq!(
@@ -460,9 +418,7 @@ fn the_sign_in_line_quotes_the_program_and_refuses_a_control_character() {
     );
 }
 
-/// THE WORKER LOOKS WHEN IT MUST (§7.3): at once where the look is on, when
-/// asked, and when the AI store's wake marker is rewritten; never while off.
-/// Each wait here is a one-minute hang detector, never a latency budget.
+/// The worker looks on start when enabled, on explicit ask, and when the wake marker changes.
 #[test]
 fn the_worker_looks_at_start_on_ask_and_on_a_rewritten_wake() {
     let dir = aterm_tempfile::tempdir().expect("scratch folder");
@@ -497,7 +453,6 @@ fn the_worker_looks_at_start_on_ask_and_on_a_rewritten_wake() {
         1,
         "an automatic look retains the admitted generation"
     );
-    // Off, then on again: the Look that turns it on looks.
     asks.send(AiAsk::Off).expect("the worker runs");
     asks.send(AiAsk::Look(2)).expect("the worker runs");
     assert_eq!(looks.recv_timeout(must).expect("a look once on again"), 2);
@@ -615,12 +570,7 @@ fn an_old_ai_completion_cannot_settle_a_new_policy_look() {
     assert!(app.ai_state().reading.is_some());
 }
 
-/// THE READING SAYS WHICH PATH A FACT NAMES (item A5 of the narrow
-/// sweep): the copy on `PATH` aterm does not manage, whole — a folder with a
-/// space in it included — where the fact says it, so the page's row cuts its
-/// detail around the path rather than at the path's first space. None where
-/// there is no such copy, or the fact (cut at its bound) does not say all of
-/// it.
+/// Extracts the full path named by a fact, including spaces, or `None` when truncated.
 #[test]
 fn a_reading_names_the_whole_path_its_fact_says() {
     let path = Path::new("/Users//someone/Library/Application Support/aterm/pkg/reroute/agy");

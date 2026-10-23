@@ -2,22 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Metal drawable present-to-glass latency and skip attribution.
-//!
-//! When a [`GlassSink`] is installed via [`install_sink`], macOS Metal
-//! presentation registers an `addPresentedHandler:` callback on the drawable
-//! that measures `presentDrawable:` registration to `-[MTLDrawable presentedTime]`
-//! (`CACurrentMediaTime`), reporting [`GlassSample::OnGlass`] or
-//! [`GlassSample::Skipped`] (`presentedTime == 0`).
-//!
-//! # Skip Attribution
-//!
-//! Before presenting, the caller arms [`arm_present`]; [`registration_begin`]
-//! records the registration timestamp, classifies the frame's [`PresentTag`]
-//! (`Occluded`, `HotBurst`, `IdleBurst`, or `Spaced`), and publishes it into
-//! a serial-indexed ring. When a frame is skipped, [`GlassReport::skip_attribution`]
-//! charges it to the next serial's tag (the frame that replaced it) or to
-//! `Spaced` / `Occluded` if unreplaced. Sink callbacks run on a
-//! Metal/CoreAnimation thread and must be lock-free and non-blocking.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -35,30 +19,24 @@ pub enum GlassSample {
     Skipped,
 }
 
-/// The pacing state a present was issued under, decided at handler
-/// registration from the facts the presenting thread armed ([`arm_present`]).
-/// The wire labels are stable: `aterm ctl metrics percentiles` prints them.
+/// Pacing state a present was issued under, decided at handler registration from [`arm_present`].
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentTag {
-    /// At least one refresh period after this window's previous registration,
-    /// window visible. A skip attributed here was not a replacement.
+    /// Registered at least one refresh period after the previous registration while visible.
     Spaced = 0,
-    /// Within one refresh of the previous registration while the keystroke
-    /// pacing bypass (`input_hot`) was live.
+    /// Registered within one refresh period while the keystroke pacing bypass (`input_hot`) was live.
     HotBurst = 1,
-    /// Within one refresh period of the previous registration with no bypass
-    /// live — two lanes colliding (an effect-lane frame beside a content frame).
+    /// Registered within one refresh period with no bypass live.
     IdleBurst = 2,
-    /// The window was occlusion-hinted when the present was issued: nobody could
-    /// have seen it, whatever the compositor did.
+    /// Issued while the window was occlusion-hinted.
     Occluded = 3,
 }
 
 impl PresentTag {
-    /// How many tags there are — the ledger arrays are sized by it.
+    /// Number of tags.
     pub const COUNT: usize = 4;
-    /// Every tag, dense and in `index` order (pinned by a test).
+    /// Every tag in [`Self::index`] order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Spaced,
         Self::HotBurst,
@@ -66,9 +44,7 @@ impl PresentTag {
         Self::Occluded,
     ];
 
-    /// The tag for a present issued under this pacing state. Occlusion wins
-    /// (nobody could see it); then whether it registered within one refresh of
-    /// the previous registration, and under which pace floor.
+    /// Classify a present from its pacing state; occlusion takes precedence.
     #[must_use]
     #[inline]
     pub const fn for_pacing(burst: bool, input_hot: bool, occluded: bool) -> Self {
@@ -80,14 +56,14 @@ impl PresentTag {
         }
     }
 
-    /// The dense slot this tag owns in a per-tag array.
+    /// Dense slot index in a per-tag array.
     #[must_use]
     #[inline]
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    /// The stable wire label.
+    /// Stable wire label.
     #[must_use]
     #[inline]
     pub const fn as_str(self) -> &'static str {
@@ -99,8 +75,6 @@ impl PresentTag {
         }
     }
 
-    /// The tag a stored discriminant names; anything else is `Spaced`, the
-    /// arm that claims nothing about pacing.
     #[must_use]
     #[inline]
     #[cfg(any(target_os = "macos", test))]
@@ -114,24 +88,19 @@ impl PresentTag {
     }
 }
 
-/// One presented handler's report: the sample plus what the frontend needs to
-/// attribute it.
+/// One presented handler's sample and attribution tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlassReport {
-    /// On glass, or never shown.
+    /// On glass or skipped.
     pub sample: GlassSample,
-    /// The tag THIS present registered under.
+    /// Tag this present registered under.
     pub tag: PresentTag,
-    /// The tag of the registration with the NEXT serial — for a single window,
-    /// the frame that replaced this one. Equal to `tag` when nothing has
-    /// registered after this present by the time its handler fired.
+    /// Tag of the next serial's registration, or `tag` when none had registered yet.
     pub successor: PresentTag,
 }
 
 impl GlassReport {
-    /// Where a SKIP belongs: an occluded present is its own explanation; a
-    /// visible one whose successor registered within a refresh is charged to the
-    /// lane that replaced it; one nothing replaced was dropped by the compositor.
+    /// Attribute a skipped present to `Occluded`, the burst lane that replaced it, or `Spaced`.
     #[must_use]
     #[inline]
     pub const fn skip_attribution(self) -> PresentTag {
@@ -144,40 +113,34 @@ impl GlassReport {
     }
 }
 
-/// The pacing facts the presenting thread arms for the present it is about to
-/// issue ([`arm_present`]); [`registration_begin`] decides the tag from them.
+/// Pacing facts armed by the presenting thread before [`registration_begin`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArmedPresent {
-    /// The keystroke pacing bypass is live in this window.
+    /// Keystroke pacing bypass is live in this window.
     pub input_hot: bool,
-    /// The window is occlusion-hinted.
+    /// Window is occlusion-hinted.
     pub occluded: bool,
-    /// This window's refresh period, nanoseconds.
+    /// Window refresh period in nanoseconds.
     pub interval_ns: u64,
-    /// This window's previous registration instant on the registration clock
-    /// (`Registration::registered_ns`), or `None` before its first.
+    /// Window's previous [`Registration::registered_ns`], or `None` before its first.
     pub prev_registered_ns: Option<u64>,
 }
 
-/// One registration, as the presenting thread takes it back
-/// ([`take_registration`]) right after its present returns.
+/// Registration record returned by [`take_registration`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Registration {
-    /// Monotonic from 1.
+    /// Monotonic serial starting at 1.
     pub serial: u64,
-    /// The `presentDrawable:` registration instant, `CACurrentMediaTime` in
-    /// nanoseconds — the value to arm as the next present's `prev_registered_ns`.
+    /// `presentDrawable:` registration timestamp (`CACurrentMediaTime` nanoseconds).
     pub registered_ns: u64,
 }
 
-/// The frontend's receiver. Called on a framework thread; must not block.
+/// Frontend callback invoked on a framework thread; must not block.
 pub type GlassSink = fn(GlassReport);
 
 static SINK: OnceLock<GlassSink> = OnceLock::new();
 static DELIVERED: AtomicU64 = AtomicU64::new(0);
 
-// The armed facts: written and read on the presenting thread only (arm, then
-// register, in that order on one thread), so `Relaxed` is the whole story.
 const ARM_HOT: u8 = 1;
 const ARM_OCCLUDED: u8 = 2;
 const ARM_HAS_PREV: u8 = 4;
@@ -185,51 +148,38 @@ static ARM_FLAGS: AtomicU8 = AtomicU8::new(0);
 static ARM_INTERVAL_NS: AtomicU64 = AtomicU64::new(0);
 static ARM_PREV_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Registration serials start at 1; 0 means "none".
 #[cfg(any(target_os = "macos", test))]
 static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
-/// The most recent registration, until the presenting thread takes it
-/// (`take_registration`): serial (0 = none) and its registration instant.
 static TAKEABLE_SERIAL: AtomicU64 = AtomicU64::new(0);
 static TAKEABLE_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The tag ring: slot `serial % TAG_RING` holds that serial's tag, published
-/// via `REGISTERED` (Release at registration, Acquire in the handler), so a
-/// handler that sees `REGISTERED >= s` sees `TAGS[s]`. A layer holds at most
-/// three drawables and windows are few, so a slot is reused only long after
-/// any handler that could read it has fired.
+/// Serial-indexed tag ring published via `REGISTERED` (Release/Acquire).
 #[cfg(any(target_os = "macos", test))]
 const TAG_RING: usize = 16;
 #[cfg(any(target_os = "macos", test))]
 static TAGS: [AtomicU8; TAG_RING] = [const { AtomicU8::new(PresentTag::Spaced as u8) }; TAG_RING];
-/// The highest serial whose `TAGS` slot is written (0 = none).
 #[cfg(any(target_os = "macos", test))]
 static REGISTERED: AtomicU64 = AtomicU64::new(0);
 
-/// Install the process's one sink. First install wins; `false` when a sink was
-/// already installed.
+/// Install the process sink; returns `false` if already installed.
 pub fn install_sink(sink: GlassSink) -> bool {
     SINK.set(sink).is_ok()
 }
 
-/// Whether a sink is installed — the swapchain registers a handler only then.
 #[inline]
 #[cfg(target_os = "macos")]
 pub(crate) fn sink_installed() -> bool {
     SINK.get().is_some()
 }
 
-/// Presented handlers delivered since process start, both kinds.
+/// Total presented handlers delivered since process start.
 #[must_use]
 #[inline]
 pub fn delivered() -> u64 {
     DELIVERED.load(Ordering::Relaxed)
 }
 
-/// Arm the pacing facts of the present about to be issued. Called by the
-/// presenting thread immediately before the present that registers the handler.
-/// A present that never registers (refused, non-Metal path) leaves the facts
-/// for the next one, which overwrites them.
+/// Arm the pacing facts for the next present on the presenting thread.
 #[inline]
 pub fn arm_present(armed: ArmedPresent) {
     let mut flags = 0;
@@ -247,7 +197,6 @@ pub fn arm_present(armed: ArmedPresent) {
     ARM_FLAGS.store(flags, Ordering::Relaxed);
 }
 
-/// `CACurrentMediaTime` seconds → nanoseconds, saturating.
 #[inline]
 #[cfg(any(target_os = "macos", test))]
 fn secs_to_ns(secs: f64) -> u64 {
@@ -258,10 +207,8 @@ fn secs_to_ns(secs: f64) -> u64 {
     }
 }
 
-/// Begin one registration at `registered_s` (`CACurrentMediaTime` seconds, read
-/// by the caller immediately before `presentDrawable:`): mint its serial, decide
-/// its tag from the armed facts, publish the tag to the ring, and leave the
-/// registration takeable.
+/// Record a registration at `registered_s` (`CACurrentMediaTime` seconds), publish its tag,
+/// and leave it takeable.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn registration_begin(registered_s: f64) -> (u64, PresentTag) {
     let registered_ns = secs_to_ns(registered_s);
@@ -279,9 +226,7 @@ pub(crate) fn registration_begin(registered_s: f64) -> (u64, PresentTag) {
     (serial, tag)
 }
 
-/// The most recent registration, once. The presenting thread takes it right
-/// after its present returns; `None` when nothing registered since the last take
-/// (a refused present, or a path with no handler).
+/// Take the most recent registration once; returns `None` if nothing registered since the last take.
 #[inline]
 pub fn take_registration() -> Option<Registration> {
     match TAKEABLE_SERIAL.swap(0, Ordering::Relaxed) {
@@ -299,8 +244,7 @@ fn ring_slot(serial: u64) -> usize {
     usize::try_from(serial % TAG_RING as u64).unwrap_or(0)
 }
 
-/// Hand one handler's outcome to the ledger, naming the registration with the
-/// next serial as its successor when one exists.
+/// Deliver one handler's sample to the sink with the next serial's tag as successor.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn deliver_report(serial: u64, tag: PresentTag, sample: GlassSample) {
     DELIVERED.fetch_add(1, Ordering::Relaxed);
@@ -318,9 +262,7 @@ pub(crate) fn deliver_report(serial: u64, tag: PresentTag, sample: GlassSample) 
     }
 }
 
-/// Classify one presented handler's reading. Both arguments are
-/// `CACurrentMediaTime` seconds: `registered_s` read just before
-/// `presentDrawable:`, `presented_s` the drawable's `presentedTime`.
+/// Classify a presented handler's `registered_s` and `presented_s` (`CACurrentMediaTime` seconds).
 #[must_use]
 #[inline]
 pub fn classify(registered_s: f64, presented_s: f64) -> GlassSample {
@@ -328,8 +270,6 @@ pub fn classify(registered_s: f64, presented_s: f64) -> GlassSample {
         return GlassSample::Skipped;
     }
     let secs = presented_s - registered_s;
-    // The registration read and the display time come from one clock, so a
-    // negative span is not expected; clamp rather than wrap if one ever lands.
     let ns = if secs.is_finite() && secs > 0.0 {
         Duration::from_secs_f64(secs).as_nanos()
     } else {
@@ -348,12 +288,8 @@ mod tests {
     };
     use std::sync::Mutex;
 
-    /// The registration statics are process-wide; the tests that drive them
-    /// take turns.
     static SERIAL: Mutex<()> = Mutex::new(());
 
-    /// A zero, NaN or negative `presentedTime` is a skipped present; a real one
-    /// reports registration-to-display, clamped at zero.
     #[test]
     fn classify_skips_unpresented_frames_and_clamps_the_span() {
         assert_eq!(classify(12.5, 0.0), GlassSample::Skipped);
@@ -369,8 +305,6 @@ mod tests {
         assert_eq!(classify(100.0, 99.0), GlassSample::OnGlass { ns: 0 });
     }
 
-    /// Arguments are `(burst, input_hot, occluded)`: occlusion wins, then the
-    /// burst splits on the bypass, and a spaced present is `Spaced` either way.
     #[test]
     fn occlusion_wins_then_burst_splits_on_the_bypass() {
         assert_eq!(
@@ -399,8 +333,6 @@ mod tests {
         );
     }
 
-    /// A skip is charged to the lane that replaced it, an occluded present to
-    /// itself, and an unreplaced one to the compositor (`Spaced`).
     #[test]
     fn a_skip_is_attributed_to_its_successor_unless_occluded() {
         let report = |tag, successor| GlassReport {
@@ -430,9 +362,6 @@ mod tests {
         );
     }
 
-    /// The tag is decided at registration on the registration clock: the same
-    /// armed facts read `Spaced` a full period after the previous registration
-    /// and `HotBurst` inside it, and the registration is takeable exactly once.
     #[test]
     fn the_tag_is_decided_at_registration_against_the_previous_registration() {
         let _turn = SERIAL
@@ -456,7 +385,6 @@ mod tests {
         assert_eq!(reg.registered_ns, 100_000_000_000);
         assert_eq!(take_registration(), None, "taken once");
 
-        // 8.33 ms later, bypass live: inside one period → hot burst.
         arm_present(ArmedPresent {
             input_hot: true,
             occluded: false,
@@ -466,7 +394,6 @@ mod tests {
         let (_, tag) = registration_begin(100.008_33);
         assert_eq!(tag, PresentTag::HotBurst);
 
-        // A full period later, bypass over: spaced, whatever arm time was.
         arm_present(ArmedPresent {
             input_hot: false,
             occluded: false,
@@ -476,7 +403,6 @@ mod tests {
         let (_, tag) = registration_begin(100.016_67);
         assert_eq!(tag, PresentTag::Spaced);
 
-        // Inside the period without the bypass: two lanes colliding.
         arm_present(ArmedPresent {
             input_hot: false,
             occluded: false,
@@ -488,9 +414,6 @@ mod tests {
         let _ = take_registration();
     }
 
-    /// A report names the NEXT serial's tag as its successor, whether the handler
-    /// fires before or after later registrations, and its own tag when nothing
-    /// has registered after it.
     #[test]
     fn a_report_names_the_next_registration_as_its_successor() {
         let _turn = SERIAL
@@ -520,13 +443,9 @@ mod tests {
         fn sink(report: GlassReport) {
             SEEN.lock().unwrap().push(report);
         }
-        // The process sink may already be installed by another test; observe
-        // through `delivered` and, when this sink won, through its captures.
         let ours = super::install_sink(sink);
         let before = delivered();
-        // a's handler fires AFTER b and c registered: its successor is b, not c.
         deliver_report(a, tag_a, GlassSample::Skipped);
-        // c has no successor yet: its own tag.
         deliver_report(c, tag_c, GlassSample::OnGlass { ns: 1 });
         deliver_report(b, tag_b, GlassSample::OnGlass { ns: 1 });
         assert_eq!(delivered(), before + 3);

@@ -369,7 +369,8 @@ pub(crate) fn hid_idle() -> Option<Duration> {
 /// Wait until no person has touched the keyboard or pointer for [`IDLE`].
 ///
 /// # Errors
-/// `Ok(Err(why))`.
+/// `Ok(Err(why))`: the desk was never idle in [`IDLE_WAIT`], or the idle clock is
+/// unreadable.
 pub(crate) fn await_idle() -> Result<Result<(), String>, Stopped> {
     let asked = Instant::now();
     loop {

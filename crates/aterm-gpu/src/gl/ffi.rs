@@ -460,7 +460,8 @@ mod egl {
         pub(crate) fns: EglFns,
     }
 
-    // SAFETY: the table is immutable function pointers into a library that stays loaded.
+    // SAFETY: the table is immutable function pointers into a library that stays loaded for the
+    // process's life; EGL's entry points are thread-safe.
     unsafe impl Send for Egl {}
     // SAFETY: as above; `&Egl` hands out only the immutable table.
     unsafe impl Sync for Egl {}
@@ -475,7 +476,8 @@ mod egl {
         fn open() -> Result<Egl, String> {
             let mut handle = std::ptr::null_mut();
             for name in [c"libEGL.so.1", c"libEGL.so"] {
-                // SAFETY: a NUL-terminated library name; RTLD_LAZY binds on first call.
+                // SAFETY: a NUL-terminated library name; RTLD_LAZY binds on first
+                // call. The handle is never closed (see the type's note).
                 handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) };
                 if !handle.is_null() {
                     break;
@@ -633,7 +635,9 @@ mod glx {
         pub(crate) x: XlibFns,
     }
 
-    // SAFETY: immutable function pointers into libraries that stay loaded for the process's life.
+    // SAFETY: immutable function pointers into libraries that stay loaded for the process's life;
+    // Xlib is thread-safe once `XInitThreads` ran, which the windowing crate's connection does
+    // first.
     unsafe impl Send for Glx {}
     // SAFETY: as above; `&Glx` hands out only the immutable tables.
     unsafe impl Sync for Glx {}

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A REVIEWER INHERITS THE ASKING AGENT'S PERMISSIONS (docs/DESIGN-ai-connections-2026-10-16.md
-//! §9.1, "inherit the current parent agent's permissions (which is
-//! usually YOLO)").
-//!
-//! A complete readable process walk identifies a person or the nearest supported AI CLI.
-//! Only an explicit unambiguous launch mode proves the CLI's level ([`level_of`]); unknown
-//! observations, option grammars and configured defaults refuse inherited permissions.
-//! A proven person may do anything: [`Level::Yolo`].
-//! `[ai] review_permissions` (or `aterm ai review --permissions`) pins a level instead.
+//! Permission levels inherited from the asking AI CLI or person, or pinned by `[ai] review_permissions`.
 
 use std::path::Path;
 
@@ -18,13 +10,11 @@ use super::connector::{self, Connector};
 /// A permission level every AI CLI can express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
-    /// No approvals and no sandbox: Claude Code's `--dangerously-skip-permissions`, Codex's
-    /// `--dangerously-bypass-approvals-and-sandbox`, agy's `--dangerously-skip-permissions`,
-    /// Muse Code's `--yolo`.
+    /// No approvals and no sandbox.
     Yolo,
     /// Edits allowed without asking.
     Edits,
-    /// Anything that would ask is refused (a one-shot run has nobody to ask).
+    /// Anything that would ask is refused.
     Ask,
     /// Read and plan only.
     Plan,
@@ -88,14 +78,14 @@ impl Choice {
     }
 }
 
-/// What the process walk proved. A missing observation is not a person.
+/// What the process walk proved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asker {
-    /// Every observed ancestor was readable, through the process-tree root.
+    /// Every observed ancestor was readable through the process-tree root.
     Person,
     /// The nearest identified CLI and an explicit, unambiguous launch mode.
     Agent(&'static str, Level),
-    /// An observation, identity, launch grammar or configured mode was unproven.
+    /// An observation, identity, launch grammar, or configured mode was unproven.
     Unknown,
 }
 
@@ -111,9 +101,7 @@ impl Asker {
     }
 }
 
-/// An explicitly named launch mode, never a vendor/project-config default.
-/// Unsupported option arity and conflicting modes are unknown. `--` ends options;
-/// a consumed option value is never searched for permission-looking words.
+/// Parses an explicitly named launch mode from `argv` for CLI `id`.
 #[must_use]
 pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Option<Level> {
     let mut level = None;
@@ -165,10 +153,8 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
                     no_shell = true;
                     None
                 }
-                // Supported inert switches from the connection's own one-shot grammar.
                 ("claude", "-p" | "--print" | "--no-session-persistence", None)
                 | ("codex", "--skip-git-repo-check" | "--ephemeral", None) => None,
-                // These known value-taking options cannot lend their values authority.
                 (
                     "claude",
                     "--append-system-prompt"
@@ -187,8 +173,6 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
                     }
                     None
                 }
-                // A positional word may precede later options in a vendor's grammar.
-                // Guessing at it, or at an unfamiliar flag's arity, proves no mode.
                 _ => return None,
             }
         };
@@ -209,7 +193,7 @@ pub fn level_of(id: &str, argv: &[String], _claude_default: Option<&str>) -> Opt
     level
 }
 
-/// The processes above this one. Injected: tests read no real process.
+/// The processes above this one.
 pub trait Procs {
     /// This process's parent.
     fn first(&self) -> Option<u32>;
@@ -257,20 +241,17 @@ impl Procs for LiveProcs {
 /// How far up the walk goes.
 pub const MAX_HOPS: usize = 24;
 
-/// The AI CLI a path runs, by its file name (a managed copy lives at
-/// `…/store/<id>/<build>/bin/<id>`, a vendor's own at `…/<id>` or `…/<id>/versions/<v>`).
+/// Identifies the AI CLI `path` runs by its file name or parent `versions` directory.
 #[must_use]
 pub fn cli_of_path(path: &str) -> Option<&'static Connector> {
     let p = Path::new(path);
     let name = p.file_name()?.to_str()?;
-    // `program_of` reads program/status words; this input is one kernel path component.
     if name.chars().any(char::is_whitespace) {
         return None;
     }
     if let Some(program) = aterm_phase::reader::program_of(name) {
         return connector::connector(program.name());
     }
-    // Claude's own install may name the executable only by its version.
     let parent = p.parent()?;
     if parent.file_name().and_then(|n| n.to_str()) == Some("versions") {
         return cli_of_path(parent.parent()?.file_name()?.to_str()?);
@@ -278,9 +259,7 @@ pub fn cli_of_path(path: &str) -> Option<&'static Connector> {
     None
 }
 
-/// The nearest supported AI CLI with proven explicit permissions, or a complete
-/// readable walk to the root. Runtime/script ambiguity and unreadable/truncated walks
-/// are Unknown. This is a launch observation, not a live interactive-mode proof.
+/// Finds the nearest supported AI CLI with proven explicit permissions, or a complete walk to root.
 #[must_use]
 pub fn asker(procs: &dyn Procs, _claude_default: &dyn Fn() -> Option<String>) -> Asker {
     let Some(mut pid) = procs.first() else {
@@ -302,8 +281,6 @@ pub fn asker(procs: &dyn Procs, _claude_default: &dyn Fn() -> Option<String>) ->
         let direct = cli_of_path(&exec).map(|c| (c, 1));
         let runtime = aterm_phase::reader::may_host_agent(exec_name);
         let identified = if runtime {
-            // A renamed runtime may put its CLI in argv[0]; conventional node/bun
-            // argv keeps the script at argv[1]. No runtime flags are guessed past.
             argv.first()
                 .and_then(|a| cli_of_path(a))
                 .map(|c| (c, 1))
@@ -317,8 +294,6 @@ pub fn asker(procs: &dyn Procs, _claude_default: &dyn Fn() -> Option<String>) ->
                 None => Asker::Unknown,
             };
         }
-        // An unresolved script runtime or a known agent without a connection row
-        // is not evidence of a human caller (Gemini, for example).
         if runtime || aterm_phase::reader::program_of(exec_name).is_some() {
             return Asker::Unknown;
         }

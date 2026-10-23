@@ -124,14 +124,7 @@ impl LandingWalk {
 #[inline]
 #[must_use]
 pub fn landing_ink(t: f32) -> u32 {
-    static LUT: OnceLock<[u32; BED_INK_LUT_LEN]> = OnceLock::new();
-    let lut = LUT.get_or_init(|| {
-        let mut lut = [0_u32; BED_INK_LUT_LEN];
-        for (i, e) in lut.iter_mut().enumerate() {
-            *e = hot_edge_ink(spectrum(walk_pace(i as f32 / (BED_INK_LUT_LEN - 1) as f32)));
-        }
-        lut
-    });
+    let lut = super::ribbon::hot_edge_ink_lut();
     let x = clamp01(t) * (BED_INK_LUT_LEN - 1) as f32;
     let i = (x as usize).min(BED_INK_LUT_LEN - 1);
     let j = (i + 1).min(BED_INK_LUT_LEN - 1);
@@ -864,7 +857,7 @@ impl Meteor {
 /// The landing pin.
 #[derive(Clone, Copy, Debug)]
 pub struct Pin {
-    /// The arrival edge this pin was born.
+    /// The arrival edge this pin was born on.
     pub at: Instant,
     /// The arc position its arms take, `tri(t_land)`.
     pub t: f32,
@@ -1535,7 +1528,6 @@ impl Meteors {
         at: Instant,
         ctx: &Ctx<'_>,
     ) -> Option<Spawn> {
-        // §6.1: typed wraps never fly, and reflow licenses nothing. A typed
         if licence.is_echo() {
             return None;
         }
@@ -1544,7 +1536,6 @@ impl Meteors {
         if drow == 0 {
             let n = dcol.unsigned_abs();
             if n < u32::from(JUMP_MIN_CELLS) {
-                // §6.12 / D17: a 2-7-cell hop is a mini-fan and not a flight.
                 if (u32::from(MINI_FAN_MIN_CELLS)..=u32::from(MINI_FAN_MAX_CELLS)).contains(&n) {
                     self.ord = self.ord.wrapping_add(1);
                     self.sown.push(Sow::MiniFan {
@@ -2145,7 +2136,6 @@ fn flash_scale(after_ms: f32) -> f32 {
 }
 
 fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
-    // §6.11: the pin exists only as motion (its arms whip into the caret),
     if ctx.cfg.reduced_motion {
         return;
     }

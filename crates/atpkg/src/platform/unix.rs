@@ -66,7 +66,8 @@ fn process_birth_platform(pid: libc::pid_t) -> crate::platform::Birth {
     let Ok(size) = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else {
         return Birth::Unreadable;
     };
-    // SAFETY: `info` points at `size` writable bytes of exactly the structure PROC_PIDTBSDINFO fills.
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
     let read = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -146,7 +147,9 @@ pub fn exclude_from_backup(dir: &Path) {
     #[cfg(target_os = "macos")]
     {
         let mut have = [0u8; 64];
-        // SAFETY: `path` and `ATTR` are NUL-terminated C strings that outlive the call, and `have` is a writable buffer of the stated length.
+        // SAFETY: `path` and `ATTR` are NUL-terminated C strings that outlive the call, and
+        // `have` is a writable buffer of the stated length; `getxattr` writes at most that
+        // many bytes and returns how many it wrote, or -1.
         let n = unsafe {
             libc::getxattr(
                 path.as_ptr(),
@@ -386,7 +389,7 @@ pub fn dir_writable_by_caller(dir: &Path) -> bool {
         // An interior NUL cannot name a real directory.
         return false;
     };
-    // SAFETY: `c` is a NUL-terminated C string that outlives the call.
+    // SAFETY: `c` is a NUL-terminated C string that outlives the call; `access` only reads it.
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
@@ -462,7 +465,8 @@ pub fn open_for_sync(path: &Path) -> io::Result<File> {
 pub fn sync_file_contents(f: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd as _;
     loop {
-        // SAFETY: `f` is a live, open `File` borrowed for the whole call, so its raw fd is valid.
+        // SAFETY: `f` is a live, open `File` borrowed for the whole call, so its raw fd is
+        // valid; `fsync` takes that fd BY VALUE and dereferences no pointer.
         let rc = unsafe { libc::fsync(f.as_raw_fd()) };
         if rc == 0 {
             return Ok(());
@@ -623,7 +627,9 @@ pub fn wait_standing_aside(
     let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
     FORWARD_TO.store(pid, Ordering::SeqCst);
     let forward = forward_to_child as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: `signal(2)` with `SIG_IGN`, or with a handler that makes only async-signal-safe calls ([`forward_to_child`]).
+    // SAFETY: `signal(2)` with `SIG_IGN`, or with a handler that makes only
+    // async-signal-safe calls ([`forward_to_child`]); the previous dispositions are kept
+    // to be restored below.
     let previous = unsafe {
         [
             (libc::SIGINT, libc::signal(libc::SIGINT, libc::SIG_IGN)),
@@ -686,7 +692,8 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
         sig,
         libc::SIGINT | libc::SIGTERM | libc::SIGHUP | libc::SIGPIPE
     ) {
-        // SAFETY: the default action for these ends the process without a core.
+        // SAFETY: the default action for these ends the process without a core; `raise`
+        // delivers it to this thread before it returns.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             #[expect(

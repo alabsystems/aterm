@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(turns(&rows(&mut TurnReader::default(), &own)).len(), 3);
     }
 
-    /// A FORK'S OWN TOTALS GO ON FROM ITS COPY'S (module header): a
+    /// A FORK'S OWN TOTALS GO ON FROM ITS COPY'S: a
     /// `token_count` its own lines write again with the copy's last total —
     /// as Codex writes one at a turn's start once the thread has a total —
     /// is a repeat, never its parent's last turn counted again; its own turn
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(stamp_ms("2026-08-01T17:36:47.1+00:00"), None);
     }
 
-    /// A PAGINATED THREAD'S FORK COPIES NO COUNT (module header, measured on
+    /// A PAGINATED THREAD'S FORK COPIES NO COUNT (measured on
     /// 0.163.0 in the lab): a subagent spawned with its parent's turns opens
     /// with its own `session_meta`, its parent's, and the parent's turns —
     /// messages and `turn_context`s, no `token_count` — in one millisecond;
@@ -1195,8 +1195,8 @@ mod tests {
         assert_eq!(legacy.last(), Some(&Row::Copied));
     }
 
-    /// A LEGACY FORK'S OWN SETTINGS LINE ENDS ITS COPY (module header,
-    /// measured on 0.163.0): `codex fork <legacy thread> <prompt>` copies its
+    /// A LEGACY FORK'S OWN SETTINGS LINE ENDS ITS COPY (measured on
+    /// 0.163.0): `codex fork <legacy thread> <prompt>` copies its
     /// parent's lines under one stamp, writes its own
     /// `thread_settings_applied` in the same millisecond, and runs the
     /// prompt's turn at once: its next line 14 ms on, its count 37 ms on,

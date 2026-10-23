@@ -45,7 +45,7 @@ fn parse_esc_with_intermediate() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // ESC ( B (set G0 to ASCII)
+    // `ESC ( B` (set G0 to ASCII)
     parser.advance_fast(b"\x1b(B", &mut sink);
 
     assert_eq!(sink.esc_dispatches.len(), 1);

@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm-render's integration suite: one test binary for every file listed
-//! below. Each file keeps its path and its `#[test]`s, named `<file>::<test>`;
-//! a file gated on a platform or feature keeps its inner `#![cfg(..)]`, which
-//! gates the module.
-//!
-//! No file below sets or removes an environment variable, installs a hook or
-//! an allocator, or reads the process's resident-set size or a process-global
-//! counter a sibling's renderer would move, except from its own process: the
-//! two that read those (`seal_maps_discovered_faces`,
-//! `sealed_never_consults_coverage_index`) re-run this binary on their one test
-//! (`common/alone.rs`) and read them there. The allocation-counting files
-//! install a `#[global_allocator]` and are their own `[[test]]`s in
-//! `Cargo.toml`, each with its reason.
-//!
-//! `autotests = false`: a `tests/*.rs` file that is neither a `mod` line here
-//! nor a `[[test]]` of its own never compiles. Run one file's tests with
-//! `targo --unverified test -p aterm-render --test render_suite -- <file>::`;
-//! an ignored perf gate with `-- <file>:: --ignored --nocapture` in `--release`,
-//! never a bare `--ignored`.
+//! `aterm-render` integration test suite binary.
 
 #[path = "common/alone.rs"]
 mod alone;

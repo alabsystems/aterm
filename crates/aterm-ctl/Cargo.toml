@@ -35,6 +35,11 @@ aterm-codec = { workspace = true }
 # First-party; it brings only first-party crates.
 amacs = { workspace = true }
 
+# The census's process table (`kproc::records`), read in-process instead of running `ps`.
+# First-party, and so is each crate it brings (its `libc` is aterm-libc).
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-sysprobe = { workspace = true }
+
 [dev-dependencies]
 # Scratch directories for the tests' sockets, removed on drop.
 aterm-tempfile = { workspace = true }

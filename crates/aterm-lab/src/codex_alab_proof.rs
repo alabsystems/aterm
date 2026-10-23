@@ -12,6 +12,7 @@ use aterm_agent::harness::acts::RULE_UPGRADE;
 use aterm_agent::supervise::policy::turn_end::{RULE_LEFT, says_done};
 use aterm_uds::spawnfd::Stdio;
 
+use crate::bus::Fabric;
 use crate::codex_alab_model::{
     self as model, KEEP_GOING, NEED, NUDGES_BEFORE_DEFENSE, PERSON_ASKS, REOPEN, REPO_COMMIT_HOLD,
     REPO_PUSH_HOLD, SLOW_TURN,
@@ -39,165 +40,10 @@ const FINISHED: &str = "finished@v1";
 /// Cruise's defend-and-find-more prompt's act.
 const DEFEND: &str = "continue-done-check@v1";
 
-/// The fleet the lab's own bus names (`/f/lab/…`).
-const FLEET: &str = "lab";
-
 /// The one-line nudge the removed `aterm drive task` typed into a worker
 /// (`DESIGN-sessions-as-subagents-2026-10-15.md` §7): nothing types it now,
 /// so the Autopilot Off step holds the screen and the ledger to its absence.
 const NUDGE: &str = "Inbox: task @";
-
-/// The proof's own bus (the Autopilot Off step's mail): a guarded broker the lab starts outside
-/// the jail on a Unix socket in the scratch, under a mint secret only the scratch holds, and the
-/// node ring the instance's bridge attaches with (THE ring `aterm fabric on` mints,
-/// `aterm_link::enable::node_grants`). The broker ends with the proof (its pid, the lab's own
-/// child) and with this process however it ends (its lifeline).
-struct Fabric {
-    broker: Option<aterm_uds::spawnfd::Child>,
-    /// The broker's lifeline (`aterm_uds::lifeline`): it ends itself once this is
-    /// dropped or the lab dies, a SIGKILL included, instead of serving on under
-    /// launchd.
-    _lifeline: aterm_uds::lifeline::Lifeline,
-    /// The `[fabric]` table the instance's `aterm.toml` gets.
-    table: String,
-}
-
-impl Fabric {
-    /// Lay the bus out under `dir` and start its broker with `aterm`'s own
-    /// `link broker`.
-    fn start(aterm: &Path, dir: &Path) -> Result<Fabric, String> {
-        use std::os::unix::fs::PermissionsExt as _;
-        let state = dir.join("state");
-        std::fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
-        for d in [dir, state.as_path()] {
-            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("{}: {e}", d.display()))?;
-        }
-        let mut random = [0u8; 40];
-        {
-            use std::io::Read as _;
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut f| f.read_exact(&mut random))
-                .map_err(|e| format!("/dev/urandom: {e}"))?;
-        }
-        let secret = dir.join("mint.secret");
-        let write_private = |path: &Path, bytes: &[u8]| {
-            std::fs::write(path, bytes)
-                .and_then(|()| {
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                })
-                .map_err(|e| format!("{}: {e}", path.display()))
-        };
-        write_private(&secret, &random[..32])?;
-        let node = format!(
-            "n-{}",
-            random[32..]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
-        write_private(&state.join("node"), format!("{node}\n").as_bytes())?;
-        let program = dir.join("aterm");
-        std::os::unix::fs::symlink(aterm, &program)
-            .map_err(|e| format!("{}: {e}", program.display()))?;
-        let mut caps = String::new();
-        for grant in aterm_link::enable::node_grants(FLEET, &node) {
-            let out = aterm_uds::spawnfd::command(&program)
-                .args(["link", "mint", &grant, "--secret-file"])
-                .arg(&secret)
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|e| format!("aterm link mint: {e}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "aterm link mint {grant}: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            caps.push_str(&String::from_utf8_lossy(&out.stdout));
-        }
-        let cap = dir.join("node.cap");
-        write_private(&cap, caps.as_bytes())?;
-        let sock = dir.join("b.sock");
-        let log = std::fs::File::create(dir.join("broker.out"))
-            .map_err(|e| format!("broker.out: {e}"))?;
-        let err = log.try_clone().map_err(|e| format!("broker.out: {e}"))?;
-        let mut broker = aterm_uds::spawnfd::command(&program);
-        broker
-            .args(["link", "broker"])
-            .arg(&sock)
-            .arg(dir.join("b.log"))
-            .arg("--secret-file")
-            .arg(&secret)
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err));
-        // Its stdin is the lifeline, whose FIFO lives in this private scratch only
-        // until both ends are open.
-        let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut broker, dir)
-            .map_err(|e| format!("the broker's lifeline in {}: {e}", dir.display()))?;
-        let broker = broker
-            .spawn()
-            .map_err(|e| format!("aterm link broker: {e}"))?;
-        let mut fabric = Fabric {
-            broker: Some(broker),
-            _lifeline: lifeline,
-            table: format!(
-                "[fabric]\ncommand = \"{program} link serve --fleet {FLEET} --broker {sock} \
-                 --cap-file {cap} --state {state} --accept-from {node}\"\n",
-                program = program.display(),
-                sock = sock.display(),
-                cap = cap.display(),
-                state = state.display(),
-            ),
-        };
-        let end = Instant::now() + Duration::from_secs(60);
-        while !sock.exists() {
-            if Instant::now() >= end
-                || fabric
-                    .broker
-                    .as_mut()
-                    .is_some_and(|b| matches!(b.try_wait(), Ok(Some(_))))
-            {
-                fabric.stop();
-                let said = std::fs::read_to_string(dir.join("broker.out")).unwrap_or_default();
-                return Err(format!("the lab's broker never listened: {}", said.trim()));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(fabric)
-    }
-
-    /// End the broker (`SIGTERM`, then `SIGKILL`): only the pid the lab started.
-    fn stop(&mut self) {
-        let Some(mut broker) = self.broker.take() else {
-            return;
-        };
-        if !matches!(broker.try_wait(), Ok(None)) {
-            return;
-        }
-        if let Ok(pid) = i32::try_from(broker.id()) {
-            let _ = crate::sys::kill(pid, libc::SIGTERM);
-            let end = Instant::now() + Duration::from_secs(10);
-            loop {
-                if !matches!(broker.try_wait(), Ok(None)) {
-                    return;
-                }
-                if Instant::now() >= end {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-        let _ = broker.kill();
-        let _ = broker.wait();
-    }
-}
-
-impl Drop for Fabric {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
 
 /// A `codex-package.json` root that carries `alab-build.json`: the package `given` names (a package directory, or a binary in one), else `$LAB_CODEX`, else the owner's managed `codex` — the binary its atpkg shim execs (the last path of `aterm pkg which codex`), since a dev-linked package's shim is a script in `pkg/bin` that no package directory holds; the shim's own path when atpkg names none.
 /// # Errors
@@ -1118,6 +964,18 @@ impl Proof {
         folder: Folder,
         autopilot: Option<&str>,
     ) -> Result<Leg, Fail> {
+        self.start_leg_using(name, prompt, extra, folder, autopilot, None)
+    }
+
+    fn start_leg_using(
+        &mut self,
+        name: &'static str,
+        prompt: Option<&str>,
+        extra: &str,
+        folder: Folder,
+        autopilot: Option<&str>,
+        program: Option<&Path>,
+    ) -> Result<Leg, Fail> {
         let dir = self.s.join("legs").join(name);
         let home = dir.join("codex-home");
         let proj = dir.join("proj");
@@ -1157,9 +1015,13 @@ impl Proof {
                 set.code == 0 && now == word,
             );
         }
-        let codex = prompt.map_or_else(
+        let program = program.map_or_else(
             || "codex".to_string(),
-            |p| format!("codex {}", sh_quote(&format!("LEG-{name} {p}"))),
+            |program| sh_quote(&program.to_string_lossy()),
+        );
+        let codex = prompt.map_or_else(
+            || program.clone(),
+            |p| format!("{program} {}", sh_quote(&format!("LEG-{name} {p}"))),
         );
         let line = format!(
             "export CODEX_HOME={}; cd {} && {codex}\r",
@@ -1297,7 +1159,7 @@ impl Proof {
         }
     }
 
-    /// Autopilot Cruise on the instance's first session (module header).
+    /// Autopilot Cruise on the instance's first session.
     fn first_leg(&mut self, first: &Leg) -> Result<(), Stopped> {
         let defended = self.await_act(first, DEFEND, Duration::from_secs(240))?;
         let parked = self
@@ -1339,7 +1201,7 @@ impl Proof {
         Ok(())
     }
 
-    /// NEEDS YOU, loud and never blocking (module header).
+    /// NEEDS YOU, loud and never blocking.
     fn needs_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let reported = self.await_tag(leg, "person", Duration::from_secs(120))?;
         let mut meta = String::new();
@@ -1481,7 +1343,7 @@ impl Proof {
         Ok(())
     }
 
-    /// The question leg under Land (module header).
+    /// The question leg under Land.
     fn question_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let answered = Self::wait_for(Duration::from_secs(180), Duration::from_secs(1), || {
             self.requests("question").iter().any(|r| {
@@ -1637,7 +1499,7 @@ impl Proof {
         Ok(())
     }
 
-    /// The usage wall (module header): waited out, then resumed once.
+    /// The usage wall: waited out, then resumed once.
     fn usage_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let resumed_act = self.await_act(leg, "usage-resume@v1", Duration::from_secs(300))?;
         let asked = self.await_tag(leg, "continue", Duration::from_secs(60))?;
@@ -1692,7 +1554,7 @@ impl Proof {
         Ok(())
     }
 
-    /// Autopilot Land, unbounded, its unclean defenses nudged (module header).
+    /// Autopilot Land, unbounded, its unclean defenses nudged.
     fn land_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let started = Instant::now();
         let land = self.await_act(leg, "land@v1", Duration::from_secs(240))?;
@@ -1769,8 +1631,7 @@ impl Proof {
     }
 
     /// The reland leg's landing and the quiet after it, past the back-off a
-    /// codex-alab that went on would wait; then a person's turn reopens it
-    /// (module header).
+    /// codex-alab that went on would wait; then a person's turn reopens it.
     fn reland_landed(&mut self, leg: &Leg) -> Result<bool, Stopped> {
         let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
         let landed = self.await_act(leg, LANDED, Duration::from_secs(120))?;
@@ -1893,7 +1754,7 @@ impl Proof {
     }
 
     /// A clean defense over a repository that still holds work: the file
-    /// untracked (module header).
+    /// untracked.
     fn repo_leg(&mut self, leg: &Leg) -> Result<(), Stopped> {
         let land = self.await_act(leg, "land@v1", Duration::from_secs(300))?;
         let defended = self.await_tag(leg, "land", Duration::from_secs(60))?;
@@ -2018,7 +1879,7 @@ impl Proof {
         }
     }
 
-    /// Autopilot Cruise, over every Cruise leg's whole run (module header):
+    /// Autopilot Cruise, over every Cruise leg's whole run:
     /// nothing finished or landed, and each done claim met by the defend
     /// prompt, by the model's own log ([`claims_of`]).
     fn cruise_rests_never(&mut self, cruise: &[&Leg]) {
@@ -2060,10 +1921,20 @@ impl Proof {
     /// `SIGKILL` the codex-alab `pid` of `leg`; the crash rule's relaunch
     /// proven again (a new pid).
     fn crash_once(&mut self, leg: &Leg, pid: i32, label: &str) -> Result<Option<i32>, Stopped> {
+        self.crash_once_with_limit(leg, pid, label, Duration::from_secs(150))
+    }
+
+    fn crash_once_with_limit(
+        &mut self,
+        leg: &Leg,
+        pid: i32,
+        label: &str,
+        limit: Duration,
+    ) -> Result<Option<i32>, Stopped> {
         let _ = crate::sys::kill(pid, libc::SIGKILL);
         println!("    {label}: SIGKILL {pid}");
         let mut next = None;
-        Self::wait_for(Duration::from_secs(150), Duration::from_millis(50), || {
+        Self::wait_for(limit, Duration::from_millis(50), || {
             next = self.proven_pid(&leg.sid).filter(|p| *p != pid);
             next.is_some()
         })?;
@@ -2147,7 +2018,7 @@ impl Proof {
             .collect()
     }
 
-    /// THE CARRY-ON AFTER A CRASH RELAUNCH (module header): `SIGKILL` the
+    /// THE CARRY-ON AFTER A CRASH RELAUNCH: `SIGKILL` the
     /// leg's codex-alab mid-turn, once its crash is relaunchable; the
     /// relaunched one carries the turn on by itself only when its launch probe
     /// saw aterm's relaunch lease.
@@ -2326,7 +2197,7 @@ impl Proof {
         Ok(up)
     }
 
-    /// THE AUTOPILOT OFF STEP's start (module header): Off while the leg's
+    /// THE AUTOPILOT OFF STEP's start: Off while the leg's
     /// first turn, real work, runs; codex-alab gives its claim back.
     fn autopilot_off(&mut self, leg: &Leg) -> Result<Option<i64>, Stopped> {
         let name = leg.name;
@@ -2358,7 +2229,7 @@ impl Proof {
         Ok(set.then_some(at))
     }
 
-    /// THE AUTOPILOT OFF STEP (module header): the turn ends inside Off, an
+    /// THE AUTOPILOT OFF STEP: the turn ends inside Off, an
     /// act due at once, and nothing is typed; the mail goes alone; On, the
     /// claim comes back and the act that fell due goes.
     fn autopilot_off_leg(
@@ -2451,7 +2322,7 @@ impl Proof {
         Ok(())
     }
 
-    /// THE EXCHANGE LEGS' TURN (module header): the message (`LEG-<leg>`
+    /// THE EXCHANGE LEGS' TURN: the message (`LEG-<leg>`
     /// and [`PERSON_ASKS`]) typed into the leg's codex composer and sent with
     /// Enter — as a PERSON types it where `as_person`, through aterm's
     /// development seam `send|key as=person` (a person's gesture through the
@@ -2557,7 +2428,7 @@ impl Proof {
         }))
     }
 
-    /// The exchange legs' turns typed (module header), and what aterm's
+    /// The exchange legs' turns typed, and what aterm's
     /// `status` said of each hand: the person's Enter stamped `human_ms` and
     /// moved `human_seq` past the send's own stamp ([`Typed::enter_stamped`];
     /// else no person's Enter reached the session, and the exchange's checks
@@ -2598,7 +2469,7 @@ impl Proof {
         Ok((theirs, ours))
     }
 
-    /// A PERSON'S OWN EXCHANGE, judged (module header): the control's turn
+    /// A PERSON'S OWN EXCHANGE, judged: the control's turn
     /// continued, the person's left to them — nothing typed, the rule named
     /// in its journal, aterm's face `theirs`.
     fn exchange_leg(
@@ -3000,7 +2871,7 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
 }
 
 /// `codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep]
-/// [--policy-only|--upgrade-only]`.
+/// [--policy-only|--upgrade-only|--raw-upgrade-only]`.
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -3009,12 +2880,18 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let keep = instance::take_flag(&mut a, "--keep");
     let policy_only = instance::take_flag(&mut a, "--policy-only");
     let upgrade_only = instance::take_flag(&mut a, "--upgrade-only");
+    let raw_upgrade_only = instance::take_flag(&mut a, "--raw-upgrade-only");
     let aterm = instance::take_value(&mut a, "--aterm")?;
     let given = instance::take_value(&mut a, "--package")?;
     let upgrade_given = instance::take_value(&mut a, "--upgrade-package")?;
-    if policy_only && (upgrade_only || upgrade_given.is_some()) {
+    if policy_only && (upgrade_only || raw_upgrade_only || upgrade_given.is_some()) {
         return Err(Fail::usage(
             "codex-alab-proof: --policy-only cannot be combined with upgrade options",
+        ));
+    }
+    if upgrade_only && raw_upgrade_only {
+        return Err(Fail::usage(
+            "codex-alab-proof: choose one upgrade-only mode",
         ));
     }
     if let Some(extra) = a.first() {
@@ -3050,7 +2927,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     );
     if let Some(upgrade_pkg) = &upgrade_pkg {
         upgrade_proof::describe_package(upgrade_pkg)?;
-    } else if upgrade_only {
+    } else if upgrade_only || raw_upgrade_only {
         println!("upgrade target: the same package bytes at another private path");
     }
     let mut world = World::new(
@@ -3095,14 +2972,9 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         made.map_err(|e| format!("codex-alab-proof: cannot lay out {}: {e}", s.display()))?;
     let fabric = Fabric::start(&aterm, &s.join("fabric"))
         .map_err(|e| format!("codex-alab-proof: cannot start the lab's bus: {e}"))?;
-    {
-        use std::io::Write as _;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(world.cfg.join("aterm/aterm.toml"))
-            .and_then(|mut f| f.write_all(fabric.table.as_bytes()))
-            .map_err(|e| format!("codex-alab-proof: cannot name the bridge: {e}"))?;
-    }
+    fabric
+        .name_in(&world.cfg.join("aterm/aterm.toml"))
+        .map_err(|e| format!("codex-alab-proof: {e}"))?;
     let (pkg_a, pkg_b) = (s.join("pkg-a"), s.join("pkg-b"));
     for (from, to) in [
         (&pkg, &pkg_a),
@@ -3170,7 +3042,9 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         fails: Vec::new(),
         fabric,
     };
-    let outcome = if upgrade_only {
+    let outcome = if raw_upgrade_only {
+        upgrade_proof::raw_legs(&mut proof, &pkg_a, &pkg_b)
+    } else if upgrade_only {
         upgrade_proof::legs(&mut proof, &pkg_a, &pkg_b)
     } else if policy_only {
         policy_proof::legs(&mut proof, &pkg_a)

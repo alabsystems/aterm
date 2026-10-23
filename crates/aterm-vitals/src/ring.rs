@@ -17,7 +17,6 @@ pub const NOW_WINDOW_MS: i64 = 10_000;
 pub const CLAMP_BACK_S: i64 = 60;
 /// How long [`Recent`] keeps a reading, ms: the longest window asked of it.
 pub const RECENT_KEEP_MS: i64 = 60_000;
-/// Maximum number of readings retained in [`Recent`].
 const RECENT_CAP: usize = 256;
 
 /// One bucket's readings, raw.
@@ -346,7 +345,6 @@ pub fn columns_of(
 mod tests {
     use super::*;
 
-    /// 10:00:00 on some day, unix ms.
     const T0: i64 = 1_792_000_800_000;
 
     #[test]

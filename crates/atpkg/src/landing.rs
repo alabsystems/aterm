@@ -1,47 +1,28 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The retired landing hand-over, now a pass-through.
-//!
-//! An older client's `agents/` twin hands a typed agent command to `atpkg __landing` while
-//! a `<prefix>/landing/<program>` marker stands. No wait is needed: activation re-lays
-//! `bin/` and the twin atomically, so the next invocation runs the new build.
-//!
-//! * No pass writes a marker, and every pass sweeps `landing/` and `optin/` (an older
-//!   client's extras opt-in markers, read by nothing) under the store lock ([`sweep`]); an
-//!   older twin that finds no marker runs its own `exec`.
-//! * The hidden verb ([`HIDDEN_VERB`], `cli::cmd_landing`) `exec`s the current
-//!   `bin/<program>` at once with the arguments verbatim ([`HandOver`], [`shim_command`])
-//!   and prints nothing.
-//! * New twins carry no landing prelude (`crate::platform::twin_prelude`), so the next pass
-//!   re-lays an older twin without it; the self-update block stays.
+//! Retired landing hand-over ([`HIDDEN_VERB`], [`HandOver`], [`shim_command`], [`sweep`]).
 
 use std::path::PathBuf;
 
 use crate::store::{Layout, ToolName};
 
-/// The hidden verb an older twin's prelude execs: `atpkg __landing <program> -- <args…>`.
-/// Unlisted, dispatched before the verb match and before the store lock, like
-/// `__pending` and `__reroute`.
+/// The hidden verb an older twin's prelude execs.
 pub const HIDDEN_VERB: &str = "__landing";
 
-/// The verb's operands, parsed: `<program> [<prefix>] -- [args…]` — the pure half of
-/// `cli::cmd_landing`, so what the verb would run is pinned on every platform.
+/// The verb's operands, parsed: `<program> [<prefix>] -- [args…]`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HandOver<'a> {
     /// The agent program the twin stands for (`claude`), not yet `ToolName`-vetted.
     pub program: &'a str,
-    /// The absolute prefix operand the twin passes, so the store is found with no `HOME`;
-    /// `None` from a twin laid before the operand existed.
+    /// The absolute prefix operand the twin passes, so the store is found with no `HOME`.
     pub prefix: Option<PathBuf>,
     /// The user's arguments, verbatim, with the one `--` the twin inserted stripped.
     pub args: &'a [String],
 }
 
 impl<'a> HandOver<'a> {
-    /// `None` only with no program. The next operand is the prefix when it is an absolute
-    /// path (a relative one, or `--`, is the user's). The twin inserts exactly one `--`, so
-    /// exactly one is stripped and a user's own leading `--` survives.
+    /// `None` only with no program.
     #[must_use]
     pub fn parse(rest: &'a [String]) -> Option<Self> {
         let (program, rest) = rest.split_first()?;
@@ -64,18 +45,7 @@ impl<'a> HandOver<'a> {
     }
 }
 
-/// The command the verb runs: the current `bin/<program>` shim ([`Layout::shim`]), never
-/// the `agents/` twin (its prelude would hand over here again), with `args` verbatim. Built
-/// apart from the `exec` so the argument vector is pinned on every platform;
-/// `cli::cmd_landing` hands it to [`crate::platform::exec_or_run`]. A self-update's forward
-/// uses it too, and the warm pass strips it itself (`warm::warm_command`).
-///
-/// Raw, not `aterm_uds::spawnfd::command`: the verb becomes the tool's shim, so its
-/// caller's descriptors are the tool's, and on Unix it `exec`s, keeping the whole table.
-/// Spawned instead, a `std` command hands its child stdio alone under Trust's std, so a
-/// pass-through that waits on its program spawns with `aterm_uds::spawnfd::transparent`.
-/// The Windows console flags are set all the same (`aterm_uds::spawn::set_flags`): the
-/// child shares the verb's console, and a caller with none gets a windowless one.
+/// The command the verb runs ([`Layout::shim`], [`crate::platform::exec_or_run`]).
 #[must_use]
 pub fn shim_command(
     layout: &Layout,
@@ -92,10 +62,7 @@ pub fn shim_command(
     command
 }
 
-/// Remove `<prefix>/landing/` and `<prefix>/optin/` and everything in them, silently and
-/// best-effort. Every pass runs it once it holds the store lock, so no other pass is
-/// running and none writes either. A link or file at either name is unlinked, never
-/// followed.
+/// Remove `<prefix>/landing/` and `<prefix>/optin/` and everything in them.
 pub fn sweep(layout: &Layout) {
     for dir in [layout.landing_dir(), layout.prefix.join("optin")] {
         match std::fs::symlink_metadata(&dir) {
@@ -115,8 +82,6 @@ pub fn sweep(layout: &Layout) {
 mod pure_tests {
     use super::*;
 
-    /// The program, the absolute prefix operand, exactly one `--` stripped and the rest
-    /// verbatim; the command is the platform's `bin/` shim, never the `agents/` twin.
     #[test]
     fn the_hand_over_parses_its_operands_and_runs_the_bin_shim_verbatim() {
         let a = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
@@ -130,18 +95,15 @@ mod pure_tests {
         assert_eq!(h.program, "claude");
         assert_eq!(h.prefix.as_deref(), Some(std::path::Path::new(prefix_str)));
         assert_eq!(h.args, &a(&["-p", "--", "50% done", "a b"])[..]);
-        // A twin from before the prefix operand: `--` right after the program.
         let old = a(&["codex", "--", "--", "x"]);
         let h = HandOver::parse(&old).unwrap();
         assert_eq!(h.prefix, None);
         assert_eq!(h.args, &a(&["--", "x"])[..]);
-        // A relative first argument is the user's, not a prefix; no `--` strips nothing.
         let rel = a(&["claude", "notes.md"]);
         let h = HandOver::parse(&rel).unwrap();
         assert_eq!(h.prefix, None);
         assert_eq!(h.args, &a(&["notes.md"])[..]);
         assert_eq!(HandOver::parse(&[]), None);
-        // The command: the bin/ shim of this platform, the arguments verbatim.
         let layout = Layout {
             prefix: PathBuf::from(prefix_str),
         };
@@ -175,8 +137,6 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-landing-{label}-"))
     }
 
-    /// Every marker goes, whoever wrote it (a live pid's marker, garbage, a stray temp), and
-    /// a second sweep over nothing is silent.
     #[test]
     fn the_sweep_removes_every_marker_and_the_directory() {
         let l = temp_layout("sweep");
@@ -190,7 +150,6 @@ mod tests {
         std::fs::write(dir.join("claude"), live).unwrap();
         std::fs::write(dir.join("codex"), b"junk\n").unwrap();
         std::fs::write(dir.join(".claude.tmp-4242"), b"").unwrap();
-        // An older client's extras opt-in markers go too.
         let optin = l.prefix.join("optin");
         std::fs::create_dir_all(&optin).unwrap();
         std::fs::write(optin.join("vendorx"), b"# opted in\n").unwrap();
@@ -202,7 +161,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A link at `landing/` is unlinked, never followed: its target keeps every file.
     #[test]
     fn the_sweep_never_follows_a_link_at_landing() {
         let l = temp_layout("sweep-link");

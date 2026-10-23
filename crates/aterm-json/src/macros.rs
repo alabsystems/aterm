@@ -5,27 +5,17 @@
 
 /// Build a [`Value`](crate::Value) from JSON-shaped syntax.
 ///
-/// ```
-/// let body = aterm_json::json!({
-///     "model": "qwen",
-///     "messages": [{"role": "user", "content": "hi"}],
-///     "stream": false,
-///     "options": {"temperature": 0},
-/// });
-/// assert_eq!(body.get("stream").and_then(aterm_json::Value::as_bool), Some(false));
-/// ```
-/// let body = aterm_json::json!({
-///     "model": "qwen",
-///     "messages": [{"role": "user", "content": "hi"}],
-///     "stream": false,
-///     "options": {"temperature": 0},
-/// });
-/// assert_eq!(body.get("stream").and_then(aterm_json::Value::as_bool), Some(false));
+/// # Examples
 ///
-/// `null`, `true` and `false` are recognised as JSON literals; `[...]` and
-/// `{...}` nest; anything else is a Rust expression, converted through
-/// [`to_value`](crate::to_value). Keys are single token trees — a string
-/// literal in every real use — and a trailing comma is allowed.
+/// ```
+/// let body = aterm_json::json!({
+///     "model": "qwen",
+///     "messages": [{"role": "user", "content": "hi"}],
+///     "stream": false,
+///     "options": {"temperature": 0},
+/// });
+/// assert_eq!(body.get("stream").and_then(aterm_json::Value::as_bool), Some(false));
+/// ```
 #[macro_export]
 macro_rules! json {
     ($($body:tt)+) => {
@@ -33,23 +23,19 @@ macro_rules! json {
     };
 }
 
-/// The muncher behind [`json!`]. Not part of the public surface; it is
-/// `#[macro_export]`ed only because `json!` expands to it at the call site.
+/// Internal token-tree muncher for [`json!`].
 #[doc(hidden)]
 #[macro_export]
 macro_rules! json_build {
-    // ── literals ───────────────────────────────────────────────────────────
     (null) => { $crate::Value::Null };
     (true) => { $crate::Value::Bool(true) };
     (false) => { $crate::Value::Bool(false) };
 
-    // ── arrays ─────────────────────────────────────────────────────────────
     ([]) => { $crate::Value::Array(::std::vec::Vec::new()) };
     ([ $($items:tt)+ ]) => {
         $crate::Value::Array($crate::json_build!(@array [] $($items)+))
     };
 
-    // ── objects ────────────────────────────────────────────────────────────
     ({}) => { $crate::Value::Object($crate::Map::new()) };
     ({ $($entries:tt)+ }) => {{
         let mut map = $crate::Map::new();
@@ -57,25 +43,14 @@ macro_rules! json_build {
         $crate::Value::Object(map)
     }};
 
-    // ── anything else is a Rust expression ─────────────────────────────────
-    //
-    // PANICS on a value that cannot serialize, as `serde_json`'s `json!` does:
-    // the macro cannot return an error, and substituting `null` would ship a
-    // document missing a field.
     ($other:expr) => {
         $crate::to_value(&$other).expect("json! value must serialize")
     };
 
-    // ── array muncher ──────────────────────────────────────────────────────
-    // Done: hand back the accumulated element vector.
     (@array [$($done:expr,)*]) => { ::std::vec![$($done,)*] };
-    // A separating comma between elements.
     (@array [$($done:expr,)*] , $($rest:tt)*) => {
         $crate::json_build!(@array [$($done,)*] $($rest)*)
     };
-    // The JSON literals, which must be matched before the `expr` arms — `null`
-    // is a perfectly good Rust path expression and would otherwise be taken as
-    // an (undefined) identifier.
     (@array [$($done:expr,)*] null $($rest:tt)*) => {
         $crate::json_build!(@array [$($done,)* $crate::Value::Null,] $($rest)*)
     };
@@ -85,15 +60,12 @@ macro_rules! json_build {
     (@array [$($done:expr,)*] false $($rest:tt)*) => {
         $crate::json_build!(@array [$($done,)* $crate::Value::Bool(false),] $($rest)*)
     };
-    // Nested array / object, matched as a single token tree so their contents
-    // are re-munched as JSON rather than parsed as a Rust block.
     (@array [$($done:expr,)*] [$($inner:tt)*] $($rest:tt)*) => {
         $crate::json_build!(@array [$($done,)* $crate::json_build!([$($inner)*]),] $($rest)*)
     };
     (@array [$($done:expr,)*] {$($inner:tt)*} $($rest:tt)*) => {
         $crate::json_build!(@array [$($done,)* $crate::json_build!({$($inner)*}),] $($rest)*)
     };
-    // A Rust expression element, with or without a following comma.
     (@array [$($done:expr,)*] $next:expr, $($rest:tt)*) => {
         $crate::json_build!(@array [$($done,)* $crate::json_build!($next),] $($rest)*)
     };
@@ -101,7 +73,6 @@ macro_rules! json_build {
         $crate::json_build!(@array [$($done,)* $crate::json_build!($last),])
     };
 
-    // ── object muncher ─────────────────────────────────────────────────────
     (@object $map:ident) => {};
     (@object $map:ident , $($rest:tt)*) => {
         $crate::json_build!(@object $map $($rest)*)

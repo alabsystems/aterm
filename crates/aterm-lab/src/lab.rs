@@ -739,7 +739,7 @@ fn lab_sets(name: &str) -> bool {
 
 /// `LAB_INSTANCE_ENV` read: `NAME=VALUE` words, each a variable the lab's OWN instance gets at every launch of it (`up`'s, `restore`'s and `crash`'s relaunches), after what the lab sets ([`lab_vars`]); nothing else the lab starts gets them.
 /// # Errors
-/// A word that is no `NAME=VALUE`, a name outside those two kinds or one the lab sets, a name given twice, an empty value or one with a control character, or a `TMPDIR` that is not absolute.
+/// A word that is no `NAME=VALUE`, a name outside those kinds (`TMPDIR`, an `ATERM_DEBUG_*` or `ATERM_DEV_*` seam, or the occupancy nudge's seam, [`NUDGE_SEAM`](aterm_agent::supervise::occupancy::rules::NUDGE_SEAM)) or one the lab sets, a name given twice, an empty value or one with a control character, or a `TMPDIR` that is not absolute.
 pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
     let refuse = |m: String| Err(format!("LAB_INSTANCE_ENV: {m}"));
     let mut out: Vec<(String, String)> = Vec::new();
@@ -755,9 +755,10 @@ pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
                         .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             })
         });
-        if !(name == "TMPDIR" || seam) || lab_sets(name) {
+        let named = name == aterm_agent::supervise::occupancy::rules::NUDGE_SEAM;
+        if !(name == "TMPDIR" || seam || named) || lab_sets(name) {
             return refuse(format!(
-                "{name} is not a variable the lab hands its instance (TMPDIR, or an ATERM_DEBUG_* or ATERM_DEV_* seam the lab does not set itself)"
+                "{name} is not a variable the lab hands its instance (TMPDIR, an ATERM_DEBUG_* or ATERM_DEV_* seam the lab does not set itself, or ATERM_OCCUPANCY_NUDGE_S)"
             ));
         }
         if value.is_empty() || value.chars().any(char::is_control) {
@@ -1156,10 +1157,8 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     )
     .and_then(|()| fs::set_permissions(&witness, fs::Permissions::from_mode(0o755)));
     run.proxy = if o.proxy_dead {
-        // 127.0.0.1:9".into()
         "http://127.0.0.1:9".into()
     } else {
-        // 127.0.0.1:{}", run.pport)
         format!("http://127.0.0.1:{}", run.pport)
     };
     run.save();
@@ -1231,7 +1230,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
 /// table; the update and package lanes off; `LAB_HARNESS_KEYS`
 /// (`harness_keys`) under `[harness]`; and the audible bell off unless
 /// `LAB_ATERM_TOML` sets `bell_sound` ([`crate::instance::bell_off`]).
-fn scratch_aterm_toml(aterm_toml: &str, harness_keys: &str) -> String {
+pub(crate) fn scratch_aterm_toml(aterm_toml: &str, harness_keys: &str) -> String {
     crate::instance::bell_off(&format!(
         "{aterm_toml}\n[update]\nenabled = false\n[packages]\nenabled = false\n[harness]\nprobe_api = false\n{harness_keys}\n"
     ))
@@ -2253,8 +2252,10 @@ mod tests {
     }
 
     /// `LAB_INSTANCE_ENV` hands the lab's instance `TMPDIR` and dev seams
-    /// alone, in the order given, and never a name the lab sets itself (its
-    /// jail's HOME, XDG dirs, state root and PATH, the harness tape, or the
+    /// alone (the `ATERM_DEBUG_*` and `ATERM_DEV_*` stems, and the occupancy
+    /// nudge's seam by its name, no other seam of another name), in the
+    /// order given, and never a name the lab sets itself (its jail's HOME,
+    /// XDG dirs, state root and PATH, the harness tape, or the
     /// headless-restore seam `LAB_RESTORE=1` owns, whether or not this lab
     /// runs under it).
     #[test]
@@ -2275,7 +2276,14 @@ mod tests {
             instance_env("ATERM_DEV_CARD_PROBE=1"),
             Ok(pairs(&[("ATERM_DEV_CARD_PROBE", "1")]))
         );
+        assert_eq!(
+            instance_env("ATERM_OCCUPANCY_NUDGE_S=60"),
+            Ok(pairs(&[("ATERM_OCCUPANCY_NUDGE_S", "60")]))
+        );
         for bad in [
+            "ATERM_UPGRADE_QUIET_S=1",
+            "ATERM_OCCUPANCY_NUDGE=60",
+            "ATERM_OCCUPANCY_NUDGE_S=",
             "HOME=/x",
             "PATH=/x",
             "XDG_RUNTIME_DIR=/x",

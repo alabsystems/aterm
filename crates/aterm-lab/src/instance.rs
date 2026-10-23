@@ -622,6 +622,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;
     let toml_after = take_values(&mut a, "--toml-after")?;
+    let harness_keys = take_values(&mut a, "--harness-key")?;
     let extra_env =
         crate::lab::instance_env(&take_values(&mut a, "--env")?.join(" ")).map_err(Fail::usage)?;
     let home = take_value(&mut a, "--home")?.map(|p| from_caller(&p));
@@ -651,7 +652,8 @@ pub fn cmd_instance(args: &[String]) -> Res {
         ));
     }
     let aterm = resolve_aterm(aterm).map_err(|e| Fail::exit(3, e))?;
-    let mut world = World::new(&config_after(&config_with(&toml), harness, &toml_after))?;
+    let config = config_after(&config_with(&toml), harness, &toml_after);
+    let mut world = World::new(&with_harness_keys(&config, &harness_keys))?;
     if keep {
         world.keep();
     }
@@ -882,6 +884,27 @@ pub fn config_after(config: &str, harness: bool, after: &[String]) -> String {
         out.push_str(line);
         out.push('\n');
     }
+    out
+}
+
+/// `config` (a [`config_with`]) with each of `keys` under its root `[harness]` table, after its
+/// `enabled` line (`instance --harness-key 'occupancy = "prompt"'`: a scratch HOME's own key, which
+/// `--toml-after` cannot give, its lines landing under the last table).
+#[must_use]
+pub fn with_harness_keys(config: &str, keys: &[String]) -> String {
+    let Some(table) = config.find("[harness]\n") else {
+        return config.to_owned();
+    };
+    let head = table + "[harness]\n".len();
+    let at = config[head..]
+        .find('\n')
+        .map_or(config.len(), |n| head + n + 1);
+    let mut out = config[..at].to_owned();
+    for key in keys {
+        out.push_str(key);
+        out.push('\n');
+    }
+    out.push_str(&config[at..]);
     out
 }
 
@@ -1326,5 +1349,39 @@ mod bell_off_tests {
                 .and_then(aterm_toml::Value::as_bool),
             Some(true),
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_key_tests {
+    use aterm_agent::supervise::SupervisorConfig;
+
+    use super::*;
+
+    /// `instance --harness-key` writes its lines under the root `[harness]` table, where the
+    /// owner's `occupancy = "prompt"` reaches `prompt` (a scratch HOME's key; the only place an
+    /// agent writes it). NEGATIVE CONTROL: the same line given to `--toml-after` lands under the
+    /// last table and grants nothing, and no line keeps `observe`.
+    #[test]
+    fn a_harness_key_lands_under_the_root_harness_table() {
+        let key = vec!["occupancy = \"prompt\"".to_string()];
+        let config = config_after(&config_with(&[]), true, &[]);
+        let keyed = with_harness_keys(&config, &key);
+        assert!(
+            keyed.contains("[harness]\nenabled = true\noccupancy = \"prompt\"\n"),
+            "{keyed}"
+        );
+        let (cfg, notes) = SupervisorConfig::from_aterm_toml(&keyed);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(cfg.occupancy.grant().is_some(), "{keyed}");
+        assert!(cfg.enabled);
+        for unkeyed in [
+            with_harness_keys(&config, &[]),
+            config_after(&config_with(&[]), true, &key),
+        ] {
+            let (cfg, _) = SupervisorConfig::from_aterm_toml(&unkeyed);
+            assert!(cfg.occupancy.grant().is_none(), "{unkeyed}");
+        }
+        assert_eq!(with_harness_keys("[update]\n", &key), "[update]\n");
     }
 }

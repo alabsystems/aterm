@@ -215,7 +215,8 @@ impl Dib {
 
 impl Drop for Dib {
     fn drop(&mut self) {
-        // SAFETY: the DC and bitmap are this buffer's; `held` is what the DC held.
+        // SAFETY: the DC and bitmap are this buffer's; `held` is what the DC
+        // held. Deselected first: GDI refuses to delete a selected bitmap.
         unsafe {
             SelectObject(self.dc, self.held);
             DeleteObject(self.bitmap);
@@ -381,7 +382,9 @@ impl DerefMut for Win32Frame<'_> {
     fn deref_mut(&mut self) -> &mut [u32] {
         let dib = self.dib();
         let (pixels, len) = (dib.pixels, dib.len);
-        // SAFETY: as `deref`, borrowed mutably through the frame, which holds the surface.
+        // SAFETY: as `deref`, borrowed mutably through the frame, which holds
+        // the surface mutably; GDI reads the section only inside a present,
+        // which flushes GDI's batch before it returns.
         unsafe { std::slice::from_raw_parts_mut(pixels.as_ptr(), len) }
     }
 }

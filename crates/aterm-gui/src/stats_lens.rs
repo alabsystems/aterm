@@ -2840,13 +2840,14 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             ),
         ],
     });
-    let marks: [(WellMark, &str); 6] = [
+    let marks: [(WellMark, &str); 7] = [
         (WellMark::Stuck, "stuck"),
         (WellMark::Quiet, "quiet"),
         (WellMark::Waiting, "waiting for you"),
         (WellMark::Zombies, "zombies"),
         (WellMark::Low, "disk low"),
         (WellMark::Dot, "memory pressure, a GPU reset"),
+        (WellMark::Cause, "the cause aterm names"),
     ];
     let item_w = |w: &str| 14.0 + m.width(w, BODY_PT, false) + 12.0;
     let mut mark_rows = 1;
@@ -2861,7 +2862,8 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     sections.push(Section {
         name: "Marks".into(),
         words: vec![
-            "Stuck, quiet, waiting for you, zombies, disk low, memory pressure or a GPU reset."
+            "Stuck, quiet, waiting for you, zombies, disk low, memory pressure or a GPU reset, \
+             and the cause aterm names."
                 .into(),
         ],
         right: true,
@@ -2873,8 +2875,8 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                     p,
                     "Marks",
                     &[
-                        "a row's state, beside its name".into(),
-                        "a row's state".into(),
+                        "a row's state beside its name, or its cause".into(),
+                        "a row's state or cause".into(),
                     ],
                 );
                 let inks = pen.inks;
@@ -2888,6 +2890,7 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
                     let base = p.y + ROW0_BASE + PITCH * row as f64;
                     let ink = match kind {
                         WellMark::Zombies | WellMark::Low | WellMark::Dot => inks.warn_text,
+                        WellMark::Cause => inks.words2,
                         _ => inks.stuck,
                     };
                     pen.mark(
@@ -2905,7 +2908,7 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
             }),
             line_form(
                 "Marks",
-                vec!["stuck, quiet, waiting, zombies, low, pressure".into()],
+                vec!["stuck, quiet, waiting, zombies, low, pressure, cause".into()],
             ),
         ],
     });

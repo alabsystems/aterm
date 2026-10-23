@@ -35,7 +35,8 @@ use aterm_restore::{
 #[cfg(unix)]
 use crate::temporal::{SpineMark, SpinePre, SpineResize, SpineSink, SpineWatermark};
 
-/// The store a window journals through: its read-write mapping, counting the pages it makes resident, shared by the threads that write it (module doc).
+/// The store a window journals through: its read-write mapping, counting the pages it makes
+/// resident, shared by the threads that write it.
 #[cfg(unix)]
 pub(crate) type Store = Shared<Touched<aterm_uds::shm::Region>>;
 
@@ -609,7 +610,19 @@ pub(crate) struct SlicePre {
 
 #[cfg(unix)]
 fn new_region() -> Result<(Touched<aterm_uds::shm::Region>, OwnedFd), String> {
-    // SAFETY: the backing object is modified only through this `Region`, which the journal alone holds (behind `Shared`), and it is never resized after `create`'s one `ftruncate` (macOS refuses a second).
+    // SAFETY: the backing object is modified only through this `Region`, which the
+    // journal alone holds (behind `Shared`), and it is never resized after `create`'s one
+    // `ftruncate` (macOS refuses a second). Unlinking the name and the custody
+    // descriptor's `O_RDONLY` mode do not prevent aliases from reopening it. Exclusion
+    // instead relies on custody going only to the keeper link (`take_custody`,
+    // `hand_custody`), whose keeper holds it unmapped (the census guard
+    // `keeper-no-mmap`, its clippy rows) and hands it on only beside an orphaned master,
+    // after every window that claimed that master, this one included, has died: no
+    // payload read through an alias happens while this `Region` lives and writes. A region
+    // the shed replaced keeps only this window's synchronized count stores and privacy
+    // erase until a SYNC confirms the keeper accepted the successor. The keeper never
+    // maps a region while this window is alive, so the same exclusion holds for the
+    // retired mapping until its last descriptor closes.
     let (region, custody) = unsafe { aterm_uds::shm::Region::create(REGION_LEN) }
         .map_err(|e| format!("region: {e}"))?;
     Ok((
@@ -1099,7 +1112,9 @@ impl SessionJournal {
         }
     }
 
-    /// Whether the session has tail past its keyframe that a quiet wait can keyframe (the parse loop then waits for its next batch with a [`QUIET`] timeout, and otherwise blocks): not while a K5 deferral parks it (module doc).
+    /// Whether the session has tail past its keyframe that a quiet wait can keyframe (the parse
+    /// loop then waits for its next batch with a [`QUIET`] timeout, and otherwise blocks): not
+    /// while a K5 deferral parks it, until the next slice or resize reaches the tail.
     pub(crate) fn dirty(&self) -> bool {
         self.broken.get().is_none() && {
             let w = self.lock();
@@ -1431,7 +1446,7 @@ impl SessionJournal {
         earliest(export, custody)
     }
 
-    /// One export tick of this session's history ring (the plan's increment 5, step 1):
+    /// One export tick of this session's history ring (the plan's increment 5, step 1).
     pub(crate) fn export_tick(&self, term: &Mutex<Terminal>) {
         if self.broken.get().is_some() {
             return;
@@ -2983,6 +2998,9 @@ pub(crate) struct Restoration {
     pub(crate) turn_ids: u64,
 }
 
+/// # Safety
+/// [`restore_offered`]'s: nothing may modify, resize, or invalidate the object behind
+/// `companion` during this call.
 #[cfg(unix)]
 unsafe fn restore_screen(
     companion: Option<aterm_keeper::client::OfferedCompanion>,

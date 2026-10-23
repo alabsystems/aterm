@@ -62,7 +62,8 @@ impl Plane {
         }
     }
 
-    /// For a component halved vertically.
+    /// For a component halved vertically: the sample row nearest output row
+    /// `y` and the one on the far side of it (the edge row repeats).
     #[inline]
     fn vertical_pair(&self, y: usize) -> (&[u8], &[u8]) {
         let near = y / 2;

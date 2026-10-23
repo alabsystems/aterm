@@ -1294,6 +1294,20 @@ fn a_root_sweep_runs_nothing_an_account_could_replace() {
         RunAs::Nobody,
         "a link its owner may repoint"
     );
+    // shell-setup: root wires only its own home, never an account's (whose profile it would leave
+    // root's) nor one that is no account's own.
+    assert_eq!(setup_refusal(me, &own, &[]), None, "not root");
+    assert_eq!(setup_refusal(0, &roots, &[]), None, "root's own home");
+    let asked = ["--path", "--man-root", "/a b"].map(String::from);
+    let accounts = setup_refusal(0, &own, &asked).expect("an account's home");
+    assert!(
+        accounts.contains(&format!("is uid {me}'s own home"))
+            && accounts
+                .contains("run `aterm pkg shell-setup --path --man-root '/a b'` as that account"),
+        "{accounts}"
+    );
+    let other = setup_refusal(0, a.home(), &[]).expect("a home nobody's own");
+    assert!(other.contains("is not root's own home"), "{other}");
     // Root's own, not group- or other-writable but by root's group or under a sticky bit; a
     // link by its owner alone.
     for (uid, gid, mode, dir, link, alone) in [
@@ -1443,6 +1457,7 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
         let counts = {
             let mut s = Sweep {
                 dry: false,
+                as_root: None,
                 removed: 0,
                 skipped: 0,
                 kept: 0,
@@ -1576,6 +1591,7 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let mut s = Sweep {
             dry: false,
+            as_root: None,
             removed: 0,
             skipped: 0,
             kept: 0,
@@ -1590,6 +1606,129 @@ fn an_uninstall_keeps_a_caffeine_copy_macos_may_still_be_assessing() {
     }
 }
 
+static AS_ACCOUNT: std::sync::Mutex<Vec<Vec<OsString>>> = std::sync::Mutex::new(Vec::new());
+
+/// Stands in for root's `sudo -n -H -u #uid -- …`: records the argv and, the test being that
+/// account, removes the path itself as `/bin/rm -rf` or `/bin/rmdir` would.
+fn as_the_account(program: &Path, argv: &[OsString]) -> i32 {
+    assert_eq!(program, Path::new(SUDO));
+    AS_ACCOUNT.lock().expect("calls").push(argv.to_vec());
+    let path = Path::new(argv.last().expect("a path"));
+    let done = if argv.iter().any(|arg| arg == RM) {
+        remove(path)
+    } else {
+        std::fs::remove_dir(path)
+    };
+    i32::from(done.is_err())
+}
+
+const fn sudo_refused(_: &Path, _: &[OsString]) -> i32 {
+    1
+}
+
+/// Under root, a path below a folder an account owns is removed only as that account, and by
+/// root itself only when root owns every folder on the way; a file is read only from a regular
+/// file, and written only through a descriptor showing a regular file of that account. A folder,
+/// link or pipe the account swaps in mid-sweep then never turns root's act into one on another
+/// owner's file, nor hangs it.
+#[test]
+fn a_root_sweep_changes_an_accounts_folder_only_as_that_account() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let me = aterm_uds::peer::our_uid();
+    assert_ne!(me, 0, "these tests run as an account");
+    assert_eq!(way_account([]), Ok(None));
+    assert_eq!(way_account([0, 0]), Ok(None));
+    assert_eq!(way_account([0, 501, 501, 0]), Ok(Some(501)));
+    assert_eq!(way_account([501, 0, 502]), Err(()));
+
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    assert_eq!(account_on_the_way(&home.join("x")), Ok(Some(me)));
+    assert_eq!(account_on_the_way(Path::new("/usr/bin/true")), Ok(None));
+    symlink("/usr", home.join("usr")).expect("symlink");
+    assert_eq!(account_on_the_way(&home.join("usr/bin/true")), Ok(Some(me)));
+
+    let file = home.join("store/aterm");
+    let empty = home.join("support");
+    write(&file, "");
+    std::fs::create_dir(&empty).expect("mkdir");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut s = Sweep {
+        dry: false,
+        as_root: Some(as_the_account),
+        removed: 0,
+        skipped: 0,
+        kept: 0,
+        shared_kept: 0,
+        outsider: None,
+        out: &mut out,
+        err: &mut err,
+    };
+    s.rm(&file, "store entry");
+    assert!(s.unlink(&empty, false).is_ok());
+    s.rm(Path::new("/usr/aterm-no-such-entry"), "store entry");
+    assert_eq!((s.removed, s.skipped), (1, 0));
+    assert!(!present(&file) && !present(&empty));
+    let account = format!("#{me}");
+    let argv = |program: &str, args: &[&str], path: &Path| {
+        let mut argv: Vec<OsString> = ["-n", "-H", "-u", &account, "--", program]
+            .iter()
+            .chain(args)
+            .map(OsString::from)
+            .collect();
+        argv.push(path.into());
+        argv
+    };
+    assert_eq!(
+        *AS_ACCOUNT.lock().expect("calls"),
+        [
+            argv(RM, &["-rf", "--"], &file),
+            argv(RMDIR, &["--"], &empty)
+        ]
+    );
+    s.as_root = Some(sudo_refused);
+    write(&file, "");
+    s.rm(&file, "store entry");
+    assert_eq!((s.removed, s.skipped), (1, 1));
+    assert!(present(&file));
+    let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+    assert!(
+        out.contains("gone already: store entry: /usr/aterm-no-such-entry"),
+        "{out}"
+    );
+    assert!(
+        err.contains(&format!(
+            "SKIPPED store entry (cannot remove: uid {me}, which owns a folder on the way to it, \
+             could not (exit 1))"
+        )),
+        "{err}"
+    );
+
+    let read = || std::fs::OpenOptions::new().read(true).clone();
+    let profile = home.join(".zshrc");
+    write(&profile, "x");
+    assert_eq!(read_checked(&profile).expect("the account's own file"), "x");
+    assert!(open_checked(&profile, std::fs::OpenOptions::new().append(true), true).is_ok());
+    let roots = home.join("roots");
+    symlink("/usr/bin/true", &roots).expect("symlink");
+    assert!(open_checked(&roots, &mut read(), false).is_ok());
+    assert!(
+        open_checked(&roots, &mut read(), true).is_err(),
+        "root's file behind the link"
+    );
+    let pipe = home.join("pipe");
+    let c = std::ffi::CString::new(pipe.as_os_str().as_bytes()).expect("path");
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(read_checked(&pipe).is_err()));
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(60)),
+        Ok(true),
+        "a pipe is refused, not waited on"
+    );
+}
+
 /// A file gone between the sweep's look and its removal (a Caffeine bridge removes its own
 /// once `caffeine quit` has saved off) is neither removed nor SKIPPED: the uninstall still
 /// succeeds.
@@ -1600,6 +1739,7 @@ fn a_file_gone_before_its_removal_is_not_skipped() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut s = Sweep {
         dry: false,
+        as_root: None,
         removed: 0,
         skipped: 0,
         kept: 0,

@@ -1765,7 +1765,7 @@ mod tests {
         let fifo = scratch_bundle("fifo", |path| {
             let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
                 .expect("no NUL in a temp path");
-            // SAFETY: `name` is a valid NUL-terminated path.
+            // SAFETY: `name` is a valid NUL-terminated path for the call.
             let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
             assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
         });

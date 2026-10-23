@@ -243,6 +243,7 @@ fn check_default_on_tuple(cx: &Errors, cont: &Container) {
         let mut first_default_index = None;
         for (i, field) in fields.iter().enumerate() {
             // Skipped fields automatically get the #[serde(default)]
+            // attribute. We are interested only on non-skipped fields here.
             if field.attrs.skip_deserializing() {
                 continue;
             }

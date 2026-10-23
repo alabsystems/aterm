@@ -6,23 +6,13 @@
 
 use aterm_spec::derive::*;
 
-/// Tag state: absent. Tags 2..=4 each hold one of these codes; the channel's first index,
-/// `atpkg-index-1`, is published before the model starts.
 const ABSENT: i64 = 0;
 
-/// One publisher's names and tag codes. A draft is what a `gh release create` killed
-/// between its create and its publish leaves behind (gh 2.96.0): visible to a publisher
-/// holding write access, answered 404 by the download host every client reads.
 struct Publisher {
-    /// Phase: 0 idle, 1 holds a baseline, 2 created a draft.
     phase: &'static str,
-    /// The baseline's index number.
     base: &'static str,
-    /// The number this publisher publishes.
     next: &'static str,
-    /// Its actions: read, create, finish, die, converge, refuse.
     actions: [&'static str; 6],
-    /// Its tag codes.
     draft: i64,
     done: i64,
 }
@@ -73,7 +63,6 @@ fn not(e: Expr) -> Expr {
     iff(e, bool_lit(false))
 }
 
-/// `atpkg-index-k` answers on the download host: tag 1 always, a draft never.
 fn published(k: i64) -> Expr {
     if k == 1 {
         return bool_lit(true);
@@ -81,8 +70,6 @@ fn published(k: i64) -> Expr {
     or_(eq(tag(k), int(2)), eq(tag(k), int(4)))
 }
 
-/// A release exists under the tag, draft or published — what `gh` shows a publisher with
-/// write access.
 fn present(k: i64) -> Expr {
     if k == 1 {
         return bool_lit(true);
@@ -90,7 +77,6 @@ fn present(k: i64) -> Expr {
     neq(tag(k), int(ABSENT))
 }
 
-/// The highest tag `holds` is true of (1 when none of 2..=4 is).
 fn highest(holds: fn(i64) -> Expr) -> Expr {
     if_(
         holds(4),
@@ -99,7 +85,6 @@ fn highest(holds: fn(i64) -> Expr) -> Expr {
     )
 }
 
-/// Whether the number `n` (an expression over 1..=4) is a published tag.
 fn number_published(n: &Expr) -> Expr {
     or_(
         eq(n.clone(), int(1)),
@@ -113,7 +98,6 @@ fn number_published(n: &Expr) -> Expr {
     )
 }
 
-/// The code under the number `n` (an expression over 2..=4).
 fn code_at(n: &Expr) -> Expr {
     if_(
         eq(n.clone(), int(2)),
@@ -122,7 +106,6 @@ fn code_at(n: &Expr) -> Expr {
     )
 }
 
-/// The three tag updates that write `code` under the number `n`, leaving the others.
 fn write_at(n: &Expr, code: &Expr) -> Vec<Update> {
     [2, 3, 4]
         .into_iter()
@@ -133,10 +116,7 @@ fn write_at(n: &Expr, code: &Expr) -> Vec<Update> {
         .collect()
 }
 
-/// The reader: a strict walk from the verified floor `f` (HEAD `f+1`, `f+2`, … on the download
-/// host, stopping at the first number that does not answer). The client's own walk may do more
-/// (look past one missing number), never less, so a channel this walk crosses every client
-/// crosses.
+/// Strict client walk from verified floor `f`, stopping at the first missing tag.
 fn walk_from(f: Expr) -> Expr {
     let from3 = if_(published(4), int(4), int(3));
     let from2 = if_(published(3), from3.clone(), int(2));
@@ -152,8 +132,6 @@ fn walk_from(f: Expr) -> Expr {
     )
 }
 
-/// Publishing index N is admitted: the number is the baseline's successor and the baseline is
-/// published (the indexer's two guards; `Buggy = 1` drops both).
 fn number_admitted(p: &Publisher) -> Expr {
     or_(
         eq(cst("Buggy"), int(1)),
@@ -164,31 +142,11 @@ fn number_admitted(p: &Publisher) -> Expr {
     )
 }
 
-/// `atpkg-publish index` (the writer) and the client's tag walk (the reader) as one contract.
-/// Two publishers (the ALab lane, the Linux lane, the rustc-group publish and a hand publish all
-/// run the same indexer) each read a baseline, the channel's newest published index, then
-/// publish `atpkg-index-<baseline + 1>`:
-///
-/// * `Create`: the tag is absent; `gh release create` makes a draft, uploads and publishes it
-///   (`Finish`); a run killed in between (`Die`) leaves the draft.
-/// * `Converge`: the tag holds this publisher's identical bytes (its own killed run); the
-///   missing assets are uploaded and a draft is published.
-/// * `Refuse`: anything else (another publisher's bytes under the tag, since the upload is a
-///   compare-and-swap, never a clobber; an unpublished baseline; a number that is not the
-///   baseline's successor). Nothing is written; the next run re-reads.
-///
-/// A client (`Walk`) moves its verified floor to where the strict walk lands; `Seed<k>` puts a
-/// fresh store's floor on any published index, so the walk is judged from every floor.
-///
-/// Invariants: the published tags are ONE RUN from the first (`OneRun`), so the walk from
-/// every verified floor lands the newest published index (`WalkLandsNewest`), and no
-/// publisher ever replaces a tag another one wrote (`NoOverwrite`).
-///
-/// Tier 1 has two halves: the writer's (`atpkg-publish/tests/channel/conformance_index_publish.rs`)
-/// drives the real indexer's number and compare-and-swap decisions from every modeled publisher
-/// state against a fake channel, refusing every `Buggy = 1` decision; the reader's
-/// (`atpkg/src/net/index_publish_conformance.rs`) drives the real tag walk over every reachable
-/// channel, its negative control a `Buggy = 1` hole the real walk does not cross either.
+/// Formal model of `atpkg-publish index` writers (`Read`, `Create`, `Finish`, `Die`,
+/// `Converge`, `Refuse`) and the client tag walk (`Walk`, `Seed2..=4`).
+/// Verifies that published tags form a contiguous prefix (`OneRun`), the strict walk
+/// from any floor reaches the newest index (`WalkLandsNewest`), and publishers never
+/// clobber another publisher's tag (`NoOverwrite`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::model]
@@ -209,8 +167,6 @@ pub fn atpkg_index_publish_walk_model() -> Model {
             ),
             admitted,
         );
-        // The baseline read: the newest published tag (Buggy: the newest release of any
-        // kind). The number is its successor (Buggy: also the one after, where there is one).
         let newest = if_(buggy(), highest(present), highest(published));
         let idle = |updates: &mut Vec<Update>| {
             for (var_name, value) in [(p.phase, 0), (p.base, 1), (p.next, 2)] {

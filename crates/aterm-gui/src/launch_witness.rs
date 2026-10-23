@@ -166,7 +166,8 @@ impl LaunchWitness {
         Some(launch)
     }
 
-    /// THE LAST COMMAND'S START, of any word: the person count its hold loaded and the wall clock it took it at ([module docs](self), "the launch's instant").
+    /// THE LAST COMMAND'S START, of any word: the person count its hold loaded and the wall clock
+    /// it took it at.
     pub(crate) fn started(&self) -> Option<Started> {
         let mark = (*self.lock())?;
         Some(Started {

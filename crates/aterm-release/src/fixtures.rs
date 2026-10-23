@@ -151,8 +151,16 @@ pub fn generator_args() -> Vec<&'static str> {
 
 /// Runs the in-tree fixture generator under `pins` into `root`, unless already staged.
 ///
+/// Refuses when the generator does not pass both its tests (one off macOS, which has no
+/// rendezvous; a desk the tree's guard cannot adopt as written fails the first), when a desk
+/// `REQUIRED_DESKS` asks of this release is missing, when a desk's `parent.toml` was not
+/// written as `pins`, and when it wrote no shipped-state answers for the release's desks
+/// ([`STAGED_ANSWERS`], at `$ATERM_SHIPPED_STATE_OUT`).
+///
 /// # Errors
-/// Returns an error if the generator fails, omits required desks or answers, or cannot write the staging directory.
+/// Each refusal above, no `rendezvous.toml` on macOS, a `targo` that cannot run, an
+/// unreadable handoff guard, and a staging or target directory that cannot be cleared,
+/// read or written.
 pub fn stage(
     targo: &Path,
     tree: &Path,
@@ -375,7 +383,8 @@ pub fn with_pinned_rows(guard: &str, version: &str, desks: &[String]) -> Result<
 /// Splices release `tag`'s cases from `staged` into `corpus` and returns the updated text and case count.
 ///
 /// # Errors
-/// Returns an error if `staged` lacks a contiguous block for `tag` or `corpus` cannot anchor it uniquely.
+/// `staged` holds no case of `tag`, or holds them apart, or first; `corpus` records `tag`
+/// already, or holds no line, or more than one, with the case id they go after.
 pub fn with_release_answers(corpus: &str, staged: &str, tag: &str) -> Result<(String, usize)> {
     let prefix = format!("{tag}/");
     let refuse = |why: String| Error::new(format!("{tag}'s shipped-state answers: {why}"));
@@ -696,8 +705,15 @@ impl Landed {
 
 /// Commits and pushes `staged` fixtures onto `origin/main` with compare-and-swap retry.
 ///
+/// A non-fast-forward rejection is a lost race: rebuild on the winner's tip, up to
+/// `max_attempts` tries; any other push failure stops at once. A push that succeeds is
+/// verified: origin/main is the commit, or has it.
+///
 /// # Errors
-/// Returns an error if pushing fails, retries are exhausted, or `origin/main` holds conflicting fixtures.
+/// Each stop above, a push origin/main does not hold, a tip whose fixture directory for the
+/// release is someone else's ([`on_commit`]) or whose `PINNED_DESKS` cannot take the
+/// release's rows ([`with_pinned_rows`]), a staged fixture directory that cannot be read,
+/// and any git failure.
 pub fn land(
     git: &dyn GitRunner,
     staged: &Staged,

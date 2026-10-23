@@ -457,6 +457,12 @@ impl Guard {
     pub fn from_code(code: u8) -> Option<Guard> {
         Guard::ALL.get(usize::from(code).checked_sub(1)?).copied()
     }
+
+    /// The [`Guard`] whose [`Self::word`] is `word`, or `None`.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Guard> {
+        Guard::ALL.into_iter().find(|g| g.word() == word)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1987,6 +1993,9 @@ pub struct Session<'a, C: Ctl> {
     /// The content seq and loop time of the screen a `status` last said had unread input
     /// ([`Self::input_unread`]).
     input_unread_at: Option<(u64, Instant)>,
+    /// When this process last took or renewed the host's hard hand for a
+    /// typed act ([`Self::under_hand`]), while it holds it.
+    hand_taken: Option<Instant>,
     launch_used: Option<(u64, String)>,
     draft_seen: Option<(String, Instant)>,
     held: bool,
@@ -2229,6 +2238,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             person: None,
             launch_status: approval_loop::LaunchStatus::default(),
             input_unread_at: None,
+            hand_taken: None,
             launch_used: None,
             draft_seen: None,
             held: false,
@@ -3262,6 +3272,13 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     fn wait(&mut self, cond: &[&str], step: Duration) -> Result<Wait, Fail> {
+        self.wait_at(cond, step).map(|(wait, _)| wait)
+    }
+
+    /// [`Self::wait`], with the content seq the host says the condition
+    /// latched at (`OK <kind> <seq>`): `None` when it did not latch or the
+    /// host said no seq.
+    fn wait_at(&mut self, cond: &[&str], step: Duration) -> Result<(Wait, Option<u64>), Fail> {
         let ms = step.as_nanos().div_ceil(1_000_000).to_string();
         let mut args = vec!["await"];
         args.extend_from_slice(cond);
@@ -3269,7 +3286,12 @@ impl<'a, C: Ctl> Session<'a, C> {
         args.push(&ms);
         let r = self.call(&args)?;
         if r.ok() {
-            Ok(Wait::Latched)
+            let latched = r
+                .stdout
+                .split_whitespace()
+                .nth(2)
+                .and_then(|seq| seq.parse().ok());
+            Ok((Wait::Latched, latched))
         } else if self.unserved(&r) {
             Err(Fail::Lost(format!(
                 "await {} failed: {}",
@@ -3277,9 +3299,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 r.stderr.trim()
             )))
         } else if r.timed_out() {
-            Ok(Wait::TimedOut)
+            Ok((Wait::TimedOut, None))
         } else if r.usage_error() {
-            Ok(Wait::Unsupported)
+            Ok((Wait::Unsupported, None))
         } else {
             Err(Fail::Hard(format!(
                 "await {} failed: {}",
@@ -4093,6 +4115,19 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     fn drive(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
+        // The window's own host, untaped, for an unwind to tell (none on a replay: its host is
+        // the tape's).
+        let live = opts.idle_host.clone().filter(|_| !self.fx.replaying());
+        let mut guard = occupancy_loop::UntoldOnUnwind::over(self, live);
+        guard.session().drive_to_end(opts, review)
+    }
+
+    /// [`Self::drive`]'s body, under its unwind's guard.
+    fn drive_to_end(
+        &mut self,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<End, String> {
         let hosted;
         let opts = match opts.idle_host.as_ref() {
             Some(host) if !self.fx.is_live() => {

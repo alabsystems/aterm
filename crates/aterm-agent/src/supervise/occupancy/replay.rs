@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `occupancy check --replay <dur>` (`docs/DESIGN-harness-occupancy-2026-10-20.md` §6): the
-//! pure decider ([`super::rules::decide`]) run again over the facts ring ([`super::ring`]) for
-//! one session, its holds rebuilt from its ledger's `fact-hold@v1` rows ([`spans_of`]): when
-//! each built-in rule would have fired, and which guard held it. Nothing is read here and
-//! nothing typed; the caller hands the ring's rows and the ledger's.
-//!
-//! The replay decides at each look, where the loop decides at each settled break: a break
-//! between two looks is judged here at the next look, at most a look late. Its books are its
-//! own, begun empty at the window's start, so a rule booked before the window counts toward
-//! no cap here. A look's guard is the one the session's loop last told
-//! ([`super::ring::RingSession::guard`]); a guard the loop never told (one that held between
-//! two looks only) is not seen.
+//! Replay of occupancy rules over recorded session ring and hold rows. The nudge's wait is
+//! this process's ([`rules::wait_nudge_after_ms`]).
 
 use super::hold::RowSaid;
 use super::ring::RingRow;
@@ -40,15 +30,9 @@ impl HoldSpan {
     }
 }
 
-/// Two open rows whose starts lie within this of each other are of one hold: a loop's open
-/// row, and its own (or its successor's) again as it ends with the hold open.
 const SAME_HOLD_MS: i64 = 60_000;
 
-/// THE HOLDS THE ROWS TELL (`rows`, oldest first: [`super::hold::hold_rows_in`]): an open row
-/// begins one (its stamp less what it had held) unless it is of the hold open already; a
-/// declaration marks the open one declared; a close ends it — or, with none open (its open
-/// row older than the ledger keeps), is a hold of its own. An open row with another still open
-/// ends the earlier where the later began.
+/// Rebuild [`HoldSpan`] intervals from ordered ledger hold `rows`.
 #[must_use]
 pub fn spans_of(rows: &[(i64, RowSaid)]) -> Vec<HoldSpan> {
     let mut spans: Vec<HoldSpan> = Vec::new();
@@ -108,14 +92,11 @@ pub struct Replayed {
     pub hold_since_ms: i64,
 }
 
-/// The guard a word names ([`Guard::word`]).
 fn guard_of(word: &str) -> Option<Guard> {
     Guard::ALL.into_iter().find(|g| g.word() == word)
 }
 
-/// THE REPLAY of session `sid` over `rows` (the ring's, oldest first) from `from_ms` on, its
-/// holds `spans` ([module docs](self)): each rule's verdict, once a change, as the loop says
-/// it; a would-be line is booked, as the loop books it, toward its caps and the pace.
+/// Replay occupancy verdicts for session `sid` over `rows` from `from_ms` onward.
 #[must_use]
 pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> Vec<Replayed> {
     let mut books = Books::default();
@@ -141,7 +122,15 @@ pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> 
             .and_then(|s| s.guard.as_deref())
             .and_then(guard_of);
         let reading = row.reading(sid);
-        for (rule, verdict) in rules::decide(&reading, Some(hold), &books, &guards, at) {
+        let verdicts = rules::decide(
+            &reading,
+            Some(hold),
+            &books,
+            &guards,
+            rules::wait_nudge_after_ms(),
+            at,
+        );
+        for (rule, verdict) in verdicts {
             let now = match verdict {
                 Verdict::Quiet => None,
                 Verdict::Spent => Some(SaidVerdict::Spent),
@@ -170,9 +159,7 @@ pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> 
     out
 }
 
-/// The replay's lines, clocks at `offset_s` east of UTC: a head — the window, its looks and
-/// its holds — then `HH:MM <rule> <verdict>` a change, then each rule's first would-be line
-/// (`first would HH:MM`, or `never`).
+/// Format replay output lines with timestamps at `offset_s` east of UTC.
 #[must_use]
 pub fn replay_lines(
     replayed: &[Replayed],
@@ -204,8 +191,7 @@ pub fn replay_lines(
     lines
 }
 
-/// A replay's window as `check --replay` takes it: `<n>s`, `<n>m`, `<n>h` or `<n>d`, ms; at
-/// most a day and a half (the ring keeps a day); `None` for anything else.
+/// Parse a `check --replay` duration (`<n>s`, `<n>m`, `<n>h`, or `<n>d`) into milliseconds.
 #[must_use]
 pub fn window_ms(word: &str) -> Option<i64> {
     let word = word.trim();

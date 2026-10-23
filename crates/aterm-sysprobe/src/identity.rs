@@ -228,7 +228,8 @@ mod imp {
     /// One `u32` answer of `ops` for `pid` (above 0); `None` when refused.
     fn word(pid: libc::pid_t, ops: u32) -> Option<u32> {
         let mut out = 0u32;
-        // SAFETY: `out` is a writable `u32` matching the passed size.
+        // SAFETY: `out` is a live `u32` and the size passed is its own; `ops`
+        // is a read operation, which writes at most that many bytes.
         let rc = unsafe { csops(pid, ops, (&raw mut out).cast(), std::mem::size_of::<u32>()) };
         (rc == 0).then_some(out)
     }
@@ -237,7 +238,8 @@ mod imp {
     /// refused, longer than [`BLOB_CAP`] or not decoded.
     fn text(pid: libc::pid_t, ops: u32) -> Option<String> {
         let mut blob = [0u8; BLOB_CAP];
-        // SAFETY: `blob` is `BLOB_CAP` writable bytes matching the passed size.
+        // SAFETY: `blob` is `BLOB_CAP` writable bytes, the size passed, and
+        // the kernel copies no more than that (`ERANGE` past it).
         let rc = unsafe { csops(pid, ops, blob.as_mut_ptr().cast(), blob.len()) };
         if rc != 0 {
             return None;

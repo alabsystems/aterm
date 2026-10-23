@@ -23,7 +23,8 @@ pub(crate) enum Tier {
     Relaxed,
 }
 
-/// How the broker stops ([`Broker::stop`]): the module doc's three restarts.
+/// How the broker stops ([`Broker::stop`]): a clean stop, a crash and a Strict power loss keep
+/// the whole log; a power loss on Ordered or Relaxed keeps a prefix at or above the durable head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     Clean,

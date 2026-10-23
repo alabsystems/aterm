@@ -130,7 +130,7 @@ struct Slot<'r, S> {
     state: SlotState<'r>,
 }
 
-/// The per-renderer timestamp ring (see the module header).
+/// The per-renderer timestamp ring: one slot per frame being timed or read back.
 pub(crate) struct TimestampRing<'r, S> {
     frames: &'r FrameRing,
     slots: Vec<Slot<'r, S>>,

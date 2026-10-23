@@ -131,7 +131,7 @@ fn run_event<'a>(payload_type: &str, payload: &'a Value) -> Option<(&'a str, &'a
     Some((payload.get("run_id")?.as_str()?, payload.get("event")?))
 }
 
-/// The task events that end a task: nothing follows one (module header).
+/// The task events that end a task: nothing follows one.
 const TASK_ENDS: [&str; 4] = ["completed", "cancelled", "failed", "rejected"];
 
 /// THE TASK KINDS THAT CARRY NO WORK A RESTART COULD LOSE, by the `task_kind`

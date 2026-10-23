@@ -4204,7 +4204,9 @@ impl<R: std::io::Read + std::os::fd::AsRawFd> Capture<R> {
     fn new(pipe: Option<R>) -> Self {
         let pipe = pipe.filter(|pipe| {
             let fd = pipe.as_raw_fd();
-            // SAFETY: `fd` is the open read end of a pipe this process owns.
+            // SAFETY: `fd` is the open read end of a pipe this process owns (`pipe` holds
+            // it for the whole call), and F_GETFL/F_SETFL read and set its status flags and
+            // touch no memory.
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFL);
                 flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0

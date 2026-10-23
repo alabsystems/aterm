@@ -718,7 +718,8 @@ fn render(
             let detail = level == 0 || Some(n) == newest;
             if detail {
                 for (sn, s) in &t.steps {
-                    // An open turn's open steps are already on its line;
+                    // An open turn's open steps are already on its line; collapsed, a closed
+                    // transcript step has none.
                     if (t.close.is_none() && s.close.is_none())
                         || (shed == TxShed::Collapsed && s.transcript())
                     {

@@ -20,6 +20,8 @@ aterm-types = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-core = { workspace = true }
+# The seal `examples/unicode_tables.rs` stamps on what it writes (`aterm_census::seal`).
+aterm-census = { workspace = true }
 
 [lints]
 workspace = true

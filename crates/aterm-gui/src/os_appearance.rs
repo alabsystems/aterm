@@ -15,7 +15,9 @@ pub(crate) enum OsAppearanceSource {
     Inert,
     /// A development build's launch reading, from `$ATERM_OS_APPEARANCE` (`dark`|`light`, [`aterm_types::dev_seam!`]).
     Injected(Appearance),
-    /// This platform's reader (see the module doc).
+    /// This platform's reader: `NSApp.effectiveAppearance` on macOS (the `AppleInterfaceStyle`
+    /// default before any window), the XDG portal or GNOME's gsettings key on other unix, the
+    /// window theme on Windows.
     Platform,
 }
 
@@ -487,7 +489,8 @@ mod mac {
         if best.is_null() {
             return None;
         }
-        // SAFETY: `-isEqualToString:` is `B@:@` on `NSString`.
+        // SAFETY: `-isEqualToString:` is `B@:@` on `NSString`; `best` is a live
+        // NSString (caller) and the name a live AppKit global.
         let dark = unsafe {
             appkit::send_bool_id(best, sel!(isEqualToString:), appkit::appearance_name(true))
         };
@@ -509,7 +512,11 @@ mod mac {
             appkit::appearance_name(false),
             appkit::appearance_name(true),
         ];
-        // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` and reads `count` live, non-nil objects (two AppKit globals).
+        // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` and reads `count`
+        // live, non-nil objects (two AppKit globals); the array is
+        // autoreleased and borrowed inside the caller's pool.
+        // `-bestMatchFromAppearancesWithNames:` is `@@:@` on `NSAppearance`
+        // and answers a borrowed `NSString` or nil.
         unsafe {
             let array = appkit::send_id_idptr_usize(
                 class(c"NSArray").as_id(),
@@ -531,7 +538,9 @@ mod mac {
         let main_thread = MainThread::new()?;
         let app = appkit::existing_application(main_thread)?;
         aterm_objc::autoreleasepool(|_| {
-            // SAFETY: `app` is the existing main-thread AppKit application.
+            // SAFETY: `app` is the existing main-thread AppKit application;
+            // `-effectiveAppearance` is `@@:` on
+            // `NSApplication` (10.14+) and answers a borrowed `NSAppearance`.
             unsafe { appearance_of(appkit::send_id(app, sel!(effectiveAppearance))) }
         })
     }
@@ -540,7 +549,9 @@ mod mac {
     pub(super) fn defaults_appearance() -> Option<Appearance> {
         aterm_objc::autoreleasepool(|_| {
             let key = appkit::nsstring("AppleInterfaceStyle")?;
-            // SAFETY: `+standardUserDefaults` is `-(id)`, the process singleton.
+            // SAFETY: `+standardUserDefaults` is `-(id)`, the process
+            // singleton; `-stringForKey:` is `@@:@` and answers a borrowed
+            // `NSString` or nil, read into a Rust string at once.
             let style = unsafe {
                 let defaults =
                     appkit::send_id(class(c"NSUserDefaults").as_id(), sel!(standardUserDefaults));
@@ -619,7 +630,11 @@ mod mac {
             let Some(key) = appkit::nsstring(KEY_PATH) else {
                 return false;
             };
-            // SAFETY: `app` is the existing main-thread AppKit application.
+            // SAFETY: `app` is the existing main-thread AppKit application;
+            // `-addObserver:forKeyPath:options:context:` is `v@:@@Q^v` on
+            // every `NSObject` — `target` lives for the process (the caller
+            // keeps it), `key` is a live +1 NSString KVO copies, options 0,
+            // and a NULL context it never dereferences.
             unsafe {
                 appkit::send_v_id_id_usize_ptr(
                     app,
@@ -662,7 +677,8 @@ mod mac {
                 class(c"ATermOsAppearanceTarget"),
                 super::OsAppearanceTarget::class()
             );
-            // SAFETY: the declared selector's exact prototype, on a live instance.
+            // SAFETY: the declared selector's exact prototype, on a live
+            // instance; nil arguments are what the body ignores.
             unsafe {
                 let send: unsafe extern "C-unwind" fn(
                     aterm_objc::Id,

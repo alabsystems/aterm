@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The wasm lanes' drivers run in a browser, not in node
-//! (docs/DESIGN-init-system-2026-10-20.md, S10): `wasm-smoke`'s host
-//! boundary and CPU replay, the `wasm` bench, and the `wasm-glue` toy and its
-//! oracle each load the ES module glue `verify glue` writes into a page of
-//! the pinned chrome-headless-shell and await one exported `run(args)`.
-//!
-//! [`browser`] finds it before a lane builds anything: `ATERM_BROWSER`, else
-//! the pinned chrome-headless-shell exactly as `verify provision` placed it
-//! ([`crate::browser::chromium::pinned`]), never an installed Chrome. [`Page`]
-//! runs it ([`crate::browser::page`], over the DevTools protocol, on unix:
-//! the only hosts verify drives a browser on). No browser is COULD NOT RUN
-//! naming its provider (docs/DESIGN-init-system-2026-10-20.md §8 rules 2 and
-//! 5), never a skip and never a finding.
-//!
-//! [`lay_drivers`] lays the perf drivers and the tree's font into a site, so
-//! a page reads every input from its own origin.
+//! Headless Chromium page runner for wasm verification lanes.
 
 use std::path::{Path, PathBuf};
 
@@ -77,9 +62,7 @@ pub(crate) fn browser_fix() -> String {
 pub(crate) struct Ran {
     /// What `run` answered, by value.
     pub value: Value,
-    /// What the page printed, in order: a `console.log` or `console.error`
-    /// line as its text, another kind as `console.<kind>: <text>`, an
-    /// uncaught exception as `uncaught: <description>`.
+    /// Console lines captured in order.
     pub console: Vec<String>,
 }
 

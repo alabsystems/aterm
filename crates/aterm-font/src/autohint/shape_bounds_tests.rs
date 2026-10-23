@@ -34,8 +34,6 @@ fn ordered_coverage_ranges_are_traversed_once() {
 
 #[test]
 fn overlapping_coverage_ranges_are_rejected_before_traversal() {
-    // A shared endpoint already repeats a glyph. Repeating a wide range
-    // can multiply traversal work without adding any covered glyphs.
     let bytes = coverage2(&[(1, 2, 0), (2, 3, 2)]);
     let coverage = Coverage::parse(&bytes).unwrap();
     assert!(coverage_glyphs(coverage).collect::<Vec<_>>().is_empty());
@@ -55,12 +53,6 @@ fn unordered_coverage_ranges_are_rejected_before_traversal() {
     assert!(coverage_glyphs(coverage).collect::<Vec<_>>().is_empty());
 }
 
-/// A two-glyph face (empty outlines, no `cmap`) whose `GSUB` 1.0 has one
-/// `DFLT` script naming feature `liga`, which names lookups `0..lookups`.
-/// Every lookup offset names one type-1 lookup of `subtables` subtables, and
-/// every subtable offset names one single substitution (format 1, delta +1)
-/// covering glyph 0: `lookups` x `subtables` subtables to walk, from a table
-/// that holds one.
 fn aliased_face(lookups: usize, subtables: usize) -> Vec<u8> {
     let be16 = |v: usize| u16::try_from(v).unwrap().to_be_bytes();
     let be32 = |v: usize| u32::try_from(v).unwrap().to_be_bytes();
@@ -82,8 +74,6 @@ fn aliased_face(lookups: usize, subtables: usize) -> Vec<u8> {
     g[4..6].copy_from_slice(&be16(script_list));
     g[6..8].copy_from_slice(&be16(feature_list));
     g[8..10].copy_from_slice(&be16(lookup_list));
-    // head (unitsPerEm 1000, short loca), hhea (one hmetric), maxp 0.5 (two
-    // glyphs), hmtx, loca and glyf for two empty glyphs.
     let mut head = vec![0u8; 54];
     head[18..20].copy_from_slice(&be16(1000));
     let mut hhea = vec![0u8; 36];
@@ -117,8 +107,6 @@ fn aliased_face(lookups: usize, subtables: usize) -> Vec<u8> {
     font
 }
 
-/// Whether the face's `GSUB` walk was refused, and the script whose style
-/// the substitution's output glyph (1) takes.
 fn output_style(face: &[u8]) -> (bool, Option<&'static str>) {
     let font = HintFont::new(face, 0).expect("the synthetic face reads");
     let shaper = Shaper::new(&font);
@@ -127,15 +115,6 @@ fn output_style(face: &[u8]) -> (bool, Option<&'static str>) {
     (shaper.refused(), style.map(|c| c.script.name))
 }
 
-/// Aliased `GSUB` offsets cannot multiply the autohinter's style walk. With
-/// 16,000 lookups that all name one lookup of 16,000 subtables, a 96 KB
-/// table built styles in 4.2 s (16 s at 32,000, measured 2026-10-19). The
-/// walk spends at most eight traversals' worth of aterm's own budget, 8
-/// units per byte of the table each ([`LayoutWork`]), and a face
-/// that runs past it gets the styles it would without `GSUB`: the output
-/// glyph falls back to the CJK style. At 10
-/// x 10 the walk is within the budget and the output glyph takes the default
-/// script's (Latin) style from `GSUB`, as before.
 #[test]
 fn aliased_gsub_walks_stay_within_the_budget() {
     assert_eq!(output_style(&aliased_face(10, 10)), (false, Some("Latin")));

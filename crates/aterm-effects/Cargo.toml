@@ -53,6 +53,8 @@ libc = { workspace = true }
 [dev-dependencies]
 # Models and cfg(test) anchors for the effect state machines.
 aterm-spec = { workspace = true }
+# The seal `examples/art_rig.rs dogs` stamps on the breed TOMLs it writes (`aterm_census::seal`).
+aterm-census = { workspace = true }
 # Atlas PNG dumps for the art gallery examples.
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-effects = { workspace = true }

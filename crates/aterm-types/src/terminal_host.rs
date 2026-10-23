@@ -3,9 +3,6 @@
 // Author: Andrew Yates
 
 //! Terminal orchestration boundary traits and shared DTOs.
-//!
-//! These contracts let orchestrator-style consumers interact with terminal state
-//! without importing concrete `aterm-core` internals.
 
 use crate::TerminalSize;
 

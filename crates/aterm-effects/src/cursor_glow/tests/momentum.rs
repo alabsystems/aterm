@@ -5,12 +5,6 @@
 
 use super::*;
 
-/// One canonical metric ([`crate::typing_momentum`]) drives all three rainbow
-/// kitty consumer groups. The glow engine's and the cursor cat's instances
-/// evolve identically under one keystream, and each consumer keys off it:
-/// (1) the star envelope/density via the eased `rainbow.disp` spine,
-/// (2) the fresh-ink pop via the spine frozen at birth,
-/// (3) the one-body cat wake via its band+dwell over the same value.
 #[test]
 fn momentum_unifies_glow_and_cat_metrics() {
     let g = geom();
@@ -20,8 +14,6 @@ fn momentum_unifies_glow_and_cat_metrics() {
     let mut out = Vec::new();
     let mut t = Instant::now();
     glow.tick(Some((3, 0)), t, &c, g, &mut out);
-    // Phase 1, a casual word: the two instances read the same value at every
-    // stamp.
     for col in 1..=10u16 {
         t += Duration::from_millis(60);
         cat.on_key(t, true);
@@ -34,15 +26,12 @@ fn momentum_unifies_glow_and_cat_metrics() {
             cat.momentum(t)
         );
     }
-    // Ten keys is a word, enough for the star onset; the cat's higher earn bar
-    // keeps it unearned.
     assert!(!cat.is_active(), "cat wake: unearned ⇒ no cat");
     assert_eq!(
         cat.frame(t).alpha,
         0,
         "cat visibility: an unearned run has no live companion frame"
     );
-    // A delete drains both instances identically (never builds).
     t += Duration::from_millis(80);
     let before = glow.typing_momentum(t);
     cat.on_key(t, false);
@@ -56,10 +45,6 @@ fn momentum_unifies_glow_and_cat_metrics() {
         glow.typing_momentum(t) < before,
         "deletes drain, never build"
     );
-    // Phase 2, sustained flow (~6.6 s): the shared value crosses the star
-    // onset and then the cat band (`CAT_BAND` held for `CAT_DWELL` in
-    // kitty_cursor.rs), so the shower and the cat are earned together. Line
-    // ends continue via the wrap-shaped move, which classifies as typing.
     let (mut row, mut col) = (3u16, 9u16);
     for _ in 0..110 {
         t += Duration::from_millis(60);
@@ -70,8 +55,6 @@ fn momentum_unifies_glow_and_cat_metrics() {
             col += 1;
         }
         cat.on_key(t, true);
-        // A real keystroke arms the committed-press hint the correlated advance
-        // requires; a program printing the same cells would build nothing.
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((row, col)), t, &c, g, &mut out);
         assert!(
@@ -86,11 +69,6 @@ fn momentum_unifies_glow_and_cat_metrics() {
     );
 }
 
-/// Earned by real typing only: a program printing one glyph per frame walks
-/// the caret forward +1 col every tick but arms no press hint, so the metric
-/// stays at zero and no pulse reaches the cat. The same moves with a real
-/// press build normally. The advance keys on the press hint, not candidate
-/// admission (see `classify_move`).
 #[test]
 fn program_output_alone_builds_no_momentum() {
     let g = geom();
@@ -99,8 +77,6 @@ fn program_output_alone_builds_no_momentum() {
     let mut out = Vec::new();
     let mut t = Instant::now();
     glow.tick(Some((3, 0)), t, &c, g, &mut out);
-    // 20 forward advances as pure output, no `note_typed` behind any (a
-    // `printf` loop, a spinner, a streaming log).
     for col in 1..=20u16 {
         t += Duration::from_millis(40);
         glow.tick(Some((3, col)), t, &c, g, &mut out);
@@ -114,8 +90,6 @@ fn program_output_alone_builds_no_momentum() {
         0.0,
         "program output alone earns zero momentum"
     );
-    // Flip on explicit correlation: the identical forward shape now
-    // builds, proving the gate is provenance, not geometry.
     let mut typed = CursorGlow::default();
     let mut t2 = Instant::now();
     typed.tick(Some((3, 0)), t2, &c, g, &mut out);
@@ -135,10 +109,6 @@ fn program_output_alone_builds_no_momentum() {
     );
 }
 
-/// The classifier knows whether a licensed cursor move is a fold, and the
-/// cursor-cat channel preserves that verdict for the ordinary next-row shape,
-/// an explicit preview-only same-row reflow projection, and the exact
-/// Backspace inverse; a navigation-shaped relocation mints nothing.
 #[test]
 fn cursor_cat_motion_pulse_preserves_licensed_fold_shape() {
     let g = geom();
@@ -175,9 +145,6 @@ fn cursor_cat_motion_pulse_preserves_licensed_fold_shape() {
     same_row_preview.tick(Some((5, 38)), t0, &c, g, &mut out);
     same_row_preview.note_synthetic_typed(at, 1);
     same_row_preview.tick(Some((5, 0)), at, &c, g, &mut out);
-    // A same-row backward typed-paired move is held for its return (the Ink
-    // rewrite's park) and judged, fold pulse included and dated at the move,
-    // on the next tick past the window.
     assert!(
         same_row_preview.take_cursor_cat_motion_pulse().is_none(),
         "the park is held, not yet judged"

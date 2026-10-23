@@ -1,7 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Windows backend of [`crate::platform`] (its module docs list the analogues): junctions for activation, `.cmd` shims, per-user profile-ACL privacy, `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec, with Ctrl-C left to the child ([`add_ctrl_handler`]).
+//! The Windows backend of [`crate::platform`]: junctions for activation, `.cmd` shims, per-user
+//! profile-ACL privacy, `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for
+//! exec, with Ctrl-C left to the child ([`add_ctrl_handler`]).
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -520,7 +522,8 @@ unsafe extern "system" {
 
 /// Install `handler` at the front of this process's console control handler list (called on its own thread for each Ctrl-C, Ctrl-Break or close event).
 pub fn add_ctrl_handler(handler: CtrlHandler) -> bool {
-    // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole program; kernel32 keeps only its address.
+    // SAFETY: `handler` is a plain `extern "system"` function that lives for the whole
+    // program; kernel32 keeps only its address. No memory of ours is handed over.
     unsafe { SetConsoleCtrlHandler(Some(handler), 1) != 0 }
 }
 

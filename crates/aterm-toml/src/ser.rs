@@ -1,32 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Serialization: a `serde::Serializer` that builds an [`crate::edit::Item`] tree and hands
-//! it to the encoder that prints a parsed document, so TOML syntax is produced in one place
-//! and values print before sub-tables (a value after a header would land in that table).
+//! Serialization via an [`crate::edit::Item`] tree encoded by the document printer.
 //!
-//! The serializer does not write text. It BUILDS an [`crate::edit::Item`] tree
-//! and hands it to the same encoder that prints a parsed document, which buys
-//! two things for free: table ordering (values before sub-tables, so the output
-//! is always re-parseable) and one single place where TOML syntax is produced.
-//!
-//! # `None`
-//!
-//! TOML has no null. A `None` struct FIELD is therefore not a value to write but
-//! a key to leave out: `serialize_none` yields [`Item::None`], the vacant item,
-//! and a struct's or struct variant's table inserts no key for it, so the field
-//! reads back as the `None` it was. That holds for a struct written as a map
-//! (one with a `#[serde(flatten)]` field) and for a flattened struct's fields
-//! too: serde hands those to `SerializeMap::serialize_field_entry`, not to
-//! `serialize_entry`. Anywhere else a `None` is refused ("TOML has no null:
-//! …"), because leaving it out would change the value: an array cannot drop an
-//! element without shifting every later one, a map without its entry is a
-//! different map, a variant cannot drop its payload, `Some(None)` would read
-//! back as `None`, and a newtype over `None` would not read back at all (an
-//! absent key gives `None` to an `Option` field only; the writer cannot see a
-//! `#[serde(default)]` that would fill it in, so it refuses). The `None` used
-//! to be a sentinel ERROR that the table swallowed, so the same error raised
-//! inside an array took the whole enclosing field with it, silently.
+//! A `None` struct field is omitted, while `None` in an array, map value, variant payload,
+//! `Some`, or newtype is refused because TOML has no null.
 
 use serde::ser::{Impossible, Serialize};
 
@@ -37,12 +15,10 @@ use crate::edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, V
 #[doc(inline)]
 pub use crate::error::Error;
 
-/// The refusal of a `None` that leaving out would lose.
 const UNSUPPORTED_NONE: &str = "TOML has no null: a `None` field is left out, but a `None` array \
                                 element, map value, variant payload, `Some` or newtype cannot be \
                                 written";
 
-/// `item`, unless it is the vacant item a `None` makes, which is refused.
 fn written(item: Item) -> Result<Item> {
     if item.is_none() {
         return Err(Error::message(UNSUPPORTED_NONE));
@@ -83,8 +59,7 @@ pub fn to_string<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     }
 }
 
-/// Convert an untyped value into the document model, so one deserializer and
-/// one encoder serve both representations.
+/// Convert an untyped [`crate::Value`] into an [`Item`].
 pub(crate) fn value_to_item(value: &crate::Value) -> Result<Item> {
     Ok(match value {
         crate::Value::String(s) => Item::Value(EValue::from(s.clone())),
@@ -109,9 +84,6 @@ pub(crate) fn value_to_item(value: &crate::Value) -> Result<Item> {
     })
 }
 
-/// Decide whether a sequence is an array of tables (`[[key]]`) or a plain array. A
-/// non-empty sequence of tables gets the header spelling, so `Vec<Struct>` reads back as
-/// written; anything mixed or scalar becomes a bracketed array with the tables inlined.
 fn seq_to_item(items: Vec<Item>) -> Result<Item> {
     if !items.is_empty() && items.iter().all(Item::is_table) {
         let mut array = ArrayOfTables::new();
@@ -130,8 +102,6 @@ fn seq_to_item(items: Vec<Item>) -> Result<Item> {
     Ok(Item::Value(EValue::Array(array)))
 }
 
-/// Flatten an item into a value: a table nested where only a value can go must
-/// take the `{ inline }` spelling.
 fn item_to_value(item: Item) -> Result<EValue> {
     Ok(match item {
         Item::Value(v) => v,
@@ -161,7 +131,6 @@ fn unsupported<T>(what: &str) -> Result<T> {
     Err(Error::message(format!("TOML cannot represent {what}")))
 }
 
-/// Serializes any value into one [`Item`].
 struct ItemSerializer;
 
 impl serde::Serializer for ItemSerializer {
@@ -241,8 +210,6 @@ impl serde::Serializer for ItemSerializer {
         Ok(Item::Value(EValue::from(v)))
     }
 
-    /// TOML has no byte string. An array of integers is the only lossless
-    /// spelling, and it is what a `Vec<u8>` would have produced anyway.
     fn serialize_bytes(self, v: &[u8]) -> Result<Item> {
         let mut array = Array::new();
         for byte in v {
@@ -251,13 +218,10 @@ impl serde::Serializer for ItemSerializer {
         Ok(Item::Value(EValue::Array(array)))
     }
 
-    /// Nothing to write: the enclosing struct leaves the field out, and
-    /// anything else refuses it.
     fn serialize_none(self) -> Result<Item> {
         Ok(Item::None)
     }
 
-    /// `Some(None)` left out would read back as `None`, so it is refused.
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Item> {
         written(value.serialize(self)?)
     }
@@ -279,8 +243,6 @@ impl serde::Serializer for ItemSerializer {
         Ok(Item::Value(EValue::from(variant)))
     }
 
-    /// A newtype over `None` left out would not read back (an absent key is
-    /// no newtype), so it is refused.
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
         self,
         _name: &'static str,
@@ -433,9 +395,6 @@ struct TableSerializer {
     key: Option<String>,
 }
 
-/// Insert a struct's field, unless it was a `None`, which a struct leaves out.
-/// Every error, a `None` refused deeper inside the value included, is the
-/// caller's.
 fn insert_unless_none<T: Serialize + ?Sized>(
     table: &mut Table,
     key: &str,
@@ -457,8 +416,6 @@ impl serde::ser::SerializeMap for TableSerializer {
         Ok(())
     }
 
-    /// A map value: a `None` is refused, since the map without the entry would
-    /// read back as a different map.
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
         let key = self.key.take().expect("serde sends a key before its value");
         self.table
@@ -466,8 +423,6 @@ impl serde::ser::SerializeMap for TableSerializer {
         Ok(())
     }
 
-    /// A struct's field written through the map: a `None` is left out, as
-    /// [`StructSerializer`] leaves it out.
     fn serialize_field_entry<T: Serialize + ?Sized>(
         &mut self,
         key: &'static str,
@@ -483,7 +438,6 @@ impl serde::ser::SerializeMap for TableSerializer {
 
 struct StructSerializer {
     table: Table,
-    /// This struct is the date-time protocol carrier, not a real table.
     datetime: bool,
 }
 
@@ -542,11 +496,6 @@ impl serde::ser::SerializeStructVariant for VariantTableSerializer {
     }
 }
 
-/// Table keys are strings. Anything with an obvious string spelling is accepted
-/// so `HashMap<u32, _>`, `bool`- and enum-keyed maps work, and
-/// `de::KeyDeserializer`, through serde's `TextKeyDeserializer`, reads each
-/// back from exactly that text; everything
-/// else is refused rather than silently stringified into something unreadable.
 struct KeySerializer;
 
 impl serde::Serializer for KeySerializer {
@@ -588,7 +537,6 @@ impl serde::Serializer for KeySerializer {
         Ok(v.to_string())
     }
 
-    /// A key is text, so TOML's 64-bit integer range does not bound it.
     fn serialize_i128(self, v: i128) -> Result<String> {
         Ok(v.to_string())
     }
@@ -712,8 +660,6 @@ impl serde::Serializer for KeySerializer {
         unsupported("a struct variant as a table key")
     }
 }
-
-// ---- the untyped value tree -----------------------------------------------
 
 impl Serialize for crate::Value {
     fn serialize<S: serde::Serializer>(

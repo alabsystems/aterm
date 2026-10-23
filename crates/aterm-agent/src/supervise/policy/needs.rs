@@ -596,9 +596,10 @@ fn need_separator(rest: &str, capitals: bool) -> Option<&str> {
 }
 
 /// What follows the [`NEEDS_YOU`] head where it is the first text of `line`
-/// (module header), trimmed: the need's words, `""` for a head with none on
-/// its line (what it heads is under it), or the qualifier in parentheses
-/// where that is all it says and it says none stands (`NEEDS YOU (none)`).
+/// past its quote gutters and the marks [`past_need_lead`] passes over,
+/// trimmed: the need's words, `""` for a head with none on its line (what it
+/// heads is under it), or the qualifier in parentheses where that is all it
+/// says and it says none stands (`NEEDS YOU (none)`).
 fn need_rest(line: &str) -> Option<&str> {
     head_from(past_need_lead(unquoted(line)), false)
 }
@@ -766,7 +767,8 @@ fn past_separator(rest: &str) -> Option<&str> {
 }
 
 /// What follows `head` (the defense's [`NOTHING_LEFT`]; a NEEDS YOU head is
-/// [`need_rest`]'s) where it is the first text of `line` (module header): the
+/// [`need_rest`]'s) where it is the first text of `line` past any Markdown
+/// heading's marks, list marker and emphasis, matched case-insensitively: the
 /// rest after its separator (a colon, or a dash: `Nothing left — all of it is
 /// merged`), trimmed, the emphasis that closes the head dropped.
 fn head_rest<'a>(line: &'a str, head: &str) -> Option<&'a str> {
@@ -1221,7 +1223,7 @@ fn items_under(
     (i, items)
 }
 
-/// The NEEDS YOU lines of `tail` (module header).
+/// The NEEDS YOU lines of `tail`, outside its fenced code blocks.
 fn needs_lines(tail: &str) -> NeedLines {
     needs_lines_by(tail, &NONE_WORDS)
 }
@@ -1365,7 +1367,7 @@ fn sanitized(need: &str) -> String {
     cut
 }
 
-/// What the report `tail` names only a person can give, each need one line (module header).
+/// What the report `tail` names only a person can give, each need one line.
 #[must_use]
 pub fn needs_you(tail: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1471,7 +1473,7 @@ fn excepted(rest: &str) -> Option<&str> {
     })
 }
 
-/// What `line` says after its [`NOTHING_LEFT`] head (module header): its
+/// What `line` says after its [`NOTHING_LEFT`] head: its
 /// rest after the separator ([`head_rest`]: `Nothing left: all on
 /// origin/main`), or — where the head runs straight into an exception, with
 /// no separator (`Nothing left but the changelog`, `Nothing left besides

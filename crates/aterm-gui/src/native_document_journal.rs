@@ -2431,7 +2431,8 @@ mod tests {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
         fn identity(fd: libc::c_int) -> Option<(libc::dev_t, libc::ino_t)> {
-            // SAFETY: `fstat` only writes the out-parameter, which lives for the call.
+            // SAFETY: `fstat` only writes the out-parameter, which lives for the
+            // call; a closed slot fails with EBADF and is skipped.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
             (unsafe { libc::fstat(fd, &raw mut stat) } == 0).then_some((stat.st_dev, stat.st_ino))
         }
@@ -2442,7 +2443,9 @@ mod tests {
         };
         for fd in 0..(1 << 16) {
             if identity(fd) == Some(wanted) {
-                // SAFETY: `fd` is the live lock descriptor its owner is still holding.
+                // SAFETY: `fd` is the live lock descriptor its owner is still
+                // holding on this thread's stack; the copy is a fresh descriptor
+                // this call owns.
                 let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
                 assert!(
                     copy >= 0,

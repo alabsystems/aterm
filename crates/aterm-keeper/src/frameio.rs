@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! One AKP1 frame on a connected stream, with its descriptor.
-//!
-//! Every read goes through `fdpass::recv_with_fds`, the header's first read with room for one
-//! descriptor and every later read for none: a descriptor riding any byte but a frame's first,
-//! or a kind that carries none, is closed and the connection refused, never dropped unnamed.
 
 use std::io::{self, Write as _};
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -26,12 +22,10 @@ fn wire(e: WireError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
-/// Read one frame. `Ok(None)` is a clean EOF at a frame boundary.
-///
+/// Read one frame.
 /// # Errors
-/// A malformed frame (`InvalidData`), EOF mid-frame (`UnexpectedEof`), a
-/// descriptor where none may ride, or the socket's own errors (a read timeout
-/// reads as `WouldBlock`).
+/// A malformed frame (`InvalidData`), EOF mid-frame (`UnexpectedEof`), a descriptor where none may
+/// ride, or the socket's own errors (a read timeout reads as `WouldBlock`).
 pub fn read_frame(stream: &CtlStream) -> io::Result<Option<Incoming>> {
     let mut hdr = [0u8; HEADER_LEN];
     let mut got = 0usize;
@@ -77,10 +71,9 @@ pub fn read_frame(stream: &CtlStream) -> io::Result<Option<Incoming>> {
 }
 
 /// Write one frame, with `fd` riding its first byte when the kind carries one.
-///
 /// # Errors
-/// A frame that will not encode, a descriptor on a kind that carries none (or
-/// none on one that does), or the socket's own errors.
+/// A frame that will not encode, a descriptor on a kind that carries none (or none on one that
+/// does), or the socket's own errors.
 pub fn write_frame(
     stream: &CtlStream,
     frame: &Frame,
@@ -145,7 +138,6 @@ mod tests {
             write_frame(&a, &Frame::Bye, Some(a.as_fd())).is_err(),
             "the writer refuses"
         );
-        // A hand-rolled BYE header carrying a descriptor.
         let bytes = Frame::Bye.encode().expect("encode");
         fdpass::send_with_fds(&a, &bytes, &[a.as_fd()]).expect("send");
         let err = read_frame(&b).expect_err("refused");

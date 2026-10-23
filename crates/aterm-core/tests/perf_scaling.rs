@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Engine complexity guard that counts heap allocation calls, not wall time, so it is
-//! deterministic and machine-independent. The engine writes into a fixed grid with a capped
-//! scrollback, so per-byte or per-line allocation shows up as growth. The retained-heap
-//! ceiling is `mem_budget.rs`.
+//! Deterministic heap-allocation complexity guard for the terminal engine.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,7 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// System allocator that counts allocation calls while `ACTIVE` (only the measured spans).
 struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
@@ -32,8 +28,6 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// `lines` rows of ASCII + a little SGR, each ending in `\r\n` so the stream
-/// scrolls (exercising scrollback, the path most at risk of per-line allocation).
 fn workload(lines: usize) -> Vec<u8> {
     let mut v = Vec::new();
     for i in 0..lines {
@@ -46,8 +40,6 @@ fn workload(lines: usize) -> Vec<u8> {
     v
 }
 
-/// Like [`workload`] but each row is multi-byte UTF-8 (CJK + emoji), which drives the bulk
-/// UTF-8 decode path.
 fn unicode_workload(lines: usize) -> Vec<u8> {
     let glyphs = ['中', '文', '日', '本', '한', '😀', 'é', '∑'];
     let mut v = Vec::new();
@@ -62,11 +54,8 @@ fn unicode_workload(lines: usize) -> Vec<u8> {
     v
 }
 
-/// Default scrollback is 10,000 lines; warming past it fills the ring so further
-/// scrolling reuses slots (the steady state we measure).
 const WARM_LINES: usize = 11_000;
 
-/// Allocation calls to process `measure_input` on an engine warmed to scrollback capacity.
 fn steady_state_alloc_calls(measure_input: &[u8]) -> u64 {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
     t.process(&workload(WARM_LINES)); // fill grid + scrollback ring to capacity
@@ -77,7 +66,6 @@ fn steady_state_alloc_calls(measure_input: &[u8]) -> u64 {
     ALLOC_CALLS.load(Ordering::Relaxed)
 }
 
-/// Allocation calls made while `f` runs.
 fn count_allocations(f: impl FnOnce()) -> u64 {
     ALLOC_CALLS.store(0, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Relaxed);
@@ -93,8 +81,6 @@ fn render_extras_avoid_temporary_allocations() {
     use std::hint::black_box;
     use std::sync::Arc;
 
-    // A history cell can hold a complex string and separately stored combining marks; the
-    // borrowed view yields both, in order, without a temporary Vec<char> per read.
     let mut extra = CellExtra::default();
     extra.set_complex_char(Some(Arc::from("👩\u{200D}💻")));
     extra.add_combining('\u{0301}');
@@ -108,8 +94,6 @@ fn render_extras_avoid_temporary_allocations() {
         }
     });
     assert!(identical, "the history tail lost or reordered marks");
-    // Two allocations of slack for the harness (the counter is process-wide); a per-read
-    // Vec, the negative control below, makes at least 128.
     assert!(
         borrowed <= 2,
         "borrowed history marks allocated {borrowed} times"
@@ -126,8 +110,6 @@ fn render_extras_avoid_temporary_allocations() {
         "the allocating negative control must fire"
     );
 
-    // The caller-owned frame buffers are already warm; only the owned cluster
-    // strings may allocate, each sized once.
     const CLUSTERS: [&str; 5] = [
         "👨\u{200D}👩\u{200D}👧",
         "👍🏽",
@@ -174,17 +156,12 @@ fn render_extras_avoid_temporary_allocations() {
     );
 }
 
-// Orders of magnitude below the line count: a per-line or per-cell allocation
-// (thousands) is caught.
 const CEILING: u64 = 64;
 
-// One test: the allocation counter is process-wide, so the measured spans must
-// not run on parallel test threads.
 #[test]
 fn engine_steady_state_processing_is_allocation_free() {
     let measure = 2_000;
 
-    // ASCII: at steady state the ring is full, so scrolling more lines reuses slots.
     let ascii = steady_state_alloc_calls(&workload(measure));
     eprintln!("PERF-BASELINE (ascii):   {measure} lines at steady-state -> {ascii} allocations");
     assert!(
@@ -193,8 +170,6 @@ fn engine_steady_state_processing_is_allocation_free() {
          {CEILING}) — the engine is allocating per line/cell instead of reusing the ring"
     );
 
-    // CJK/emoji: the grapheme write path allocates grapheme storage, so assert linear
-    // scaling instead: 2x the lines must not cost ~4x the allocations.
     let u_n = steady_state_alloc_calls(&unicode_workload(measure));
     let u_2n = steady_state_alloc_calls(&unicode_workload(measure * 2));
     eprintln!(
@@ -202,7 +177,6 @@ fn engine_steady_state_processing_is_allocation_free() {
         measure * 2,
         u_2n as f64 / u_n.max(1) as f64
     );
-    // Linear is 2.0x, quadratic ~4x; 3x leaves headroom for fixed per-call cost.
     assert!(
         u_2n <= u_n.max(1) * 3,
         "unicode allocation scaled super-linearly: {u_n} -> {u_2n} for 2x input (ceiling {}) \

@@ -91,7 +91,7 @@ impl Row {
 
         let mut end_half_blanked = false;
         if self.flags.contains(RowFlags::HAS_WIDE_CHARS) {
-            // SAFETY: Col_usize < cells_len verified above.
+            // SAFETY: col_usize < cells_len verified above.
             let current_flags = unsafe { self.cells.get_unchecked(col_usize) }.flags();
             let wide_mask = CellFlags::WIDE.union(CellFlags::WIDE_CONTINUATION);
             if (current_flags.bits() & wide_mask.bits()) != 0 {
@@ -107,7 +107,7 @@ impl Row {
             '\u{FFFD}' as u16
         };
 
-        // SAFETY: Col_usize < cells_len verified above.
+        // SAFETY: col_usize < cells_len verified above.
         unsafe {
             *self.cells.get_unchecked_mut(col_usize) =
                 Cell::from_raw_parts(char_data, colors, flags);
@@ -242,7 +242,7 @@ impl Row {
             return false;
         }
 
-        // SAFETY: Col_usize < cells_len and col_usize + 1 < cells_len verified above.
+        // SAFETY: col_usize < cells_len and col_usize + 1 < cells_len verified above.
         let first_flags = unsafe { self.cells.get_unchecked(col_usize) }.flags();
         let second_flags = unsafe { self.cells.get_unchecked(col_usize + 1) }.flags();
 

@@ -4,14 +4,10 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/xsettings.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's requests,
-// where upstream used x11rb's.)
+// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's requests, where
+// upstream used x11rb's.)
 
 //! Parser for the xsettings data format.
-//!
-//! Some of this code is referenced from [here].
-//!
-//! [here]: https://github.com/derat/xsettingsd
 
 use std::num::NonZeroUsize;
 
@@ -35,14 +31,11 @@ impl XConnection {
     ) -> core::result::Result<Option<f64>, super::X11Error> {
         let atoms = self.atoms();
 
-        // Get the current owner of the screen's settings.
         let owner = self.request(xproto::get_selection_owner(xsettings_screen))?;
 
-        // Read the _XSETTINGS_SETTINGS property.
         let data: Vec<u8> =
             self.get_property(owner.owner, atoms[_XSETTINGS_SETTINGS], atoms[_XSETTINGS_SETTINGS])?;
 
-        // Parse the property.
         let dpi_setting = read_settings(&data)?
             .find(|res| res.as_ref().map_or(true, |s| s.name == DPI_NAME))
             .transpose()?;
@@ -64,17 +57,12 @@ impl XConnection {
     }
 }
 
-/// Read over the settings in the block of data.
 fn read_settings(data: &[u8]) -> Result<impl Iterator<Item = Result<Setting<'_>>> + '_> {
-    // Create a parser. This automatically parses the first 8 bytes for metadata.
     let mut parser = Parser::new(data)?;
-
-    // Read the total number of settings.
     let count = parser.i32()?;
     let mut remaining = usize::try_from(count).map_err(|_| ParserError::NegativeCount(count))?;
 
-    // End after the first malformed setting. A count larger than the payload
-    // must not yield the same parse error billions of times to a collector.
+    // Stop after the first malformed setting so an excessive count cannot loop.
     Ok(std::iter::from_fn(move || {
         if remaining == 0 {
             return None;
@@ -88,16 +76,13 @@ fn read_settings(data: &[u8]) -> Result<impl Iterator<Item = Result<Setting<'_>>
     }))
 }
 
-/// A setting in the settings list.
 struct Setting<'a> {
     /// The name of the setting.
     name: &'a [u8],
-
     /// The data contained in the setting.
     data: SettingData<'a>,
 }
 
-/// The data contained in a setting.
 enum SettingData<'a> {
     Integer(i32),
     String(#[allow(dead_code)] &'a [u8]),
@@ -105,30 +90,20 @@ enum SettingData<'a> {
 }
 
 impl<'a> Setting<'a> {
-    /// Parse a new `SettingData`.
     fn parse(parser: &mut Parser<'a>) -> Result<Self> {
-        // Read the type.
         let ty: SettingType = parser.i8()?.try_into()?;
-
-        // Read another byte of padding.
         parser.advance(1)?;
 
-        // Read the name of the setting.
         let name_len = parser.i16()?;
         let name = parser.advance(name_len as usize)?;
         parser.pad(name.len(), 4)?;
 
-        // Ignore the serial number.
         parser.advance(4)?;
 
         let data = match ty {
-            SettingType::Integer => {
-                // Read a 32-bit integer.
-                SettingData::Integer(parser.i32()?)
-            },
+            SettingType::Integer => SettingData::Integer(parser.i32()?),
 
             SettingType::String => {
-                // Read the data.
                 let data_len = parser.i32()?;
                 let data = parser.advance(data_len as usize)?;
                 parser.pad(data.len(), 4)?;
@@ -137,7 +112,6 @@ impl<'a> Setting<'a> {
             },
 
             SettingType::Color => {
-                // Read i16's of color.
                 let (red, blue, green, alpha) =
                     (parser.i16()?, parser.i16()?, parser.i16()?, parser.i16()?);
 
@@ -169,14 +143,12 @@ impl TryFrom<i8> for SettingType {
     }
 }
 
-/// Parser for the incoming byte stream.
 struct Parser<'a> {
     bytes: &'a [u8],
     endianness: Endianness,
 }
 
 impl<'a> Parser<'a> {
-    /// Create a new parser.
     fn new(bytes: &'a [u8]) -> Result<Self> {
         let (endianness, bytes) = bytes.split_first().ok_or_else(|| ParserError::ran_out(1, 0))?;
         let endianness = match *endianness {
@@ -186,13 +158,12 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Self {
-            // Ignore three bytes of padding and the four-byte serial.
+            // Skip three bytes of padding and the four-byte serial.
             bytes: bytes.get(7..).ok_or_else(|| ParserError::ran_out(7, bytes.len()))?,
             endianness,
         })
     }
 
-    /// Get a slice of bytes.
     fn advance(&mut self, n: usize) -> Result<&'a [u8]> {
         if n == 0 {
             return Ok(&[]);
@@ -207,19 +178,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Skip some padding.
     fn pad(&mut self, size: usize, pad: usize) -> Result<()> {
         let advance = (pad - (size % pad)) % pad;
         self.advance(advance)?;
         Ok(())
     }
 
-    /// Get a single byte.
     fn i8(&mut self) -> Result<i8> {
         self.advance(1).map(|s| s[0] as i8)
     }
 
-    /// Get two bytes.
     fn i16(&mut self) -> Result<i16> {
         self.advance(2).map(|s| {
             let bytes: &[u8; 2] = s.try_into().unwrap();
@@ -230,7 +198,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Get four bytes.
     fn i32(&mut self) -> Result<i32> {
         self.advance(4).map(|s| {
             let bytes: &[u8; 4] = s.try_into().unwrap();
@@ -242,7 +209,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Endianness of the incoming data.
 enum Endianness {
     Little,
     Big,
@@ -285,7 +251,6 @@ impl ParserError {
 }
 
 #[cfg(test)]
-/// Tests for the XSETTINGS parser.
 mod tests {
     use super::*;
 

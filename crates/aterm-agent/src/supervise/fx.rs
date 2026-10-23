@@ -43,7 +43,7 @@ pub(crate) enum ClockSource {
     Virtual(Arc<VirtualClock>),
 }
 
-/// What the door does besides reading its live world ([module docs](self)).
+/// What the door does besides reading its live world.
 #[derive(Clone, Debug)]
 enum Mode {
     /// Passes every read through and keeps nothing.
@@ -614,7 +614,7 @@ impl ClockSource {
 
     /// The monotonic clock and the loop's wall clock (Unix milliseconds),
     /// read without making a read: a scripted clock's staged jump is not
-    /// swapped in, a virtual clock does not move ([module docs](self)).
+    /// swapped in, a virtual clock does not move.
     fn peek(&self) -> (Instant, i64) {
         match self {
             Self::Os => (Instant::now(), super::limit::unix_now_ms()),

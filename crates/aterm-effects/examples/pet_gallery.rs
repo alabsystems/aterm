@@ -1,22 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `pet_gallery`: full-body pet contact sheets, the twin of `kitty_gallery`
-//! (which covers the head/cat-art roster).
-//!
-//! Bakes every authored pose in [`PET_GLYPH_IDS`] through the real bake path
-//! ([`PetBakeKey::bake`], the same fill resolver and face LOD `PetBaker::tile`
-//! uses) at ship size (the ~1.7-row body on a 20 px cell) and at 2×, side by
-//! side, on a light and a dark ground: every pose, at the size users see, on
-//! one page.
-//!
-//! ```text
-//! targo --unverified run -q -p aterm-effects --example pet_gallery -- [out_dir] [--contact]
-//! (default out_dir: target/pet_gallery)
-//! ```
-//!
-//! `--contact` narrows the sheet to the contact/terrain family and shows
-//! 16/24/32/34/68 px art, with the same production fills and detail culling.
+//! Full-body pet contact sheets for [`PET_GLYPH_IDS`] through [`PetBakeKey::bake`].
 
 use std::path::Path;
 
@@ -25,13 +10,11 @@ use aterm_effects::pet_baker::{PetBakeKey, PetBaker};
 use aterm_effects::pet_glyphs_gen::{PET_GLYPH_IDS, PetGlyphId};
 use aterm_scene::Tile;
 
-/// Tokyo-Night-ish dark ground / warm paper light ground (kitty_gallery's).
 const DARK_BG: [u8; 3] = [0x1A, 0x1B, 0x26];
 const LIGHT_BG: [u8; 3] = [0xFA, 0xFA, 0xF4];
 const DARK_FG: [u8; 3] = [0xC0, 0xCA, 0xF5];
 const LIGHT_FG: [u8; 3] = [0x24, 0x29, 0x2F];
 
-/// Ship art height: the resident pet's ~1.70 rows on a 20 px cell.
 const SHIP_H: u32 = 34;
 
 fn main() {
@@ -106,8 +89,6 @@ fn main() {
     println!("pet gallery written to {out}/ (poses_light.png, poses_dark.png)");
 }
 
-/// Bake one pose through the real path at art height `h`, width from the
-/// pose's own aspect, neutral context, the gallery's reference coat/iris.
 fn bake(pose: PetGlyphId, dark: bool, h: u32) -> Tile {
     let w = ((h as f32) * PetBaker::aspect(pose)).round().max(1.0) as u32;
     let key = PetBakeKey {
@@ -123,9 +104,6 @@ fn bake(pose: PetGlyphId, dark: bool, h: u32) -> Tile {
     };
     key.bake()
 }
-
-// ─── canvas (the kitty_gallery montage kit, minus the patch strip the pet
-//     tiles never carry) ────────────────────────────────────────────────────
 
 struct Canvas {
     w: usize,
@@ -238,7 +216,6 @@ fn sheet(title: &str, items: &[Cell], cols: usize, bg: [u8; 3], fg: [u8; 3]) -> 
     cv
 }
 
-/// Composite tiles horizontally, bottom-aligned, over an opaque ground.
 fn hstack(tiles: &[&Tile], bg: [u8; 3]) -> Tile {
     const GAP: u32 = 8;
     let total_w: u32 =
@@ -297,7 +274,6 @@ fn write_png(path: &Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
         .map_err(std::io::Error::other)
 }
 
-/// Compact 5×7 bitmap font — the subset the pose labels need.
 fn font5x7(c: char) -> [&'static str; 7] {
     match c.to_ascii_uppercase() {
         'A' => [

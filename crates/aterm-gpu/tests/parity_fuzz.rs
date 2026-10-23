@@ -119,6 +119,7 @@ fn cpu_gpu_parity_fuzz() {
         let token_count = 12 + (next() % 40) as usize;
         for _ in 0..token_count {
             // ~1 in 8 tokens is an inline image over the text, so many frames
+            // exercise the image pass without it dominating.
             if next() % 8 == 0 {
                 term.process(&image_token);
                 continue;

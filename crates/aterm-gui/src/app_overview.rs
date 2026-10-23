@@ -250,7 +250,6 @@ impl App {
                         continue;
                     };
                     let Some(h) = by_local.get(&local) else {
-                        // an unregistered stub labels no chip
                         continue; // an unregistered stub labels no chip
                     };
                     if placed.insert(local) {
@@ -259,7 +258,6 @@ impl App {
                 }
             }
             if chips.is_empty() {
-                // an all-native window has no session lines to head
                 continue; // an all-native window has no session lines to head
             }
             let active_title = ws

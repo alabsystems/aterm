@@ -16,28 +16,20 @@ use crate::run::Run;
 use crate::util::scratch_text;
 use crate::{Fail, Res, stop};
 
-/// An ordinary turn's prompt: Muse Code answers a bare greeting itself, with no request.
 const PROMPT: &str = "carry on with the task";
 
-/// The stub's reply to a turn in mode `ok` (`… (reply N)`), drawn.
 const REPLIED: &str = r"\(reply [0-9]+\)";
 
-/// Muse Code's status row while a turn runs (`◆ Thinking (2s · esc to interrupt)`).
 const BUSY: &str = "^[◇◈◆] .*esc to interrupt";
 
-/// The stub's answer once a scripted call's result came back.
 const DONE: &str = "Tool call done";
 
-/// The shell call that asks: `bash` leaving the sandbox.
 const SHELL: &str = r#"{"name":"bash","input":{"command":"touch probe.txt","description":"Create the probe file","sandbox_permissions":"require_escalated"}}"#;
 
-/// A write to a protected path (`.agents/`), which asks.
 const WRITE: &str = r#"{"name":"write_file","input":{"path":".agents/probe-write.md","content":"written by the lab stub\n"}}"#;
 
-/// An edit of the same protected file.
 const EDIT: &str = r#"{"name":"edit_file","input":{"path":".agents/probe-write.md","find":"written","replace":"edited"}}"#;
 
-/// One single-select question with two options (Muse Code adds `None of the above`).
 const QUESTION: &str = r#"{"name":"request_user_input","input":{"questions":[{"id":"color","header":"Color","question":"Which color should the probe use?","options":[{"label":"Red (Recommended)","description":"Warm and loud."},{"label":"Blue","description":"Cool and calm."}]}]}}"#;
 
 /// Tool calls (`(capture name, tool, input)`) captured with an empty follow-up reply.
@@ -84,10 +76,24 @@ pub const TOOL_ROWS: [(&str, &str, &str); 12] = [
     ("work-list", "work_list", "{}"),
 ];
 
-/// The README the tool rows' project holds (one line naming the parser).
+/// Muse Code's own launch switch that turns its shell sandbox off (its build's words:
+/// `sandbox enforcement is off (--disable-sandbox or --yolo)`). The lab's jail refuses the
+/// nested `sandbox-exec` Muse Code wraps each shell call in, so a shell call draws its success
+/// row only with Muse Code's sandbox off; the jail still confines the command.
+pub const NO_SANDBOX: &str = "--disable-sandbox";
+
+/// Shell calls captured with [`NO_SANDBOX`], so each runs and draws the row of a call that ran.
+pub const RAN_ROWS: [(&str, &str, &str); 2] = [
+    ("bash-ran", "bash", r#"{"command":"ls"}"#),
+    (
+        "bash-ran-described",
+        "bash",
+        r#"{"command":"wc -l README.md","description":"Count the README's lines"}"#,
+    ),
+];
+
 const README: &str = "the lab's project: a parser module";
 
-/// The captures' own lab.
 struct Cap {
     tag: String,
     ver: String,
@@ -95,7 +101,6 @@ struct Cap {
 }
 
 impl Cap {
-    /// A lab of its own (the harness off), the previous one down.
     fn fresh(&self) -> Result<Run, Fail> {
         let _ = crate::lab::down(&self.tag, false);
         let o = UpOpts {
@@ -115,8 +120,6 @@ impl Cap {
         })
     }
 
-    /// Muse Code launched in `run` with `args`, and the lab as it is then,
-    /// once `drawn` shows.
     fn muse(&self, run: &Run, args: &[&str], drawn: &str) -> Result<Run, Fail> {
         let l = crate::muse::Launch {
             args: args.iter().map(|s| (*s).to_string()).collect(),
@@ -133,8 +136,6 @@ impl Cap {
         Ok(run)
     }
 
-    /// [`Cap::fresh`], then Muse Code trusting the workspace (`--trust-workspace`
-    /// and `extra`), at its composer.
     fn fresh_muse(&self, extra: &[&str]) -> Result<Run, Fail> {
         let run = self.fresh()?;
         let mut args = vec!["--trust-workspace"];
@@ -153,7 +154,6 @@ impl Cap {
         }
     }
 
-    /// `ctl <args>` on the lab, which must succeed.
     fn ctl(&self, run: &Run, args: &[&str]) -> Result<(), Fail> {
         let ok = Door::new(run)?.ctl(args)?.code == 0;
         self.must(ok, &format!("ctl {}", args.join(" ")))
@@ -173,11 +173,6 @@ impl Cap {
         self.must(seen, &format!("wait '{re}'"))
     }
 
-    /// After a reply, until the run behind it is over: Muse Code's reminder
-    /// agents make their side calls once the reply is drawn (measured: a
-    /// ctrl+c a moment after the reply drew `◆ Interrupting (0s · esc to
-    /// interrupt)`, not the exit prompt), and its tip side call follows about
-    /// four seconds later. Five seconds, then a screen quiet for 1.5 s.
     fn settle(&self, run: &Run) -> Result<(), Fail> {
         stop::sleep(Duration::from_secs(5))?;
         let quiet = Door::new(run)?.await_idle(1500, 20)?;
@@ -193,15 +188,12 @@ impl Cap {
         crate::verbs::set_mode(run, m).map(drop)
     }
 
-    /// The stub's `tool` mode with `script`.
     fn tool(&self, run: &Run, script: &str) -> Result<(), Fail> {
         crate::util::atomic_write(&run.w.join("tool.json"), script.as_bytes())
             .map_err(|e| Fail::die(format!("cannot write the tool script: {e}")))?;
         self.mode(run, "tool")
     }
 
-    /// The stub's log of the lab's turns (its `POST /responses` lines but
-    /// the side calls) beside the capture `name`.
     fn stub_log(&self, run: &Run, name: &str) {
         let mut text = format!(
             "# muse {} · the stub's log of the turns behind muse-{}-{name} (the lab's fixed fake key is logged as auth=key, never a value)\n",
@@ -224,8 +216,6 @@ impl Cap {
         }
     }
 
-    /// A file in the project dir, made INSIDE the jail (the tab's shell could
-    /// have put a link at that path): `printf '%s\n' TEXT > proj/<rel>`.
     fn project_file(&self, run: &Run, rel: &str, text: &str) -> Result<(), Fail> {
         let (rc, _) = crate::procs::jailed(
             run,
@@ -289,7 +279,8 @@ pub fn cmd_muse_captures(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Returns whether `screen` offers `cmd` on the slash menu's first row with the composer reading `cmd`.
+/// Returns whether `screen` offers `cmd` on the slash menu's first row with the composer
+/// reading `cmd`.
 #[must_use]
 pub fn menu_offers_first(screen: &str, cmd: &str) -> bool {
     let rows: Vec<String> = screen.lines().map(str::to_string).collect();
@@ -542,7 +533,14 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
         if !any(&["tool-row", &cap]) {
             continue;
         }
-        tool_row(c, &cap, tool, input)?;
+        tool_row(c, &cap, tool, input, &[])?;
+    }
+    for (name, tool, input) in RAN_ROWS {
+        let cap = format!("tool-row-{name}");
+        if !any(&["tool-row", &cap]) {
+            continue;
+        }
+        tool_row(c, &cap, tool, input, &[NO_SANDBOX])?;
     }
     if any(&["rate-limit-retry", "rate-limit-final"]) {
         let run = c.fresh_muse(&["-c", "provider_retry.max_attempts=3"])?;
@@ -628,15 +626,12 @@ fn captures(c: &mut Cap, want: &dyn Fn(&str) -> bool) -> Result<(), Fail> {
     Ok(())
 }
 
-/// One of [`TOOL_ROWS`] captured as `name`: a fresh session in a project
-/// holding [`README`], the stub's custom mode answering the turn with the one
-/// call (`tool` with `input`) and its result with no words, the turn over
-/// (the stub's log shows the call made, then the empty reply to its result),
-/// the screen settled.
-fn tool_row(c: &Cap, name: &str, tool: &str, input: &str) -> Result<(), Fail> {
+fn tool_row(c: &Cap, name: &str, tool: &str, input: &str, extra: &[&str]) -> Result<(), Fail> {
     let run = c.fresh()?;
     c.project_file(&run, "README.md", README)?;
-    let run = c.muse(&run, &["--trust-workspace"], "^❯")?;
+    let mut args = vec!["--trust-workspace"];
+    args.extend_from_slice(extra);
+    let run = c.muse(&run, &args, "^❯")?;
     let input = crate::pyjson::J::parse(input)
         .map_err(|e| Fail::die(format!("muse-captures: {name}'s input: {e}")))?;
     let spec = crate::pyjson::J::obj([
@@ -672,7 +667,8 @@ fn tool_row(c: &Cap, name: &str, tool: &str, input: &str) -> Result<(), Fail> {
         &run,
         name,
         &format!(
-            "launched with --trust-workspace in a project whose README.md holds `{README}`; `{PROMPT}` and Enter, the stub's custom mode answering the turn with the one call `muse.{tool} {}` and its result with a reply holding no words: the turn over on the call's own rows, its run settled (5 s and a quiet screen)",
+            "launched with {} in a project whose README.md holds `{README}`; `{PROMPT}` and Enter, the stub's custom mode answering the turn with the one call `muse.{tool} {}` and its result with a reply holding no words: the turn over on the call's own rows, its run settled (5 s and a quiet screen)",
+            args.join(" "),
             input.dump(crate::pyjson::COMPACT)
         ),
     )?;
@@ -699,9 +695,6 @@ pub fn tool_answered(text: &str, called: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A tool row's capture waits for the call and the empty reply to its
-    /// result, in that order, on the turn's own lines. NEGATIVE CONTROLS: the
-    /// call alone, a side call's line, and the reply before the call.
     #[test]
     fn a_tool_rows_turn_is_over_once_its_result_was_answered() {
         let call = "1 POST /responses -> 200 body=9B mode=toolrow kind=muse auth=key model=lab-stub stream=true items=2 tools=1 instructions=0c last_user=\"x\" custom tool:search";
@@ -726,10 +719,6 @@ mod tests {
         ));
     }
 
-    /// Enter after `/usage` only when the menu's first row IS `/usage` and the
-    /// composer reads exactly that. NEGATIVE CONTROLS: a first row of another
-    /// command, a longer one that starts with the same letters, and a composer
-    /// that reads otherwise.
     #[test]
     fn a_slash_command_is_entered_only_when_the_menu_offers_it_first() {
         let rule = "─".repeat(60);

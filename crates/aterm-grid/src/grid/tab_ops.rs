@@ -3,20 +3,12 @@
 // Author: Andrew Yates
 
 //! Tab stop operations: HT/CHT (CSI Ps I), CBT (CSI Ps Z), HTS (ESC H), TBC
-//! (CSI Ps g) and the default every-8 reset.
-//!
-//! Tab motion keeps `pending_wrap`, as xterm's `TabToNextStop()` and
-//! `TabToPrevStop()` never touch `do_wrap`. The flag is only set at the line's
-//! last writable column, where no further tab stop exists.
+//! (CSI Ps g), and default every-8 reset.
 
 use super::{Grid, row_u16};
 
 impl Grid {
     /// Tab (move to next tab stop).
-    ///
-    /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
-    /// ENSURES: self.storage.cursor.col >= old(self.storage.cursor.col)
-    /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
     pub fn tab(&mut self) {
         let max_col = self.storage.max_col_for_row(self.storage.cursor.row);
@@ -40,8 +32,7 @@ impl Grid {
         );
     }
 
-    /// Margin-aware tab (DECLRMM): inside the horizontal margins HT stops at the
-    /// right margin; outside them it uses the screen edge, like CUF.
+    /// Margin-aware tab (DECLRMM): stops at the right margin when inside horizontal margins.
     #[inline]
     pub fn tab_margin(&mut self, left_right_margin_mode: bool) {
         if !left_right_margin_mode {
@@ -75,10 +66,6 @@ impl Grid {
     }
 
     /// Tab forward by n stops (CHT, CSI Ps I).
-    ///
-    /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
-    /// ENSURES: self.storage.cursor.col >= old(self.storage.cursor.col)
-    /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
     #[inline]
     #[cfg(test)]
     pub fn tab_n(&mut self, n: u16) {
@@ -96,8 +83,6 @@ impl Grid {
     }
 
     /// Back tab (CBT, CSI Ps Z): move to the previous tab stop, or column 0.
-    ///
-    /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
     pub fn back_tab(&mut self) {
         let max_col = usize::from(self.storage.max_col_for_row(self.storage.cursor.row));
@@ -114,13 +99,7 @@ impl Grid {
         self.storage.cursor.col = 0;
     }
 
-    /// Margin-aware back tab (CBT): the left margin binds only when DECLRMM and
-    /// origin mode are both on. VT510's CBT stops at column one, which DECOM
-    /// makes the left margin; xterm's `TabToPrevStop` and Ghostty's
-    /// `horizontalTabBack` clamp to it only under origin mode, and xterm's left
-    /// margin is 0 unless DECLRMM is on. Unlike CUB, CBT does not clamp
-    /// otherwise. A cursor already left of the margin stays put (as in Ghostty;
-    /// xterm drags it forward).
+    /// Margin-aware back tab (CBT): clamps to the left margin when DECLRMM and origin mode are both active.
     #[inline]
     pub fn back_tab_margin(&mut self, left_right_margin_mode: bool, origin_mode: bool) {
         if !(left_right_margin_mode && origin_mode) {
@@ -132,8 +111,6 @@ impl Grid {
         let current = usize::from(self.storage.cursor.col).min(max_col);
         let left_bound = usize::from(margins.left);
         if current <= left_bound {
-            // At or left of the margin: a backward tab never moves the cursor
-            // forward (Ghostty's guard, not xterm's clamp).
             return;
         }
         for col in (left_bound..current).rev() {
@@ -146,8 +123,6 @@ impl Grid {
     }
 
     /// Back tab by n stops.
-    ///
-    /// ENSURES: self.storage.cursor.col <= old(self.storage.cursor.col)
     #[inline]
     #[cfg(test)]
     pub fn back_tab_n(&mut self, n: u16) {
@@ -165,8 +140,6 @@ impl Grid {
     }
 
     /// Set a tab stop at the current cursor column (HTS - Horizontal Tab Set).
-    ///
-    /// ENSURES: self.storage.cursor.col < self.storage.tab_stops.len() implies self.storage.tab_stops[self.storage.cursor.col]
     #[inline]
     pub fn set_tab_stop(&mut self) {
         let col = self.storage.cursor.col;
@@ -174,8 +147,6 @@ impl Grid {
     }
 
     /// Clear the tab stop at the current cursor column (TBC 0).
-    ///
-    /// ENSURES: self.storage.cursor.col < self.storage.tab_stops.len() implies !self.storage.tab_stops[self.storage.cursor.col]
     #[inline]
     pub fn clear_tab_stop(&mut self) {
         let col = self.storage.cursor.col;
@@ -183,16 +154,12 @@ impl Grid {
     }
 
     /// Clear all tab stops (TBC 3).
-    ///
-    /// ENSURES: self.storage.tab_stops.iter().all(|&s| !s)
     #[inline]
     pub fn clear_all_tab_stops(&mut self) {
         self.storage.clear_all_tab_stops();
     }
 
     /// Reset tab stops to default (every 8 columns).
-    ///
-    /// ENSURES: self.storage.tab_stops.len() == usize::from(self.storage.cols)
     #[inline]
     pub fn reset_tab_stops(&mut self) {
         let cols = self.storage.cols;

@@ -1,18 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stale copies of aterm (macOS): bundles that claim aterm's identifier, signed ad hoc to
-//! their own cdhash, left beside the installed release (`aterm-prev-<epoch>.app` and the
-//! like, made by hand or by an agent: the updater, `tools/install.sh` and `ship dev-app`
-//! leave none). Each one resets aterm's privacy grants whenever it asks macOS for one
-//! (`aterm_containment::consent`, "The claimant census").
-//!
-//! `aterm doctor` prunes them ([`prune`]): exactly the copies the census offers for the
-//! Trash ([`aterm_containment::consent::Claimants::retirable`]: ad hoc to their cdhash or
-//! unsigned, no link leading to them, beside a running release whose grant survives
-//! updates; never a Developer ID copy), re-checked right before the move and never while a
-//! process runs from one, moved with Apple's own tool so each stays recoverable. The
-//! Settings ▸ Security panel's *Move to Trash* uses the same move ([`trash`]).
+//! Stale aterm bundle detection and Trash pruning ([`prune`], [`trash`]).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -25,18 +14,14 @@ use crate::doctor::{Level, Row};
 /// The trash tool macOS 15 and later ship.
 pub const TRASH_TOOL: &str = "/usr/bin/trash";
 
-/// How long one move may take. Within a volume it is a rename; across volumes it is a
-/// copy.
+/// How long one move may take.
 const TRASH_CEILING: Duration = Duration::from_secs(120);
 
-/// Move `path` to the Trash with [`TRASH_TOOL`], bounded by two minutes. The error is the
-/// system's own reason when it gave one.
-///
+/// Move `path` to the Trash with [`TRASH_TOOL`], bounded by two minutes.
 /// # Errors
 /// A relative path, a tool that could not run or did not finish, or the tool's refusal.
 pub fn trash(path: &Path) -> Result<(), String> {
     use aterm_uds::spawnfd::Stdio;
-    // Census paths are absolute, so the argument can never read as an option.
     if !path.is_absolute() {
         return Err("not an absolute path".to_string());
     }
@@ -77,8 +62,7 @@ pub fn trash(path: &Path) -> Result<(), String> {
     )
 }
 
-/// The system's reason from the tool's stderr: the first quoted description after
-/// `Code=<n>`, e.g. `The file “x.app” doesn’t exist.`
+/// The system's reason from the tool's stderr.
 fn trash_refusal(stderr: &str) -> Option<String> {
     let after = &stderr[stderr.find("Code=")?..];
     let open = after.find('"')? + 1;
@@ -90,16 +74,14 @@ fn trash_refusal(stderr: &str) -> Option<String> {
 /// What one prune found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pruned {
-    /// Not looked: why (a test binary, a build outside an app bundle, no bundle id, not
-    /// macOS, a read-only run).
+    /// Not looked: why.
     NotLooked(String),
-    /// The census could not finish: copies may exist that it did not see.
+    /// The census could not finish.
     Incomplete {
         /// What the moves that did happen did.
         moved: Vec<(PathBuf, Retired)>,
     },
-    /// A read-only look (`aterm doctor --read-only`): what a prune would move, and what
-    /// it would keep, nothing moved.
+    /// A read-only look (`aterm doctor --read-only`).
     Found {
         /// The copies a prune would move to the Trash.
         offered: Vec<PathBuf>,
@@ -108,7 +90,7 @@ pub enum Pruned {
         /// Whether the census read every place a copy can be.
         complete: bool,
     },
-    /// The census finished; each retirable copy and what became of it (empty: none).
+    /// The census finished.
     Done {
         /// Each copy offered, with its outcome.
         moved: Vec<(PathBuf, Retired)>,
@@ -117,7 +99,7 @@ pub enum Pruned {
     },
 }
 
-/// What a prune of `bundle_id` would move and keep, moving nothing: the census alone.
+/// What a prune of `bundle_id` would move and keep, moving nothing.
 pub fn look_with(bundle_id: &str, census: impl Fn(&str) -> Claimants, trash_tool: bool) -> Pruned {
     let found = census(bundle_id);
     Pruned::Found {
@@ -141,8 +123,7 @@ fn kept_of(found: &Claimants, trash_tool: bool) -> Vec<(PathBuf, &'static str)> 
         .collect()
 }
 
-/// The census's moves for `bundle_id`, with every reach injected: the census, the fresh
-/// identity check, whether a process runs from a copy, and the move. Pure apart from them.
+/// The census's moves for `bundle_id`, with every reach injected.
 pub fn prune_with(
     bundle_id: &str,
     census: impl Fn(&str) -> Claimants,
@@ -158,8 +139,6 @@ pub fn prune_with(
         .map(|copy| copy.path.clone())
         .collect();
     let kept = kept_of(&found, trash_tool);
-    // A fresh census right before the moves, as the panel's worker takes: only a copy
-    // both looks offered and is still the same bundle moves.
     let moved = if plan.is_empty() {
         Vec::new()
     } else {
@@ -179,10 +158,7 @@ pub fn prune_with(
     }
 }
 
-/// Prune the stale copies of the running aterm ([`prune_with`] with the live census, the
-/// fresh identity check, the process table and [`trash`]); with `dry_run`, only look
-/// ([`look_with`]). Refuses, reading nothing, outside an app bundle (a test binary among
-/// them) and off macOS.
+/// Prune the stale copies of the running aterm ([`prune_with`], [`trash`], [`look_with`]).
 #[must_use]
 pub fn prune(dry_run: bool) -> Pruned {
     if !cfg!(target_os = "macos") {
@@ -211,9 +187,7 @@ pub fn prune(dry_run: bool) -> Pruned {
     )
 }
 
-/// The `copies:` row, pure over what the prune did: `ok` when nothing is left over, a
-/// `note` naming each copy moved to the Trash (recoverable) or kept and why, and a
-/// `warn` for a copy that should have moved and did not.
+/// The `copies:` row.
 #[must_use]
 pub fn row(pruned: &Pruned) -> Row {
     let name = |path: &Path| {
@@ -350,8 +324,6 @@ mod tests {
         Claimants { found, enumeration }
     }
 
-    /// The release running, ad hoc copies beside it, and a Developer ID rollback that is
-    /// never moved.
     fn owners_mac() -> Claimants {
         census_of(
             vec![
@@ -465,7 +437,6 @@ mod tests {
         }
     }
 
-    /// A read-only look names what a prune would move as a `warn`, and moves nothing.
     #[test]
     fn a_look_names_what_a_prune_would_move() {
         let got = look_with("com.aterm.aterm", |_| owners_mac(), true);

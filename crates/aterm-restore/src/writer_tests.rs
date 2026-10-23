@@ -804,7 +804,7 @@ fn an_erased_region_holds_nothing_it_recorded_and_reads_as_no_region() {
 }
 
 /// `adaptive_hist_cap` scales with the line limit and bytes-per-line floor while staying
-/// 8-byte aligned and within `[MIN_HIST_CAP, hist_cap_phys]`.
+/// 8-byte aligned, never past the ring, and at least `MIN_HIST_CAP` unless the ring is smaller.
 #[test]
 fn the_adaptive_cap_follows_the_line_limit_and_the_corpus() {
     let phys = Geometry::v1().hist_cap_phys;

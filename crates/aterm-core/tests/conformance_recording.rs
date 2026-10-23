@@ -2,22 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Tier-1 conformance for hydration faithfulness (`recording_model`): a keyframe from
-//! [`Terminal::checkpoint`] at `t0` plus the deltas `t0 -> t1` replayed on a
-//! [`Terminal::from_checkpoint`]-hydrated terminal reproduces the live terminal's
-//! checkpoint at `t1` exactly. Negative control: dropping one delta chunk makes them
-//! diverge.
-//!
-//! The hydrated terminal is a restore that output reached before any host adopted it,
-//! so its checkpoint also carries that lineage's seed uncertainty
-//! (`HolderRepr::seed_untrusted`), which no live terminal has; [`lineage_taken`]
-//! asserts it and takes it out, and every other field is compared.
+//! Tier-1 conformance for checkpoint hydration and delta replay (`recording_model`).
 
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
-/// Prefix script driven to `t0`, the keyframe point: scrollback, SGR, scroll
-/// region, alt-screen round-trip, cursor moves, charset, kitty keyboard, cwd.
-/// Ends at parser ground (required by `checkpoint()`).
 const PREFIX: &[&[u8]] = &[
     b"\x1b[1;4;38;5;202;48;2;10;20;30mstyled prefix\x1b[0m\r\n",
     b"alpha\r\nbravo\r\ncharlie\r\ndelta\r\necho\r\nfoxtrot\r\ngolf\r\nhotel\r\n",
@@ -31,9 +19,6 @@ const PREFIX: &[&[u8]] = &[
     b"\x1b[3;1Hback on main",
 ];
 
-/// Delta events `t0 -> t1`, replayed on both terminals. Each chunk ends at
-/// parser ground and changes captured state, so dropping any chunk perturbs
-/// the grid.
 const DELTA: &[&[u8]] = &[
     b"\x1b[5;1Hmore output line\r\n",
     b"\x1b[7mreverse\x1b[0m and \x1b[32mgreen\x1b[0m\r\n",
@@ -42,7 +27,6 @@ const DELTA: &[&[u8]] = &[
     b"\x1b[?7l", // toggle autowrap off (a captured mode bit)
 ];
 
-/// A hydrated terminal's checkpoint with its restore lineage asserted and taken out.
 fn lineage_taken(c: TerminalCheckpoint) -> TerminalCheckpoint {
     assert!(
         c.holder.seed_untrusted,
@@ -51,7 +35,6 @@ fn lineage_taken(c: TerminalCheckpoint) -> TerminalCheckpoint {
     c.without_seed_lineage()
 }
 
-/// Drive `t` through a slice of byte chunks.
 fn run(t: &mut Terminal, chunks: &[&[u8]]) {
     for c in chunks {
         t.process(c);
@@ -62,7 +45,6 @@ fn run(t: &mut Terminal, chunks: &[&[u8]]) {
 fn replay_from_checkpoint_matches_live_engine() {
     let (rows, cols) = (10u16, 40u16);
 
-    // Live timeline: prefix -> t0 (keyframe) -> delta -> t1.
     let mut live = Terminal::new(rows, cols);
     run(&mut live, PREFIX);
     assert!(
@@ -74,17 +56,14 @@ fn replay_from_checkpoint_matches_live_engine() {
     run(&mut live, DELTA); // advance live to t1
     assert!(live.parser_is_ground(), "delta must end at parser-ground");
 
-    // Hydrated timeline: from_checkpoint(t0) -> replay the same delta -> t1'.
     let mut replay = Terminal::from_checkpoint(&keyframe);
     run(&mut replay, DELTA);
 
-    // The checkpoint+replay reproduces live at t1 over the full projection.
     assert_eq!(
         live.checkpoint(),
         lineage_taken(replay.checkpoint()),
         "checkpoint+replay must reproduce the live projection (B.8.4 faithfulness)"
     );
-    // Human-readable cross-check on the rendered content.
     assert_eq!(
         live.visible_content(),
         replay.visible_content(),
@@ -94,7 +73,6 @@ fn replay_from_checkpoint_matches_live_engine() {
 
 #[test]
 fn replay_negative_control_dropped_delta_diverges() {
-    // The analogue of the model's Buggy=1 dropped-event counterexample.
     let (rows, cols) = (10u16, 40u16);
     const DROP_IDX: usize = 2; // the "scroll1/2/3" chunk — perturbs the grid
 

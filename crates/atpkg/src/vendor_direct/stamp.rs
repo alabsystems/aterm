@@ -153,7 +153,8 @@ impl ProgramStamp {
     /// Records that legacy index build `build` carries `version`.
     ///
     /// # Errors
-    /// Returns an error if `build` is a vendor build id or the stamp cannot be written.
+    /// `build` is a vendor build id, `program` is not vendor-direct, or the stamp could not
+    /// be locked or written.
     pub(crate) fn record_legacy_version(
         layout: &Layout,
         program: &str,
@@ -181,7 +182,8 @@ impl ProgramStamp {
     /// Records the signed `root` for legacy index build `build`.
     ///
     /// # Errors
-    /// Returns an error if `build` or `root` is invalid or the stamp cannot be written.
+    /// `build` is a vendor build id, `root` is not 64 hex digits, `program` is not
+    /// vendor-direct, or the stamp could not be locked or written.
     pub(crate) fn record_legacy_root(
         layout: &Layout,
         program: &str,
@@ -201,7 +203,7 @@ impl ProgramStamp {
     /// Records a head check timestamp, head version, and `ETag`.
     ///
     /// # Errors
-    /// Returns an error if `program` is not vendor-direct or the stamp cannot be written.
+    /// `program` is not vendor-direct, or the stamp could not be locked or written.
     pub fn record_check(
         layout: &Layout,
         program: &str,

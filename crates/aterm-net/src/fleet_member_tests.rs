@@ -1361,9 +1361,12 @@ impl Issuing {
     }
 }
 
+/// `serve` looks at `running` when an accept returns or its `ACCEPT_POLL`
+/// (200 ms) wait ends: a connect after the store returns the accept at once.
 impl Drop for Issuing {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        let _ = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }

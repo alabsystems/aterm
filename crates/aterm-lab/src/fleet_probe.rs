@@ -128,7 +128,7 @@ pub fn closed(stream: &mut dyn Rw) -> bool {
     }
 }
 
-/// The fleet's RFC 5705 exporter label (`aterm_net::fleet`'s module doc).
+/// The fleet's RFC 5705 exporter label (`aterm_net::fleet`'s `EXPORTER_LABEL`).
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-aterm-fleet-v1";
 
 /// The dialer's proof line for `op` on the channel whose exporter is `exporter`.

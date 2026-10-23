@@ -2,17 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A tiered grid whose total scrollback limit is at or below its ring cap.
-//!
-//! `set_scrollback_line_limit(L)` with `L <= ring cap` re-caps the ring to `L`
-//! and leaves the store a share of zero: the store keeps nothing, so the ring
-//! is the whole retention, exactly as on a ring-only grid of cap `L`. Whatever
-//! the resizes, history must stay a contiguous suffix of what was written: a
-//! line the program wrote may age out only after every older line has.
-//!
-//! The oracle is a numbered-line transcript: every row holds one `L<n>` line
-//! (short enough never to wrap at the widths used), so reading history and
-//! then the screen down to the cursor must give `k..=newest` for some `k`.
+//! Tests for a tiered grid whose total scrollback limit is at or below its ring cap.
 
 use super::super::*;
 use crate::grid::test_support::history_trimmed;
@@ -27,8 +17,6 @@ fn zero_share_grid(rows: u16, cols: u16, limit: usize) -> Grid {
     grid
 }
 
-/// Write `L<n>` on the cursor's row; every line after the first opens a new
-/// line first, so the cursor rests on the newest line.
 fn write_numbered(grid: &mut Grid, n: usize) {
     if n > 0 {
         grid.line_feed();
@@ -39,9 +27,6 @@ fn write_numbered(grid: &mut Grid, n: usize) {
     }
 }
 
-/// The written numbers in reading order: history oldest first, then the
-/// screen down to the cursor's row. Blank rows carry no number and are
-/// skipped; a lost line still shows as a gap in the numbers.
 fn transcript(grid: &Grid) -> Vec<usize> {
     let screen = (0..=grid.cursor_row()).map(|r| {
         grid.row(r)
@@ -60,8 +45,6 @@ fn transcript(grid: &Grid) -> Vec<usize> {
         .collect()
 }
 
-/// History is a contiguous suffix of what was written (ending with the screen
-/// at `newest`), and holds no more than the total `limit`.
 fn assert_contiguous_suffix(grid: &Grid, newest: usize, limit: usize, ctx: &str) {
     let got = transcript(grid);
     let first = got.first().copied().unwrap_or(newest);
@@ -87,10 +70,6 @@ enum Step {
     Write(usize),
 }
 
-/// A zero-share tiered grid reads as a ring-only grid of cap = total through
-/// width shrinks and grows (with and without rows), rewrap-free width changes
-/// and rows-only resizes, under both resize drivers: the synchronous one and
-/// the offloaded one (detach, rewrap, re-attach).
 #[test]
 fn zero_share_grid_matches_its_ring_only_twin_through_resizes() {
     use Step::{Resize, ResizeNoReflow, Write};
@@ -156,10 +135,6 @@ fn zero_share_grid_matches_its_ring_only_twin_through_resizes() {
     }
 }
 
-/// A reset racing an off-thread reflow attaches a replacement store whose share
-/// is zero (total at or below the ring cap). A synchronous width change inside
-/// that window keeps what the ring's cap allows and stages nothing for the
-/// store.
 #[test]
 fn zero_share_replacement_store_in_an_offload_window_stages_nothing() {
     let limit = 4;
@@ -183,7 +158,6 @@ fn zero_share_replacement_store_in_an_offload_window_stages_nothing() {
     }
     assert_contiguous_suffix(&grid, newest, limit, "before the in-window resize");
 
-    // The rows shrink pushes three screen rows past the ring's cap of four.
     grid.resize(3, 12);
     assert_contiguous_suffix(&grid, newest, limit, "after the in-window resize");
     assert_eq!(
@@ -197,17 +171,10 @@ fn zero_share_replacement_store_in_an_offload_window_stages_nothing() {
         assert_contiguous_suffix(&grid, newest, limit, &format!("in the window at L{newest}"));
     }
 
-    // The worker's result loses to the replacement, as a reset requires.
     grid.reattach_reflowed_scrollback(job.reflow());
     assert_contiguous_suffix(&grid, newest, limit, "after re-attach");
 }
 
-/// A drag step that lands while the offloaded rewrap is out resizes in place,
-/// so the job comes back rewrapped for a width the grid has left. With a zero
-/// store share its ring history goes back into the ring at the current width,
-/// newest first, keeping what the ring-only twin keeps. Covers both re-attach
-/// entry points, window output short of and past the ring's cap, and a step
-/// that also takes rows away.
 #[test]
 fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
     let cases = [
@@ -234,7 +201,6 @@ fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
                 let job = tiered
                     .resize_offloading_scrollback(6, 16)
                     .expect("a tiered width change offloads its history");
-                // The newest lines the window holds back stay in the ring.
                 let held = tiered.ring_buffer_scrollback();
                 twin.resize(6, 16);
                 for _ in 0..in_window {
@@ -242,7 +208,6 @@ fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
                     write_numbered(&mut tiered, newest);
                     write_numbered(&mut twin, newest);
                 }
-                // The drag's next step, inside the window.
                 assert!(
                     tiered.resize_offloading_scrollback(rows, cols).is_none(),
                     "{ctx}: the store is out, so the step resizes in place"
@@ -293,10 +258,6 @@ fn zero_share_drag_step_during_the_offloaded_rewrap_keeps_the_rings_history() {
     }
 }
 
-/// A rewrap-free width change that also takes rows away drains the screen's
-/// bottom rows; a zero-share grid drops them as its ring-only twin does. Judged
-/// against the twin, not the contiguous-suffix oracle: this shrink drops the
-/// cursor's line on both grids.
 #[test]
 fn zero_share_rows_shrinking_rewrap_free_width_change_reads_as_its_twin() {
     for limit in [0, 1, 4, RING_CAP] {

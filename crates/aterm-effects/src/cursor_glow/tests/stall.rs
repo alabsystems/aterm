@@ -5,10 +5,6 @@
 
 use super::*;
 
-/// Keys at 85 ms into a stall, the row echoing late as one hop: thirty keys
-/// echoed 400 ms after the last, and fifty keys (the oldest press 5.3 s old)
-/// echoed a second after the last. Each is licensed as one sweep, every cell
-/// lit, no `no-credits`, nothing for the ledger to bridge.
 #[test]
 fn thirty_keys_typed_into_a_stall_are_laid_as_one_sweep_when_the_row_echoes() {
     let g = wide_geom();
@@ -47,9 +43,6 @@ fn thirty_keys_typed_into_a_stall_are_laid_as_one_sweep_when_the_row_echoes() {
     }
 }
 
-/// A batch whose last key is three seconds old when the row echoes is licensed and lit in the
-/// echoing frame and the frame after: the sweep's cells are born no earlier than one stamp
-/// window before the echo, not into a cohort that has already faded.
 #[test]
 fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     let g = wide_geom();
@@ -72,8 +65,6 @@ fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
         dark.is_empty(),
         "the echoing frame must show the batch lit; dark: {dark:?}"
     );
-    // No key, one more frame: still lit — the batch joined a refreshed
-    // cohort, not a three-second-old one.
     glow.tick(
         Some((27, 17)),
         echo + Duration::from_millis(100),
@@ -88,23 +79,10 @@ fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     );
 }
 
-/// A stalled batch is judged by the share rule, not paid cell for cell: with
-/// every stamp stale, the presses in flight license a wider same-row echo on
-/// the two-press floor and the share rule weighs it. Three keys echoing four
-/// cells (an editor's auto-closed bracket: three quarters paid) and three
-/// keys echoing three wide glyphs (six columns, each press paying for its
-/// glyph's second half) are each laid whole by the late echo, nothing
-/// declined. CONTROL: two keys against the same four cells are refused
-/// `no-credits` and lay none of the cells they swept (the ribbon's head
-/// follows the caret to its landing either way, so the landing is not
-/// counted).
 #[test]
 fn a_stalled_batch_the_share_rule_pays_for_is_laid_whole_when_the_row_echoes() {
     let g = wide_geom();
     let c = cfg(GlowStyle::RainbowKitty, true);
-    // (declined, why, swept cells short of the landing left dark) for
-    // `keys` presses echoed 400 ms late as `cells` columns, wide glyphs or
-    // narrow.
     let late_echo = |keys: u64, wide: bool, cells: u16| {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
@@ -147,9 +125,6 @@ fn a_stalled_batch_the_share_rule_pays_for_is_laid_whole_when_the_row_echoes() {
     );
 }
 
-/// One key stalled three seconds: its own +1 echo is licensed by the press in flight
-/// (`licence=inflight`), its cell is lit on the echoing frame and one beat later, and the press
-/// is spent, so the next key echoed on time has nothing to bridge.
 #[test]
 fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
     let g = wide_geom();
@@ -201,7 +176,6 @@ fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
         0,
         "the press is spent by its own cell"
     );
-    // The next key, echoed on time: its own cell, nothing to bridge.
     let k2 = echo + Duration::from_millis(200);
     glow.note_typed(k2);
     glow.tick(
@@ -223,10 +197,6 @@ fn one_key_stalled_three_seconds_lights_its_own_cell_on_the_late_echo() {
     );
 }
 
-/// Anti-stray bound of the one-press echo: a swallowed press (a modal's key,
-/// vim's `x`) followed by a program's +1 on the same row buys at most its own
-/// one cell, once (the credit is spent on admission); a press an unexplained
-/// edge forgot buys nothing.
 #[test]
 fn a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once() {
     let g = wide_geom();
@@ -259,7 +229,6 @@ fn a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once() {
         v2_cols(&glow, 3)
     );
 
-    // The forget control: press, keyless backward hop, then +1 is refused.
     let mut forgot = CursorGlow::default();
     forgot.tick(Some((3, 8)), t0, &c, g, &mut out);
     forgot.note_typed(t0 + Duration::from_millis(10));
@@ -286,9 +255,6 @@ fn a_swallowed_press_buys_at_most_its_own_one_cell_and_only_once() {
     assert!(v2_cols(&forgot, 3).is_empty(), "{:?}", v2_cols(&forgot, 3));
 }
 
-/// One stalled press against a hop wider than one cell is refused (vim's `w`
-/// on a stale stamp), and the credit is kept for the delivered insert receipt
-/// and the next key's ledger bridge.
 #[test]
 fn a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept() {
     let g = wide_geom();
@@ -315,10 +281,6 @@ fn a_single_stalled_press_wider_than_one_cell_is_still_refused_and_kept() {
     assert!(v2_cols(&glow, 3).is_empty());
 }
 
-/// A hidden-caret TUI's single stalled key (Claude Code's bracket) is admitted
-/// by the same one-press rule on the anchored lane: the established echo row's
-/// end advancing by one with one press in flight and no fresh stamp is that
-/// press's echo. A row no licensed anchored echo has established stays silent.
 #[test]
 fn a_hidden_caret_single_key_stall_relights_on_its_own_anchored_echo() {
     let g = wide_geom();
@@ -329,13 +291,11 @@ fn a_hidden_caret_single_key_stall_relights_on_its_own_anchored_echo() {
     glow.tick(Some((5, 2)), t0, &c, g, &mut out);
     glow.observe_print_anchor(Some((5, 2, 1)));
     glow.tick(None, t0 + Duration::from_millis(10), &c, g, &mut out);
-    // One licensed anchored echo establishes the row.
     let k1 = t0 + Duration::from_millis(100);
     glow.note_typed(k1);
     glow.observe_print_anchor(Some((5, 3, 2)));
     glow.tick(None, k1 + Duration::from_millis(10), &c, g, &mut out);
     assert_eq!(glow.admission_tally().licensed, 1, "the row is established");
-    // The stalled key: pressed, its echo 400 ms later, no stamp fresh.
     let k2 = k1 + Duration::from_millis(200);
     glow.note_typed(k2);
     let echo = k2 + Duration::from_millis(400);
@@ -355,7 +315,6 @@ fn a_hidden_caret_single_key_stall_relights_on_its_own_anchored_echo() {
         v2_cols(&glow, 5)
     );
 
-    // Control: a row no licensed anchored echo has established is silent.
     let mut cold = CursorGlow::default();
     cold.tick(Some((5, 2)), t0, &c, g, &mut out);
     cold.observe_print_anchor(Some((7, 10, 1)));

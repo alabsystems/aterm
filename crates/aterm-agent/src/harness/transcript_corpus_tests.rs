@@ -1,21 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The transcript projections over rows shaped like Claude Code's and Codex's,
-//! and over the vendor drift and malformed input they must survive, recorded
-//! while the projection drove registry serde's `Visitor`, `MapAccess`,
-//! `SeqAccess` and `IgnoredAny` (docs/AUDIT-third-party-2026-10-15.md, SP.3),
-//! and held since SP.6 against aterm-serde's.
-//! Each row is read by all five projections; an `Ok` is the kept value written
-//! back out by `aterm_json`, an `Err` its `Display`.
+//! Transcript projections over Claude Code and Codex rows, vendor drift, and malformed input.
 
 #[path = "../../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
 
 use answers::Corpus;
 
-/// Rows with the keys the vendors write, values made up (the step fold's
-/// agreement test reads the `claude/` ones too).
+/// Rows with the keys the vendors write and synthetic values.
 pub(crate) const ROWS: &[(&str, &str)] = &[
     (
         "claude/assistant",
@@ -57,7 +50,6 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
         "codex/response-item",
         r#"{"timestamp":"2026-10-15T20:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
     ),
-    // Vendor drift: a kept key of the wrong shape reads as null, never an error.
     (
         "drift/usage-strings",
         r#"{"type":"assistant","message":{"model":["opus"],"usage":{"input_tokens":"3","output_tokens":{"n":1},"cache_read_input_tokens":null}}}"#,
@@ -74,7 +66,6 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
         "drift/quota-shapes",
         r#"{"type":"system","quotaLimits":{"status":{"is":"rejected"},"resetsAt":"soon","rateLimitType":["seven_day"]}}"#,
     ),
-    // Duplicate keys: the last one wins, an escaped spelling of a key included.
     (
         "duplicate/last-wins",
         r#"{"type":"user","type":"assistant","message":{"model":"a","model":"b"},"type":"system"}"#,
@@ -83,7 +74,6 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
         "duplicate/escaped-spelling",
         r#"{"type":"assistant","\u0074ype":"user","message":{"model":"a","mod\u0065l":"b"}}"#,
     ),
-    // Numbers at the edges of every width the JSON reader keeps.
     (
         "number/u64-max",
         r#"{"type":"assistant","message":{"usage":{"input_tokens":18446744073709551615}}}"#,
@@ -120,7 +110,6 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
         "number/leading-zero",
         r#"{"type":"system","durationMs":01}"#,
     ),
-    // Not a row at all.
     ("shape/array", r#"[{"type":"assistant"}]"#),
     ("shape/string", r#""assistant""#),
     ("shape/null", "null"),
@@ -144,13 +133,7 @@ pub(crate) const ROWS: &[(&str, &str)] = &[
     ("shape/whitespace", " \t\r\n{ \"type\" : \"user\" }\n "),
 ];
 
-/// Rows of a turn Claude Code begins of its own (`claude/begins/`) and of
-/// rows that go on the running turn (`claude/goes-on/`), the running turn
-/// being `promptId` `v1` (values made up; the shapes `upgrade_tests.rs`
-/// holds `upgrade::FinishedScan` to, and Claude Code 2.1.302's `/loop` wake):
-/// read by the step projections (`steps.txt`) and by the step fold's
-/// agreements with `upgrade.rs` and with the harness's end, never by
-/// `transcript.txt`, which stays as SP.6 recorded it.
+/// Rows of a turn Claude Code begins on its own and rows that continue the running turn.
 pub(crate) const TURN_ROWS: &[(&str, &str)] = &[
     (
         "claude/begins/loop-wake",
@@ -205,11 +188,6 @@ fn transcript_projections_answer_as_recorded() {
     corpus.finish();
 }
 
-/// The step fold's two projections (addendum A8) over the same rows, held to
-/// their own recorded answers (`steps.txt`; `transcript.txt` is untouched):
-/// what each keeps, and that neither keeps any text — a string content, and
-/// a bare string among the parts, read as null; a text part keeps only its
-/// `type`.
 #[test]
 fn steps_projections_answer_as_recorded() {
     let mut corpus = Corpus::new(env!("CARGO_MANIFEST_DIR"), "steps");

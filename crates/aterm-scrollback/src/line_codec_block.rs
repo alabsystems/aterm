@@ -14,9 +14,6 @@ pub fn serialize_lines(lines: &[Line]) -> Vec<u8> {
         .map(Line::serialized_size_estimate)
         .fold(4usize, usize::saturating_add);
     let mut result = if estimate < crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES {
-        // The `.min(MAX - 1)` is a no-op in this branch; it restates the branch
-        // condition on the allocation count for the strict L0 gate's
-        // unbounded-allocation check.
         Vec::with_capacity(estimate.min(crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES - 1))
     } else {
         Vec::new()
@@ -84,8 +81,6 @@ pub(crate) fn serialize_pages(lines: &[Line], max_page_bytes: usize) -> Vec<(usi
     pages
 }
 
-/// Write a [`serialize_pages`] page's `[count:4]` header (saturating at
-/// `u32::MAX`, as [`serialize_lines`] does).
 fn seal_page(mut page: Vec<u8>, count: usize) -> (usize, Vec<u8>) {
     if let Some(header) = page.get_mut(..4) {
         header.copy_from_slice(&u32::try_from(count).unwrap_or(u32::MAX).to_le_bytes());
@@ -103,7 +98,6 @@ const _: () = assert!(
         <= crate::codec::MAX_DECOMPRESSED_SCROLLBACK_PAGE_BYTES
 );
 
-/// Compute the byte size of a legacy (v0) line record.
 const fn line_size_v0(data: &[u8]) -> Option<usize> {
     if data.len() < 5 {
         return None;
@@ -112,9 +106,6 @@ const fn line_size_v0(data: &[u8]) -> Option<usize> {
     5usize.checked_add(content_len)
 }
 
-/// Compute the byte size of a v1/v2/v3/v4 line record:
-/// `[version:1][flags:1][len:4][content:len][has_attrs:1][attrs...][hyperlinks]`
-/// then, in v4, the underline colours.
 fn line_size_v1v2(data: &[u8], version: u8) -> Option<usize> {
     if data.len() < 7 {
         return None;
@@ -157,8 +148,6 @@ fn line_size_v1v2(data: &[u8], version: u8) -> Option<usize> {
     }
 }
 
-/// Compute the byte size of the v4 underline-colour section: `[count:2]` then
-/// `count` fixed 8-byte records, so `2 + count * 8`.
 fn underline_colors_size_v4(data: &[u8], base_size: usize) -> Option<usize> {
     let hdr_end = base_size.checked_add(2)?;
     let count_bytes = data.get(base_size..hdr_end)?;
@@ -169,7 +158,6 @@ fn underline_colors_size_v4(data: &[u8], base_size: usize) -> Option<usize> {
     count.checked_mul(8)?.checked_add(2)
 }
 
-/// Compute the byte size of the v2 hyperlinks section (no IDs).
 fn hyperlinks_size_v2(data: &[u8], base_size: usize) -> Option<usize> {
     let hdr_end = base_size.checked_add(2)?;
     let count_bytes = data.get(base_size..hdr_end)?;
@@ -195,8 +183,6 @@ fn hyperlinks_size_v2(data: &[u8], base_size: usize) -> Option<usize> {
     Some(size)
 }
 
-/// Compute the byte size of the v3 hyperlinks section (with IDs), with the
-/// sub-slice reads of [`hyperlinks_size_v2`].
 fn hyperlinks_size_v3(data: &[u8], base_size: usize) -> Option<usize> {
     let hdr_end = base_size.checked_add(2)?;
     let count_bytes = data.get(base_size..hdr_end)?;
@@ -239,11 +225,6 @@ pub(crate) const MAX_DECODE_PAGE_LINES: usize = 1 << 20;
 
 #[cfg(test)]
 thread_local! {
-    /// Serialized line records this thread's block walks have accepted: the
-    /// decode work every read of a warm block or cold page pays. Counted at the
-    /// one walk both the decode and the eviction's framing check run, so a
-    /// regression that decompresses the whole scrollback to trim one line shows
-    /// as a count proportional to the scrollback. Thread-local for parallel tests.
     static RECORDS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -288,8 +269,6 @@ fn walk_records(
         };
 
         if accept(record_bytes) {
-            // Bounded by `max_lines` (the loop guard); saturation is dead code
-            // carrying the no-overflow proof.
             accepted = accepted.saturating_add(1);
         }
         offset = line_end;
@@ -300,8 +279,6 @@ fn walk_records(
     (accepted, offset)
 }
 
-/// Read a block's declared line count (the 4-byte header), or `None` when the
-/// buffer is too short to hold one.
 fn declared_count(data: &[u8]) -> Option<usize> {
     let header = data.get(..4)?;
     if header.len() < 4 {
@@ -508,7 +485,6 @@ fn decode_line_strict(
     spans_bounded.then_some((line, size))
 }
 
-/// The number of characters in a line's content, as the attrs RLE counts them.
 fn line_char_count(content: &[u8]) -> usize {
     content.iter().filter(|&&byte| byte & 0xC0 != 0x80).count()
 }

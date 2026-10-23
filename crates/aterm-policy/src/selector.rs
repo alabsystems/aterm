@@ -95,8 +95,10 @@ impl SequenceSelector {
     /// Parse a selector string (TOML form) into a compiled selector.
     ///
     /// # Errors
+    ///
     /// Returns [`SelectorParseError`] if the input cannot be classified as
-    /// a catch-all or a function-major selector.
+    /// a catch-all or a function-major selector. The engine keeps such a rule
+    /// but never matches it.
     #[inline]
     pub fn parse(src: &str) -> Result<Self, SelectorParseError> {
         parse_compiled(expand_alias(src))

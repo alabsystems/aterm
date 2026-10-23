@@ -1170,19 +1170,28 @@ impl Root {
                 continue;
             };
             let read_at = Some(std::time::Instant::now());
-            let footprint = self.status_footprint(pid).unwrap_or_else(|| {
-                self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
-                    .flatten()
-                    .map(|pages| pages.saturating_mul(page_bytes))
-            });
             let ticks = stat.utime.saturating_add(stat.stime);
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
-            let Some(confirm) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten() else {
-                continue;
+            // A kernel thread maps no user memory: nothing in `status` or `statm` for it,
+            // and no read after its `stat` to confirm. Most of a sweep's rows are kernel
+            // threads (341 of 519 on the GB10 desk, 2026-10-23).
+            let footprint = if stat.kernel_thread() {
+                Some(0)
+            } else {
+                let footprint = self.status_footprint(pid).unwrap_or_else(|| {
+                    self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
+                        .flatten()
+                        .map(|pages| pages.saturating_mul(page_bytes))
+                });
+                let Some(confirm) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten()
+                else {
+                    continue;
+                };
+                if confirm.start != stat.start {
+                    continue;
+                }
+                footprint
             };
-            if confirm.start != stat.start {
-                continue;
-            }
             procs.push(ProcessReading {
                 pid,
                 start: u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok(),

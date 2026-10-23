@@ -87,7 +87,8 @@ pub(crate) struct UnscaledOutlineRef<'a> {
 }
 
 impl UnscaledOutlineRef<'_> {
-    /// The point range of the contour holding the last point where `f` answers true.
+    /// The point range of the contour holding the last point where `f`
+    /// answers true, and that point's index in it.
     pub(crate) fn find_last_contour(
         &self,
         mut f: impl FnMut(&UnscaledPoint) -> bool,

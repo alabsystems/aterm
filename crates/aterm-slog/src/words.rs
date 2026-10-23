@@ -5,26 +5,26 @@
 
 use crate::vocab::{BOX_WORDS, NEED_WORDS, OUT_WORDS, UNKNOWN, WALL_WORDS, lookup};
 
-/// A wall kind (`aterm_phase::WallKind::name()`'s words, §3.3).
+/// A wall kind (`aterm_phase::WallKind::name()`'s words).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WallKind {
-    /// `usage-session`
+    /// `usage-session`.
     UsageSession,
-    /// `usage-weekly`
+    /// `usage-weekly`.
     UsageWeekly,
-    /// `model-bucket`
+    /// `model-bucket`.
     ModelBucket,
-    /// `spend`
+    /// `spend`.
     Spend,
-    /// `context`
+    /// `context`.
     Context,
-    /// `auth`
+    /// `auth`.
     Auth,
-    /// `api-error`
+    /// `api-error`.
     ApiError,
-    /// `overloaded`
+    /// `overloaded`.
     Overloaded,
-    /// `memory`
+    /// `memory`.
     Memory,
 }
 
@@ -228,15 +228,15 @@ pub enum StepOut {
 /// A session's outcome: `ExitReason`'s tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionOut {
-    /// `shell-exit`
+    /// `shell-exit`.
     ShellExit,
-    /// `ctl-close`
+    /// `ctl-close`.
     CtlClose,
-    /// `ui-close`
+    /// `ui-close`.
     UiClose,
-    /// `window-close`
+    /// `window-close`.
     WindowClose,
-    /// `app-quit`
+    /// `app-quit`.
     AppQuit,
     /// The process went away (a synthetic close).
     Gone,
@@ -320,7 +320,7 @@ impl Out {
         }
     }
 
-    /// The outcome of a node closed because its parent closed (§2.3).
+    /// The outcome of a node closed because its parent closed.
     #[inline]
     #[must_use]
     pub const fn gone(lvl: crate::vocab::Lvl) -> Out {
@@ -335,7 +335,7 @@ impl Out {
     }
 }
 
-/// Precedence rank of a need word (§7.1).
+/// Precedence rank of a need word.
 #[must_use]
 pub fn need_rank(word: &str) -> u8 {
     match word {

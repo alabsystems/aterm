@@ -53,7 +53,8 @@ impl<'a> Users<'a> {
     /// `GET /rate_limit`.
     ///
     /// # Errors
-    /// The call's error.
+    /// The call's error; a protocol error when the answer lacks `resources` or an entry's `limit`,
+    /// `remaining` or `reset`.
     pub fn rate(&self, who: Option<&str>) -> Result<Vec<RateSnapshot>> {
         let route = match who {
             Some(profile) => {

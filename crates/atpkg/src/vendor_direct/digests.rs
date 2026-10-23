@@ -120,8 +120,9 @@ pub(crate) fn digests_path(layout: &Layout, program: &str) -> PathBuf {
 /// Check `digest` against the first digest seen for `(program, version, triple)` and, when
 /// `record`, record it if none was.
 /// # Errors
-/// An argument is malformed (not a vendor program, or a triple that is not `[a-z0-9_.]` words
-/// joined by `-`), the log exists but does not read, or it could not be locked or written.
+/// An argument is malformed (not a vendor program, or a triple that is not 2 to 5 `[a-z0-9_.]`
+/// words joined by `-`, at most 64 bytes), the log exists but does not read, or it could not be
+/// locked or written.
 pub(crate) fn record_or_conflict(
     layout: &Layout,
     program: &str,
@@ -173,6 +174,12 @@ pub(crate) fn record_or_conflict(
     Ok(DigestSeen::New)
 }
 
+/// The log at `path` as a map, empty when there is none yet; entries that do not
+/// re-validate are dropped alone.
+///
+/// # Errors
+/// A log that exists but does not read (malformed, oversized, not a regular file, another
+/// schema): read as empty, its first sightings would be overwritten unseen.
 fn read_log(path: &Path) -> io::Result<BTreeMap<Key, AuthenticatedDigest>> {
     let unreadable = || {
         io::Error::new(

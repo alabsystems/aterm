@@ -40,7 +40,7 @@ static EDIT_HOLD: Mutex<Holds> = Mutex::new(Holds {
     unwaited: BTreeSet::new(),
 });
 
-/// The map's lock, a leaf (see the module doc). Callers lock it themselves
+/// The map's lock, a leaf: nothing else is acquired while it is held. Callers lock it themselves
 /// (`edit_hold().lock_or_recover()`), so every acquisition carries the name.
 fn edit_hold() -> &'static Mutex<Holds> {
     &EDIT_HOLD

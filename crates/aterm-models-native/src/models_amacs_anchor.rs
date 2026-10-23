@@ -1,40 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `AmacsAnchor`: an edit script applied against `line:h6` anchors
-//! (docs/DESIGN-amacs-2026-10-19.md §7c, §4.9; slice S6).
-//!
-//! Invariants: AllOrNothing; AnchorExact (an op lands only on a hash match,
-//! unless `near=`); SubstituteUnique. Buggy mutants: OffByOne (`Buggy = 1`,
-//! in `LandExact`), PartialApply (2, in `LandExact`, `Relocate` and
-//! `Substitute`) and FirstMatchWins (3, in `Substitute`). Tier-1: the
-//! `#[cfg(test)]` conformance module in `crates/amacs/src/protocol/script.rs`,
-//! which drives the real per-op resolver and plan through every scenario of
-//! this model's box and writes each mutant as a planner the model must refuse.
+//! `AmacsAnchor`: formal model of an edit script applied against `line:h6` anchors.
 
 use aterm_spec::derive::Model;
 
-/// One plan of a two-op script (amacs's `protocol::script`).
-///
-/// Op 1 is anchored: its anchor names line `want` (1..`Lines`) with the h6 of
-/// some content, and in the pre-text that content sits at line `at` (0: it is
-/// gone). The model's hash is injective, so the anchor holds exactly where
-/// `at == want`. `near` is 1 when the script was given `near=Window`. Op 2 is
-/// a literal substitute whose old text occurs `matches` times, applied in
-/// `mode` 0 (it must be unique), 1 (`all`) or 2 (`nth=Nth`). The setup
-/// actions (phase 0) choose all of that; `Start` begins the plan.
-///
-/// The plan resolves the ops in order (phases 1 and 2): `landed` is the line
-/// op 1 lands on (0: refused), `replaced` how many matches op 2 replaces, and
-/// `staged` how many ops are in the plan. A refusal ends the plan (phase 4,
-/// `outcome = 2`); with both ops resolved, `Commit` writes the whole plan
-/// (`outcome = 1`). `applied` counts the ops whose edits reached the text.
-///
-/// Each mutant is its own dial, dead at `Buggy = 0`: an anchor checked one
-/// line off, landing on a line whose hash it never checked (`LandExact`,
-/// Buggy 1); each op's edits written into the text as it resolves, so a later
-/// refusal leaves the first behind (Buggy 2); and a unique substitute that
-/// takes the first of several matches (`Substitute`, Buggy 3).
+/// Formal model for two-op anchored edit script resolution and atomic commit.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn amacs_anchor_model() -> Model {

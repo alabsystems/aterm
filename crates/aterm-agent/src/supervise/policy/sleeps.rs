@@ -233,7 +233,9 @@ impl SleepBook {
         }
     }
 
-    /// THE SLEEP BEFORE THIS LOOP'S FIRST LOOK, at `now_ms`, that no read of its own measured: what the system's record and the ledger say of it ([module docs](self)).
+    /// THE SLEEP BEFORE THIS LOOP'S FIRST LOOK, at `now_ms`, that no read of its own measured: what
+    /// the system's record of its last sleep (`last`) and the sleep count on the ledger's last act
+    /// (`act`, against `now`) say of it.
     pub fn take_up(
         &mut self,
         now_ms: i64,

@@ -61,7 +61,9 @@ mod imp {
             reason = "dev_t and ino_t are narrower than u64 on some targets; widened as std widens them"
         )]
         pub(super) fn remove_if_still_ours(&self) -> bool {
-            // SAFETY: `stat` is POD, so zeroed is valid, and `lstat` writes it; `self.path` is a live NUL-terminated string.
+            // SAFETY: `stat` is POD, so zeroed is valid, and `lstat` writes it;
+            // `self.path` is a live NUL-terminated string. `lstat`/`unlink` are
+            // async-signal-safe.
             unsafe {
                 let mut now: libc::stat = std::mem::zeroed();
                 if libc::lstat(self.path.as_ptr(), &mut now) != 0
@@ -85,7 +87,9 @@ mod imp {
         /// Unlink the alias iff it still points where this instance pointed it.
         pub(super) fn remove_if_still_ours(&self) -> bool {
             let mut buf = [0u8; 1024];
-            // SAFETY: `buf` is a live, writable stack buffer of the passed length; `readlink` returns the byte count (no NUL), bounds-checked below.
+            // SAFETY: `buf` is a live, writable stack buffer of the passed length;
+            // `readlink` returns the byte count (no NUL), bounds-checked below.
+            // `readlink`/`unlink` are async-signal-safe.
             unsafe {
                 let n = libc::readlink(self.link.as_ptr(), buf.as_mut_ptr().cast(), buf.len());
                 let Ok(n) = usize::try_from(n) else {
@@ -327,7 +331,9 @@ mod imp {
     /// orderly quit's arm ran first) is left as it is.
     fn install_exit_handlers() {
         for sig in EXIT_SIGNALS {
-            // SAFETY: both `sigaction` structs are zeroed POD; the first call only reads the disposition, the second installs a valid `extern "C"` handler with an empty mask.
+            // SAFETY: both `sigaction` structs are zeroed POD; the first call only
+            // reads the disposition, the second installs a valid `extern "C"` handler
+            // with an empty mask. Runs at arm time, outside signal context.
             unsafe {
                 let mut old: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(sig, std::ptr::null(), &mut old) != 0

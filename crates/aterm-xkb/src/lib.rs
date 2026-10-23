@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! First-party libxkbcommon for aterm: the entry points the keyboard handling
-//! calls, read at run time through `aterm-dl`, their types and constants, and
-//! the keysyms it names ([`keysym`]).
-//!
-//! It replaces xkbcommon-dl and xkeysym on Linux
-//! (docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6; the winit
-//! fork's Linux backend moves onto it at LW.7). Each row of [`Xkb`],
-//! [`XkbCompose`] and [`XkbX11`] transcribes a prototype of libxkbcommon's
-//! `xkbcommon.h`, `xkbcommon-compose.h` and `xkbcommon-x11.h`: the 26
-//! keymap, state and keysym calls, the 9 compose calls and the 4 X11 calls
-//! that aterm's key handling and its tests make. The C enums are their
-//! `int`-sized values as `u32` constants.
-//!
-//! The libraries are `libxkbcommon.so.0` and `libxkbcommon-x11.so.0`, each
-//! opened once per process and never closed.
+//! Dynamic `libxkbcommon` and `libxkbcommon-x11` bindings and keysym tables.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;

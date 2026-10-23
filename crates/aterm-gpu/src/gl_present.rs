@@ -62,10 +62,16 @@ pub(crate) struct GlPosted {
     /// The frame's size, and the destination's.
     frame: (u32, u32),
     dest: (u32, u32),
-    /// What the effects drew over the present copy the blit sampled, frame
-    /// pixels: `Some([0; 4])` nothing (the blit sampled the clean
-    /// offscreen), `None` unbounded.
+    /// What the effects other than the bloom and the tray card drew over the
+    /// present copy the blit sampled, frame pixels: `Some([0; 4])` nothing
+    /// (the blit sampled the clean offscreen), `None` unbounded.
     fx: Option<[u32; 4]>,
+    /// The bloom's scissor, frame pixels, as `fx`: `Some([0; 4])` where no
+    /// bloom drew.
+    bloom: Option<[u32; 4]>,
+    /// The tray card drawn: its rect, frame pixels, and its upload
+    /// (`GlTrayCard::serial`).
+    tray: Option<([u32; 4], u64)>,
     /// The crown's scissor in the blit pass, destination pixels; `[0; 4]`
     /// where no crown drew.
     crown: [u32; 4],
@@ -77,7 +83,10 @@ pub(crate) struct GlPosted {
 /// destination pixels, or `None` for all of it. All of it where nothing was
 /// posted or the blit or a size moved; otherwise what changed in the frame
 /// (`dirty`, with the effects over the copy at the last post and at this
-/// one) carried through the blit, with both crowns.
+/// one) carried through the blit, with both crowns. A bloom held (drawn from
+/// the same inputs at both posts, `bloom_held`) adds nothing: it blends the
+/// same glow over each texel, so only the texels written show anew under it.
+/// Nor does the same tray card at the same place, for the same reason.
 #[cfg_attr(
     all(wgpu_arm, not(test)),
     expect(dead_code, reason = "a build with wgpu posts windows on wgpu")
@@ -86,13 +95,26 @@ fn post_damage(
     last: Option<&GlPosted>,
     now: &GlPosted,
     dirty: Option<[u32; 4]>,
+    bloom_held: bool,
 ) -> Option<[u32; 4]> {
     let last = last?;
     let same_blit = aterm_bits::bytes_of(&last.blit) == aterm_bits::bytes_of(&now.blit);
     if !same_blit || last.frame != now.frame || last.dest != now.dest {
         return None;
     }
-    let changed = union_rect_opt(union_rect_opt(dirty, last.fx, now.frame), now.fx, now.frame)?;
+    let both = |held: bool, a: Option<[u32; 4]>, b: Option<[u32; 4]>| {
+        if held {
+            Some([0, 0, 0, 0])
+        } else {
+            union_rect_opt(a, b, now.frame)
+        }
+    };
+    let card = |t: Option<([u32; 4], u64)>| Some(t.map_or([0, 0, 0, 0], |(rect, _)| rect));
+    let bloom = both(bloom_held, last.bloom, now.bloom);
+    let tray = both(last.tray == now.tray, card(last.tray), card(now.tray));
+    let changed = [last.fx, now.fx, bloom, tray]
+        .into_iter()
+        .try_fold(dirty?, |acc, r| union_rect_opt(Some(acc), r, now.frame))?;
     let placed = blit_footprint(&now.blit, changed, now.dest);
     union_rect_opt(
         union_rect_opt(Some(placed), Some(last.crown), now.dest),
@@ -211,7 +233,9 @@ fn ensure_offscreen_family(
     if fits {
         return Ok(false);
     }
-    *slot = None;
+    if let Some(old) = slot.take() {
+        old.retire();
+    }
     let (format, alias) = offscreen_format(&live.dev);
     *slot = Some(live.dev.texture_2d(format, w, h, alias)?);
     Ok(true)
@@ -344,7 +368,12 @@ impl GpuRenderer {
             .map(|o| (o.w, o.h))
             .ok_or("the armed frame's GL offscreen is absent")?;
         debug_assert_eq!(off_dims, (fw, fh), "the present composes the encoded frame");
-        if use_present_off && ensure_offscreen_family(live, &mut win.gl_present_off, (fw, fh))? {
+        let (format, alias) = offscreen_format(&live.dev);
+        if use_present_off
+            && live
+                .dev
+                .texture_2d_resizing(&mut win.gl_present_off, format, fw, fh, alias)?
+        {
             win.offscreen_dirty_since_sync = None;
             win.present_offscreen_fx = None;
         }
@@ -401,34 +430,39 @@ impl GpuRenderer {
                     w: t.pw,
                     h: t.ph,
                     pixels,
+                    serial: self.tray_uploads,
                 });
             }
         }
+        let bloom_uniforms = bloom_state.map(|_| {
+            (
+                Uniforms {
+                    screen: [fw as f32, fh as f32],
+                    text_blend: text_blend as f32,
+                    _pad: 0.0,
+                },
+                BloomUniform {
+                    texel: [1.0 / bw as f32, 1.0 / bh as f32],
+                    strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
+                    radius: self.bloom_radius,
+                    chroma_radius: bloom_chroma_radius(self.bloom_radius),
+                    _pad: [0.0; 3],
+                },
+            )
+        });
         let mut bufs = live.present.take().expect("minted above");
         let staged = (|| -> Result<(), String> {
             live.dev
                 .write_buffer(&bufs.blit, aterm_bits::bytes_of(&want))?;
-            if let Some((count, _, extract_first)) = bloom_state {
+            if let (Some((count, _, extract_first)), Some((cell, bloom))) =
+                (bloom_state, bloom_uniforms.as_ref())
+            {
                 let insts = &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
                 upload_glow(live, &mut bufs.extract, aterm_bits::cast_slice(insts))?;
-                live.dev.write_buffer(
-                    &bufs.bloom_cell,
-                    aterm_bits::bytes_of(&Uniforms {
-                        screen: [fw as f32, fh as f32],
-                        text_blend: text_blend as f32,
-                        _pad: 0.0,
-                    }),
-                )?;
-                live.dev.write_buffer(
-                    &bufs.bloom,
-                    aterm_bits::bytes_of(&BloomUniform {
-                        texel: [1.0 / bw as f32, 1.0 / bh as f32],
-                        strength: page_bloom_strength(self.bloom_strength, input, self.theme.bg),
-                        radius: self.bloom_radius,
-                        chroma_radius: bloom_chroma_radius(self.bloom_radius),
-                        _pad: [0.0; 3],
-                    }),
-                )?;
+                live.dev
+                    .write_buffer(&bufs.bloom_cell, aterm_bits::bytes_of(cell))?;
+                live.dev
+                    .write_buffer(&bufs.bloom, aterm_bits::bytes_of(bloom))?;
             }
             if let Some(region) = shimmer_region.as_ref() {
                 let mut heat = [[0f32; 4]; SHIMMER_BANDS / 4];
@@ -508,6 +542,19 @@ impl GpuRenderer {
             }
             .filter(|[sx0, sy0, sx1, sy1]| sx1 > sx0 && sy1 > sy0)
         });
+        win.gl_bloom_inputs.clear();
+        if let (Some((count, _, extract_first)), Some((cell, bloom))) =
+            (bloom_state, bloom_uniforms.as_ref())
+        {
+            let insts = &self.bloom_glow_scratch[extract_first as usize..][..count as usize];
+            let inputs = &mut win.gl_bloom_inputs;
+            inputs.extend_from_slice(aterm_bits::cast_slice(insts));
+            inputs.extend_from_slice(aterm_bits::bytes_of(cell));
+            inputs.extend_from_slice(aterm_bits::bytes_of(bloom));
+            for v in bloom_scissor.unwrap_or([u32::MAX; 4]) {
+                inputs.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         let copy_rect = present_copy_rect(
             win.offscreen_dirty_since_sync,
             win.present_offscreen_fx,
@@ -685,8 +732,12 @@ impl GpuRenderer {
         }
         frame.submit()?;
         let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
+        let bloom = if bloom_state.is_some() {
+            bloom_scissor
+        } else {
+            Some([0, 0, 0, 0])
+        };
         if use_present_off {
-            fx = union_rect_opt(fx, bloom_scissor, (fw, fh));
             if let Some(region) = shimmer_region.as_ref() {
                 fx = union_rect_opt(
                     fx,
@@ -694,17 +745,27 @@ impl GpuRenderer {
                     (fw, fh),
                 );
             }
-            for footprint in [band_fx, tray_fx].into_iter().flatten() {
+            if let Some(footprint) = band_fx {
                 fx = union_rect_opt(fx, Some(footprint), (fw, fh));
             }
             win.offscreen_dirty_since_sync = Some([0, 0, 0, 0]);
-            win.present_offscreen_fx = fx;
+            win.present_offscreen_fx = union_rect_opt(
+                union_rect_opt(fx, bloom, (fw, fh)),
+                Some(tray_fx.unwrap_or([0, 0, 0, 0])),
+                (fw, fh),
+            );
         }
+        let tray = tray_fx.map(|rect| {
+            let card = win.gl_tray_card.as_ref().expect("uploaded above");
+            (rect, card.serial)
+        });
         let posted = GlPosted {
             blit: want,
             frame: (fw, fh),
             dest: (dw, dh),
             fx,
+            bloom,
+            tray,
             crown: crown_drawn,
         };
         if win.video.is_some() || win.presented_snapshot.is_some() {
@@ -1047,15 +1108,20 @@ impl GpuRenderer {
         win.last_present_encode_ns = win.last_present_work_ns;
         let live = self.gl_arm.as_ref().expect("checked above");
         let fill = frame_live_bg(input, self.theme.bg);
+        let bloom_held =
+            !win.gl_bloom_inputs.is_empty() && win.gl_bloom_inputs == win.gl_posted_bloom;
         let damage = post_damage(
             win.gl_posted.as_ref(),
             &composed,
             win.offscreen_dirty_since_post,
+            bloom_held,
         );
         let posted = win.measure_surface_acquire(|| gs.present(&live.dev, fill, damage));
+        live.dev.free_retired();
         win.gl_posted = posted.is_ok().then_some(composed);
         if posted.is_ok() {
             win.offscreen_dirty_since_post = Some([0, 0, 0, 0]);
+            std::mem::swap(&mut win.gl_posted_bloom, &mut win.gl_bloom_inputs);
         }
         posted.map_err(|e| {
             gl_arm_note(&format!("armed present: the post failed ({e})"));
@@ -1090,6 +1156,8 @@ mod tests {
             frame: (800, 600),
             dest,
             fx: Some([0, 0, 0, 0]),
+            bloom: Some([0, 0, 0, 0]),
+            tray: None,
             crown: [0, 0, 0, 0],
         }
     }
@@ -1143,38 +1211,41 @@ mod tests {
         let row = Some([0, 40, 800, 70]);
         let fit = posted([0.0, 0.0], (800, 600));
         assert_eq!(
-            post_damage(None, &fit, row),
+            post_damage(None, &fit, row, false),
             None,
             "the first post is whole"
         );
-        assert_eq!(post_damage(Some(&fit), &fit, row), Some([0, 40, 800, 70]));
         assert_eq!(
-            post_damage(Some(&fit), &fit, Some([0, 0, 0, 0])),
+            post_damage(Some(&fit), &fit, row, false),
+            Some([0, 40, 800, 70])
+        );
+        assert_eq!(
+            post_damage(Some(&fit), &fit, Some([0, 0, 0, 0]), false),
             Some([0, 0, 0, 0]),
             "nothing written, nothing posted"
         );
         assert_eq!(
-            post_damage(Some(&fit), &fit, None),
+            post_damage(Some(&fit), &fit, None, false),
             None,
             "unknown is whole"
         );
 
         let placed = posted([3.0, 5.0], (806, 610));
         assert_eq!(
-            post_damage(Some(&placed), &placed, row),
+            post_damage(Some(&placed), &placed, row, false),
             Some([3, 45, 803, 75]),
             "frame pixels land at the blit's placement"
         );
         let half = posted([2.5, 0.5], (806, 610));
         assert_eq!(
-            post_damage(Some(&half), &half, row),
+            post_damage(Some(&half), &half, row, false),
             Some([2, 40, 803, 71]),
             "a fractional placement covers both pixels a texel can reach"
         );
         let mut chrome = placed;
         chrome.blit.chrome_y1 = 30.0;
         assert_eq!(
-            post_damage(Some(&chrome), &chrome, row),
+            post_damage(Some(&chrome), &chrome, row, false),
             Some([0, 45, 806, 75]),
             "beside chrome the bands repeat the frame's edge: the whole width"
         );
@@ -1182,12 +1253,12 @@ mod tests {
         let mut flash = fit;
         flash.blit.flag = 1;
         assert_eq!(
-            post_damage(Some(&fit), &flash, row),
+            post_damage(Some(&fit), &flash, row, false),
             None,
             "a new blit is whole"
         );
         assert_eq!(
-            post_damage(Some(&fit), &posted([0.0, 0.0], (801, 600)), row),
+            post_damage(Some(&fit), &posted([0.0, 0.0], (801, 600)), row, false),
             None,
             "a new size is whole"
         );
@@ -1195,24 +1266,84 @@ mod tests {
         let mut halo = fit;
         halo.fx = Some([100, 300, 200, 400]);
         assert_eq!(
-            post_damage(Some(&halo), &fit, row),
+            post_damage(Some(&halo), &fit, row, false),
             Some([0, 40, 800, 400]),
             "an effect gone since the last post is damage"
         );
         assert_eq!(
-            post_damage(Some(&fit), &halo, row),
+            post_damage(Some(&fit), &halo, row, false),
             Some([0, 40, 800, 400]),
             "an effect drawn now is damage"
         );
         let mut unbounded = fit;
         unbounded.fx = None;
-        assert_eq!(post_damage(Some(&unbounded), &fit, row), None);
+        assert_eq!(post_damage(Some(&unbounded), &fit, row, false), None);
         let mut crowned = fit;
         crowned.crown = [10, 500, 20, 520];
         assert_eq!(
-            post_damage(Some(&crowned), &fit, row),
+            post_damage(Some(&crowned), &fit, row, false),
             Some([0, 40, 800, 520]),
             "a crown gone since the last post is damage"
+        );
+
+        let mut bloomed = fit;
+        bloomed.bloom = Some([0, 0, 800, 600]);
+        assert_eq!(
+            post_damage(Some(&bloomed), &bloomed, row, true),
+            Some([0, 40, 800, 70]),
+            "a bloom held since the last post shows only the texels written under it"
+        );
+        assert_eq!(
+            post_damage(Some(&bloomed), &bloomed, row, false),
+            Some([0, 0, 800, 600]),
+            "a bloom drawn from new inputs is damage over its scissor"
+        );
+        assert_eq!(
+            post_damage(Some(&bloomed), &fit, row, false),
+            Some([0, 0, 800, 600]),
+            "a bloom gone since the last post is damage"
+        );
+        let mut spread = fit;
+        spread.bloom = None;
+        assert_eq!(post_damage(Some(&fit), &spread, row, false), None);
+        assert_eq!(
+            post_damage(Some(&spread), &spread, row, true),
+            Some([0, 40, 800, 70]),
+            "an unscissored bloom held is no damage of its own either"
+        );
+        let mut both = halo;
+        both.bloom = Some([0, 0, 800, 600]);
+        assert_eq!(
+            post_damage(Some(&both), &both, row, true),
+            Some([0, 40, 800, 400]),
+            "a held bloom leaves the other effects' damage"
+        );
+
+        let mut card = fit;
+        card.tray = Some(([0, 0, 800, 30], 7));
+        assert_eq!(
+            post_damage(Some(&card), &card, row, false),
+            Some([0, 40, 800, 70]),
+            "the same card at the same place shows nothing new"
+        );
+        let mut redrawn = card;
+        redrawn.tray = Some(([0, 0, 800, 30], 8));
+        assert_eq!(
+            post_damage(Some(&card), &redrawn, row, false),
+            Some([0, 0, 800, 70]),
+            "a new card is damage"
+        );
+        let mut moved = card;
+        moved.tray = Some(([0, 500, 800, 530], 7));
+        assert_eq!(
+            post_damage(Some(&card), &moved, row, false),
+            Some([0, 0, 800, 530]),
+            "a card moved is damage where it was and where it is"
+        );
+        assert_eq!(
+            post_damage(Some(&card), &fit, row, false),
+            Some([0, 0, 800, 70]),
+            "a card gone is damage"
         );
     }
 }

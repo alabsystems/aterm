@@ -2,30 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! agent-gate: a per-agent decision is an exhaustive `match`
-//! (docs/DESIGN-harness-plugins-2026-10-15.md §2).
-//!
-//! `aterm_phase::Program` and `upgrade::Agent` are closed enums, so a `match`
-//! on one makes the compiler name every site a new agent must answer. An
-//! equality test (`agent == Program::Claude`), a `matches!` or a refutable
-//! `let` pattern on a variant compiles cleanly past a new variant, which
-//! silently takes its else branch. Read over the shipped code of the crates
-//! that decide per agent, the whole file at once (a test the formatter wraps
-//! still reads as one); an agent's own module (a directory or file naming
-//! the agent, `claude` or `codex`) decides for that agent alone and is not
-//! read. A variant built as a value (`program: Program::Claude`, an argument,
-//! a `let` initialiser) or matched in an arm is no test.
-//!
-//! The agents are read from the two enums' declarations ([`AGENT_ENUMS`]),
-//! never listed here, so a new agent is fenced the day its variant lands.
+//! `agent-gate`: requires per-agent decisions on `aterm_phase::Program` and `upgrade::Agent` to use an exhaustive `match` rather than `==`, `!=`, `matches!`, or refutable `let` patterns.
 
 use std::ops::Range;
 
 use super::rules::test_path;
 use super::{Bound, Finding, Rule, SourceFile, Tree, after_ws, has, hits, is_word};
 
-/// The crates whose code decides per agent (aterm-gui's with its split-out
-/// libraries, `crates/aterm-gui-*`).
+/// Crates whose shipped source is checked for per-agent decisions.
 const AGENT_CRATES: &[&str] = &[
     "crates/aterm-agent/src/",
     "crates/aterm-gui/src/",
@@ -33,9 +17,7 @@ const AGENT_CRATES: &[&str] = &[
     "crates/aterm-phase/src/",
 ];
 
-/// Where the agent enums are declared, and each one's name: every variant
-/// but `Generic` (no agent) is an agent the guard fences, under any path
-/// prefix (`Program::Codex`, `upgrade::Agent::Codex`).
+/// Declarations of the agent enums; every variant except `Generic` is fenced.
 const AGENT_ENUMS: &[(&str, &str)] = &[
     ("crates/aterm-phase/src/reader.rs", "Program"),
     ("crates/aterm-agent/src/harness/upgrade.rs", "Agent"),
@@ -53,7 +35,6 @@ pub(super) const AGENT_GATE: Rule = Rule {
 fn agent_gate(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let mut variants = Vec::new();
     for (rel, name) in AGENT_ENUMS {
-        // Fail closed: with no declaration to read, nothing would be fenced.
         let Some(agents) = tree.corpus.get(rel).and_then(|f| enum_variants(f, name)) else {
             out.push(Finding {
                 rule: AGENT_GATE.id,
@@ -70,7 +51,6 @@ fn agent_gate(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 .map(|v| format!("{name}::{v}")),
         );
     }
-    // `Program::Codex` → `::Codex` (the prefilter) and `codex` (its own module).
     let tails: Vec<&str> = variants
         .iter()
         .filter_map(|v| v.rfind("::").map(|at| &v[at..]))
@@ -95,16 +75,13 @@ fn agent_gate(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     }
 }
 
-/// Is `rel` a file of one agent's own module: a directory or file naming
-/// one of `agents` (`claude`, `codex`)?
+/// Returns true if `rel` is inside an agent-specific module or file (`claude`, `codex`, etc.).
 fn agents_own(rel: &str, agents: &[String]) -> bool {
     rel.split('/')
         .any(|part| agents.iter().any(|agent| part.contains(agent.as_str())))
 }
 
-/// The variants of `enum <name>` as `file` declares it, in order: each line
-/// of its body that opens with a variant's name (attributes and doc comments
-/// aside). `None` where the file declares no such enum.
+/// Extracts the variant identifiers declared on `enum <name>` in `file`.
 fn enum_variants(file: &SourceFile, name: &str) -> Option<Vec<String>> {
     let mut lines = file.lines();
     lines.find(|l| {
@@ -134,8 +111,7 @@ fn enum_variants(file: &SourceFile, name: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Each of `variants` `code` tests, in order: its offset, its name and the
-/// form of the test.
+/// Finds non-exhaustive variant checks in `code`, returning `(offset, variant, form)`.
 fn gates<'v>(code: &str, variants: &'v [String]) -> Vec<(usize, &'v str, &'static str)> {
     let invocations = matches_args(code);
     let mut found: Vec<_> = variants
@@ -159,8 +135,7 @@ fn gates<'v>(code: &str, variants: &'v [String]) -> Vec<(usize, &'v str, &'stati
     found
 }
 
-/// Where the path whose last two segments sit at `at` starts: back over each
-/// `segment::` before it (`aterm_phase::`, `upgrade::`, a leading `::`).
+/// Walks backward across leading `segment::` prefixes to the start of the path at `at`.
 fn path_start(code: &str, mut at: usize) -> usize {
     let b = code.as_bytes();
     while code[..at].ends_with("::") {
@@ -172,8 +147,7 @@ fn path_start(code: &str, mut at: usize) -> usize {
     at
 }
 
-/// Is the operand `code[start..end]` (the variant, under any `&` and
-/// `Some(…)` around it) one side of `==` or `!=`?
+/// Returns true if `code[start..end]` (including surrounding `&` or `Some(...)`) is an operand of `==` or `!=`.
 fn compared(code: &str, start: usize, end: usize) -> bool {
     let mut before = code[..start].trim_end();
     let mut open = 0;
@@ -206,16 +180,14 @@ fn compared(code: &str, start: usize, end: usize) -> bool {
         || after.starts_with("!=")
 }
 
-/// Does the path starting at `start` sit in a `let` pattern: a `let` before
-/// it with no `=` or `;` between? A variant sits there only refutably (`if
-/// let`, `while let`, `let … else`).
+/// Returns true if the path at `start` appears in a refutable `let` pattern.
 fn in_let_pattern(code: &str, start: usize) -> bool {
     let head = &code[..start];
     let from = head.rfind(['=', ';']).map_or(0, |at| at + 1);
     has(&head[from..], "let", Bound::Word)
 }
 
-/// The byte range of each `matches!` invocation, delimiters included.
+/// Byte ranges of all `matches!` invocations in `code`, including delimiters.
 fn matches_args(code: &str) -> Vec<Range<usize>> {
     let b = code.as_bytes();
     let mut out = Vec::new();
@@ -251,8 +223,7 @@ mod tests {
     use super::super::tests::{run, spots};
     use super::*;
 
-    /// The two enums as their files declare them, with `extra` agents
-    /// before `Generic`.
+    /// Synthetic enum declarations with `extra` variants inserted before `Generic`.
     fn enums(extra: &str) -> [(&'static str, String); 2] {
         [
             (
@@ -271,7 +242,7 @@ mod tests {
         ]
     }
 
-    /// The rule's findings over `files` beside the two enums.
+    /// Runs `AGENT_GATE` over `files` alongside the synthetic enum declarations.
     fn gate(extra: &str, files: &[(&str, &str)]) -> Vec<Finding> {
         let enums = enums(extra);
         let mut all: Vec<(&str, &str)> = enums
@@ -282,7 +253,7 @@ mod tests {
         run(&AGENT_GATE, &all)
     }
 
-    /// Each form of an agent test, with the line it fires on.
+    /// Every non-exhaustive agent test form is flagged on the expected line.
     #[test]
     fn every_form_of_an_agent_test_is_found() {
         let cases: &[(&str, &str, usize)] = &[
@@ -382,8 +353,7 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
-    /// An agent added to `Program` is fenced with no edit here, and its own
-    /// module is exempt by its name.
+    /// A newly declared `Program` variant is automatically fenced outside its own module.
     #[test]
     fn a_new_variant_is_fenced_from_its_declaration() {
         let src = "fn f(a: Program) -> bool {\n    a == Program::Gemini\n}\n\
@@ -402,12 +372,10 @@ mod tests {
                 "crates/aterm-gui/src/harness_host.rs:5"
             ]
         );
-        // Not yet declared, it is nobody's variant.
         assert!(gate("", &[("crates/aterm-gui/src/harness_host.rs", src)]).is_empty());
     }
 
-    /// With an enum's declaration missing, the guard says so rather than
-    /// fence nothing.
+    /// Missing enum declarations fail closed with a finding on the declaration file.
     #[test]
     fn a_missing_declaration_fails_closed() {
         let gated = "fn f(a: Program) -> bool {\n    a == Program::Claude\n}\n";

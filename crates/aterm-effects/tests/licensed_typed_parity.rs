@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The move license (`docs/design/EFFECTS-LICENSE-REDESIGN.md`), per style,
-//! through the public API: a licensed move earns light, an unlicensed one
-//! mints none, and neither wipes the light already earned.
-//!
-//! The light census reads whichever engine owns the frame (`live_light`): the
-//! rainbow kitty is its v2 engine, whose light is ribbon cells, stars and
-//! meteors, never a v1 spark, so for that style the census reads the `Status`
-//! rows `trail status` reports; the other styles read `live_sparks`.
+//! Move-license parity tests across styles: licensed moves earn light, unlicensed
+//! moves mint none, and neither wipes resident light.
 
 use std::time::{Duration, Instant};
 
@@ -39,7 +33,6 @@ fn geom() -> Geom {
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
         classic_mono: false,
-        // The shipping default; explicit underline geometry has its own pins.
         ribbon_tall: true,
         ribbon_flat: false,
         enabled: true,
@@ -71,10 +64,7 @@ fn trail_cfg() -> TrailConfig {
     }
 }
 
-/// The live per-cell light population from whichever engine owns the frame:
-/// v2's resident ribbon cells + live stars + live meteors while the rainbow
-/// kitty's engine is engaged (`CursorGlow::v2_status` is `Some` exactly then),
-/// v1's spark census for every other style.
+/// Live light population from whichever engine (`v2_status` or `live_sparks`) owns the frame.
 fn live_light(glow: &CursorGlow) -> usize {
     glow.v2_status().map_or_else(
         || glow.live_sparks(),
@@ -82,23 +72,13 @@ fn live_light(glow: &CursorGlow) -> usize {
     )
 }
 
-/// The resident typed band: the cells the ribbon holds, lit or not. Under v2
-/// `CursorGlow::ribbon_segments` answers what is lit (after the edge-in fade),
-/// so on the frame a press lays its first cell it reads 0 while the cell is
-/// resident; `Status::cells` keeps the resident count. For other styles the
-/// two readings agree.
+/// Resident ribbon cell count from `v2_status` or `ribbon_segments`.
 fn resident_ribbon(glow: &CursorGlow) -> usize {
     glow.v2_status()
         .map_or_else(|| glow.ribbon_segments(), |s| s.cells as usize)
 }
 
-/// A typed script, the shape the license exists to admit: six glyph echoes at
-/// human cadence, a wrap at the right margin, three more glyphs on the new
-/// row, a gesture jump, and the decay tail.
-///
-/// With `licensed` false the identical trajectory arrives with no key hint
-/// behind it (cold program movement), so the difference between the two folds
-/// is the license alone.
+/// Summary of a scripted typing and jump trajectory with or without license hints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TypedScriptOutcome {
     fingerprint: u64,
@@ -146,9 +126,7 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
             }
         };
 
-    // Seed the anchor.
     step(&mut glow, &mut trail, t0, (2, 30));
-    // Six typed glyph echoes at 90 ms — the licensed typing run.
     for k in 1..=6u64 {
         let at = t0 + Duration::from_millis(90 * k);
         if licensed {
@@ -157,7 +135,6 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
         }
         step(&mut glow, &mut trail, at, (2, 30 + k as u16));
     }
-    // The wrap at the right margin, then three glyphs on the new row.
     for (k, cell) in [(7u64, (3u16, 0u16)), (8, (3, 1)), (9, (3, 2))] {
         let at = t0 + Duration::from_millis(90 * k);
         if licensed {
@@ -166,14 +143,12 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
         }
         step(&mut glow, &mut trail, at, cell);
     }
-    // A licensed gesture jump.
     let jump = t0 + Duration::from_millis(1_100);
     if licensed {
         glow.note_synthetic_move(jump);
         trail.note_synthetic_move(jump);
     }
     step(&mut glow, &mut trail, jump, (5, 30));
-    // The decay tail.
     for ms in [1_150u64, 1_400, 2_200, 4_000] {
         let at = t0 + Duration::from_millis(ms);
         step(&mut glow, &mut trail, at, (5, 30));
@@ -189,8 +164,7 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
     }
 }
 
-/// Earned light is never destroyed by someone else's output: a cold program
-/// move must not wipe the ribbon a licensed typed run laid.
+/// A cold program move does not wipe resident light or comet cells earned by a licensed typed move.
 #[test]
 fn earned_light_survives_a_cold_program_move() {
     let g = geom();
@@ -204,7 +178,6 @@ fn earned_light_survives_a_cold_program_move() {
         let t0 = Instant::now();
         glow.tick(Some((2, 3)), t0, &c, g, &mut out);
         trail.tick(Some((2, 3)), t0, &tc, &mut trail_out);
-        // A licensed typed echo earns real light…
         let typed = t0 + Duration::from_millis(8);
         glow.note_synthetic_typed(typed, 1);
         trail.note_synthetic_typed(typed);
@@ -214,8 +187,6 @@ fn earned_light_survives_a_cold_program_move() {
         let earned_trail = trail_out.len();
         assert!(earned > 0, "{style:?}: the typed echo must earn light");
         assert!(earned_trail > 0, "{style:?}: the comet must exist");
-        // …and a cold program hop at the same instant (so nothing can decay) leaves every cell
-        // of it alone.
         glow.tick(Some((4, 20)), typed, &c, g, &mut out);
         trail.tick(Some((4, 20)), typed, &tc, &mut trail_out);
         assert_eq!(
@@ -231,11 +202,7 @@ fn earned_light_survives_a_cold_program_move() {
     }
 }
 
-/// One keypress can present as several cursor deltas when the response is
-/// split across parser batches. The key's one-shot license belongs to the
-/// first observed move; a later suffix in the same freshness window neither
-/// borrows it nor erases the light the first batch earned, but becomes the
-/// source anchor for what arrives next.
+/// The first move after a keypress consumes the one-shot license; a split-batch suffix stays dark while advancing anchors.
 #[test]
 fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
     let g = geom();
@@ -250,8 +217,6 @@ fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
     glow.tick(Some((2, 3)), t0, &c, g, &mut out);
     trail.tick(Some((2, 3)), t0, &tc, &mut trail_out);
 
-    // The physical press is stamped once at the input boundary. Its first
-    // parser batch moves the caret and consumes that one-shot license.
     let first = t0 + Duration::from_millis(8);
     glow.note_typed_cells(first, 1);
     trail.note_typed(first);
@@ -275,9 +240,6 @@ fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
     assert!(!glow.move_licensed(first), "the glow license is one-shot");
     assert!(!trail.move_licensed(first), "the trail license is one-shot");
 
-    // The response's suffix lands in a later parser batch while the original
-    // timestamp would still be fresh. It owns no second license: no births,
-    // no resident wipe, but both engines must track its real destination.
     let suffix = first + Duration::from_millis(1);
     glow.tick(Some((2, 5)), suffix, &c, g, &mut out);
     trail.tick(Some((2, 5)), suffix, &tc, &mut trail_out);
@@ -323,10 +285,6 @@ const ALL_STYLES: [GlowStyle; 9] = [
     GlowStyle::Water,
     GlowStyle::Comet,
 ];
-// `GlowStyle::Classic` is absent: every test here asserts that a style draws
-// nothing for a move no keystroke asked for, and the classic engine does not
-// consult the license (it spawns on observed cursor motion). Its idle-zero pin
-// lives in `classic_wake`.
 
 #[test]
 fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
@@ -343,7 +301,6 @@ fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
         let pressed = t0 + Duration::from_millis(8);
         if backspace {
             glow.note_backspace_erasing(pressed, Some(1));
-            // The host maps Backspace to the trail's typed hint.
             trail.note_typed(pressed);
         }
         let echoed = pressed + delay;
@@ -353,8 +310,6 @@ fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
         (glow.spawns(), trail_out.len(), glow.admission_tally())
     };
 
-    // A fresh Backspace really reaches both move engines; an unkeyed retreat
-    // reaches neither. These are injected event times, not elapsed waits.
     let fresh = retreat(GlowStyle::Fire, Duration::from_millis(8), true);
     assert_eq!(fresh.0, 1);
     assert!(fresh.1 > 0);
@@ -365,8 +320,6 @@ fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
         Some(CursorGlow::DECLINE_NO_FRESH_HINT)
     );
 
-    // Rainbow Kitty's erase ledger may still owe its retreat after the ordinary
-    // hint expires. Keep that intended extension while the trail stays dark.
     let rainbow = retreat(GlowStyle::RainbowKitty, Duration::from_secs(1), true);
     assert_eq!(rainbow.0, 1);
     assert_eq!(rainbow.1, 0);
@@ -385,9 +338,7 @@ fn a_delayed_backspace_extends_only_rainbow_kittys_move_licence() {
     }
 }
 
-/// The identical script with key hints withheld (cold program movement over
-/// the same trajectory) is declined move by move and mints no light, in every
-/// style, while the licensed script admits every move.
+/// Withholding key hints declines every move and mints no light across all styles.
 #[test]
 fn an_unlicensed_script_mints_nothing_the_licensed_one_lays() {
     for &style in &ALL_STYLES {

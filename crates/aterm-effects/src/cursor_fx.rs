@@ -19,7 +19,7 @@ use crate::cursor_phaser::{CursorPhaser, PhaserConfig};
 use crate::cursor_rainbow::{CursorRainbow, RainbowConfig};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
 
-/// The cursor family's engines and per-frame scratch, one per drawing surface (a native window, a web page); holds no flash budget.
+/// Cursor effect engines and per-frame scratch for one drawing surface.
 #[derive(Default)]
 pub struct CursorFx {
     /// The aurora — every style's light, the rainbow kitty ribbon included.

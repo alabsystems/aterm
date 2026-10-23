@@ -12,7 +12,6 @@ use super::Grid;
 
 impl Grid {
     /// Extract the whole off-screen scrollback as logical [`Line`]s.
-    // COST: UNBOUNDED(ring+tiered-history-lines) — materializes the entire off-screen scrollback.
     // COST: UNBOUNDED(ring+tiered-history-lines) — materializes the entire
     // off-screen scrollback. Must stay behind the `resize_offloading_scrollback`
     // detach on any main-thread-reachable path (`aterm-census --mainloop`).
@@ -39,14 +38,13 @@ impl Grid {
     }
 
     /// Extract only the ring's scrollback rows as logical [`Line`]s (oldest first).
-    // COST: O(ring-scrollback-rows): bounded by the ring capacity (a construction-time constant).
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
+    // construction-time constant), not by session history.
     pub(super) fn take_ring_scrollback_lines(&mut self) -> Vec<Line> {
         self.take_older_ring_scrollback_lines(0)
     }
 
     /// Extract the ring's scrollback rows but the `keep` newest as logical [`Line`]s.
-    // COST: O(ring-scrollback-rows): bounded by the ring capacity (a construction-time constant).
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
     // construction-time constant), not by session history.
     pub(super) fn take_older_ring_scrollback_lines(&mut self, keep: usize) -> Vec<Line> {
@@ -140,7 +138,8 @@ impl Grid {
             for line in &lines[..skip] {
                 let (row, extras) = self.build_scrollback_row(line, new_cols);
                 self.storage.lazy_buffer.push_row(&row, extras);
-                // SAFETY: Build_scrollback_row allocated this temporary row in self.storage.pages.
+                // SAFETY: build_scrollback_row allocated this temporary row in
+                // self.storage.pages; lazy_buffer owns its copied cell data.
                 unsafe { row.recycle(&mut self.storage.pages) };
             }
         }
@@ -195,7 +194,8 @@ impl Grid {
         line: &Line,
         new_cols: u16,
     ) -> (crate::Row, super::ScrolledRowExtras) {
-        // SAFETY: The row is moved into `self.storage.rows` by the caller, which owns the pages.
+        // SAFETY: the caller moves the row into `self.storage.rows` and owns `self.storage.pages`
+        // for at least as long as the row lives.
         let mut row = unsafe { crate::Row::new(new_cols, &mut self.storage.pages) };
         let extras = super::scroll_fill::fill_row_into(&mut row, line, new_cols);
         (row, extras)
@@ -315,7 +315,6 @@ pub(super) fn rewrap_cell_row(
 }
 
 /// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`.
-// COST: O(rows × new_cols + one logical line).
 // COST: O(rows × new_cols + one logical line): every logical line rewrapped
 // but the oldest one visited yields only kept rows, at most `new_cols` cells
 // each.
@@ -359,7 +358,10 @@ pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -
     out
 }
 
-/// Wrap-invariance gate for the clone-through fast path. True only for:
+/// Wrap-invariance gate for the clone-through fast path: true only for a line of printable
+/// ASCII (so byte length is display width) that fits `new_cols`, with no stored WIDE flag
+/// and no hyperlink, SGR 58 underline-colour or inline-image spans, which the rebuild may
+/// widen, re-coalesce or clip where a clone would not. The caller checks it is one row.
 fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
     if line.hyperlinks().is_some_and(|spans| !spans.is_empty())
         || line

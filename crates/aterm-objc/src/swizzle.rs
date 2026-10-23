@@ -189,7 +189,7 @@ pub enum SwizzleError {
     NoSuchMethod,
     /// The row has no type encoding, so the install's check cannot run.
     NoEncoding,
-    /// The runtime's encoding and the one derived from the Rust prototype disagree (claim 3 in the module docs).
+    /// The runtime's encoding and the one derived from the Rust prototype disagree.
     EncodingMismatch {
         /// What the runtime holds, offsets stripped.
         registered: String,
@@ -282,14 +282,16 @@ impl std::error::Error for SwizzleError {}
 struct Claim {
     /// The implementation the row held before this site replaced it.
     original: Imp,
-    /// The class the row actually lives on — see the module docs on blast
-    /// radius.
+    /// The class the row actually lives on ([`owning_class`]), not necessarily the class the
+    /// install named.
     owner: ClassPtr,
     /// The selector.
     sel: Sel,
 }
 
-// SAFETY: every field is an immortal, immutable word — a code address, a class object and an interned selector — readable from any thread.
+// SAFETY: every field is an immortal, immutable word — a code address, a class
+// object and an interned selector — readable from any thread. A registered
+// class is never unregistered and its address never moves.
 unsafe impl Send for Claim {}
 // SAFETY: as above.
 unsafe impl Sync for Claim {}
@@ -408,6 +410,7 @@ impl<F: MethodFn> SwizzleSite<F> {
     ///
     /// # Safety
     /// `new` must be entered exactly as the runtime enters the implementation it replaces and must not unwind (catch and [`crate::abort_on_unwind`], as [`crate::declare_class!`]'s trampolines do).
+    /// `cls` must be a live class object or null, and `sel` interned.
     /// # Errors
     /// Every [`SwizzleError`] except [`SwizzleError::Raced`] means nothing was written.
     pub unsafe fn install(
@@ -494,7 +497,10 @@ impl<F: MethodFn> SwizzleSite<F> {
             return Err(SwizzleError::Contended);
         }
 
-        // SAFETY: `method` is the live handle above; `new_imp` is an `extern "C"` function whose prototype matched the row's encoding.
+        // SAFETY: `method` is the live handle above; `new_imp` is an
+        // `extern "C"` function whose prototype matched the row's encoding.
+        // `method_setImplementation` leaves the encoding untouched and returns
+        // the displaced IMP.
         let displaced = unsafe { method_setImplementation(method, new_imp.as_ptr()) };
         // SAFETY: the row had an implementation (read above), so the call returns it.
         let displaced = unsafe { Imp::from_ptr(displaced) }.unwrap_or(current);

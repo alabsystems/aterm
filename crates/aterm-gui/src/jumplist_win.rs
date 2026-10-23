@@ -266,7 +266,6 @@ pub(crate) fn install() {
         .collect();
     let attach = attach_policy_is_on();
     let Some(notes) = crate::jumplist_recent::take_notes() else {
-        // a second install in one process: the first one's worker serves
         return; // a second install in one process: the first one's worker serves
     };
     let mut worker = Worker {
@@ -326,7 +325,10 @@ impl Worker {
             recents_tracked(),
             &|dir| std::path::Path::new(dir).is_dir(),
             &mut |rows| {
-                // SAFETY: `build` is one linear pass of documented shell COM calls.
+                // SAFETY: `build` is one linear pass of documented shell COM calls; every pointer
+                // it hands the shell lives for the duration of its call (the wide strings are
+                // locals that outlive each use), every returned interface is RAII-released, and the
+                // apartment is balanced by CoUninitGuard.
                 unsafe { build(crate::win32::AUMID, &exe, attach, rows) }
             },
         )
@@ -460,7 +462,10 @@ fn reg_dword(root: isize, subkey: &str, value: &str) -> Option<u32> {
     let value = wide(value);
     let mut data: u32 = 0;
     let mut cb: u32 = core::mem::size_of::<u32>() as u32;
-    // SAFETY: One documented flat-C registry read.
+    // SAFETY: one documented flat-C registry read. Both names are NUL-terminated
+    // UTF-16 locals that outlive the call; `RRF_RT_REG_DWORD` refuses anything
+    // but a 4-byte DWORD, so `data` is written as one `u32` or not at all, and
+    // `cb` is its exact size.
     let rc = unsafe {
         RegGetValueW(
             root,
@@ -1111,7 +1116,8 @@ mod acceptance {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        // SAFETY: `build` is one linear pass of documented shell COM calls on this thread.
+        // SAFETY: `build` is one linear pass of documented shell COM calls on
+        // this thread; every buffer it hands the shell outlives its call.
         let built = unsafe { super::build(TEST_AUMID, &exe_w, true, &dirs) }
             .unwrap_or_else(|(step, hr)| panic!("commit: {step} hr={hr:#010x}"));
         let tracked = super::recents_tracked();

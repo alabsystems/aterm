@@ -4,6 +4,8 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/input_method.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): aterm-x11's XIM declarations, where upstream used x11-dl's.
+
 use std::ffi::{CStr, CString, IntoStringError};
 use std::os::raw::{c_char, c_ulong, c_ushort};
 use std::sync::{Arc, Mutex};

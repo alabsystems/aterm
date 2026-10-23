@@ -1684,7 +1684,6 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
     let denied = app.execute_recovery_request(
         WindowId(0),
         crate::native_app::RecoveryRequest::OpenOriginal {
-            // /tmp/safe.md\nhttps://attacker.example".to_string(),
             uri: "file:///tmp/safe.md\nhttps://attacker.example".to_string(),
         },
     );
@@ -6359,6 +6358,14 @@ fn a_cold_relaunch_waiting_for_its_roster_confirmation_holds_and_books_nothing()
 }
 
 /// A check's report is never lost to a read that began before it. Two orderings:
+///
+/// 1. the arm-time read ends waiting; the check confirms and reports before the lane's first poll
+///    reaches the hold (that poll waits for a quiet terminal);
+/// 2. a hold's re-read starts; the check reports; the re-read, which read the marker before the
+///    confirmation, ends waiting.
+///
+/// Either way the stale answer is read again at once (held, nothing new said or booked) and the
+/// fresh answer decides.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_check_report_is_never_lost_to_a_read_that_began_before_it() {

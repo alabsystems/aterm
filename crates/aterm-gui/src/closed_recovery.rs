@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Bounded, identity-free recovery records for closed views and tabs.
-//!
-//! These ledgers are deliberately separate. `Cmd-Shift-T` consumes only [`ClosedTab`]
-//! records; the named Reopen Closed Pane command consumes only [`ClosedView`] records.
-//! A candidate is removed only by an explicit token commit after reconstruction succeeds,
-//! so an unavailable document/app never destroys the user's last recovery path.
 
 use std::collections::VecDeque;
 
@@ -19,8 +14,7 @@ pub(crate) const CLOSED_TAB_LIMIT: usize = 32;
 pub(crate) const CLOSED_VIEW_MAX_AGE_MS: u64 = 30 * 60 * 1_000;
 pub(crate) const CLOSED_TAB_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
 
-/// Where a removed leaf belonged beneath its parent split. Reopening uses the original
-/// parent path when the tab is still live; otherwise the view becomes a one-leaf tab.
+/// Where a removed leaf belonged beneath its parent split.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct ClosedViewPlacement {
     pub(crate) parent_path: Vec<RestoreBranch>,
@@ -45,8 +39,7 @@ impl ClosedViewPlacement {
     }
 }
 
-/// One non-last leaf close. It carries no retired `ViewId`, app instance id, or terminal
-/// pool identity; reconstruction must mint a new view identity.
+/// One non-last leaf close.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct ClosedView {
     pub(crate) original_window: WindowId,
@@ -69,8 +62,7 @@ pub(crate) enum LeafCloseRecordKind {
     ClosedTab,
 }
 
-/// Closing the only leaf is always a tab close. The caller uses this before mutating the
-/// tree, which prevents one gesture from entering both recovery ledgers.
+/// Closing the only leaf is always a tab close.
 pub(crate) const fn leaf_close_record_kind(leaves_before_close: usize) -> LeafCloseRecordKind {
     if leaves_before_close <= 1 {
         LeafCloseRecordKind::ClosedTab
@@ -100,8 +92,7 @@ struct RecoveryEntry<T> {
     value: T,
 }
 
-/// A deterministic newest-last, drop-oldest ledger. Time is supplied by the host so tests
-/// and replay never depend on wall-clock reads inside the state machine.
+/// A deterministic newest-last, drop-oldest ledger.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct RecoveryLedger<T> {
     entries: VecDeque<RecoveryEntry<T>>,
@@ -147,8 +138,6 @@ impl<T> RecoveryLedger<T> {
         });
     }
 
-    /// Every record a reopen could still hand out at `now_ms`, oldest first,
-    /// with the first instant it no longer can.
     fn live(&self, now_ms: u64) -> impl Iterator<Item = (&T, u64)> {
         self.entries
             .iter()
@@ -174,8 +163,7 @@ impl<T> RecoveryLedger<T> {
 }
 
 impl<T: Clone> RecoveryLedger<T> {
-    /// Whether [`Self::candidate_snapshot`] would answer `Some`, without cloning
-    /// the record — the menu's enabled bit asks this on the way to every wait.
+    /// Whether [`Self::candidate_snapshot`] would answer `Some`, without cloning the record.
     pub(crate) fn has_candidate(&self, now_ms: u64) -> bool {
         self.entries
             .back()
@@ -190,14 +178,13 @@ impl<T: Clone> RecoveryLedger<T> {
         })
     }
 
-    /// Copy the latest candidate without consuming it. Reconstruction may fail freely.
+    /// Copy the latest candidate without consuming it.
     pub(crate) fn candidate(&mut self, now_ms: u64) -> Option<ReopenCandidate<T>> {
         self.prune(now_ms);
         self.candidate_snapshot(now_ms)
     }
 
-    /// Consume exactly the candidate that was successfully reconstructed. Any intervening
-    /// push/prune makes the token stale and leaves the current newest record untouched.
+    /// Consume exactly the candidate that was successfully reconstructed.
     pub(crate) fn commit(
         &mut self,
         candidate: RecoveryToken,
@@ -222,10 +209,7 @@ pub(crate) struct ClosedRecoveryLedgers {
 }
 
 impl ClosedRecoveryLedgers {
-    /// The URI of every document view a reopen could still bring back at
-    /// `now_ms`, with the first instant its record no longer can. Each holds
-    /// its document in memory, so a reopen finds the very document, its undo
-    /// history with it (§5.10's "recovery records").
+    /// Returns `(uri, expires_ms)` pairs for all recoverable document views at `now_ms`.
     pub(crate) fn document_uris(&self, now_ms: u64) -> Vec<(&str, u64)> {
         fn leaf_uri(view: &RestoredView) -> Option<&str> {
             match view {
@@ -330,8 +314,6 @@ mod tests {
         assert_eq!(oldest.value.tab.root, tab("two").tab.root);
     }
 
-    /// `has_candidate` answers exactly what `candidate_snapshot().is_some()`
-    /// does — empty, fresh, and past the age bound — without cloning.
     #[test]
     fn has_candidate_agrees_with_the_snapshot() {
         let mut ledger = RecoveryLedger::new(4, 10);
@@ -372,10 +354,6 @@ mod tests {
         );
     }
 
-    /// Tier-1 conformance for `ClosedRecoveryLedgers` through the App's shipping close and
-    /// reopen paths (`close_active_tab` on a two-leaf tab, `close_tab_at` on a one-leaf tab,
-    /// `reopen_last_closed_view`/`_tab`), with the ledgers rebuilt at the model's capacities (2
-    /// views, 3 tabs). Which ledger each close records into is the App's choice, never the test's.
     #[test]
     fn dual_ledgers_tier1_conform_and_reject_double_record_negative_control() {
         use aterm_models_native::closed_recovery_ledgers_model;
@@ -392,7 +370,6 @@ mod tests {
 
         fn project(model: &aterm_spec::derive::Model, app: &App, facts: Facts) -> State {
             let window = &app.windows[&WindowId(0)];
-            // Tab 0 is the bootstrap terminal; the model's one tab is the one after it.
             let live_tabs = window.tab_set.len() as i64 - 1;
             let live_leaves = if live_tabs == 1 {
                 window.tab_set.tabs()[1].root.len() as i64
@@ -462,7 +439,6 @@ mod tests {
         step(&mut app, "CloseView", &close_leaf);
         step(&mut app, "CloseTab", &close_tab);
         step(&mut app, "OpenTab", &open_two_leaf_tab);
-        // The view ledger is full: the real push drops the oldest record.
         let (before_full_view, at_view_cap) = step(&mut app, "CloseView", &close_leaf);
         assert_eq!(at_view_cap["view_ledger"], 2);
         step(&mut app, "CloseTab", &close_tab);
@@ -474,8 +450,6 @@ mod tests {
             app.reopen_last_closed_tab().unwrap();
         });
 
-        // Failed reconstruction consumes neither ledger. With no window left
-        // to host it, both reopens fail and both candidates stay.
         let views = app.closed_recovery.views.len();
         let tabs = app.closed_recovery.tabs.len();
         app.windows.clear();
@@ -489,21 +463,17 @@ mod tests {
         assert_eq!(app.closed_recovery.tabs.len(), tabs);
         let mut after_tab_failure = after_view_failure.clone();
         after_tab_failure.insert("failures", 2);
-        // Healthy, the two failures are one transition (they differ only in the
-        // ledger a consuming failure would hit), so `admits` names `FailView`.
         assert_eq!(
             model.successors("FailTab", &after_view_failure).as_slice(),
             std::slice::from_ref(&after_tab_failure),
             "the failed tab reopen conforms to FailTab"
         );
 
-        // Negative controls. One close recorded in both ledgers:
         let mut double_record = after_view.clone();
         double_record.insert("tab_ledger", 1);
         double_record.insert("double_recorded", 1);
         assert_eq!(admits(&model, &before_view, &double_record), None);
         assert!(!model.check_invariant("OnlyOneRecordPerClose", &double_record));
-        // A full push that evicts one too few, in either ledger:
         let mut overfull_view = at_view_cap.clone();
         overfull_view.insert("view_ledger", 3);
         assert_eq!(admits(&model, &before_full_view, &overfull_view), None);
@@ -512,7 +482,6 @@ mod tests {
         overfull_tab.insert("tab_ledger", 4);
         assert_eq!(admits(&model, &before_full_tab, &overfull_tab), None);
         assert!(!model.check_invariant("TabLedgerBounded", &overfull_tab));
-        // A failed reopen that consumed its record:
         let mut lossy = after_view_failure;
         lossy.insert("view_ledger", reopened_tab["view_ledger"] - 1);
         lossy.insert("lost_on_failure", 1);

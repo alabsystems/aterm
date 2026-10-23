@@ -32,7 +32,16 @@ pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 ///   its exit status to `<dir>\exit` when it ends;
 /// - `readback <pid> <class> <ppm>`: the client area of `pid`'s window of
 ///   `class` as its DC holds it (`BitBlt` into a bitmap, then `GetDIBits`),
-///   written as a binary PPM: the pixels a CPU present put on the window.
+///   written as a binary PPM: the pixels a CPU present put on the window;
+/// - `watch <pid> <class> <ms> <path>`: for `ms`, a line per change written to `path`: the
+///   foreground window and its focus, the layout, IME status and conversion mode of `pid`'s
+///   window of `class`, the keys held down, and the visible top-level windows that come and go;
+/// - `place <pid> <class>`: a `place ...` line: that window's client size, its top-left on the
+///   virtual screen, and the virtual screen's rectangle;
+/// - `move <pid> <class> <top>`: that window moved so its client area's top is at screen row
+///   `top`, its size and z-order kept, not activated; then its `place` line;
+/// - `lift <pid> <class> <rows>`: that window moved up until its client area's top `rows` rows
+///   are above the virtual screen's top edge; then its `place` line.
 pub const HELPER: &str = r##"$ErrorActionPreference = 'Stop'
 $verb = $args[0]
 if ($verb -eq 'launch') {

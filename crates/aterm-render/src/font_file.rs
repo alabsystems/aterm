@@ -201,7 +201,12 @@ pub struct MappedFontFile {
     never: core::convert::Infallible,
 }
 
-// SAFETY: the mapping is read-only (unix: PROT_READ and MAP_PRIVATE; Windows: a PAGE_READONLY section viewed FILE_MAP_READ).
+// SAFETY: the mapping is read-only (unix: PROT_READ and MAP_PRIVATE; Windows: a PAGE_READONLY
+// section viewed FILE_MAP_READ) — nothing writes through it, and the kernel owns the pages — so
+// sharing or moving the handle between threads is sharing an immutable byte slice. `Drop` runs
+// once, on the last `Arc` holder. On Windows, CreateFileW's FILE_SHARE_WRITE rule covers mappings
+// as well as open handles, so the no-write-share admission open also excludes an existing writable
+// mapping, and the retained handle refuses later writable opens and mappings.
 #[cfg(any(unix, windows))]
 unsafe impl Send for MappedFontFile {}
 #[cfg(any(unix, windows))]
@@ -227,7 +232,11 @@ impl MappedFontFile {
         }
         let metadata = file.metadata()?;
         let identity = (metadata.dev(), metadata.ino());
-        // SAFETY: `fd` is the caller's open, admitted handle.
+        // SAFETY: `fd` is the caller's open, admitted handle; a NULL hint with
+        // PROT_READ|MAP_PRIVATE asks the kernel for a fresh read-only private
+        // region of exactly `len_usize` bytes at offset 0, which the fstat
+        // above proved the file has. MAP_FAILED is checked before the pointer
+        // is used.
         let raw = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -273,7 +282,9 @@ impl MappedFontFile {
         }
         let identity = win::file_identity(file)?;
         let held = file.try_clone()?;
-        // SAFETY: `file` is the caller's open, admitted handle.
+        // SAFETY: `file` is the caller's open, admitted handle. A NULL name and
+        // zero maximum size ask for an anonymous read-only section over the
+        // whole current file, which the size check above proved non-empty.
         let section = unsafe {
             win::CreateFileMappingW(
                 file.as_raw_handle(),
@@ -337,7 +348,9 @@ impl core::ops::Deref for MappedFontFile {
     #[inline]
     fn deref(&self) -> &[u8] {
         #[cfg(any(unix, windows))]
-        // SAFETY: `ptr` is a live `len`-byte read-only mapping owned by `self` until `Drop`.
+        // SAFETY: `ptr` is a live `len`-byte read-only mapping owned by
+        // `self` until `Drop`; nothing writes through it, so handing out
+        // shared slices for `&self`'s lifetime is sound.
         unsafe {
             std::slice::from_raw_parts(self.ptr.as_ptr(), self.len)
         }
@@ -375,6 +388,8 @@ impl Drop for MappedFontFile {
 impl Drop for MappedFontFile {
     fn drop(&mut self) {
         // SAFETY: `ptr` is the base `MapViewOfFile` returned for this handle, and `Drop` runs once.
+        // The held handle (`_file`) closes after this body, so the write-sharing refusal lasts
+        // exactly as long as the view.
         unsafe {
             let _ = win::UnmapViewOfFile(self.ptr.as_ptr().cast_const().cast());
         }

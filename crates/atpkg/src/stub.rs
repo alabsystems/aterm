@@ -480,7 +480,7 @@ fn temp_roots_from(temp_dir: PathBuf) -> Vec<PathBuf> {
     roots
 }
 
-/// Which atpkg a file laid now names (module doc, "Which atpkg a laid file names").
+/// Which atpkg a file laid now names.
 #[derive(Debug, Clone)]
 pub(crate) struct Embedder {
     /// The atpkg this process offers ([`co_located_atpkg_path`]); [`Self::embed`] takes it

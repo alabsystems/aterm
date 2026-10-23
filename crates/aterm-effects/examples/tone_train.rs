@@ -3,18 +3,6 @@
 
 //! Offline trainer for the tone-of-typing classifier (`aterm_effects::tone`). Run by
 //! hand when the corpus or architecture changes:
-//!
-//! ```sh
-//! targo --unverified run -p aterm-effects --example tone_train --release
-//! ```
-//!
-//! Reads `data/tone_corpus.tsv`, trains the fastText-style bag model with plain SGD
-//! (deterministic seed), quantizes through the runtime's `encode_model` /
-//! `from_bytes` pair, audits the quantized model against `data/tone_holdout.tsv`,
-//! and only then overwrites `data/tone_model.atn`. Its floors (train ≥ 0.95,
-//! holdout ≥ 0.78 overall, ≥ 0.70 per focus language) are stricter than the
-//! conformance tests' 0.70 / 0.60, so the committed asset carries margin. Features
-//! come from the runtime's own `tone::for_each_ngram_bucket`.
 
 use aterm_effects::tone::{self, BUCKETS, EMBED, HIDDEN, TONE_COUNT, Tone, ToneModel, ToneScratch};
 
@@ -33,7 +21,6 @@ const LR1: f32 = 0.01;
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
-        // xorshift64* — deterministic, dependency-free.
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -104,7 +91,6 @@ impl Net {
         }
     }
 
-    /// Forward pass; returns (pooled embedding, hidden, softmax probs).
     fn forward(&self, buckets: &[usize]) -> ([f32; EMBED], [f32; HIDDEN], [f32; TONE_COUNT]) {
         let mut e = [0.0f32; EMBED];
         for &b in buckets {
@@ -146,13 +132,10 @@ impl Net {
         (e, h, p)
     }
 
-    /// One SGD step of softmax cross-entropy on one example.
     fn step(&mut self, ex: &Example, lr: f32) {
         let (e, h, p) = self.forward(&ex.buckets);
-        // dL/dlogit = p - onehot.
         let mut g = p;
         g[ex.label] -= 1.0;
-        // Hidden gradient through w2.
         let mut dh = [0.0f32; HIDDEN];
         for j in 0..HIDDEN {
             let mut acc = 0.0;
@@ -161,7 +144,6 @@ impl Net {
             }
             dh[j] = acc * (1.0 - h[j] * h[j]); // tanh'
         }
-        // Output layer update.
         for (j, &hj) in h.iter().enumerate() {
             for (c, &gc) in g.iter().enumerate() {
                 self.w2[j * TONE_COUNT + c] -= lr * hj * gc;
@@ -170,7 +152,6 @@ impl Net {
         for (c, &gc) in g.iter().enumerate() {
             self.b2[c] -= lr * gc;
         }
-        // Pooled-embedding gradient through w1, computed before w1 is updated.
         let mut de = [0.0f32; EMBED];
         for (i, dei) in de.iter_mut().enumerate() {
             let mut acc = 0.0;
@@ -187,7 +168,6 @@ impl Net {
         for (j, &dhj) in dh.iter().enumerate() {
             self.b1[j] -= lr * dhj;
         }
-        // Embedding bag update: mean pool distributes 1/n to each occurrence.
         let inv = 1.0 / ex.buckets.len() as f32;
         for &b in &ex.buckets {
             let row = &mut self.emb[b * EMBED..(b + 1) * EMBED];
@@ -245,7 +225,6 @@ fn main() {
     let mut order: Vec<usize> = (0..train.len()).collect();
     for epoch in 0..EPOCHS {
         let lr = LR0 + (LR1 - LR0) * epoch as f32 / (EPOCHS - 1) as f32;
-        // Fisher–Yates with the deterministic rng.
         for i in (1..order.len()).rev() {
             let j = (rng.next() % (i as u64 + 1)) as usize;
             order.swap(i, j);
@@ -265,8 +244,6 @@ fn main() {
         }
     }
 
-    // Quantize through the runtime's encode/decode pair, then audit that
-    // model: what ships is what was measured.
     let bytes = tone::encode_model(&net.emb, &net.w1, &net.b1, &net.w2, &net.b2);
     let model = ToneModel::from_bytes(&bytes).expect("round trip");
     let (train_acc, _, _) = accuracy(&model, &train_labeled);
@@ -285,7 +262,6 @@ fn main() {
         println!("  {:10} {row:?}", Tone::from_index(r).label());
     }
 
-    // Refuse to write an asset that would not carry margin over the pins.
     assert!(
         train_acc >= 0.95,
         "train floor missed: {train_acc:.3} < 0.95"

@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Linux lane, end to end over the fake channel and real git: per-target row states
-//! and latch precedence, buildable targets, narrowing on divergence, the merge chain, the
-//! byte-prefix gate, the lineage gate on new rows only, the READY partition and its
-//! phases, and the downgrade refusals.
+//! End-to-end Linux lane publication, row state, and lineage gate tests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -27,7 +24,6 @@ use atpkg_publish::triple::{
 use super::super::shared::{Made, made_once, scratch};
 use super::fixture::{Fx, Held, manifest, row};
 
-/// What this fixture builder can cross-build.
 struct FakeBuilder(Mutex<BTreeSet<Triple>>);
 
 impl FakeBuilder {
@@ -59,9 +55,6 @@ impl Builder for FakeBuilder {
     }
 }
 
-/// The world: index 7 pins ay 10, clean 20, trust 30, trust-ir 40. ay's published manifest
-/// carries the darwin rows and the x86_64 Linux row; the others only the darwin rows. The
-/// builder is x86_64 Linux and can cross-build aarch64.
 struct World {
     fx: Fx,
     host: Triple,
@@ -76,7 +69,6 @@ impl World {
         Self::new_at(scratch(label))
     }
 
-    /// [`World::new`] in `tmp`.
     fn new_at(tmp: aterm_tempfile::TempDir) -> Self {
         let fx = Fx::at(tmp);
         for (p, b) in [("ay", 10), ("clean", 20), ("trust", 30), ("trust-ir", 40)] {
@@ -102,10 +94,6 @@ impl World {
         }
     }
 
-    /// [`World::new`], keyless, after (i)'s staging run of every program (`unproven`: its
-    /// rows packed by a compiler with no lineage receipt). A run of the lane (about 30 git
-    /// processes), so each is made once per process, by the first caller in its own
-    /// directory, and laid down for every caller after ([`Fx::laid`]).
     fn after_staging(label: &str, unproven: bool) -> Self {
         static MADE: Made<bool, Held> = Mutex::new(BTreeMap::new());
         let mut tmp = Some(scratch(label));
@@ -188,7 +176,6 @@ fn table_row(tx: &Transcript, p: &str) -> String {
 
 #[test]
 fn a_latch_outranks_every_quieter_reading_of_a_row() {
-    // (published, staged, latched, buildable)
     assert_eq!(row_state(true, true, true, true), RowState::Published);
     assert_eq!(row_state(false, true, true, true), RowState::Staged);
     assert_eq!(row_state(false, false, true, true), RowState::Blocked);
@@ -201,7 +188,6 @@ fn a_latch_outranks_every_quieter_reading_of_a_row() {
 fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
     let w = World::new("linux-dry");
     let (o, tx) = ok(w.run(true));
-    // ay ships x86_64 only: its aarch64 row is planned, not "done".
     assert_eq!(*decision(&o, "ay"), Decision::Build { held: vec![] });
     let ay = table_row(&tx, "ay");
     assert!(
@@ -213,7 +199,6 @@ fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
             || ay.contains("pack aarch64-unknown-linux-gnu"),
         "{ay}"
     );
-    // clean has no Linux row: both targets.
     let clean = table_row(&tx, "clean");
     assert!(
         clean.contains(
@@ -221,7 +206,6 @@ fn a_dry_run_sees_every_served_target_and_plans_the_missing_rows() {
         ),
         "{clean}"
     );
-    // The bundle is the bundle lane's, and its group holds trust-ir on both targets.
     assert_eq!(*decision(&o, "trust"), Decision::ManualBundle);
     assert!(table_row(&tx, "trust-ir").contains("BUILD+HOLD(group rustc: x86_64,aarch64)"));
     assert!(w.fx.packer.legs().is_empty() && w.fx.calls("clone ").is_empty());
@@ -249,7 +233,6 @@ fn a_latch_on_one_target_is_blocked_and_never_stops_the_other() {
     )
     .expect("latch");
     let (o, tx) = ok(w.run(true));
-    // A latched failure is the loudest thing true about ay: never a partial publish.
     assert_eq!(*decision(&o, "ay"), Decision::Blocked);
     assert!(table_row(&tx, "ay").contains("BLOCKED: latched for aarch64-unknown-linux-gnu"));
     let clean = table_row(&tx, "clean");
@@ -311,7 +294,6 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
     let w = World::new("linux-stage");
     w.keyless();
     let (o, _) = ok(w.run(false));
-    // Both targets, one manifest, the second merge chained onto the first.
     let clean = w.manifest_of("clean", 20);
     for t in [
         "x86_64-unknown-linux-gnu",
@@ -334,7 +316,6 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
                 .is_file()
         );
     }
-    // The merge extends the published bytes; ay gains exactly its aarch64 row.
     let published = String::from_utf8(
         w.fx.staging_asset("clean", 20, "pkg-clean-20.toml")
             .expect("pub"),
@@ -357,7 +338,6 @@ fn staging_extends_the_published_bytes_with_every_target_in_one_manifest() {
         !w.staged().join(format!("ay/ay-10-{X86}.tar.zst")).exists(),
         "a published row is never re-packed"
     );
-    // READY.md: every tarball the manifest names, trust-ir HELD, keyless said.
     let ready = w.ready();
     for t in [
         "clean/clean-20-x86_64-unknown-linux-gnu.tar.zst",
@@ -478,8 +458,6 @@ fn a_keyed_run_that_stops_before_the_index_leaves_the_ceremony() {
         ready.contains("If its log has no \"published atpkg-index-8\", run the ceremony below."),
         "{ready}"
     );
-    // The next keyed run finds the uploads published, nothing READY, and finishes the
-    // index they are owed.
     w.fx.indexer.fail.store(false, Ordering::SeqCst);
     let (o, _) = ok(w.run(false));
     assert!(o.ready.is_empty() && o.signed.is_empty());
@@ -531,8 +509,6 @@ fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_
     assert!(!m.with_extension("toml.sig").exists());
 }
 
-/// A keyless staging run whose rows carry no lineage receipt, then a keyed run with the
-/// receipt switch reading `switch`.
 fn unproven(label: &str, switch: Option<Switch>) -> (World, Result<Outcome>) {
     let w = World::after_staging(label, true);
     w.rekey();
@@ -651,8 +627,6 @@ fn the_lane_serves_linux_targets_on_a_linux_host_only() {
     );
 }
 
-/// `text` signed by the fixture machine as `pkg-<p>-<b>.toml` on the public owner only:
-/// another machine's extension that reached the channel.
 fn publish_public_only(w: &World, p: &str, b: u64, text: &str) {
     let slug = w.fx.ctx.public_slug(p);
     let tag = format!("atpkg-{p}-{b}");
@@ -667,7 +641,6 @@ fn publish_public_only(w: &World, p: &str, b: u64, text: &str) {
     );
 }
 
-/// Every upload that touched `tag`.
 fn uploads_of(w: &World, tag: &str) -> Vec<String> {
     w.fx.calls("upload ")
         .into_iter()
@@ -675,9 +648,6 @@ fn uploads_of(w: &World, tag: &str) -> Vec<String> {
         .collect()
 }
 
-/// A keyless staging run; then another machine's extension of clean reaches the public
-/// owner and the staging release of clean stops verifying (no manifest, or a signature the
-/// client refuses); then a keyed run.
 fn unverifiable(label: &str, tamper: bool) -> (World, Result<Outcome>, Vec<u8>) {
     let w = World::after_staging(label, false);
     let mut theirs = manifest("clean", 20, &DARWIN);
@@ -739,8 +709,6 @@ fn a_manifest_that_cannot_be_verified_is_never_signed_over_on_either_owner() {
 #[test]
 fn a_public_manifest_another_machine_extended_refuses_the_signing() {
     let w = World::after_staging("linux-public-extended", false);
-    // The staging copy still matches what the run read; only the public owner moved, to
-    // another machine's aarch64 row.
     let mut theirs = manifest("clean", 20, &DARWIN);
     theirs.push_str(&row("clean", 20, ARM, false));
     publish_public_only(&w, "clean", 20, &theirs);
@@ -804,8 +772,6 @@ fn a_public_upload_an_earlier_run_owed_is_finished_before_the_index() {
     w.fx.indexer.fail.store(true, Ordering::SeqCst);
     let _ = w.run(false);
     w.fx.indexer.fail.store(false, Ordering::SeqCst);
-    // That run's public upload of clean never landed: the public owner still serves the
-    // manifest it read, and none of the Linux tarballs.
     let original = manifest("clean", 20, &DARWIN);
     let public = w.fx.ctx.public_slug("clean");
     let mut assets = std::collections::BTreeMap::new();
@@ -890,7 +856,6 @@ fn a_real_run_needs_the_staging_token_and_a_dry_run_does_not() {
 fn a_scratch_clone_is_fetched_as_the_staging_identity_never_by_its_origin() {
     let w = World::after_staging("linux-fetch", false);
     let clone = w.fx.ctx.state_dir.join("progs/clean");
-    // A bare `git fetch origin` would now fail and latch clean.
     super::fixture::git(
         &clone,
         &["remote", "set-url", "origin", "/nonexistent/clean"],
@@ -953,8 +918,6 @@ fn the_lane_plans_the_build_its_targets_resolve_not_the_bare_pin() {
 #[test]
 fn a_signed_manifest_the_client_would_refuse_is_never_uploaded() {
     let w = World::after_staging("linux-client-refuses", false);
-    // Still a byte-prefix extension, and still the lane's own type — but a row of a kind
-    // the client's parser refuses outright.
     let m = linux::staged_manifest(&w.staged(), "clean", 20);
     let mut text = std::fs::read_to_string(&m).expect("staged");
     text.push_str(

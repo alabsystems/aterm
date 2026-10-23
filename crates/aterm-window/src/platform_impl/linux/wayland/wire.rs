@@ -36,7 +36,8 @@ impl Owned {
     /// Owns `proxy` and records its decoded events in `inbox`.
     ///
     /// # Safety
-    /// As [`Owned::new`], and `proxy` must have no listener yet.
+    /// As [`Owned::new`], and `proxy` must have no listener yet. `decode` must not leave a
+    /// descriptor argument unclosed (none of the objects this backend listens to sends one).
     pub(crate) unsafe fn listened(
         proxy: Proxy,
         destroy: unsafe fn(Proxy),
@@ -44,7 +45,8 @@ impl Owned {
         decode: impl Fn(Proxy, u32, &[EventArg<'_>]) -> Option<Wire> + Send + 'static,
     ) -> Owned {
         let inbox = inbox.clone();
-        // SAFETY: caller guarantees `proxy` is valid; listener is freed after proxy destruction.
+        // SAFETY: the caller's contract; the listener is freed after the object is destroyed
+        // (Drop).
         let listener = unsafe {
             proxy.listen(move |object, opcode, args| {
                 if let Some(wire) = decode(object, opcode, args) {

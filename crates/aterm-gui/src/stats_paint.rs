@@ -281,6 +281,8 @@ pub(crate) enum WellMark {
     Down,
     /// ●: memory pressure, a GPU reset.
     Dot,
+    /// ∵: the cause aterm names, three dots (the faces lack the glyph).
+    Cause,
 }
 
 impl WellMark {
@@ -296,6 +298,7 @@ impl WellMark {
             Self::Up => "up",
             Self::Down => "down",
             Self::Dot => "warn",
+            Self::Cause => "cause",
         }
     }
 
@@ -311,6 +314,7 @@ impl WellMark {
             words::Mark::Stopped => Self::Stopped,
             words::Mark::Up => Self::Up,
             words::Mark::Down => Self::Down,
+            words::Mark::Cause => Self::Cause,
         }
     }
 
@@ -322,7 +326,7 @@ impl WellMark {
             Self::Quiet => inks.quiet,
             Self::Waiting => inks.tab,
             Self::Zombies | Self::Low | Self::Dot => inks.warn,
-            Self::Stopped | Self::Up | Self::Down => inks.words2,
+            Self::Stopped | Self::Up | Self::Down | Self::Cause => inks.words2,
         }
     }
 }
@@ -954,6 +958,18 @@ impl<'a> Painter<'a> {
                 r: r * 0.33 / 0.36,
                 color: c,
             }),
+            WellMark::Cause => {
+                // Two dots above and one below, inside the ● Dot's disc.
+                let disc = r * 0.33 / 0.36;
+                for (dx, dy) in [(-0.5, -0.42), (0.5, -0.42), (0.0, 0.5)] {
+                    self.prims.push(DrawPrim::Dot {
+                        cx: cx + disc * dx,
+                        cy: cy + disc * dy,
+                        r: disc * 0.28,
+                        color: c,
+                    });
+                }
+            }
         }
     }
 }

@@ -1,11 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bell presentation state: when a host turns BEL into a visual flash or an audible beep.
-//! Hosts own the I/O; every method takes the current [`Instant`] instead of reading the clock.
+//! Visual-bell flash and audible-bell rate-limiting state.
 
-// The engine's clock seam uses aterm_time::Instant: std's on native, a JS-clock instant on
-// wasm32 (where std's Instant::now() panics).
 use aterm_time::Instant;
 use std::time::Duration;
 
@@ -13,12 +10,6 @@ use std::time::Duration;
 pub const FLASH_DURATION: Duration = Duration::from_millis(100);
 
 /// Visual-bell flash state machine.
-///
-/// [`ring`](Self::ring) arms a flash ending [`FLASH_DURATION`] later;
-/// [`is_active`](Self::is_active) says whether the current frame should be
-/// drawn flashed; [`deadline`](Self::deadline) is the instant the host must
-/// wake to repaint the normal frame — `None` while idle, so a host that
-/// schedules wakeups only from `deadline` runs zero timers between bells.
 #[derive(Debug, Default)]
 pub struct BellFlash {
     deadline: Option<Instant>,
@@ -32,9 +23,7 @@ impl BellFlash {
         Self { deadline: None }
     }
 
-    /// A bell rang at `now`: (re)start the flash window. Ringing during an
-    /// active flash extends it, so a bell flood reads as one continuous
-    /// flash rather than strobing.
+    /// Arms or extends the flash window until `now + FLASH_DURATION`.
     #[inline]
     pub fn ring(&mut self, now: Instant) {
         self.deadline = Some(now + FLASH_DURATION);
@@ -47,20 +36,14 @@ impl BellFlash {
         self.deadline.is_some_and(|d| now < d)
     }
 
-    /// The wakeup deadline while a flash is pending, `None` when idle.
-    ///
-    /// Stays `Some` until [`expire`](Self::expire) observes the deadline
-    /// passing, so a host that missed the exact instant still wakes up and
-    /// repaints rather than presenting a stuck-inverted frame.
+    /// Wakeup deadline while a flash is pending, or `None` when idle.
     #[must_use]
     #[inline]
     pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
-    /// Retire a finished flash: when the deadline has passed, clear it and
-    /// return `true` (the host must repaint the normal frame). A still
-    /// running or idle flash is left untouched and returns `false`.
+    /// Clears the deadline and returns `true` when it has passed at `now`.
     #[inline]
     pub fn expire(&mut self, now: Instant) -> bool {
         match self.deadline {
@@ -73,9 +56,7 @@ impl BellFlash {
     }
 }
 
-/// Minimum-interval gate for the audible bell: at most one beep per
-/// `interval`, however fast BEL arrives. The visual flash still re-arms on
-/// every bell, so a flood stays visible without becoming a wall of sound.
+/// Minimum-interval gate for the audible bell.
 #[derive(Debug)]
 pub struct BellRateLimiter {
     interval: Duration,
@@ -93,8 +74,7 @@ impl BellRateLimiter {
         }
     }
 
-    /// Whether a beep may fire at `now`; records the firing when allowed.
-    /// The first call always fires.
+    /// Returns whether a beep may fire at `now`, recording the timestamp when allowed.
     #[inline]
     pub fn try_fire(&mut self, now: Instant) -> bool {
         if self
@@ -128,10 +108,8 @@ mod tests {
         let mut flash = BellFlash::new();
         let t0 = Instant::now();
         flash.ring(t0);
-        // Mid-flash: not expired, still active, deadline still armed.
         assert!(!flash.expire(t0 + Duration::from_millis(50)));
         assert!(flash.is_active(t0 + Duration::from_millis(50)));
-        // At the deadline: expires exactly once, then idle.
         let end = t0 + FLASH_DURATION;
         assert!(flash.expire(end));
         assert!(flash.deadline().is_none());
@@ -147,7 +125,6 @@ mod tests {
         let t1 = t0 + Duration::from_millis(60);
         flash.ring(t1);
         assert_eq!(flash.deadline(), Some(t1 + FLASH_DURATION));
-        // Still active past the original deadline.
         assert!(flash.is_active(t0 + FLASH_DURATION + Duration::from_millis(10)));
     }
 
@@ -166,7 +143,6 @@ mod tests {
         let t0 = Instant::now();
         assert!(gate.try_fire(t0));
         assert!(gate.try_fire(t0 + Duration::from_secs(1)));
-        // The boundary fire re-arms the gate from its timestamp.
         assert!(!gate.try_fire(t0 + Duration::from_millis(1500)));
         assert!(gate.try_fire(t0 + Duration::from_secs(2)));
     }

@@ -1117,7 +1117,6 @@ mod reported_cwd_tests {
     }
 
     fn osc7(path: &str) -> Vec<u8> {
-        // host{path}\x07").into_bytes()
         format!("\x1b]7;file://host{path}\x07").into_bytes()
     }
 

@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The wire between the controller and a host's forced-command dispatcher.
-//!
-//! The fleet SSH key's `authorized_keys` line forces `<agent> machines agent ssh`, which reads
-//! `SSH_ORIGINAL_COMMAND` (split on spaces, never through a shell) as one of:
-//!
-//! | command | runs as | stdin | stdout |
-//! |---|---|---|---|
-//! | `hello` | the admin | — | one [`Hello`] JSON line |
-//! | `put <sha256>` | the admin | the artifact's bytes | `ok <sha256>` once the bytes hash to it |
-//! | `apply` | root, via `sudo -n <agent> machines agent apply` | the signed envelope | [`Line`]s |
-//! | `attach <run>` | the admin | — | [`Line`]s from the start of that run |
-//! | `screen` | the admin | the viewer's bytes | screensharingd's bytes, from the host's `127.0.0.1:5900` |
-//!
-//! Anything else is refused with `refused: <why>` and exit status 2.
+//! Wire protocol between the controller and a host's forced-command dispatcher ([`Hello`], [`Line`]).
 
 use crate::model::{HostReport, ItemReport};
 use serde::{Deserialize, Serialize};
@@ -87,7 +74,8 @@ pub struct Hello {
     pub vitals: Option<HostVitals>,
 }
 
-/// Live system telemetry snapshot reported in [`Hello::vitals`] or sampled by `aterm machines monitor`.
+/// Live system telemetry snapshot reported in [`Hello::vitals`] or sampled by `aterm machines
+/// monitor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HostVitals {
     /// Logical CPU core count (`hw.ncpu` / `nproc`).
@@ -417,14 +405,14 @@ pub struct Floor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Line {
-    /// The run started: its id.
+    /// The run started.
     Started {
         /// The run id.
         run: String,
     },
     /// One item finished (boxed as the report is: a row is the largest line by far).
     Item(Box<ItemReport>),
-    /// The run finished: the whole report.
+    /// The run finished.
     Report(Box<HostReport>),
     /// The agent refused the envelope or the request.
     Refused {

@@ -64,18 +64,15 @@ pub const IID_IDXGIOutput6: GUID = GUID::from_u128(0x068346e8_aaec_4b84_add7_137
 #[repr(C)]
 pub struct IDXGIFactory1_Vtbl {
     pub base__: IUnknown_Vtbl,
-    // IDXGIObject
     pub SetPrivateData: usize,
     pub SetPrivateDataInterface: usize,
     pub GetPrivateData: usize,
     pub GetParent: usize,
-    // IDXGIFactory
     pub EnumAdapters: usize,
     pub MakeWindowAssociation: usize,
     pub GetWindowAssociation: usize,
     pub CreateSwapChain: usize,
     pub CreateSoftwareAdapter: usize,
-    // IDXGIFactory1
     pub EnumAdapters1: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
 }
 
@@ -83,12 +80,10 @@ pub struct IDXGIFactory1_Vtbl {
 #[repr(C)]
 pub struct IDXGIAdapter1_Vtbl {
     pub base__: IUnknown_Vtbl,
-    // IDXGIObject
     pub SetPrivateData: usize,
     pub SetPrivateDataInterface: usize,
     pub GetPrivateData: usize,
     pub GetParent: usize,
-    // IDXGIAdapter
     pub EnumOutputs: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
 }
 
@@ -96,12 +91,10 @@ pub struct IDXGIAdapter1_Vtbl {
 #[repr(C)]
 pub struct IDXGIOutput6_Vtbl {
     pub base__: IUnknown_Vtbl,
-    // IDXGIObject
     pub SetPrivateData: usize,
     pub SetPrivateDataInterface: usize,
     pub GetPrivateData: usize,
     pub GetParent: usize,
-    // IDXGIOutput
     pub GetDesc: usize,
     pub GetDisplayModeList: usize,
     pub FindClosestMatchingMode: usize,
@@ -114,20 +107,14 @@ pub struct IDXGIOutput6_Vtbl {
     pub SetDisplaySurface: usize,
     pub GetDisplaySurfaceData: usize,
     pub GetFrameStatistics: usize,
-    // IDXGIOutput1
     pub GetDisplayModeList1: usize,
     pub FindClosestMatchingMode1: usize,
     pub GetDisplaySurfaceData1: usize,
     pub DuplicateOutput: usize,
-    // IDXGIOutput2
     pub SupportsOverlays: usize,
-    // IDXGIOutput3
     pub CheckOverlaySupport: usize,
-    // IDXGIOutput4
     pub CheckOverlayColorSpaceSupport: usize,
-    // IDXGIOutput5
     pub DuplicateOutput1: usize,
-    // IDXGIOutput6
     pub GetDesc1: unsafe extern "system" fn(*mut c_void, *mut DXGI_OUTPUT_DESC1) -> HRESULT,
 }
 
@@ -135,14 +122,11 @@ pub struct IDXGIOutput6_Vtbl {
 #[repr(C)]
 pub struct IDXGISwapChain3_Vtbl {
     pub base__: IUnknown_Vtbl,
-    // IDXGIObject
     pub SetPrivateData: usize,
     pub SetPrivateDataInterface: usize,
     pub GetPrivateData: usize,
     pub GetParent: usize,
-    // IDXGIDeviceSubObject
     pub GetDevice: usize,
-    // IDXGISwapChain
     pub Present: usize,
     pub GetBuffer: usize,
     pub SetFullscreenState: usize,
@@ -153,7 +137,6 @@ pub struct IDXGISwapChain3_Vtbl {
     pub GetContainingOutput: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
     pub GetFrameStatistics: usize,
     pub GetLastPresentCount: usize,
-    // IDXGISwapChain1
     pub GetDesc1: usize,
     pub GetFullscreenDesc: usize,
     pub GetHwnd: usize,
@@ -165,7 +148,6 @@ pub struct IDXGISwapChain3_Vtbl {
     pub GetBackgroundColor: usize,
     pub SetRotation: usize,
     pub GetRotation: usize,
-    // IDXGISwapChain2
     pub SetSourceSize: usize,
     pub GetSourceSize: usize,
     pub SetMaximumFrameLatency: usize,
@@ -173,7 +155,6 @@ pub struct IDXGISwapChain3_Vtbl {
     pub GetFrameLatencyWaitableObject: usize,
     pub SetMatrixTransform: usize,
     pub GetMatrixTransform: usize,
-    // IDXGISwapChain3
     pub GetCurrentBackBufferIndex: usize,
     pub CheckColorSpaceSupport:
         unsafe extern "system" fn(*mut c_void, DXGI_COLOR_SPACE_TYPE, *mut u32) -> HRESULT,

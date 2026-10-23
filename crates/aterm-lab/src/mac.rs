@@ -448,7 +448,8 @@ fn fda_grant() -> String {
     )
 }
 
-/// `mac dmg`: the lane (the module docs).
+/// `mac dmg`: the `dmg_acceptance` benches, built here and run in a fresh guest with SIP on and
+/// tccd's log streamed, then a `~/Desktop` read as the control.
 ///
 /// # Errors
 /// Usage, or the lane could not run.

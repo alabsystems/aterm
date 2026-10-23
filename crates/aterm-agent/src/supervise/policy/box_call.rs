@@ -22,6 +22,14 @@ pub const LAG_TRIES: u32 = 4;
 pub const LAG_STEP: Duration = Duration::from_millis(250);
 
 /// A main-chain tool call with no result yet: its id, its tool, the file it names (`file_path`, or a notebook's `notebook_path`) and a Bash call's `command`.
+///
+/// `command` completes the parsed record of the call. Since `breaker-read-only@v6`
+/// stopped reading the transcript, no Bash or tool rule reads it (`drew` keys on
+/// `tool` and `file`); it is kept — not moved or dropped — so `pending_calls`
+/// records every call field the transcript carries and its parser test
+/// (`box_call_tests`) can pin the `command` extraction. Classifier audit 2
+/// (2026-10-22) confirmed `aterm-lab` does not read it either (its `.command`
+/// reads are on `forever_cover`'s ledger rows, an unrelated struct).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCall {
     pub id: String,
@@ -186,7 +194,9 @@ pub fn drew(
         })
 }
 
-/// WHETHER THE SCREEN DRAWS THE `Edit file` BOX `p` (on `rows`) AS THE EDIT TOOL'S OWN CALL, not a Bash `sed -i` (module docs, "THE SCREEN'S WORD").
+/// WHETHER THE SCREEN DRAWS THE `Edit file` BOX `p` (on `rows`) AS THE EDIT TOOL'S OWN CALL, not a
+/// Bash `sed -i`: both draw `⏺ Update(<file>)` above the box, and only the Bash call's carries an
+/// unrun child row (`⎿  Waiting…`, `⎿  Running…` or `⎿  $ <command>`).
 #[must_use]
 pub fn screen_shows_edit_call(p: &PromptV2, rows: &[String]) -> bool {
     if !reads_the_screen_above(p) || p.head_off_screen {

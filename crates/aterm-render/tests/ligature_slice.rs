@@ -2,19 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Ligature slicing: the shaping gate [`aterm_render::ligature_shaping::classify_shape`]
-//! admits exactly the two grid-mappable forms (1:1, or N:1 with `N>=2` behind the flag)
-//! and, with the flag off, is `accept iff n_out == n_in`; the `LigatureGate` ty model's own
-//! `Classify` rule judges every real verdict. The tile arithmetic the N:1 path rests on is
-//! the lattice `extract_cell_slice_reassembles_wide_raster` in `ligature_shaping.rs` (ty
-//! has no multiplication).
+//! Tier-1 conformance of [`aterm_render::ligature_shaping::classify_shape`] to the `LigatureGate` model.
 
 use aterm_render::ligature_shaping::{ShapeVerdict, classify_shape};
 
-// The conservative gate.
-
-/// One shape decision as `LigatureGate`'s variables: `accept` is the real verdict's
-/// admission (`Reject` is the only refusal); `phase` is the model's Pick/Classify phase.
 fn gate_state(phase: i64, n_in: usize, n_out: usize, admit: bool, accept: bool) -> GateState {
     [
         ("phase", phase),
@@ -29,14 +20,6 @@ fn gate_state(phase: i64, n_in: usize, n_out: usize, admit: bool, accept: bool) 
 
 type GateState = std::collections::BTreeMap<&'static str, i64>;
 
-/// Tier-1 bind of `aterm_models_render::ligature_gate_model()` to the shipping
-/// `classify_shape`: for every `(n_in, n_out, admit)` in `0..=8 × 0..=8 × {off, on}` the
-/// model's `Classify` step, replayed with the real verdict as `accept'`, is one
-/// `LigatureGate.Next` admits at `Buggy = 0`, and `ConservativeAccept` holds on every real
-/// post-state. `Pick` is checked over its `0..=4` range.
-///
-/// Negative control: the real verdict with the flag check dropped (the model's defect)
-/// yields a step the committed model rejects and the `Buggy = 1` model admits.
 #[test]
 fn classify_shape_conforms_to_ligature_gate_model() {
     use aterm_models_render::ligature_gate_model;
@@ -80,7 +63,6 @@ fn classify_shape_conforms_to_ligature_gate_model() {
     }
     assert_eq!(classified, 9 * 9 * 2, "the whole lattice was classified");
 
-    // Negative control: a 3:1 collapse with the flag off, which a flag-blind gate accepts.
     assert_eq!(classify_shape(3, 1, false), ShapeVerdict::Reject);
     let picked = gate_state(1, 3, 1, false, false);
     let flag_blind = gate_state(0, 3, 1, false, true);

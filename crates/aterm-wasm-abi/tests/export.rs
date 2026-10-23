@@ -148,6 +148,8 @@ fn error(msg: &str) -> Option<Thrown> {
 #[test]
 fn a_class_is_built_called_and_freed_through_its_exports() {
     let (name, len) = pass(b"clicks");
+    // SAFETY (this test): words as the glue lowers them; each handle is used
+    // only while live.
     unsafe {
         let c = counter_new(4, 0, name, len);
         assert_ne!(c, 0);

@@ -222,7 +222,7 @@ fn lands(step: Step) -> Option<i64> {
     }
 }
 
-/// T1-a, the reducer (see the module header).
+/// T1-a, the reducer of the ask-and-drain flow.
 #[test]
 fn the_real_reducer_is_the_derived_machine() {
     use aterm_spec::xref;
@@ -427,7 +427,7 @@ fn quiet_bound(s: &State, word: &str) -> bool {
     }
 }
 
-/// T1-a', the quiet upgrade's read (see the module header). The quiet flow's one step is the
+/// T1-a', the quiet upgrade's read. The quiet flow's one step is the
 /// restart at a genuinely idle point ([`upgrade::quiet_step`]); what it shares with the machine is
 /// the recorded word, bound over every reachable state read quietly ([`quiet_facts`],
 /// [`quiet_truth`]).
@@ -625,7 +625,7 @@ fn deadlines(row: &Row) -> Vec<u64> {
     out
 }
 
-/// T1-f, the classifier over the machine's states (see the module header).
+/// T1-f, the classifier over the machine's states.
 #[test]
 fn the_real_view_is_the_derived_machine() {
     use aterm_spec::xref;

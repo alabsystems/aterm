@@ -820,7 +820,8 @@ impl CompanionOwner {
         rest.taken
     }
 
-    /// The frame's notes, everything before the tick, in native order:
+    /// The frame's notes, everything before the tick, in native order; a capture advances none
+    /// of the latches a present owns.
     #[inline]
     pub fn prepare(&mut self, f: PetFacts<'_>, decos: &mut WordDecorations) -> PetTick {
         let PetFacts {
@@ -1503,7 +1504,7 @@ impl CompanionOwner {
     /// ([`PetBrain::set_letters_unseen`]).
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_pet_letters_unseen(&mut self, unseen: bool) {
+    pub const fn set_pet_letters_unseen(&mut self, unseen: bool) {
         self.pet.set_letters_unseen(unseen);
     }
 

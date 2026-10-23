@@ -2,25 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Reflow helpers (chunk boundaries, cell copying) and source-coordinate
-//! tracking that preserves `CellExtras` across reflow.
+//! Reflow chunking, cell copying, and `CellExtras` coordinate remapping.
 
 use crate::CellExtra;
 use crate::CellFlags;
 #[cfg(any(test, debug_assertions))]
 use crate::test_counters::count_reflow_cell_ops;
 
-/// Maps a copied cell's source index back to its [`CellCoord`] during extras
-/// remapping. A single-row copy is index arithmetic (`Row(r)`); only the
-/// continuation merge, which concatenates several source rows, needs the
-/// per-index `Coords` table.
+/// Maps a copied cell's source index back to its [`CellCoord`] during extras remapping.
 #[derive(Clone, Copy)]
 pub(super) enum ExtrasSource<'a> {
-    /// No extras to remap (the source row had none) — `remap_copied_extra` no-ops.
+    /// Source row had no extras.
     None,
-    /// Single source row `r`: `src_index` maps to `CellCoord::new(r, src_index)`.
+    /// Single source row `r` where `src_index` maps to `CellCoord::new(r, src_index)`.
     Row(u16),
-    /// Explicit index→coord table (the merge path spans multiple source rows).
+    /// Explicit index-to-coordinate table across merged source rows.
     Coords(&'a [CellCoord]),
 }
 
@@ -53,11 +49,7 @@ pub(super) const fn adjust_chunk_boundary(
     actual_end
 }
 
-/// Check if a cursor at `cursor_logical_offset` falls within a reflow chunk.
-///
-/// Returns `Some((dest_row, column_in_chunk))` if the cursor (clamped to
-/// `cells_len`) is in `[cell_offset, actual_end)` (or `<= actual_end` for the
-/// last chunk, so a cursor past the final cell lands on the last row).
+/// Returns `Some((dest_row, col_in_chunk))` if `cursor_logical_offset` falls within this chunk.
 #[inline]
 pub(super) const fn cursor_in_chunk(
     cursor_logical_offset: usize,
@@ -92,7 +84,6 @@ pub(super) fn source_coords_for_row(row: u16, len: usize) -> Vec<CellCoord> {
         .collect()
 }
 
-/// The source coordinate of the copied cell at `src_index`, for extras lookups.
 #[inline]
 const fn source_coord(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> Option<CellCoord> {
     match extras_ctx.source {
@@ -121,10 +112,6 @@ fn remap_copied_extra(
         return;
     };
 
-    // Structured extras and rings can both contribute to one cell (an emoji's
-    // base in the complex ring, its ZWJ/skin-tone suffix in the map's combining
-    // marks). Keep full stored strings, supplement missing bases, and resolve
-    // RGB ring-first as the renderer does.
     let stored = old_extras.get(coord);
     let complex = if stored.and_then(CellExtra::complex_char).is_none() {
         old_extras.complex_codepoint_for(coord.row, coord.col)
@@ -154,9 +141,6 @@ fn remap_copied_extra(
     }
 }
 
-/// Is the blank source cell at `src_index` an inline-image tile? An image cell
-/// carries no glyph; its row's length is pinned only so the rewrap copies it
-/// (`Terminal::pin_image_rows_for_width_change`), so it is not text content.
 fn is_image_blank(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> bool {
     let Some(old_extras) = extras_ctx.old_extras else {
         return false;
@@ -166,16 +150,7 @@ fn is_image_blank(extras_ctx: &ExtrasCopyCtx<'_>, src_index: usize) -> bool {
         .is_some_and(|extra| extra.image().is_some())
 }
 
-/// Copy cells into a row, blanking wide chars that cannot fit.
-///
-/// `content_len` is where the source's content ends (an index into `cells`):
-/// every copied cell before it, a printed blank included, is inside the row's
-/// length, as the write path counts a printed space. `Row::set` counts only
-/// non-empty cells, so without this a printed space at a chunk end would fall
-/// out of the content and tiered history (staged at the row's length) would
-/// join the words around it. Cells past `content_len` (an autowrap row's
-/// trailing pad, the ConPTY cursor row's blanks through the cursor) and blank
-/// image tiles are copied but not counted.
+/// Copies chunk cells into `new_row`, blanking wide glyphs that cannot fit and updating length.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn copy_cells_to_row(
     new_row: &mut Row,
@@ -196,17 +171,12 @@ pub(super) fn copy_cells_to_row(
     for (src_index, cell) in cells[cell_offset..actual_end].iter().enumerate() {
         if cell.flags().contains(CellFlags::WIDE) && new_cols < 2 {
             new_row.set(j, crate::Cell::EMPTY);
-            // Cell::EMPTY does not advance row.len via set(); force it so the
-            // replacement space is visible to row_text() and merges.
             new_row.update_len(j.saturating_add(1));
             j += 1;
             skip_next_spacer = true;
         } else if skip_next_spacer && cell.flags().contains(CellFlags::WIDE_CONTINUATION) {
             skip_next_spacer = false;
         } else if cell.flags().contains(CellFlags::WIDE) && j.saturating_add(1) == new_cols {
-            // A wide head in the last column has nowhere for its continuation
-            // (reachable from the in-place DECDWL/DECDHL truncation); blank it as
-            // `Row::resize` does.
             new_row.set(j, crate::Cell::EMPTY);
             j = j.saturating_add(1);
             skip_next_spacer = true;
@@ -227,16 +197,7 @@ pub(super) fn copy_cells_to_row(
     new_row.update_len(content_end);
 }
 
-/// Chunk `cells` into new-width rows with cursor tracking. Rows after the first
-/// are marked wrapped; the caller sets the first row's flag.
-///
-/// `content_len` is where the content of `cells` ends ([`copy_cells_to_row`]).
-/// `points` are the cursors carried through the rewrap (the live one and the
-/// saved one), each a logical offset into `cells` mapped to its new cell.
-///
-/// A chunk the boundary backs off a wide glyph ends one cell short: that cell
-/// is an early-wrap hole, recorded on the row (`RowFlags::EARLY_WRAP_HOLE`) so
-/// the next rewrap drops it and nothing else.
+/// Chunks `cells` into `new_cols`-wide rows, remapping extras and tracking cursor `points`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chunk_cells_to_rows(
     cells: &[crate::Cell],
@@ -268,13 +229,7 @@ pub(super) fn chunk_cells_to_rows(
         if !first {
             row.set_wrapped(true);
         }
-        // `adjust_chunk_boundary` ends a chunk before `chunk_end` only to move
-        // a wide head that would straddle the edge onto the next row.
         if actual_end < chunk_end {
-            // Recreate the print path's BCE blank from the wide glyph that
-            // wraps here. The old hole was non-content and was omitted from
-            // the logical line, so an independently erased/recoloured old
-            // hole has no historical paint to restore.
             let col = new_cols - 1;
             let mut blank = crate::Cell::bce_blank(cells[actual_end].colors());
             if blank.colors().bg_is_rgb()
@@ -298,9 +253,6 @@ pub(super) fn chunk_cells_to_rows(
                 && let Some((row, col)) =
                     cursor_in_chunk(offset, cells.len(), cell_offset, actual_end, new_rows.len())
             {
-                // Past the line's content, a gap-keeping point keeps its
-                // distance from the last chunk's start (finalize clamps it to
-                // the new width), where the live cursor is pulled back.
                 let col = if point.keeps_gap && offset > cells.len() {
                     row_u16(offset.saturating_sub(cell_offset))
                 } else {
@@ -315,15 +267,7 @@ pub(super) fn chunk_cells_to_rows(
     }
 }
 
-/// A cursor the rewrap carries: its logical offset in the line being chunked
-/// (`None` when it is on another line), and the `(row, col)` it lands on in
-/// the new rows once its line is chunked (`None` until then).
-///
-/// An offset past the line's content lands on the line's last row. The live
-/// cursor is pulled back to the content's end there; a `keeps_gap` point (the
-/// saved cursor) keeps its offset, so a column a program saved past its output
-/// survives a widening, and a narrowing clamps it only to the new width, as
-/// xterm (which never moves the slot) would restore it.
+/// Cursor logical offset and destination `(row, col)` tracked across line chunking.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct TrackedPoint {
     pub(super) offset: Option<usize>,
@@ -368,14 +312,10 @@ mod tests {
             Some("https://example.com")
         );
         assert_eq!(copied.underline_color(), Some([7, 8, 9]));
-        // A map-only copy would keep the stale map colours; the ring is what
-        // the renderer shows.
         assert_ne!(old.get(coord).unwrap().fg_rgb(), copied.fg_rgb());
         assert_ne!(old.get(coord).unwrap().bg_rgb(), copied.bg_rgb());
     }
 
-    /// A chunk boundary that would split a wide glyph backs off to its lead
-    /// (but always advances at least one glyph); any other boundary stays.
     #[test]
     fn adjust_chunk_boundary_never_splits_a_wide_glyph() {
         let [head, tail] = wide('W');
@@ -394,11 +334,8 @@ mod tests {
         }
     }
 
-    /// A cursor offset lands in the chunk that holds it, at `offset - start`;
-    /// only the last chunk owns its end (and any clamped offset past it).
     #[test]
     fn cursor_in_chunk_owns_only_its_span() {
-        // (offset, cells_len, chunk start, chunk end, dest row, want)
         let cases = [
             (3, 10, 2, 5, 1, Some((1, 1))),
             (0, 10, 0, 5, 0, Some((0, 0))),
@@ -459,11 +396,8 @@ mod tests {
         assert!(!cell.flags().contains(CellFlags::WIDE));
     }
 
-    /// The pages (first, so a caller's binding drops them after the rows),
-    /// the chunked rows and where each tracked cursor landed.
     type Chunked = (PageStore, Vec<Row>, [Option<(usize, u16)>; 2]);
 
-    /// Chunk `cells` (all content) at `new_cols`, tracking two cursors.
     fn chunk(cells: &[Cell], new_cols: u16, offsets: [Option<usize>; 2]) -> Chunked {
         let mut new_pages = PageStore::new();
         let mut new_rows: Vec<Row> = Vec::new();
@@ -535,8 +469,6 @@ mod tests {
             Cell::new('E'),
             Cell::new('F'),
         ];
-        // With new_cols=3: [ABC][DEF]. 'E' (offset 4) lands at row 1, col 1;
-        // 'B' (offset 1) at row 0, col 1.
         let (_pages, new_rows, at) = chunk(&cells, 3, [Some(4), Some(1)]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(at, [Some((1, 1)), Some((0, 1))]);
@@ -550,14 +482,11 @@ mod tests {
             Cell::new('C'),
             Cell::new('D'),
         ];
-        // Cursor at 4 (past end) is in the last chunk [2..4): row 1, col 2.
         let (_pages, new_rows, at) = chunk(&cells, 2, [Some(4), None]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(at, [Some((1, 2)), None]);
     }
 
-    /// A printed space at a chunk end is content: the row's length covers it,
-    /// as the write path counts a printed space.
     #[test]
     fn a_printed_space_at_a_chunk_end_stays_inside_the_rows_length() {
         let cells = [
@@ -571,8 +500,6 @@ mod tests {
         assert_eq!(new_rows[1].len(), 1);
     }
 
-    /// A chunk backed off a wide glyph ends in an early-wrap hole, recorded on
-    /// its row; a chunk filled to the edge records none.
     #[test]
     fn a_chunk_backed_off_a_wide_glyph_records_its_hole() {
         let [head, tail] = wide('中');

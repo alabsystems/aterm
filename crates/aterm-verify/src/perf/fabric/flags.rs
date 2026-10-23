@@ -45,6 +45,10 @@ fn flags_of(value: &Value) -> Result<Vec<String>, String> {
 }
 
 /// Extracts configured `rustflags` from `targo config get --format json` output.
+///
+/// # Errors
+///
+/// Text that is not the JSON `config get` prints, or a rustflags value cargo would not take.
 pub(crate) fn config_sources(
     build: Option<&str>,
     target: Option<&str>,

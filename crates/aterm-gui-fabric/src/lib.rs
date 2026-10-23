@@ -65,6 +65,10 @@ pub trait Timeline {
         self.record(kind, payload);
         false
     }
+    /// Whether this session's log is the one the predecessor of a seamless update wrote, carried and read (not one that started over after a gap), so every [`FabricFact::MailIn`] that predecessor recorded is already in it ([`FabricCarry::marked`]).
+    fn log_carried(&self) -> bool {
+        false
+    }
 }
 
 /// What a fabric record says, typed, for the session log's mark beside it ([`FabricSession::record_fact`]), so nothing parses a timeline payload back.
@@ -712,8 +716,11 @@ pub struct Inbox {
     bus_head: u64,
     addressed_head: Option<u64>,
     oldest_on_bus: Option<u64>,
-    dedup: VecDeque<u64>,
+    /// The offsets this session took or refused, oldest first, each with whether its delivery recorded a [`FabricFact::MailIn`] (a quota refusal records none).
+    dedup: VecDeque<(u64, bool)>,
     dedup_set: HashSet<u64>,
+    /// THE MARKS A SEAMLESS UPDATE CARRIED ([`FabricCarry::marked`]): offsets the carried log already marks delivered, which this successor's bridge offers again. Each is taken back into the ring once with no second mark.
+    carried_marks: HashSet<u64>,
     holds: Holds,
     advisory: Option<(Hold, u64)>,
     hold_fenced: bool,
@@ -813,6 +820,14 @@ pub struct FabricCarry {
     /// Of [`Self::broadcasts_uncarried`], the ones the successor's bridge offers again, which are therefore not lost.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub broadcasts_refilled: u64,
+    /// The offsets, on [`Self::bus_log`], of the mail whose delivery this session's log marked (`mail dir=in`), oldest first, as far as the budget reached. The successor's bridge offers the unhandled ones again, because the ring is not carried. A successor whose log is the carried one ([`Timeline::log_carried`]) takes each such row back into its ring without a second mark. Otherwise its fold would hold the mail twice (`mail in 2`, and no turn could link it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marked: Vec<u64>,
+}
+
+/// What one carried [`FabricCarry::marked`] offset costs the manifest: its digits and the array's `, `.
+fn mark_cost(off: u64) -> usize {
+    off.checked_ilog10().map_or(1, |d| d as usize + 1) + 2
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -902,14 +917,20 @@ impl FabricCarry {
                     .chain(&self.earlier_receipts)
                     .map(ReceiptCarry::cost),
             )
+            .chain(self.marked.iter().copied().map(mark_cost))
             .fold(0, usize::saturating_add)
     }
 
-    /// Give up the rows, keep the counters.
+    /// Give up the rows, keep the counters. A shed mark costs only a second `mail dir=in` mark for that mail in the successor's log.
     pub fn shed(&mut self) -> bool {
-        if self.posts.is_empty() && self.receipts.is_empty() && self.earlier_receipts.is_empty() {
+        if self.posts.is_empty()
+            && self.receipts.is_empty()
+            && self.earlier_receipts.is_empty()
+            && self.marked.is_empty()
+        {
             return false;
         }
+        self.marked.clear();
         self.uncarried.extend(self.posts.drain(..).map(|p| p.id));
         self.uncarried.sort_unstable();
         self.uncarried.dedup();
@@ -1165,8 +1186,9 @@ impl Inbox {
         for r in &mut self.receipts {
             r.earlier_log |= !kept(r.off);
         }
-        self.dedup.retain(|off| kept(*off));
+        self.dedup.retain(|(off, _)| kept(*off));
         self.dedup_set.retain(|off| kept(*off));
+        self.carried_marks.retain(|off| kept(*off));
         self.oldest_on_bus = self.oldest_on_bus.filter(|off| kept(*off));
         self.addressed_head = self.addressed_head.and_then(|h| {
             if kept(h) {
@@ -1178,7 +1200,7 @@ impl Inbox {
         if !kept(self.bus_head) {
             let rows = self.rows.iter().filter(|r| r.on_log).map(|r| r.off);
             self.bus_head = rows
-                .chain(self.dedup.iter().copied())
+                .chain(self.dedup.iter().map(|(off, _)| *off))
                 .chain(self.oldest_on_bus)
                 .max()
                 .unwrap_or(0);
@@ -1222,6 +1244,7 @@ impl Inbox {
         self.oldest_on_bus.is_some()
             || !self.receipts.is_empty()
             || !self.fetches.is_empty()
+            || !self.carried_marks.is_empty()
             || self
                 .posts
                 .iter()
@@ -1725,6 +1748,22 @@ impl SessionFabric {
                 carry.receipts_uncarried = carry.receipts_uncarried.saturating_add(1);
             }
         }
+        // The marks last: one the budget leaves out costs a second mark, never a mail.
+        // The newest first, since the oldest are the likeliest handled.
+        for off in inbox
+            .dedup
+            .iter()
+            .rev()
+            .filter(|(off, marked)| *marked && *off <= CARRY_INT_MAX)
+            .map(|(off, _)| *off)
+        {
+            if mark_cost(off) > *budget {
+                break;
+            }
+            *budget -= mark_cost(off);
+            carry.marked.push(off);
+        }
+        carry.marked.reverse();
         carry
     }
 
@@ -1805,6 +1844,17 @@ impl SessionFabric {
             });
         }
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        // A log that started over holds none of the predecessor's marks, so its refilled rows are marked as new.
+        if tl.log_carried() {
+            inbox.carried_marks = carry
+                .marked
+                .iter()
+                .rev()
+                .copied()
+                .filter(|off| *off <= CARRY_INT_MAX)
+                .take(DEDUP_CAP)
+                .collect();
+        }
         dead.sort_unstable();
         dead.dedup();
         for id in dead
@@ -4543,7 +4593,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         // more — rather than refused, and counted, a second time.
         if topic.is_some() {
             inbox.dropped += 1;
-            remember_offset(&mut inbox, off);
+            remember_offset(&mut inbox, off, false);
         }
         return "ERR quota\n".to_string();
     }
@@ -4587,7 +4637,16 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         inbox.addressed_head = Some(inbox.addressed_head.map_or(off, |h| h.max(off)));
     }
     inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
-    remember_offset(&mut inbox, off);
+    remember_offset(&mut inbox, off, true);
+    if inbox.carried_marks.remove(&off) {
+        // THE REFILL OF A CARRIED MARK: the row is back in the ring, and
+        // the carried log already marks its delivery (and its fold holds it
+        // waiting), so a second mark would count one mail twice.
+        drop(inbox);
+        ctx.fabric().changed.notify_all();
+        ctx.fabric_changed();
+        return format!("OK {id}\n");
+    }
     let fact = FabricFact::MailIn {
         kind: &kind,
         from: &from,
@@ -4612,11 +4671,11 @@ fn quota_key(from: &str) -> &str {
     from.split_once('@').map_or(from, |(_, node)| node)
 }
 
-fn remember_offset(inbox: &mut Inbox, off: u64) {
-    inbox.dedup.push_back(off);
+fn remember_offset(inbox: &mut Inbox, off: u64, marked: bool) {
+    inbox.dedup.push_back((off, marked));
     inbox.dedup_set.insert(off);
     while inbox.dedup.len() > DEDUP_CAP {
-        if let Some(old) = inbox.dedup.pop_front() {
+        if let Some((old, _)) = inbox.dedup.pop_front() {
             inbox.dedup_set.remove(&old);
         }
     }
@@ -5727,6 +5786,8 @@ mod test_support {
     pub(crate) struct TestTimeline {
         events: Vec<Event>,
         pub(crate) facts: Vec<String>,
+        /// What [`Timeline::log_carried`] answers: a seamless update's successor whose log is the carried one.
+        pub(crate) log_carried: bool,
     }
 
     impl TestTimeline {
@@ -5751,6 +5812,10 @@ mod test_support {
             self.facts.push(format!("{kind}: {fact:?}"));
             self.record(kind, payload);
             true
+        }
+
+        fn log_carried(&self) -> bool {
+            self.log_carried
         }
     }
 
@@ -6461,6 +6526,125 @@ mod inbox_hold {
             2,
             "the second broadcast refusal"
         );
+    }
+
+    /// THE MARKS A SEAMLESS UPDATE CARRIES (6G-4's latch finding). The
+    /// ring is not carried, so the successor's bridge offers the unhandled
+    /// mail again. Only a delivery that recorded its `MailIn` is carried as
+    /// marked; a quota refusal recorded none. A successor whose log is the
+    /// carried one takes each marked row back with no second `MailIn`, and
+    /// marks a new offset and a refused one. A successor whose log started
+    /// over marks every row. A log switch forgets the carried marks with the
+    /// rest of the offsets.
+    #[test]
+    fn a_carried_mark_takes_its_refill_back_without_a_second_mail_in() {
+        let mail_ins = |ctx: &SessionCtx| {
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .facts
+                .iter()
+                .filter(|f| f.starts_with("inbox: MailIn"))
+                .count()
+        };
+        let quota = u64::try_from(SENDER_QUOTA).unwrap();
+        let refused = 5000 + quota;
+        let carry = with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            assert_eq!(
+                ctx.fabric.topic_add("news", "head", &ctx.timeline),
+                Ok(true)
+            );
+            assert_eq!(deliver(&store, &sid, 7, "h-a", "task", "t"), "OK 1\n");
+            for off in 5000..refused {
+                assert!(broadcast(&store, &sid, off, "news", "b").starts_with("OK "));
+            }
+            assert_eq!(broadcast(&store, &sid, refused, "news", "b"), "ERR quota\n");
+            assert_eq!(mail_ins(&ctx), 1 + usize::try_from(quota).unwrap());
+            ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone())
+        });
+        assert_eq!(carry.marked.first(), Some(&7), "oldest first");
+        assert_eq!(carry.marked.len(), 1 + usize::try_from(quota).unwrap());
+        assert!(
+            !carry.marked.contains(&refused),
+            "a refusal marked nothing, so its refill is marked as new"
+        );
+        let wire = aterm_toml::to_string(&carry).expect("serializes");
+        let carry: FabricCarry = aterm_toml::from_str(&wire).expect("reads back");
+        assert!(wire.len() <= carry.rows_cost() + 512, "{wire}");
+
+        for log_carried in [true, false] {
+            with_link(|| {
+                let store = new_store();
+                let (sid, ctx) = registered(&store);
+                ctx.timeline.lock().unwrap().log_carried = log_carried;
+                ctx.fabric.seed_carry(&carry, &ctx.timeline);
+                assert_eq!(
+                    ctx.fabric.topic_add("news", "head", &ctx.timeline),
+                    Ok(true)
+                );
+                let before = mail_ins(&ctx);
+                let id = carry.last_msg_id + 1;
+                assert_eq!(
+                    deliver(&store, &sid, 7, "h-a", "task", "t"),
+                    format!("OK {id}\n"),
+                    "the refill is taken back into the ring (log carried: {log_carried})"
+                );
+                assert!(
+                    ctx.fabric.lock().row_at(7).is_some(),
+                    "the row is held again"
+                );
+                assert_eq!(
+                    deliver(&store, &sid, 7, "h-a", "task", "t"),
+                    format!("OK {id}\n"),
+                    "and once only"
+                );
+                assert_eq!(
+                    mail_ins(&ctx) - before,
+                    usize::from(!log_carried),
+                    "a carried log already marks it; a log that started over does not"
+                );
+                assert!(broadcast(&store, &sid, refused, "news", "b").starts_with("OK "));
+                assert_eq!(
+                    deliver(&store, &sid, 8, "h-a", "task", "n"),
+                    format!("OK {}\n", id + 2)
+                );
+                assert_eq!(
+                    mail_ins(&ctx) - before,
+                    2 + usize::from(!log_carried),
+                    "the refused offset and a new one are marked"
+                );
+            });
+        }
+
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            ctx.timeline.lock().unwrap().log_carried = true;
+            ctx.fabric.seed_carry(&carry, &ctx.timeline);
+            assert!(
+                ctx.fabric.lock().holds_bus_references(),
+                "carried marks are offsets on the carried log"
+            );
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            assert_eq!(
+                cmd_link(
+                    &store,
+                    &format!("log {}.0", "b".repeat(32)),
+                    Some(generation)
+                ),
+                "OK forgot=1\n"
+            );
+            let before = mail_ins(&ctx);
+            assert!(deliver(&store, &sid, 7, "h-a", "task", "t").starts_with("OK "));
+            assert_eq!(
+                mail_ins(&ctx) - before,
+                1,
+                "off=7 on another log is another mail"
+            );
+        });
     }
 
     #[test]

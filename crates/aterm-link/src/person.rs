@@ -337,8 +337,8 @@ const LIVE: Bounds = Bounds {
 };
 const _: () = assert!(LIVE.subscription.as_millis() > LIVE.request.as_millis());
 
-/// Publish once, as `person`, under a fresh sequence (the module doc's
-/// rule), and answer the record's offset.
+/// Publish once, as `person`, under a fresh sequence (the wall clock's nanoseconds; a record
+/// the broker deduped is an error), and answer the record's offset.
 fn publish(
     cfg: &Config,
     cmd: &PersonCmd,

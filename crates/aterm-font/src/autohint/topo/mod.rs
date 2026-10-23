@@ -79,8 +79,6 @@ impl Axis {
             {
                 break;
             }
-            // Edges with the same position and minor direction should appear
-            // before those with the major direction
             if prev_fpos == edge.fpos && edge.dir == self.major_dir {
                 break;
             }
@@ -228,8 +226,8 @@ impl Segment {
         segments.get(self.link_ix.map(|ix| ix as usize)?)
     }
 
-    /// Adjust the height of the segment by half the distance between v1
-    /// and v2 using wrapping arithmetic.
+    /// Adjust the height of the segment by half the distance between v1 and v2 using wrapping
+    /// arithmetic.
     pub(crate) fn adjust_height(&mut self, v1: i32, v2: i32) {
         self.height = (self.height as i32).wrapping_add(v1.wrapping_sub(v2) >> 1) as i16;
     }

@@ -1,19 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! No landing wait (`docs/DESIGN-atpkg-vendor-direct-updates-2026-09-22.md` Phase 2), at
-//! the real process edge: the dev `atpkg` binary over a temp prefix.
-//!
-//! * `__landing` — the hidden verb a twin laid by an older client still execs while a
-//!   landing marker stands — reached the way it is reached in the field: an older twin's
-//!   own bytes (the self-update block, then the landing prelude) run in `/bin/sh` with a
-//!   marker naming a LIVE writer (this test process) standing; `bin/<program>` runs at
-//!   ONCE and nothing is printed.
-//! * Every pass sweeps `landing/`: a mutating verb (`gc`, the one that needs no network)
-//!   leaves no marker behind, whoever wrote it.
-//!
-//! Never the real store: `HOME` is a temp directory and `XDG_CONFIG_HOME` an absent one, so
-//! the default prefix lands under that temp `HOME`; the registry is a local directory.
+//! End-to-end tests for the `atpkg __landing` pass-through verb and `landing/` sweep.
 
 #![cfg(unix)]
 #![allow(
@@ -64,8 +52,6 @@ impl Fixture {
         }
     }
 
-    /// A managed `claude` at `build`: a store tree whose `bin/claude` echoes its argv and
-    /// exits 7, and its `bin/` shim laid by the activation code.
     fn install_claude(&self, build: u64) -> PathBuf {
         let layout = self.layout();
         let dir = layout.build_dir("claude", build);
@@ -84,8 +70,6 @@ impl Fixture {
         exe
     }
 
-    /// A landing marker naming a live writer and a build the shim does not run — the
-    /// state the retired verb waited out.
     fn stand_marker(&self) -> PathBuf {
         let layout = self.layout();
         let marker = layout.landing_dir().join("claude");
@@ -102,7 +86,6 @@ impl Fixture {
         marker
     }
 
-    /// `program argv…` confined to this fixture, both pipes captured, run to completion.
     fn run(&self, program: &Path, argv: &[OsString]) -> Output {
         Command::new(program)
             .args(argv)
@@ -124,10 +107,6 @@ fn atpkg() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_atpkg"))
 }
 
-/// An older twin as it runs in the field: the bytes an older client laid in
-/// `agents/claude` — the self-update block, then the landing prelude — run in `/bin/sh`
-/// with the marker standing and this dev binary as the embedded atpkg. A non-verb takes
-/// the hand-over and the store build runs at once, silently.
 #[test]
 fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     let fx = Fixture::new("twin");
@@ -156,14 +135,9 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     );
     std::fs::write(&twin, body).unwrap();
     std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // A known print option establishes the launch shape. An invented leading
-    // --probe has unknown arity and intentionally preserves today's argv.
     let argv = [OsString::from("-p"), OsString::from("probe")];
     let out = fx.run(&twin, &argv);
     assert_eq!(out.status.code(), Some(7), "{out:?}");
-    // The forward execs today's `bin/claude`, whose yolo-by-default block leads
-    // the argv and says so (`crate::yolo` in atpkg's lib); the passthrough
-    // itself — at once, no wait, no other word — is what this pins.
     assert_eq!(
         text(&out.stdout),
         "fake: --dangerously-skip-permissions -p probe\n"
@@ -175,9 +149,6 @@ fn an_older_twin_under_a_standing_marker_runs_the_tool_at_once() {
     );
 }
 
-/// Every pass sweeps `landing/`: a mutating verb takes the store lock and removes the
-/// directory — a live writer's marker in the old format and garbage alike, since no pass
-/// of this client writes one and the lock holder is the only pass.
 #[test]
 fn a_pass_sweeps_every_landing_marker() {
     let fx = Fixture::new("sweep");

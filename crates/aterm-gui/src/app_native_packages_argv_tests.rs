@@ -35,18 +35,11 @@ fn an_offline_check_says_offline() {
     assert!(said.contains("offline"), "{said}");
 }
 
-/// The machine apply worker sorts the child's stdout: the `machine-settings:`
-/// row becomes the pull-down/status event, the last `atpkg machine: …` line is
-/// the verdict, and a `machine settings not applied — …` line is the refusal
-/// reported as the failure (by its reason).
+/// `machine_apply_stdout` splits child stdout into `machine-settings:` events, the `machine-state:` record, the final verdict, and any refusal.
 #[test]
 fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
     use atpkg::cli::{MACHINE_NOT_APPLIED_PREFIX, MACHINE_SETTINGS_MARKER, MACHINE_VERDICT_PREFIX};
-    // A verdict line after atpkg's own prefix; the worker passes its words on as-is.
     let nothing_changed = format!("{MACHINE_VERDICT_PREFIX}nothing changed — already applied");
-    // The apply prints its own `machine-state:` record after the change line;
-    // the worker hands it on as the status's newest state, so the completion
-    // has nothing to confirm by a read.
     let applied = machine_apply_stdout(&format!(
         "atpkg: Universal Control disabled for this host (revert: …)\n\
          atpkg: {MACHINE_SETTINGS_MARKER}universal-control disabled\n\
@@ -80,8 +73,6 @@ fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
     );
     assert!(nothing.refusal.is_none());
 
-    // A refused apply: the refusal line, then the verb's own `not applied` verdict
-    // (never a "nothing changed" beside a refusal).
     let refused = machine_apply_stdout(&format!(
         "{MACHINE_NOT_APPLIED_PREFIX}HOME is /tmp/synthetic, the account home is /Users//x\n\
          {MACHINE_VERDICT_PREFIX}not applied — HOME is /tmp/synthetic, the account home is /Users//x\n"
@@ -96,15 +87,11 @@ fn machine_apply_stdout_is_sorted_into_events_verdict_and_refusal() {
     );
     assert!(refused.events.is_empty());
 
-    // Nothing said: no verdict, no refusal, no events — the worker then reports
-    // the exit status alone.
     let silent = machine_apply_stdout("");
     assert!(silent.verdict.is_none() && silent.refusal.is_none() && silent.events.is_empty());
 }
 
-/// The machine read parses the `machine-state:` record out of the prose
-/// `atpkg machine` prints around it; prose alone or a malformed record is no
-/// record, reported as "printed no state".
+/// `parse_machine_state_output` parses only a complete `machine-state:` marker line and ignores surrounding prose.
 #[test]
 fn machine_state_is_read_from_the_marker_line_and_never_guessed() {
     use atpkg::machine::{HomePosture, UcPosture};
@@ -137,10 +124,7 @@ fn machine_state_is_read_from_the_marker_line_and_never_guessed() {
     );
 }
 
-/// The worker's exit classification: success is no sentence; the contention
-/// code (75) never quotes the child's own line (it names a peer and a lock)
-/// and reads the same with or without stderr; any other exit is the last
-/// stderr line.
+/// `packages_child_failure` returns `None` on success, a uniform contention message on `CONTENDED_EXIT`, and the last stderr line otherwise.
 #[cfg(unix)]
 #[test]
 fn a_contended_verb_names_the_other_installer_by_exit_code() {
@@ -173,14 +157,7 @@ fn a_contended_verb_names_the_other_installer_by_exit_code() {
     );
 }
 
-/// A Settings Check that stood down behind a sibling's cached-index pass
-/// names the cause. atpkg writes that stand-down line to stdout, and the
-/// Check maps failures through [`packages_child_failure`] over stderr alone.
-/// The child is built from atpkg's real stand-down decision
-/// (`atpkg::cli::stand_down_exit` over `atpkg::status::stale_index_only_end`)
-/// and fed to [`check_pass_failure`], binding the two halves. Also covers the
-/// Check's own pass on the cached index. Controls: an unmoved record, no
-/// store, a holder that also failed a member (stderr quoted), and a success.
+/// A Settings check that stood down behind a sibling's cached-index pass reports the recorded cache cause from `status.toml`.
 #[cfg(unix)]
 #[test]
 fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
@@ -198,8 +175,6 @@ fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
     let cached = "up to date (index build 46) (index from cache \u{2014} GitHub rate limit \
                   hit (HTTP 403))";
     let cause = "GitHub rate limit hit (HTTP 403)";
-    // The sibling's pass end as atpkg records it: seq 8, failed, the cache clause, and
-    // whether it failed for its index alone.
     let sibling_ended = |stale_only: bool| {
         let status = atpkg::status::Status {
             schema: 1,
@@ -226,8 +201,6 @@ fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
         };
         (run, std::process::ExitStatus::from_raw(code << 8))
     };
-    // The Check's child: read seq 7 before the spawn, queued, stood down — its streams
-    // and exit exactly as atpkg's stand-down decides them.
     let stood_down = |record: &atpkg::status::Status| {
         let exit = atpkg::cli::stand_down_exit(
             PassOutcome::Failed,
@@ -248,7 +221,6 @@ fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
     };
     let bare = Some("atpkg update exited with exit status: 1".to_string());
 
-    // THE GAP: stood down behind a stale-index-only pass — exit 1, stderr silent.
     let stale = stood_down(&sibling_ended(true));
     assert!(
         stale.0.said.is_empty(),
@@ -259,35 +231,25 @@ fn a_check_behind_a_cached_index_pass_names_the_cause_regression_2026_09_26() {
     assert!(!said.contains("exit status"), "never the bare exit: {said}");
     assert_eq!(said, cached_index_check_message(cause));
 
-    // The Check's OWN pass on the cached index: the same record, no queue.
     let own = child(1, String::new(), Some(7), false);
     assert_eq!(
         check(&own, Some(&layout)),
         Some(cached_index_check_message(cause))
     );
 
-    // Control: the record did not move past the one read before the spawn (not this
-    // child's pass; an edge refusal writes none): the bare exit.
     let unmoved = child(1, String::new(), Some(8), false);
     assert_eq!(check(&unmoved, Some(&layout)), bare);
-    // Control: no store to read.
     assert_eq!(check(&stale, None), bare);
-    // Control: the sibling also failed a member; the stand-down speaks on stderr and
-    // that line is the Check's sentence.
     let failed = stood_down(&sibling_ended(false));
     let said = check(&failed, Some(&layout)).expect("a failure");
     assert!(said.contains("the last update failed"), "{said}");
     assert_eq!(said, failed.0.said.trim());
-    // Control: success is no sentence, whatever the record says.
     let ok = child(0, String::new(), Some(7), false);
     assert_eq!(check(&ok, Some(&layout)), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The host re-reads the machine record after exactly the verbs whose atpkg
-/// pass runs `apply_machine_settings` first, derived from the pinned argv
-/// table to mirror atpkg's `verb_applies_machine_settings` (`update`, every
-/// `install`, `machine apply`; not `uninstall --all`).
+/// `packages_busy` marks `applies_machine_settings` for `update`, `install`, and `machine apply`, but not `uninstall --all`.
 #[test]
 fn a_pass_that_applies_the_machine_settings_rereads_the_record() {
     let requests = [
@@ -314,8 +276,7 @@ fn a_pass_that_applies_the_machine_settings_rereads_the_record() {
     assert_eq!(rereads, 3, "update, install --default-set, machine apply");
 }
 
-/// The structural admission: every verb but the `[machine]` host settings is
-/// admissible anywhere.
+/// `packages_request_admissible` admits package verbs everywhere and restricts `MachineApply` to macOS.
 #[test]
 fn packages_requests_are_admitted_by_platform() {
     for request in [
@@ -325,8 +286,6 @@ fn packages_requests_are_admitted_by_platform() {
     ] {
         assert!(packages_request_admissible(&request).is_ok(), "{request:?}");
     }
-    // The [machine] host settings are macOS host settings: admissible there,
-    // refused by name everywhere else — before any child is spawned.
     let machine = packages_request_admissible(&PackagesRequest::MachineApply);
     if cfg!(target_os = "macos") {
         assert!(machine.is_ok());
@@ -340,8 +299,7 @@ fn packages_requests_are_admitted_by_platform() {
     }
 }
 
-/// Under a private state root Apply Now is refused, and nothing else is;
-/// unset, every request passes.
+/// `packages_request_refusal` refuses `MachineApply` under a private state root and admits all other requests.
 #[test]
 fn apply_now_is_refused_under_a_private_state_root_and_nothing_else_is() {
     let all = [

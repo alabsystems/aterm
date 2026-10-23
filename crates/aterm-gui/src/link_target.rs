@@ -177,7 +177,6 @@ fn host_span(url: &str) -> Range<usize> {
             &['/', '\\', '?', '#'],
         )
     } else {
-        //"), &['/', '?', '#'])
         (after.strip_prefix("//"), &['/', '?', '#'])
     };
     if let Some(authority) = authority {

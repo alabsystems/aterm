@@ -193,7 +193,8 @@ impl Invocation {
 
     /// For a verb whose first positional is REPO.
     /// # Errors
-    /// Usage, next `agh help {verb}`.
+    /// Usage, next `agh help {verb}`: `name the repository: OWNER/NAME or @TARGET`; `no target
+    /// named @{name} in agh.toml [targets]`; `RepoArg::parse`'s errors.
     pub(crate) fn repo(&self, router: &Router) -> Result<(Slug, Named)> {
         self.named_repo(router)
             .map_err(|e| e.with_next(help_next(&self.path)))
@@ -320,7 +321,10 @@ pub fn verb_name(path: &[&str]) -> String {
 
 /// Rule 6 (what a tape cannot hold), for `verb` under `global`.
 /// # Errors
-/// Usage, next `agh help {verb}`.
+/// Usage, next `agh help {verb}`: under `--record` or `--replay`, `M1's tapes are anonymous:
+/// drop --as` for `--as` or `--profile`; `{verb} cannot be taped: it answers from this
+/// machine, not from GitHub` for a `Local` or `Provision` verb; `release download cannot be
+/// taped in M1: it streams a body`.
 pub(crate) fn tape_rule(verb: &Verb, global: &Global) -> Result<()> {
     if global.record.is_none() && global.replay.is_none() {
         return Ok(());

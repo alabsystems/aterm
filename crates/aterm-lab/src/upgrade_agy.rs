@@ -31,7 +31,6 @@ pub const SUBAGENT_HOLD_MS: i64 = 40_000;
 /// The host's line on agy's own activation notice.
 pub const NOTICED: &str = "an activation notice for Antigravity CLI";
 
-/// The words agy's command box asks with (`Run this command?`).
 const COMMAND_BOX: &str = "Run this command";
 
 fn could_not(m: &str) -> Fail {
@@ -69,8 +68,6 @@ pub fn bumped(version: &str, k: u64) -> Option<String> {
     Some(format!("{head}.{}", patch.parse::<u64>().ok()? + k))
 }
 
-/// The build a twin script execs (`exec '<build>' "$@"`), or `path` itself
-/// where it is no script.
 fn exec_target(path: &Path) -> PathBuf {
     let text = crate::util::scratch_text(path);
     text.lines()
@@ -79,7 +76,6 @@ fn exec_target(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// The scratch store: its prefix, the source build, its record.
 struct Store {
     /// `<scratch home>/Library/Application Support/aterm/pkg`.
     prefix: PathBuf,
@@ -98,9 +94,6 @@ impl Store {
         self.prefix.join("agents/agy")
     }
 
-    /// LAND build `version` as atpkg lands one (the module's order): its
-    /// tree, its record and `.ready`, `current` swapped, the twin rewritten,
-    /// and agy's activation notice published.
     fn land(&self, version: &str) -> Result<PathBuf, String> {
         let id = plain_build_id(version).ok_or("no build id")?;
         let bin = self.store().join(id.to_string()).join("bin/agy");
@@ -148,8 +141,6 @@ impl Store {
     }
 }
 
-/// The agy processes under the lab's instance run from the scratch store
-/// (`<store>/<build>/bin/agy …`), `(pid, build, words)`.
 fn store_agys(run: &Run, store: &Path) -> Vec<(i32, String, Vec<String>)> {
     let prefix = store.to_string_lossy().into_owned();
     crate::procs::descendants(run.instance_pid)
@@ -169,8 +160,6 @@ fn store_agys(run: &Run, store: &Path) -> Vec<(i32, String, Vec<String>)> {
         .collect()
 }
 
-/// How many MAIN turns the stub has answered agy (`kind=gemini`, never a
-/// side request), by its log: logged as each answer ends.
 fn main_turns(run: &Run) -> usize {
     crate::util::scratch_text(&run.w.join("stub.log"))
         .lines()
@@ -178,12 +167,10 @@ fn main_turns(run: &Run) -> usize {
         .count()
 }
 
-/// The descendants of `pid` (its tasks' processes).
 fn children(pid: i32) -> usize {
     crate::procs::descendants(pid).len()
 }
 
-/// agy's config under its scratch home.
 fn config(run: &Run) -> PathBuf {
     let c = run
         .w
@@ -192,7 +179,6 @@ fn config(run: &Run) -> PathBuf {
     std::fs::canonicalize(&c).unwrap_or(c)
 }
 
-/// The conversation whose presence lock `pid` holds open (`lsof`).
 fn conversation_of(run: &Run, pid: i32) -> Option<String> {
     let config = config(run);
     let held: Vec<String> = open_files(pid)
@@ -205,7 +191,6 @@ fn conversation_of(run: &Run, pid: i32) -> Option<String> {
     }
 }
 
-/// What one restart onto a build looked like, read off the real thing.
 struct Moved {
     pid: i32,
     words: Vec<String>,
@@ -213,8 +198,6 @@ struct Moved {
     rows: Vec<(i64, String, String)>,
 }
 
-/// Wait up to `secs` for an agy resuming `conversation` from build `build`,
-/// other than `old`; then its lock and the ledger since `since`.
 fn moved_onto(
     run: &Run,
     store: &Path,
@@ -247,8 +230,6 @@ fn moved_onto(
     }))
 }
 
-/// Press `key` on agy's command box while it is drawn (fenced on its words,
-/// so a key never lands in the composer): whether it was drawn.
 fn approve_box(door: &Door<'_>) -> bool {
     door.out(&["text"]).contains(COMMAND_BOX)
         && door
@@ -256,15 +237,10 @@ fn approve_box(door: &Door<'_>) -> bool {
             .is_ok_and(|r| r.code == 0)
 }
 
-/// Whether the work first seen at `from` and seen ended at `end` (ms) ran its
-/// course ([`RAN_MS`]).
 const fn ran(from: Option<i64>, end: Option<i64>) -> bool {
     matches!((from, end), (Some(from), Some(end)) if end - from >= RAN_MS)
 }
 
-/// Whether the `terminated` row of `m` came at or after `end` (ms), to the
-/// second the ledger keeps — [`held_while`] already saw the agy stand past
-/// the work's end.
 fn after(m: Option<&Moved>, end: Option<i64>) -> bool {
     match (m, end) {
         (Some(m), Some(end)) => {
@@ -274,7 +250,6 @@ fn after(m: Option<&Moved>, end: Option<i64>) -> bool {
     }
 }
 
-/// One restart said: its rows, its process.
 fn show_moved(m: &Moved, build: u64, what: &str) {
     show_rows(&m.rows);
     println!(
@@ -285,7 +260,6 @@ fn show_moved(m: &Moved, build: u64, what: &str) {
     );
 }
 
-/// Whether `m` is a quiet restart onto its build that kept the conversation.
 fn kept(m: Option<&Moved>) -> bool {
     m.is_some_and(|m| m.holds_lock && quiet(&m.rows))
 }
@@ -751,8 +725,6 @@ pub fn cmd_agy_upgrade(args: &[String]) -> Res {
 mod tests {
     use super::*;
 
-    /// The build id atpkg lays a plain version under, as its store holds them
-    /// (the scratch-agents copy's `1000001000004000000` is `1.4.0`).
     #[test]
     fn a_plain_versions_build_id_is_atpkgs() {
         assert_eq!(plain_build_id("1.4.0"), Some(1_000_001_000_004_000_000));

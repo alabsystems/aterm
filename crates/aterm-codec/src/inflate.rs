@@ -614,7 +614,8 @@ fn block_loop<const TABLE: bool>(
 /// Decompress a raw DEFLATE (RFC 1951) stream, bounded by `max_output` bytes.
 ///
 /// # Errors
-/// Returns an [`InflateError`] for any malformed input or if the decompressed size would exceed `max_output` (decompression-bomb guard).
+/// Returns an [`InflateError`] for any malformed input or if the decompressed
+/// size would exceed `max_output` (decompression-bomb guard). Never panics.
 #[inline]
 pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError> {
     inflate_prefix(input, max_output).map(|(out, _)| out)
@@ -719,7 +720,9 @@ fn check_zlib_header(cmf: u8, flg: u8) -> Result<(), InflateError> {
 /// Decompress a zlib (RFC 1950) stream, bounded by `max_output` bytes, verifying the header and the trailing Adler-32.
 ///
 /// # Errors
-/// Returns an [`InflateError`] for a bad header, malformed DEFLATE data, size over `max_output`, or bad Adler-32.
+/// Returns an [`InflateError`] for a bad header, malformed DEFLATE data, a size
+/// over `max_output`, or an Adler-32 that is wrong or not where the stream
+/// ends. Never panics.
 pub fn zlib_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError> {
     // 2-byte header + at least an empty deflate stream + 4-byte Adler-32.
     if input.len() < 6 {
@@ -755,7 +758,9 @@ pub fn zlib_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>, Infla
 /// Decompress a zlib (RFC 1950) prefix of `input`, verifying its Adler-32 and returning `(output, consumed)`.
 ///
 /// # Errors
-/// Returns an [`InflateError`] for a bad header, malformed DEFLATE data, size over `max_output`, or bad Adler-32.
+/// Returns an [`InflateError`] for a bad header, malformed DEFLATE data, a size
+/// over `max_output`, an input that ends before the checksum, or an Adler-32
+/// mismatch. Never panics.
 pub fn zlib_decompress_prefix(
     input: &[u8],
     max_output: usize,

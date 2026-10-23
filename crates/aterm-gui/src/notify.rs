@@ -1141,7 +1141,10 @@ mod win_balloon {
     impl Notifier {
         fn create() -> Option<Self> {
             let class: Vec<u16> = "aterm_notify_wnd\0".encode_utf16().collect();
-            // SAFETY: `class` is a live NUL-terminated UTF-16 buffer for the duration of both calls; the WNDCLASSW points only at it and at `notifier_proc`.
+            // SAFETY: `class` is a live NUL-terminated UTF-16 buffer for the
+            // duration of both calls; the WNDCLASSW points only at it and at
+            // `notifier_proc`. CreateWindowExW's returned window is owned by
+            // this thread and destroyed in Drop.
             unsafe {
                 let hinstance = GetModuleHandleW(std::ptr::null());
                 let wc = WNDCLASSW {

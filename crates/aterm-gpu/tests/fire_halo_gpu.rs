@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Fire glyph contrast-halo: both backends draw a dark warm ring around a fire-engulfed glyph (a
-// `fire_halo` cell in a `fire_patch` frame; the ink is never recoloured) so the letterform stays
-// legible. The GPU uses a deco-over path and the CPU a true dilation, so this is not
-// byte-exact: the halos must stay within a bounded per-channel delta (shared offsets, blend
-// contract and `fire_halo_alpha` byte), scale with engulfment strength, and be gated on fire
-// (`fire_halo` without `fire_patch`, and `char_fg` alone, stay byte-exact).
-//
-// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::render::{CharFg, FireHaloCell};
 use aterm_core::terminal::Terminal;
@@ -20,7 +11,6 @@ fn luma(p: u32) -> i32 {
     rr(p) + gg(p) + bb(p)
 }
 
-/// One bright single-row fire patch filling `row`'s band across a column span.
 fn bright_fire(row: u16, ch: usize, x: usize, w: usize, cov_cap: u8) -> FirePatch {
     FirePatch {
         row,
@@ -44,12 +34,8 @@ fn halo(row: u16, col: u16, strength: u8) -> FireHaloCell {
     FireHaloCell { row, col, strength }
 }
 
-/// A hot-gold ink used to pin that `char_fg` alone stays a byte-exact fg
-/// substitution that never keys the ring.
 const HEAT_GLOW_FG: u32 = 0x00FF_C87A;
 
-/// Count ring pixels just outside the engulfed block cell at `col`, row 1,
-/// that the halo frame darkened well below the fire-only frame.
 fn halo_ring_px(
     halo: &[u32],
     fire_only: &[u32],
@@ -74,8 +60,6 @@ fn halo_ring_px(
     ring
 }
 
-/// Summed luma deficit the halo carves out of the same ring margins: the strength-scaling
-/// metric (linear in the stamp alpha, so ordering is exact).
 fn halo_ring_deficit(
     halo: &[u32],
     fire_only: &[u32],
@@ -98,8 +82,6 @@ fn halo_ring_deficit(
     sum
 }
 
-/// Both backends render the fire contrast-halo at strength-scaled alpha, gated on a live fire
-/// field.
 #[test]
 fn both_backends_render_the_fire_contrast_halo() {
     let theme = Theme::default();
@@ -107,7 +89,6 @@ fn both_backends_render_the_fire_contrast_halo() {
     let mut win = aterm_gpu::WindowGpu::new();
     let (rows, cols) = (3usize, 12usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
-    // Hidden cursor; a full-block glyph at row 1, col 4, spaces around it.
     term.process(b"\x1b[?25l\x1b[2;5H\xe2\x96\x88");
     let (cw, ch) = cpu.cell_size();
     let width = cpu.render_input(&term.cell_frame(rows, cols)).width;
@@ -115,7 +96,6 @@ fn both_backends_render_the_fire_contrast_halo() {
     let fire = bright_fire(1, ch, cw, 8 * cw, 255);
     let engulfed = halo(1, 4, 255);
 
-    // (a) fire_halo alone (no fire): gated off, so byte-exact CPU==GPU.
     let mut halo_only = term.cell_frame(rows, cols);
     halo_only.fire_halo = vec![engulfed];
     let cpu_ho = cpu.render_input(&halo_only).pixels.clone();
@@ -126,7 +106,6 @@ fn both_backends_render_the_fire_contrast_halo() {
         "fire_halo WITHOUT fire draws no halo and must stay byte-exact CPU==GPU"
     );
 
-    // (a2) `char_fg` alone (no fire): a pure fg substitution, byte-exact, never keying the ring.
     let mut char_only = term.cell_frame(rows, cols);
     char_only.char_fg = vec![CharFg {
         row: 1,
@@ -141,13 +120,11 @@ fn both_backends_render_the_fire_contrast_halo() {
         "char_fg WITHOUT fire draws no halo and must stay byte-exact CPU==GPU"
     );
 
-    // (b) Fire-only reference.
     let mut fire_only = term.cell_frame(rows, cols);
     fire_only.fire_patch = vec![fire];
     let cpu_fo = cpu.render_input(&fire_only).pixels.clone();
     let gpu_fo = gpu.render_input(&mut win, &fire_only, None).pixels;
 
-    // (c) fire + fire_halo: the halo rings the engulfed glyph on both backends.
     let mut haloed = term.cell_frame(rows, cols);
     haloed.fire_patch = vec![fire];
     haloed.fire_halo = vec![engulfed];
@@ -173,14 +150,11 @@ fn both_backends_render_the_fire_contrast_halo() {
         cpu_h, cpu_fo,
         "the halo frame must differ from the fire-only frame (non-vacuous)"
     );
-    // A loose bound: catches gross divergence without pinning exact bytes.
     assert!(
         delta <= 24,
         "CPU and GPU halos must stay visually close (max per-channel delta {delta})"
     );
 
-    // (d) Strength scaling: a weak lick rims strictly less than the full wall, as close
-    // CPU-vs-GPU.
     let mut licked = term.cell_frame(rows, cols);
     licked.fire_patch = vec![fire];
     licked.fire_halo = vec![halo(1, 4, 24)];

@@ -338,7 +338,8 @@ fn probe_version(trustc: &Path) -> Result<String, String> {
 
 /// The content half of [`check_compiler`]: location, head, identity and a clean scan of the compiler's own bytes.
 /// # Errors
-/// Every refusal found, one line each.
+/// Every refusal found, one line each. A script or a stock location is refused before
+/// anything is executed.
 pub fn admit_content(bin_dir: &Path) -> Result<CompilerContent, Vec<String>> {
     admit_content_with(bin_dir, &probe_version)
 }

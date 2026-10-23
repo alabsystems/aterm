@@ -4,6 +4,15 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/state.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
+// LOCAL PATCH (aterm): the globals are bound through first-party `aterm-wayland`'s registry, at
+// the versions smithay-client-toolkit 0.19.2 bound them, and the state applies what the loop's
+// dispatch heard in the order it heard it (`WinitState::drain`): one `Inbox` holds the backend's
+// own objects' events and, through sinks, the seats', the drags', the selection sources' and the
+// outputs' `done`s. sctk's `CompositorHandler`, `WindowHandler`, `SeatHandler`, device handlers
+// and output scale watchers are the `Wire` arms here; the per-surface scale is the backend's own
+// `SurfaceScale`, as sctk's `SurfaceData` kept it, and an output's scale is the one its last
+// applied `done` gave, as sctk's `OutputData` kept it.
+
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -43,7 +52,9 @@ pub(crate) struct Connection {
     display: aterm_wayland::proxy::OwnedDisplay,
 }
 
-// SAFETY: the queue is accessed only on the event-loop thread and the display pointer is thread-safe.
+// SAFETY: the queue is read and dispatched only by the event loop's thread (its state's methods,
+// and `Window::new`, which runs there); every other thread holding the connection holds it to keep
+// it alive, and reads only the display pointer, which libwayland lets any thread use.
 unsafe impl Sync for Connection {}
 
 impl Connection {
@@ -53,13 +64,16 @@ impl Connection {
     ) -> Result<Connection, aterm_wayland::proxy::Error> {
         let display = aterm_wayland::proxy::OwnedDisplay::connect(name)?;
         // SAFETY: the owner moves into Connection after its queue, so the queue is destroyed first.
+        // Dispatch is confined to the event-loop thread; window object destruction is serialized
+        // there, or follows its final dispatch.
         let queue = Queue::new(unsafe { display.display() })?;
         Ok(Connection { queue, display })
     }
 
     /// The display.
     pub(crate) fn display(&self) -> Display {
-        // SAFETY: callers retain this Connection while using the handle.
+        // SAFETY: callers retain this Connection while using the handle. Its queue drops before its
+        // display, and only the event-loop thread dispatches it.
         unsafe { self.display.display() }
     }
 }
@@ -182,9 +196,13 @@ impl WinitState {
             registry.find(name).and_then(|global| registry.bind(&global, iface, version))
         };
         let owned = |proxy: Option<Proxy>, destroy: unsafe fn(Proxy)| {
-            // SAFETY: `proxy` is a newly bound global owned exclusively here.
+            // SAFETY: `proxy` is a newly bound global owned exclusively here, and `destroy` is its
+            // destructor (or `Proxy::destroy` for one with none).
             proxy.map(|proxy| unsafe { Owned::new(proxy, destroy) })
         };
+        // LOCAL PATCH (aterm): `wl_subcompositor` is bound for the shadow margin's border parts,
+        // where upstream bound it for sctk-adwaita's frame; a compositor without one shows windows
+        // with no shadow.
         let subcompositor = owned(
             bind(c"wl_subcompositor", &wl_subcompositor::INTERFACE, 1),
             wl_subcompositor::destroy,
@@ -281,7 +299,8 @@ impl WinitState {
         Arc::clone(&self.shm)
     }
 
-    /// Destroy the retired seat objects no window holds.
+    /// Destroy the retired seat objects no window holds, apply what the last dispatch heard in
+    /// order, then bind or release the globals that came or went.
     pub(crate) fn drain(&mut self) {
         self.reap_retired();
         self.add_new_seats();
@@ -505,7 +524,6 @@ impl WinitState {
         let window_id = surface;
 
         if let Some(window) = self.windows.get_mut().get(&window_id) {
-            // Don't update the scaling factor, when legacy method is used.
             if is_legacy && self.fractional_scaling_manager.is_some() {
                 return;
             }

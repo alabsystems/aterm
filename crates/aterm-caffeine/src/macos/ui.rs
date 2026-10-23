@@ -169,8 +169,11 @@ impl Drop for StatusUi {
 /// Show the menu below its button and return when it closes.
 pub(super) fn pop_up(popup: &Popup) {
     autoreleasepool(|_| {
-        // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains, each in its
-        // method's prototype (`PopUpFn` for the pop-up).
+        // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains.
+        // `-highlight:` is `v20@0:8B16`, `-bounds` `{CGRect=…}16@0:8`, `-isFlipped` `B16@0:8`, and
+        // the pop-up `PopUpFn`'s prototype: a nil positioning item puts the menu's top-left corner
+        // at the point, in the button's coordinates. It runs the menu's tracking loop and answers
+        // whether an item was chosen.
         unsafe {
             let button = popup.button.id();
             send_v_bool(button, sel!(highlight:), true);
@@ -289,7 +292,10 @@ fn set_show_menu_action(button: Id, target: Id, show: Sel) {
     let Some(name) = aterm_objc::ns_string(SHOW_MENU) else {
         return;
     };
-    // SAFETY: main-thread AppKit sends on live receivers.
+    // SAFETY: main-thread AppKit sends on live receivers. `-initWithName:target:selector:` is
+    // `@40@0:8@16@24:32` and consumes the +alloc (the target held weakly: the caller keeps it
+    // alive); `+arrayWithObject:` is `@24@0:8@16` and answers +0; `-setAccessibilityCustomActions:`
+    // is `v24@0:8@16` and copies the array.
     unsafe {
         let Some(action) = Obj::from_owned(send_id_id_id_sel(
             alloc(class(c"NSAccessibilityCustomAction")),
@@ -356,7 +362,9 @@ fn new_item(row: &Row, target: Id, choose: Sel) -> Option<Obj> {
     let empty = aterm_objc::ns_string("")?;
     let action = if tagged.is_some() { choose } else { Sel::NULL };
     // SAFETY: `-initWithTitle:action:keyEquivalent:` is `@40@0:8@16:24@32`, consuming the `+alloc`
-    // and answering +1; a nil action is its "no action".
+    // and answering +1; a nil action is its "no action". `-setTarget:` (`v24@0:8@16`) holds
+    // `target` weakly: the caller keeps it alive. `-setEnabled:` is `v20@0:8B16`, `-setTag:` and
+    // `-setState:` `v24@0:8q16`.
     unsafe {
         let item = Obj::from_owned(send_id_id_sel_id(
             alloc(class(c"NSMenuItem")),

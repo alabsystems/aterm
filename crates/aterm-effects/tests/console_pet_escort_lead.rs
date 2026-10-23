@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The escort stays off what was just typed, measured on a real `Terminal`.
-//!
-//! Three typing bursts with pauses at a steady key cadence, one frame per 16 ms, the host's ink
-//! seam fed every frame, the first burst waking a cat asleep at the prompt. The oracle reads the
-//! drawn body (`PetFrame::body_px`) against an independent `PetWorld`, never the brain's
-//! decisions: frames covering a glyph typed on the caret's row, how far the body trails the
-//! caret on the ground, its largest grounded step, how often it turns round, and any brace.
+//! Tests that the console pet escort stays off newly typed glyphs and recovers after held deletes.
 
 use std::time::{Duration, Instant};
 
@@ -22,8 +16,6 @@ const CELL_W: u16 = 8;
 const CELL_H: u16 = 16;
 const TICK_MS: u64 = 16;
 const WORDS: [&[u8]; 6] = [b"hello ", b"world ", b"this ", b"is ", b"a ", b"test "];
-/// Cells past the escort's own width inside which the station may already be
-/// crossing to the wall side (the wall's hysteresis margin).
 const WALL_BAND: f32 = 3.0;
 
 struct Fx {
@@ -55,7 +47,6 @@ impl Fx {
         let input = self.term.cell_frame(usize::from(ROWS), usize::from(COLS));
         let facts = PetWorldFacts::read(&self.term, 7);
         assert!(self.world.observe(&input, &facts, PetPane::full(&input)));
-        // The host's ink seam (`pet_ink()` → `sense_ink`), every frame.
         let spans: Vec<(u16, u16)> = (0..usize::from(ROWS))
             .map(|row| {
                 let inked = |col: &usize| self.world.ink_at(row, *col) == Some(true);
@@ -107,7 +98,6 @@ struct Seen {
     covered: usize,
 }
 
-/// Glyphs on the caret's row, left of the caret, that a body rect covers.
 fn covered(world: &PetWorld, caret: (u16, u16), body: Option<(i32, i32, i32, i32)>) -> usize {
     let Some((x0, x1, y0, y1)) = body else {
         return 0;
@@ -150,9 +140,6 @@ impl Feel {
         self.flips as f32 / self.secs
     }
 
-    /// The oracle over a run of frames. Coverage and trail are judged only where the escort's
-    /// station fits on the caret's right (at the wall it crosses to the left by design); trail
-    /// never in the air.
     fn judge(seen: &[Seen]) -> Self {
         let width = art_cols(CELL_W, CELL_H);
         let mut m = Self {
@@ -190,7 +177,6 @@ impl Feel {
     }
 }
 
-/// Three bursts of `WORDS` at `ms_per_key`, each followed by `pause_ms`.
 fn run(ms_per_key: u64, pause_ms: u64) -> Vec<Seen> {
     let mut f = Fx::new();
     let mut seen = Vec::new();
@@ -213,7 +199,6 @@ fn run(ms_per_key: u64, pause_ms: u64) -> Vec<Seen> {
         seen.push(s);
     };
     for _ in 0..3 {
-        // Key `k` of the burst is due at `k · ms_per_key` and lands before the first frame past it.
         let mut clock = 0;
         for (k, &ch) in WORDS.concat().iter().enumerate() {
             f.key(ch);
@@ -229,8 +214,6 @@ fn run(ms_per_key: u64, pause_ms: u64) -> Vec<Seen> {
     seen
 }
 
-/// `(ms per key, pause ms, covering % ceiling, flips/s ceiling)`. The flip ceilings are this
-/// fixture's measured baseline, settle-turn and walk home included.
 const CADENCES: [(u64, u64, f32, f32); 3] = [
     (62, 1000, 10.0, 1.00),
     (100, 1000, 5.0, 0.72),
@@ -284,14 +267,6 @@ fn the_escort_keeps_off_the_words_it_leads() {
     }
 }
 
-/// A held backspace frightens the cat once, and then it follows the caret
-/// back. The bottle used to be held open by every delete: through a 1.6 s
-/// key repeat at 30 a second the cat stood startled in 96 % of the frames
-/// while the caret ran 55 cells away, and caught up in bounds (review of
-/// `fix/kitty-jitter`, 2026-10-20). A run of deletes bottles once, for the
-/// bottle's own hold: the cat is startled in under a third of the hold's
-/// frames, never falls more than 30 cells behind, and holding a key forward
-/// after it is walked or run, not leapt, most of the way.
 #[test]
 fn a_held_backspace_frightens_the_cat_once_and_it_follows() {
     use aterm_effects::kitty_pet::PetAction;
@@ -310,7 +285,6 @@ fn a_held_backspace_frightens_the_cat_once_and_it_follows() {
     for _ in 0..60 {
         step(&mut f, "rest", &mut seen);
     }
-    // Key repeat: a delete every four 16 ms frames, fifty of them.
     for _ in 0..50 {
         f.brain.note_console_input(f.now, PetInputKind::Delete);
         f.term.process(b"\x08\x1b[K");

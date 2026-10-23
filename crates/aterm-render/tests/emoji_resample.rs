@@ -2,17 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Emoji strike selection and the premultiplied area filter, checked exhaustively.
-//!
-//! The strike-selection law (chosen from the available strikes; minimal adequate, else the
-//! maximum) is checked against [`aterm_render::select_strike_ppem`] over every small strike
-//! multiset. The area filter's laws involve products, which ty's `Expr` language lacks, so
-//! the integer lattice here is their only check.
+//! Exhaustive tests for emoji strike selection and the premultiplied area filter.
 
 use aterm_render::{area_overlap, resample_rgba, select_strike_ppem};
 
-/// The sRGB encoding of a linear-light value as a byte: the test's own piecewise OETF, so
-/// the expectation shares no code with the implementation.
 fn srgb_encode(l: f64) -> u8 {
     let c = if l <= 0.003_130_8 {
         12.92 * l
@@ -22,7 +15,6 @@ fn srgb_encode(l: f64) -> u8 {
     (c * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-/// Tiny deterministic LCG so the soundness sweep is reproducible.
 struct Lcg(u64);
 impl Lcg {
     fn next_u8(&mut self) -> u8 {
@@ -34,10 +26,6 @@ impl Lcg {
     }
 }
 
-// Partition of unity.
-
-/// Exhaustive over 1..=48 × 1..=48: each destination texel's footprint weights sum to
-/// exactly `src` (normalized, exactly 1), and each source texel's mass sums to `dst`.
 #[test]
 fn area_weights_partition_of_unity_lattice() {
     for src in 1usize..=48 {
@@ -58,7 +46,6 @@ fn area_weights_partition_of_unity_lattice() {
             }
         }
     }
-    // Non-vacuity: 3→2 splits the middle texel across both footprints.
     assert_eq!(area_overlap(0, 1, 3, 2), 1, "texel 1 of 3→2 leans into d=0");
     assert_eq!(
         area_overlap(1, 1, 3, 2),
@@ -67,9 +54,6 @@ fn area_weights_partition_of_unity_lattice() {
     );
 }
 
-/// A 1px black/white checkerboard minified 4x lands uniform linear-light mid-grey (the
-/// sRGB encoding of 0.5, ~188) at every texel; the sRGB-space average (~128) and
-/// skipped-tap extremes (0/255) are ruled out explicitly.
 #[test]
 fn checkerboard_minified_4x_lands_uniform_linear_midgrey() {
     let (sw, sh) = (8usize, 8usize);
@@ -100,7 +84,6 @@ fn checkerboard_minified_4x_lands_uniform_linear_midgrey() {
         }
         assert_eq!(px[3], 255, "an opaque source stays opaque");
     }
-    // Negative controls: the gamma-space average and the skipped-tap extremes.
     assert!(
         (i32::from(first) - 128).abs() > 20,
         "output {first} is the too-dark sRGB-space average, not linear light"
@@ -111,8 +94,6 @@ fn checkerboard_minified_4x_lands_uniform_linear_midgrey() {
     );
 }
 
-/// A solid image, opaque or semi-transparent, survives any ratio through both filter arms
-/// within 1 LSB.
 #[test]
 fn solid_image_survives_any_ratio() {
     let cases: [(usize, usize, usize, usize); 6] = [
@@ -141,10 +122,6 @@ fn solid_image_survives_any_ratio() {
     }
 }
 
-/// The fitted inline-image route (OSC 1337, Kitty with `c=`/`r=`) is the same resampler:
-/// `decode_image_to_footprint` is byte-identical to `resample_rgba`, and the GPU image pass
-/// decodes through the same path. `PixelExact` placements run no resampler
-/// (`sixel_footprint_decode_is_pixel_exact` in `tests/inline_image.rs`).
 #[test]
 fn inline_image_footprint_uses_the_same_resampler() {
     use aterm_core::grid::extra::ImageFormat;
@@ -185,11 +162,6 @@ fn inline_image_footprint_uses_the_same_resampler() {
     );
 }
 
-// Premultiply soundness: a=0 texels contribute nothing to RGB.
-
-/// Resampling an image whose invisible texels carry a garish RGB payload is byte-identical
-/// to resampling it with that payload zeroed, through both filter arms. Non-vacuity: the
-/// same payload made opaque changes the output.
 #[test]
 fn invisible_texels_contribute_nothing() {
     let cases: [(usize, usize, usize, usize); 4] = [
@@ -217,7 +189,6 @@ fn invisible_texels_contribute_nothing() {
                 zeroed[base + 3] = 255;
                 opaque[base + 3] = 255;
             } else {
-                // Invisible: magenta in `garish`, black in `zeroed`.
                 garish[base] = 255;
                 garish[base + 2] = 255;
                 opaque[base] = 255;
@@ -235,7 +206,6 @@ fn invisible_texels_contribute_nothing() {
             any_opaque_diff = true;
         }
     }
-    // Non-vacuity: the invisible positions are inside the filter's reach.
     assert!(
         any_opaque_diff,
         "opaque twin never diverged — the a=0 texels were outside every footprint \
@@ -243,8 +213,6 @@ fn invisible_texels_contribute_nothing() {
     );
 }
 
-/// One visible white texel in a field of invisible magenta, minified to one texel, yields
-/// pure white at 1/16 coverage; a straight average would bleed magenta (the CBDT halo).
 #[test]
 fn halo_worst_case_stays_payload_free() {
     let (sw, sh) = (4usize, 4usize);
@@ -252,9 +220,7 @@ fn halo_worst_case_stays_payload_free() {
     for i in 0..sw * sh {
         src[i * 4] = 255; // magenta payload…
         src[i * 4 + 2] = 255;
-        // …fully transparent (a stays 0)
     }
-    // one visible white texel
     src[0] = 255;
     src[1] = 255;
     src[2] = 255;
@@ -272,15 +238,9 @@ fn halo_worst_case_stays_payload_free() {
     );
 }
 
-// Strike selection.
-
-/// Exhaustive over strike multisets of size 0..=3 from ppems 1..=6 and targets 1..=8: the
-/// choice is a member, the minimal adequate strike when one exists, else the maximum.
-/// Asserted as properties, not by mirroring the implementation; both arms are reached.
 #[test]
 fn strike_selection_law_exhaustive() {
     let (mut hits_adequate, mut hits_fallback) = (0usize, 0usize);
-    // 0 encodes "slot unused" so sizes 0..=3 are all enumerated.
     for a in 0u16..=6 {
         for b in 0u16..=6 {
             for c in 0u16..=6 {

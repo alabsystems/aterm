@@ -83,7 +83,7 @@ fn strings<'a>(v: &'a Node, out: &mut Vec<&'a str>) {
     }
 }
 
-/// An id the reducer wrote (module docs: a UUID of zeros and a count, or
+/// An id the reducer wrote (a UUID of zeros and a count, or
 /// `<prefix>_r<n>` / `r<n>`, with `/` when the source's was no `StepId`).
 fn placeholder_id(s: &str) -> bool {
     let s = s.strip_suffix('/').unwrap_or(s);

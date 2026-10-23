@@ -77,7 +77,8 @@ window_ledger! {
     pub(crate) struct PresentLedger {
         /// Successful application presents (`frames`).
         pub(crate) frames: Counter,
-        /// Output→application-present-return on glass (the module header's `present_latency`, an OPEN interval).
+        /// Output→application-present-return on glass (`present_latency`): measured from the
+        /// first output still waiting to be shown, so time in which nothing presented is inside it.
         pub(crate) latency: Dist,
         /// When the worst `latency` was booked (`now_ns`), and the gap since its window's previous present: see [`SchedLedger::wake_late`].
         pub(crate) latency_at: Last,

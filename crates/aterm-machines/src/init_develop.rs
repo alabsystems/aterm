@@ -137,6 +137,9 @@ fn read_profile(sys: &dyn System, user: &User) -> Result<Profile, String> {
 }
 
 /// Expanded checkouts recorded in the develop profile.
+///
+/// # Errors
+/// A recorded spelling is neither `~/<path>` nor absolute, or has a `..` component or a NUL.
 pub(crate) fn recorded(user: &User, table: Option<&Table>) -> Result<Vec<PathBuf>, String> {
     table.map_or_else(
         || Ok(Vec::new()),
@@ -366,6 +369,9 @@ pub(crate) struct Workspace {
 }
 
 /// The aterm workspace whose root is `dir`.
+///
+/// # Errors
+/// The manifest cannot be read safely (not the user's, a link, too large) or parsed.
 pub(crate) fn workspace(
     sys: &dyn System,
     user: &User,
@@ -1101,6 +1107,11 @@ pub struct Inputs<'a> {
 }
 
 /// The develop items for `ctx`'s one user, each with its place, in run order.
+///
+/// # Errors
+/// `ctx` names no one user, the profile or a manifest cannot be read safely or is invalid,
+/// or `--develop` runs in a linked worktree, cannot list the checkouts the GitHub item
+/// verifies, or finds no checkout to record and none is recorded.
 pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<Placed>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init --develop requires exactly one local user".into());

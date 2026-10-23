@@ -602,7 +602,9 @@ impl Client {
 
     /// Build and check `request`.
     /// # Errors
-    /// [`RestError::Local`].
+    /// [`RestError::Local`]: a URL off the api and uploads origins, a write without a token, a
+    /// scratch directory that could not be made, a path that is not UTF-8, or a JSON body that
+    /// could not be written.
     pub fn prepare(&self, request: &Request<'_>) -> Result<Prepared, RestError> {
         let url = request.url;
         if !Origins::on(&self.origins.api, url) && !Origins::on(&self.origins.uploads, url) {

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The machine's [`World`]: GitHub's REST API ([`crate::github`]), the release download host,
-//! `curl` for the live site, the wasm32 pin's stock cargo and `wasm-opt` for the `/terminal`
-//! engine, the site's `deploy.sh` and `firebase`.
+//! Real [`World`] implementation for site engine builds, verification, and deployment.
 
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -17,10 +15,7 @@ use aterm_verify::wasm_glue::WASM_OPT_FLAGS;
 use super::engine::{STEM, TARGET};
 use super::{Launch, Ran, World, output};
 
-/// The variables that relocate cargo's output or replace its compiler or flags: the engine's inputs
-/// are the fresh clone and its pin, never the caller's shell (a `CARGO_TARGET_DIR` or build dir
-/// moves the build out of the clone the remaps cover; a `RUSTC_WRAPPER` that caps lints changes
-/// what compiles).
+/// Environment variables stripped from the engine cargo build.
 pub const ENGINE_BUILD_UNSET: [&str; 12] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
@@ -36,8 +31,8 @@ pub const ENGINE_BUILD_UNSET: [&str; 12] = [
     "CARGO_BUILD_RUSTFLAGS",
 ];
 
-/// `pin`'s own `cargo` (STOCK EXCEPTION: Trust ships only its host std) building the CPU module in
-/// `clone`: release profile, the clone's own lock, wasm32, the output in the clone's `target/`.
+/// Builds the command for `pin`'s `cargo` (STOCK EXCEPTION: Trust ships only its host std) on `aterm-wasm` in `clone`.
+///
 /// # Errors
 /// A flag [`encoded_rustflags`] cannot carry.
 pub fn module_command(
@@ -75,8 +70,8 @@ pub fn module_command(
     Ok(build)
 }
 
-/// `flags` as `CARGO_ENCODED_RUSTFLAGS` spells them: joined by the unit separator (0x1f), so a path
-/// with a space stays one flag.
+/// Joins `flags` with `0x1f` for `CARGO_ENCODED_RUSTFLAGS`.
+///
 /// # Errors
 /// A flag that holds 0x1f itself, which cargo would split in two.
 pub fn encoded_rustflags(flags: &[String]) -> Result<String, String> {
@@ -98,9 +93,6 @@ pub fn module_path(clone: &Path) -> PathBuf {
         .join(format!("{STEM}.wasm"))
 }
 
-/// This process's `RUSTUP_HOME` and `CARGO_HOME`, handed back to a rustup or cargo
-/// child after the release's scrub (which drops every `RUST*`/`CARGO*` name), as the
-/// release's wasm32 gate keeps them: the pin lives where this machine's rustup put it.
 fn keep_rust_homes(cmd: &mut Command) {
     for name in ["RUSTUP_HOME", "CARGO_HOME"] {
         if let Some(v) = std::env::var_os(name) {
@@ -109,9 +101,6 @@ fn keep_rust_homes(cmd: &mut Command) {
     }
 }
 
-/// The wasm-opt the site's engine build runs: the resolver's (`ATERM_TEST_WASM_OPT`, the
-/// pinned binaryen `verify provision` places, then PATH), else the bare name, whose
-/// failure to start names it.
 fn wasm_opt_program() -> PathBuf {
     aterm_uds::host::find_tool("wasm-opt").unwrap_or_else(|| "wasm-opt".into())
 }
@@ -127,8 +116,7 @@ pub fn deploy_command(site: &Path, unset: &[String]) -> Command {
     deploy
 }
 
-/// `firebase projects:list` with the credential deploy.sh would use: the service-account key when
-/// it exists (and the site's headless config), else the pinned account.
+/// Builds the `firebase projects:list` probe command for `site`.
 #[must_use]
 pub fn firebase_probe_command(
     site: &Path,
@@ -154,24 +142,14 @@ pub fn firebase_probe_command(
     probe
 }
 
-/// How long the output is still read once the child has exited: a daemon it left
-/// behind may hold the pipe for ever, and the deploy must not wait on it
-/// (`release_steps`' rule for a streamed step).
 const DRAIN_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// What the reader and the waiter hand the copying loop.
 enum Event {
     Line(Vec<u8>),
     End,
     Exited(std::io::Result<std::process::ExitStatus>),
 }
 
-/// `cmd` started through `launch` with its stdout and stderr on one pipe, each line
-/// copied to `out` as it arrives: its exit code and everything it printed. Bytes that
-/// are not UTF-8 are shown replaced. The pipe is read to its end while the child runs,
-/// so the child never meets a closed pipe mid-deploy; once it has exited, for at most
-/// `drain` more ([`DRAIN_AFTER_EXIT`] in a deploy) — whatever it left holding the pipe
-/// is not waited on.
 fn streamed(
     launch: &dyn Launch,
     cmd: &mut Command,
@@ -555,8 +533,6 @@ mod tests {
         assert_eq!(cmd.get_args().next(), Some(OsStr::new("--account")));
     }
 
-    /// The daemon a test's child left, ended however the test ends: its pid is the
-    /// file's first line once the child wrote it.
     struct Daemon(std::path::PathBuf);
 
     impl Drop for Daemon {
@@ -570,9 +546,6 @@ mod tests {
         }
     }
 
-    /// A CHILD THAT LEAVES A DAEMON HOLDING THE PIPE does not hang the deploy: its
-    /// output up to its exit is copied, its status read, and the pipe the grandchild
-    /// still holds is left the drain's bound after the exit.
     #[test]
     fn a_grandchild_holding_the_pipe_is_not_waited_on() {
         const DRAIN: std::time::Duration = std::time::Duration::from_millis(100);

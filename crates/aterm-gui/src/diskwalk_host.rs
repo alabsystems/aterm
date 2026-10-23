@@ -529,22 +529,38 @@ pub(crate) fn disk_report(scope: DiskScope, detail: Detail, now: Instant) -> Dis
     DISKWALK.report(scope)
 }
 
-/// Start the walker thread for `shared`: the receiver is the loop's end of
-/// its publications, and `proxy` wakes the loop after each.
+/// How the walker thread is scheduled: its CPU class and its disk reads.
+#[derive(Clone, Copy, Debug)]
+struct WalkerClass {
+    role: crate::qos::Role,
+    disk: aterm_diskwalk::DiskIo,
+}
+
+/// The walker's class in the product: [`crate::qos::Role::Housekeeping`],
+/// work with no deadline that the scheduler may hold back for as long as
+/// the machine is busy, its disk reads throttled behind other I/O (a reply
+/// never waits on a walk: it reads the board).
+const WALKER_CLASS: WalkerClass = WalkerClass {
+    role: crate::qos::Role::Housekeeping,
+    disk: aterm_diskwalk::DiskIo::Throttled,
+};
+
+/// Start the walker thread for `shared` in `class` ([`WALKER_CLASS`] in the
+/// product): the receiver is the loop's end of its publications, and `proxy`
+/// wakes the loop after each.
 fn spawn_walker(
     shared: &'static Shared,
     proxy: Option<Proxy>,
+    class: WalkerClass,
 ) -> std::io::Result<Receiver<Arc<Published>>> {
     let (inbox_tx, inbox) = std::sync::mpsc::channel();
     let (out, from_walker) = std::sync::mpsc::channel();
     if shared.inbox.set(inbox_tx).is_err() {
         return Err(std::io::Error::other("the disk walker already runs"));
     }
-    match crate::qos::spawn_lane_thread(
-        "aterm-diskwalk",
-        crate::qos::Role::Housekeeping,
-        move || walker_main(inbox, out, proxy),
-    ) {
+    match crate::qos::spawn_lane_thread("aterm-diskwalk", class.role, move || {
+        walker_main(inbox, out, proxy, class.disk)
+    }) {
         Ok(_) => {
             shared.set_walker_state(WalkerState::Running);
             Ok(from_walker)
@@ -1132,8 +1148,13 @@ struct Engine {
     dirty: bool,
 }
 
-fn walker_main(inbox: Receiver<ToWalker>, out: Sender<Arc<Published>>, proxy: Option<Proxy>) {
-    let policy_out = aterm_diskwalk::set_walker_thread_policy();
+fn walker_main(
+    inbox: Receiver<ToWalker>,
+    out: Sender<Arc<Published>>,
+    proxy: Option<Proxy>,
+    disk: aterm_diskwalk::DiskIo,
+) {
+    let policy_out = aterm_diskwalk::set_walker_thread_policy(disk);
     if !policy_out.failed.is_empty() {
         aterm_log::warn!("disk walker: I/O policy not taken: {:?}", policy_out.failed);
     }
@@ -2191,7 +2212,7 @@ impl crate::App {
         {
             self.diskwalk.started = true;
             *DISKWALK.proxy.lock_or_recover() = Some(proxy.clone());
-            match spawn_walker(&DISKWALK, Some(proxy)) {
+            match spawn_walker(&DISKWALK, Some(proxy), WALKER_CLASS) {
                 Ok(rx) => self.diskwalk.from_walker = Some(rx),
                 Err(error) => aterm_log::warn!("disk walker: the thread did not start: {error}"),
             }

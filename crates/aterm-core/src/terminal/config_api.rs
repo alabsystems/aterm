@@ -147,6 +147,25 @@ impl Terminal {
 
     /// Apply configuration changes to the terminal at runtime and return the
     /// aspects that changed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use aterm_core::config::{ConfigChange, TerminalConfig};
+    /// use aterm_core::terminal::{CursorStyle, Terminal};
+    ///
+    /// let mut term = Terminal::new(24, 80);
+    ///
+    /// // Create new configuration: a STEADY bar, where the terminal's power-on
+    /// // cursor is a blinking block — both the shape and the blink move.
+    /// let mut config = TerminalConfig::default();
+    /// config.cursor_style = CursorStyle::SteadyBar;
+    ///
+    /// // Apply and check what changed
+    /// let changes = term.apply_config(&config);
+    /// assert!(changes.contains(&ConfigChange::CursorStyle));
+    /// assert!(changes.contains(&ConfigChange::CursorBlink));
+    /// ```
     #[allow(
         clippy::too_many_lines,
         reason = "flat field-by-field config application"

@@ -143,7 +143,8 @@ pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Remove a directory [`make_dir`] made, and forget it.
+/// Remove a directory [`make_dir`] made, and forget it; kept instead (and
+/// named) while a program started from a copy in it has not shown it ran.
 pub(crate) fn remove_dir(dir: &Path) {
     let mut live = live();
     if live.unproven.remove(dir) {

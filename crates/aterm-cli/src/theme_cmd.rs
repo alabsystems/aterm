@@ -3,22 +3,6 @@
 // Author: Andrew Yates
 
 //! `aterm theme`: the themes family.
-//!
-//! `list` (also `aterm list-themes`) prints the theme catalog's listing. The
-//! catalog lives in the window library, so the front door hands it in as a
-//! [`ThemeHost`]; this file owns only the grammar.
-//!
-//! `check | new | export | schema` are the authoring commands
-//! (`theme_author.rs`).
-//!
-//! `import` converts another terminal's theme with
-//! `aterm_types::scheme_import` and writes it with
-//! `aterm_types::scheme_install`, the write path Settings' "Import…" shares.
-//! This file is the grammar and the report around it.
-//!
-//! `aterm theme pack | install` are the community theme pack's
-//! (`theme_pack_cmd.rs`): built-in, permissively licensed palettes copied
-//! into the themes folder on request.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -179,33 +163,27 @@ pub struct ThemeListRequest {
     pub format: ThemeListFormat,
 }
 
-/// What the theme commands need from the window library, which owns the
-/// theme catalog this crate does not link. The front door supplies it, so
-/// every command answers from the window's own catalog and classifier.
+/// What the theme commands need from the window library, which owns the theme catalog this crate
+/// does not link.
 pub trait ThemeHost {
     /// The one theme listing (`aterm theme list`).
     fn list(&self, request: &ThemeListRequest) -> String;
-    /// The theme `id` names, by the catalog's lookup (built-ins first, then
-    /// themes-folder files that loaded); `Err` says why there is none.
-    ///
+    /// The theme `id` names, by the catalog's lookup (built-ins first, then themes-folder files
+    /// that loaded); `Err` says why there is none.
     /// # Errors
     /// No theme by that id, or its file did not load.
     fn lookup(&self, id: &str) -> Result<aterm_types::scheme::CatalogTheme, String>;
-    /// The appearance a background measures as, by the rule the themes
-    /// folder admits a file with.
+    /// The appearance a background measures as, by the rule the themes folder admits a file with.
     fn measure(&self, background: aterm_types::Rgb) -> Appearance;
-    /// Whether a font family a theme names is installed here, by the
-    /// window's own font resolution (never touching a display server);
-    /// `None` when this host cannot tell. `aterm theme check` notes a miss.
+    /// Whether a font family a theme names is installed here, by the window's own font resolution
+    /// (never touching a display server); `None` when this host cannot tell.
     fn font_available(&self, family: &str) -> Option<bool> {
         let _ = family;
         None
     }
 }
 
-/// `aterm list-themes [<args>]` is `aterm theme list [<args>]`: the theme
-/// verb's arguments for that spelling, or `None` for any other first operand.
-/// The front door routes the spelling here, ahead of the diagnostics.
+/// `aterm list-themes [<args>]` is `aterm theme list [<args>]`.
 #[must_use]
 pub fn list_themes_alias(first: &str, rest: &[OsString]) -> Option<Vec<OsString>> {
     (first == "list-themes").then(|| {
@@ -249,7 +227,6 @@ pub(crate) fn run(args: &[OsString], theme_dir: Option<&Path>, host: &dyn ThemeH
     }
 }
 
-/// Parse `list`'s flags: `None` for `--help`.
 fn parse_list_args(args: &[OsString]) -> Result<Option<ThemeListRequest>, String> {
     let mut request = ThemeListRequest {
         appearance: None,
@@ -316,7 +293,6 @@ fn list(args: &[OsString], host: &dyn ThemeHost) -> Outcome {
     }
 }
 
-/// The parsed `import` operands.
 struct ImportArgs {
     file: OsString,
     name: Option<String>,
@@ -415,8 +391,7 @@ fn import(args: &[OsString], theme_dir: Option<&Path>) -> Outcome {
     }
 }
 
-/// Read a theme file up to the theme bound (`scheme_install`'s reader, the one
-/// `import` uses).
+/// Read a theme file up to the theme bound (`scheme_install`'s reader, the one `import` uses).
 pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     scheme_install::read_bounded(path)
 }
@@ -459,13 +434,10 @@ pub(crate) mod tests {
         list.iter().map(OsString::from).collect()
     }
 
-    /// The lister for a command that must not list.
     fn never_lists(_: &ThemeListRequest) -> String {
         panic!("only `list` lists")
     }
 
-    /// A lister that echoes the request it got, so a test sees what the
-    /// grammar handed the front door's listing.
     fn echo(request: &ThemeListRequest) -> String {
         format!("{request:?}")
     }
@@ -500,8 +472,6 @@ pub(crate) mod tests {
         run(&args(argv), None, &ECHO)
     }
 
-    /// `list` hands the listing exactly the filter and format it was given,
-    /// in either flag spelling, and prints what the listing returns.
     #[test]
     fn list_passes_its_filter_and_format_to_the_listing() {
         let plain = listed(&["list"]);
@@ -527,8 +497,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A flag `list` does not know, or a bad value, is a usage error that
-    /// never reaches the listing.
     #[test]
     fn list_refuses_what_it_does_not_take() {
         for argv in [
@@ -546,8 +514,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// `aterm list-themes <args>` is `aterm theme list <args>`; no other
-    /// operand is rewritten.
     #[test]
     fn list_themes_is_the_theme_list_spelling() {
         let rest = args(&["--format", "tsv"]);
@@ -585,20 +551,15 @@ pub(crate) mod tests {
             .scheme;
         assert_eq!(parsed.scheme, converted);
         assert_eq!(parsed.scheme.name, "Harbour");
-        // Nothing but the theme is left in the folder.
         let entries: Vec<_> = std::fs::read_dir(&themes).unwrap().collect();
         assert_eq!(entries.len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// No byte below 0x20 but a newline (nor DEL or a C1 control) in `text`.
     fn printable(text: &str) -> bool {
         !text.chars().any(|c| c.is_control() && c != '\n')
     }
 
-    /// A newer-schema theme's skipped key names are untrusted: `theme check`
-    /// and `theme import` print them escaped, never as raw control bytes.
-    /// Negative control: a plain unknown key is listed as written.
     #[test]
     fn skipped_key_names_reach_the_terminal_escaped() {
         let root = scratch("skipped-escaped");
@@ -682,8 +643,6 @@ pub(crate) mod tests {
             assert!(out.stderr.contains(USAGE), "{argv:?}");
         }
         assert!(!themes.exists(), "a refusal must write nothing");
-        // Negative control: a free id on a missing file gets past the id
-        // checks and fails on the read (exit 1), not as a usage error.
         let out = run(
             &args(&["import", "/nonexistent/x.conf"]),
             Some(&themes),

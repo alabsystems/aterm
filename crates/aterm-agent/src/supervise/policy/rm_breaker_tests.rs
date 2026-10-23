@@ -1017,36 +1017,55 @@ fn an_unknown_word_forgets_only_where_it_can_name_a_variable() {
 
 /// SHELL_NAMES keeps every name whose assignment does not read back: in zsh
 /// and bash, each name the shell reports (`${(k)parameters}`, `compgen -v`) is
-/// assigned `/x/y` in a subshell and read back.
+/// assigned `/x/y` in a subshell and, where that succeeded, read back. Each lane
+/// that runs must find both kinds of its own shell's such names, those whose
+/// assignment fails and those assigned but read back otherwise (zsh 5.9 reports
+/// 64 and 6, bash 3.2 reports 12 and 7), so a probe that measures nothing, or
+/// never reads back, in one shell fails in that lane, whatever the other found.
+/// A shell not installed ends the test COULD NOT RUN once the other has run
+/// ([`Lanes`]).
+///
+/// Only an assignment that succeeded is read back: a failed one leaves the
+/// fresh shell's value, never `/x/y`, and reading zsh's read-only `userdirs`
+/// and `usergroups` walks the user and group databases over opendirectoryd,
+/// which a starved machine answers in minutes
+/// (`docs/measured/test-hygiene-2-2026-10-22.md`).
 #[cfg(unix)]
 #[test]
 fn every_name_whose_assignment_does_not_read_back_is_kept() {
     let mut lanes = Lanes::default();
-    for (shell, probe, floor) in [
+    for (shell, probe, floors) in [
         (
             "/bin/zsh",
             "for n in ${(k)parameters}; do [[ $n =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]] || continue; \
-             ( eval \"$n=/x/y\" 2>/dev/null; [[ ${(P)n} == /x/y ]] ) 2>/dev/null || print -r -- $n; \
-             done",
-            20,
+             ( eval \"$n=/x/y\" 2>/dev/null || exit 1; \
+             [[ ${(P)n} == /x/y ]] || print -r -- \"= $n\"; exit 0 ) 2>/dev/null \
+             || print -r -- $n; done",
+            (20, 2),
         ),
         (
             "/bin/bash",
-            "for n in $(compgen -v); do ( eval \"$n=/x/y\" 2>/dev/null; \
-             [ \"${!n}\" = /x/y ] ) 2>/dev/null || echo \"$n\"; done",
-            10,
+            "for n in $(compgen -v); do ( eval \"$n=/x/y\" 2>/dev/null || exit 1; \
+             [ \"${!n}\" = /x/y ] || echo \"= $n\"; exit 0 ) 2>/dev/null || echo \"$n\"; done",
+            (5, 2),
         ),
     ] {
         let Some((out, _)) = lanes.run(shell, probe) else {
             continue;
         };
-        let names: Vec<&str> = out.lines().collect();
-        let kept: Vec<&str> = names.iter().copied().filter(|n| !shell_name(n)).collect();
+        let lines: Vec<&str> = out.lines().collect();
+        let read_back_otherwise = lines.iter().filter(|l| l.starts_with("= ")).count();
+        let refused = lines.len() - read_back_otherwise;
+        let kept: Vec<&str> = lines
+            .iter()
+            .map(|l| l.strip_prefix("= ").unwrap_or(l))
+            .filter(|n| !shell_name(n))
+            .collect();
         assert!(kept.is_empty(), "{shell}: not in SHELL_NAMES: {kept:?}");
         assert!(
-            names.len() > floor,
-            "{shell}: the probe found the shell's own names ({})",
-            names.len()
+            refused > floors.0 && read_back_otherwise > floors.1,
+            "{shell}: the probe found the shell's own names \
+             ({refused} refused, {read_back_otherwise} read back otherwise)"
         );
     }
 }

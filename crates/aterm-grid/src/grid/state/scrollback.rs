@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Scrollback-facing `GridStorage` accessors.
 
@@ -29,11 +28,7 @@ impl GridStorage {
         self.scrollback.as_mut()
     }
 
-    /// Set the tiered store's raw line limit (the store share, not the user's
-    /// total). [`Grid::set_scrollback_line_limit`] does the total = share + ring
-    /// cap split, drains the lazy buffer and re-caps the ring.
-    ///
-    /// [`Grid::set_scrollback_line_limit`]: crate::Grid::set_scrollback_line_limit
+    /// Set the tiered store's raw line limit.
     #[cfg(test)]
     #[inline]
     pub fn set_store_line_limit(&mut self, limit: Option<usize>) {
@@ -43,10 +38,6 @@ impl GridStorage {
     }
 
     /// The effective total scrollback line limit (`None` = unlimited).
-    ///
-    /// Tiered grids report the store's limit plus the ring cap, so a set/get
-    /// round-trips; during an off-thread reflow, the detach-time value or the
-    /// newest deferred mutation. Ring-only grids report the ring cap.
     #[must_use]
     #[inline]
     pub fn scrollback_line_limit(&self) -> Option<usize> {
@@ -60,15 +51,12 @@ impl GridStorage {
                 .scrollback
                 .as_ref()
                 .and_then(ScrollbackStorage::line_limit)
-                // saturating: an (unrealistic) usize::MAX store limit must not
-                // wrap when the ring share is folded back in.
                 .map(|store_limit| store_limit.saturating_add(self.max_scrollback));
         }
         (self.max_scrollback < super::UNLIMITED_RING_SCROLLBACK).then_some(self.max_scrollback)
     }
 
-    /// Effective tiered-store byte budget, including a mutation deferred while
-    /// the store is detached for off-thread reflow.
+    /// Effective tiered-store byte budget.
     #[must_use]
     #[inline]
     pub fn scrollback_memory_budget(&self) -> Option<usize> {
@@ -82,11 +70,7 @@ impl GridStorage {
             .map(ScrollbackStorage::memory_budget)
     }
 
-    /// Whether an attached tiered store keeps any line: `false` with no store, or
-    /// with a zero-share store (a total limit at or below the ring cap leaves the
-    /// store nothing; see `Grid::set_scrollback_line_limit`), where the ring is
-    /// the whole retention. The reflow restore and the offload re-attach take the
-    /// ring route when it is `false`.
+    /// Whether an attached tiered store has a non-zero line limit.
     #[must_use]
     #[inline]
     pub(crate) fn store_retains_lines(&self) -> bool {
@@ -95,12 +79,7 @@ impl GridStorage {
             .is_some_and(|sb| sb.line_limit() != Some(0))
     }
 
-    /// Whether a row leaving the ring is staged in the lazy buffer rather than
-    /// dropped: a store that retains a line is attached, or the store is
-    /// detached for reflow (the re-attach seats staged lines, in the ring if the
-    /// store keeps nothing). Every site where the ring sheds a row asks this: a
-    /// line staged with no store to keep it would outlive newer ring rows and
-    /// leave a hole in history.
+    /// Whether a row leaving the ring is staged in the lazy buffer rather than dropped.
     #[must_use]
     #[inline]
     pub(crate) fn stages_evicted_rows(&self) -> bool {
@@ -156,8 +135,7 @@ impl GridStorage {
         self.lazy_buffer.len()
     }
 
-    /// Lines in the tiered scrollback plus the lazy buffer (deferred lines
-    /// pending promotion to the store).
+    /// Lines in the tiered scrollback plus the lazy buffer.
     #[must_use]
     #[inline]
     pub fn tiered_scrollback_lines(&self) -> usize {

@@ -1,14 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A thread-affinity container, [`MainThreadBound<T>`], built from the [`MainThread`] witness and [`run_on_main`].
+//! Thread-affinity container [`MainThreadBound<T>`], built from [`MainThread`] and [`run_on_main`].
+//!
+//! # Obligations
+//!
+//! `Send` and `Sync` are implemented unconditionally in `T`, sound only because the value is:
+//!
+//! 1. born on the main thread: [`MainThreadBound::new`] takes a [`MainThread`];
+//! 2. read only on the main thread: [`MainThreadBound::get`], [`MainThreadBound::get_mut`] and
+//!    [`MainThreadBound::into_inner`] take a witness, [`MainThreadBound::get_on_main`] runs there,
+//!    and [`MainThread`] is `!Send`;
+//! 3. dropped only on the main thread: [`Drop`] reschedules through [`run_on_main`].
+//!
+//! A witness minted off the main thread with the `unsafe` [`MainThread::new_unchecked`] breaks
+//! all three, which is that constructor's obligation.
 
 use std::mem::ManuallyDrop;
 
 use crate::declare::MainThread;
 use crate::dispatch::run_on_main;
 
-/// A value that may only be touched on the process main thread, in a container that may travel anywhere.
+/// `Send + Sync` container for a value that is constructed, accessed, and dropped only on the main thread.
 ///
 /// # Examples
 ///
@@ -28,21 +41,24 @@ use crate::dispatch::run_on_main;
 /// ```
 pub struct MainThreadBound<T>(ManuallyDrop<T>);
 
-// SAFETY: obligations 1-3 of the module docs: born, read and dropped only on the main thread, so what crosses threads is an inert copy of `T`'s bytes.
+// SAFETY: born, read and dropped only on the main thread (`new`, `get`, `get_mut` and `into_inner`
+// take a `MainThread` witness; `Drop` runs through `run_on_main`), so what crosses threads is an
+// inert copy of `T`'s bytes.
 unsafe impl<T> Send for MainThreadBound<T> {}
 
-// SAFETY: every `&T` exists on the main thread and `&mut T` needs `&mut self`; see the module docs.
+// SAFETY: every `&T` exists on the main thread (`get` takes a witness, `get_on_main` runs there)
+// and `&mut T` needs `&mut self`.
 unsafe impl<T> Sync for MainThreadBound<T> {}
 
 impl<T> MainThreadBound<T> {
-    /// Put `inner` in the container.
+    /// Wrap `inner` on the main thread.
     #[inline]
     #[must_use]
     pub const fn new(inner: T, _mt: MainThread) -> Self {
         Self(ManuallyDrop::new(inner))
     }
 
-    /// The value, borrowed, on the thread it belongs to.
+    /// Borrow the inner value on the main thread.
     ///
     /// The witness is `!Send`, so it cannot follow the container to a worker
     /// (the error names the marker field, "`*const u8` cannot be sent between
@@ -65,14 +81,14 @@ impl<T> MainThreadBound<T> {
         &self.0
     }
 
-    /// The value, mutably, on the thread it belongs to.
+    /// Mutably borrow the inner value on the main thread.
     #[inline]
     #[must_use]
     pub fn get_mut(&mut self, _mt: MainThread) -> &mut T {
         &mut self.0
     }
 
-    /// Take the value out, onto the main thread where it may live.
+    /// Extract the inner value on the main thread.
     #[inline]
     #[must_use]
     pub fn into_inner(self, _mt: MainThread) -> T {
@@ -81,7 +97,7 @@ impl<T> MainThreadBound<T> {
         unsafe { ManuallyDrop::take(&mut this.0) }
     }
 
-    /// Run `f` against the value on the main thread and bring its result back.
+    /// Run `f` against `&T` on the main thread and return its `Send` result.
     ///
     /// `R: Send`, and `f` takes a higher-ranked `&T` with no lifetime `R` can
     /// unify with, so a borrow of the value cannot come back:
@@ -119,6 +135,10 @@ impl<T> MainThreadBound<T> {
     /// });
     /// ```
     ///
+    /// # Blocking
+    /// Off the main thread this blocks until the main thread services its queue — see
+    /// [`run_on_main`].
+    ///
     /// # Panics
     /// If `f` panics, the panic is re-raised here with its original payload.
     #[inline]
@@ -132,8 +152,7 @@ impl<T> MainThreadBound<T> {
 }
 
 impl<T> Drop for MainThreadBound<T> {
-    /// Obligation 3. A `T` with no destructor is dropped in place, so it never
-    /// blocks; anything else is dropped on the main thread.
+    /// Drop `T` in place when trivial, or on the main thread via [`run_on_main`].
     fn drop(&mut self) {
         if !std::mem::needs_drop::<T>() {
             return;
@@ -147,8 +166,6 @@ impl<T> Drop for MainThreadBound<T> {
 }
 
 impl<T> std::fmt::Debug for MainThreadBound<T> {
-    /// Opaque: printing the value needs a witness `Debug` cannot have, and
-    /// `Debug` must not block on the main queue.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MainThreadBound").finish_non_exhaustive()
     }

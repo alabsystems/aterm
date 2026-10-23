@@ -11,18 +11,16 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-/// The managed shell-profile block's marker PAIR.
+/// Start marker of the managed shell-profile block.
 pub const PATH_BLOCK_START: &str = "# >>> aterm ALab toolset (managed by install.sh) >>>";
-/// The block's end marker.
+/// End marker of the managed shell-profile block.
 pub const PATH_BLOCK_END: &str = "# <<< aterm ALab toolset <<<";
-/// The first line of the Linux desktop entry `shell-setup --desktop` writes.
+/// Marker line written at the top of the managed Linux desktop entry.
 pub const DESKTOP_MARKER: &str =
     "# Managed by aterm install.sh — its uninstall removes only an entry carrying this line.";
-/// Every man page basename aterm has ever shipped.
 const SHIPPED_MAN_PAGES: [&str; 3] = ["aterm.1", "aterm-ctl.1", "aterm-gui.1"];
-/// The icon sizes install.sh writes beside the desktop entry.
 const ICON_SIZES: [&str; 5] = ["32x32", "64x64", "128x128", "256x256", "512x512"];
-/// The app icon at every size the repo ships ([`ICON_SIZES`]).
+/// Embedded hicolor app icons for [`ICON_SIZES`].
 #[cfg(target_os = "linux")]
 pub const HICOLOR_ICONS: [(&str, &[u8]); 5] = [
     (
@@ -46,15 +44,12 @@ pub const HICOLOR_ICONS: [(&str, &[u8]); 5] = [
         include_bytes!("../../../assets/linux/icons/hicolor/512x512/apps/aterm.png"),
     ),
 ];
-/// The man pages the repo ships ([`SHIPPED_MAN_PAGES`]).
 const CARRIED_MAN_PAGES: [(&str, &str, &[u8]); 1] =
     [("1", "aterm.1", include_bytes!("../../../man/aterm.1"))];
-/// An aterm bundle's identifier.
 const BUNDLE_ID: &str = "com.aterm.aterm";
-/// A hang detector on a child run to completion.
 const CHILD_HANG: Duration = Duration::from_secs(60);
 
-/// Where install.sh lays things for this account.
+/// Account installation paths used by `shell-setup` and `self-uninstall`.
 #[derive(Clone, Debug)]
 pub struct Places {
     /// `$HOME`.
@@ -74,7 +69,7 @@ pub struct Places {
 }
 
 impl Places {
-    /// install.sh's defaults under `home`.
+    /// Default installation paths under `home`.
     #[must_use]
     pub fn defaults(home: &Path, xdg_data: Option<&Path>, xdg_config: Option<&Path>) -> Self {
         Self {
@@ -88,7 +83,6 @@ impl Places {
         }
     }
 
-    /// The bin dirs the sweep walks: the configured one.
     fn bin_dirs(&self) -> Vec<PathBuf> {
         let local = self.home.join(".local/bin");
         let mut dirs = vec![self.bin_dir.clone()];
@@ -98,7 +92,6 @@ impl Places {
         dirs
     }
 
-    /// The directories the app half installs `aterm.app` into: the scope alone, when set.
     fn app_dirs(&self) -> Vec<PathBuf> {
         self.install_dir.clone().map_or_else(
             || {
@@ -111,13 +104,12 @@ impl Places {
         )
     }
 
-    /// aterm's support directory, where atpkg keeps its store and its decline record.
     fn support(&self) -> PathBuf {
         self.home.join("Library/Application Support/aterm")
     }
 }
 
-/// What the shell side of the environment says.
+/// Shell environment snapshot for [`shell_setup`].
 #[derive(Clone, Debug, Default)]
 pub struct ShellEnv {
     /// The account's login shell ([`crate::hooks::login_shell`], [`rc_target`]).
@@ -137,14 +129,12 @@ impl ShellEnv {
         }
     }
 
-    /// The shell's name.
     fn shell_name(&self) -> &str {
         self.shell
             .as_deref()
             .map_or("", |s| s.rsplit('/').next().unwrap_or(s))
     }
 
-    /// The first `name` on `$PATH` that is a file.
     fn on_path(&self, name: &str) -> Option<PathBuf> {
         let path = self.path.as_ref()?;
         std::env::split_paths(path)
@@ -153,24 +143,20 @@ impl ShellEnv {
     }
 }
 
-/// The bundle's `CFBundleIdentifier`, read as `CFBundle` reads it, or `None`.
 fn bundle_identifier(app: &Path) -> Option<String> {
     aterm_containment::consent::bundle_id_of(app, &[])
 }
 
-/// Whether `app` is an aterm bundle.
 fn bundle_is_ours(app: &Path) -> bool {
     bundle_identifier(app).as_deref() == Some(BUNDLE_ID)
 }
 
-/// `path`'s symlink target, as written.
 fn link_target(path: &Path) -> Option<String> {
     std::fs::read_link(path)
         .ok()
         .map(|t| t.to_string_lossy().into_owned())
 }
 
-/// Whether a bin entry is a symlink this installer places.
 fn bin_entry_is_ours(path: &Path, store: &Path) -> bool {
     link_target(path).is_some_and(|t| {
         t.contains("/aterm.app/Contents/MacOS/")
@@ -178,7 +164,6 @@ fn bin_entry_is_ours(path: &Path, store: &Path) -> bool {
     })
 }
 
-/// The aterm bundle the symlink `link` leads into, or `None`.
 fn link_bundle(link: &Path) -> Option<PathBuf> {
     let t = link_target(link)?;
     let t = if t.starts_with('/') {
@@ -190,7 +175,6 @@ fn link_bundle(link: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(format!("{}/aterm.app", &t[..at])))
 }
 
-/// Whether `a` and `b` are one file (device and inode).
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::metadata(a), std::fs::metadata(b)) {
         (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
@@ -198,7 +182,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// `path` as the deepest directory on it that exists.
 fn dir_split(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut path = if path.is_absolute() {
         path.to_path_buf()
@@ -252,7 +235,6 @@ fn dir_split(path: &Path) -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-/// Whether directory `a` lies within directory `b`, by identity.
 fn dir_within(a: &Path, b: &Path) -> bool {
     let (Some((mut ah, at)), Some((bh, bt))) = (dir_split(a), dir_split(b)) else {
         return false;
@@ -271,7 +253,6 @@ fn dir_within(a: &Path, b: &Path) -> bool {
     same_file(&ah, &bh) && at.starts_with(&bt)
 }
 
-/// The first line `exe args…` prints within `within`, or nothing.
 fn first_line_bounded(exe: &Path, args: &[impl AsRef<OsStr>], within: Duration) -> String {
     let mut cmd = aterm_uds::spawnfd::command(exe);
     cmd.args(args);
@@ -286,8 +267,6 @@ fn first_line_bounded(exe: &Path, args: &[impl AsRef<OsStr>], within: Duration) 
         .unwrap_or_default()
 }
 
-/// Whether the regular executable file at `path` answers `--version` as aterm, asked as `run_as`
-/// says ([`runs_as`]).
 fn answers_as_aterm(path: &Path, run_as: RunAs) -> bool {
     let line = match run_as {
         _ if !is_executable_file(path) => return false,
@@ -302,53 +281,72 @@ fn answers_as_aterm(path: &Path, run_as: RunAs) -> bool {
     line.starts_with("aterm ")
 }
 
-/// Whether `path` itself (not a link's target) is a regular file someone may execute.
 fn is_executable_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Who a sweep runs a program it found as ([`runs_as`]), rather than one it was started as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunAs {
-    /// This process.
     Me,
-    /// The home's owner, through [`SUDO`].
     Account(u32),
-    /// None: root runs nothing another account could have put in its place, nor anything
-    /// that would write root's files into a home not its own.
     Nobody,
 }
 
-/// What a skip says of a program [`RunAs::Nobody`] leaves unrun.
 const NOT_AS_ROOT: &str = "root runs a program only as the account whose own home HOME is, or \
                            for its own HOME one no account can replace (run the uninstall as \
                            that account)";
 
-/// [`RunAs`] for `program`, found by a sweep of `home` run as `our_uid`. Root asks as the home's
-/// owner when `home` is that owner's own ([`caffeine_account`]; sudo keeps the person's HOME).
-/// Otherwise it runs a program itself only for its own home, where what the program makes is
-/// root's to make (in another, a root-owned store or log directory would refuse that home's
-/// account later), and only one it already runs ([`ours_already`]) or no account can replace
-/// ([`roots_alone`]).
-fn runs_as(our_uid: u32, home: &Path, program: &Path) -> RunAs {
+/// Who acts on `home` under `our_uid`: root itself only for its own home, an account for its own.
+fn home_as(our_uid: u32, home: &Path) -> RunAs {
     if our_uid != 0 {
         return RunAs::Me;
     }
     if let Some((uid, _)) = caffeine_account(our_uid, home) {
         return RunAs::Account(uid);
     }
-    let roots_home = aterm_uds::account::home_of(0).is_some_and(|own| same_file(&own, home));
-    if roots_home && (ours_already(program) || roots_alone(program)) {
+    if aterm_uds::account::home_of(0).is_some_and(|own| same_file(&own, home)) {
         RunAs::Me
     } else {
         RunAs::Nobody
     }
 }
 
-/// Whether `program` is this process's own executable, or in the bundle it runs from, spelled
-/// as it resolves: a link on the way is one its owner may repoint before the exec reads the
-/// path again.
+/// Execution identity for `program` during a sweep of `home` under `our_uid`.
+fn runs_as(our_uid: u32, home: &Path, program: &Path) -> RunAs {
+    match home_as(our_uid, home) {
+        RunAs::Me if our_uid == 0 && !(ours_already(program) || roots_alone(program)) => {
+            RunAs::Nobody
+        }
+        who => who,
+    }
+}
+
+/// Why `shell-setup` under `our_uid` writes nothing in `home`: root wiring an account's home would
+/// leave it root's profile, man pages and completions, which that account cannot then change.
+fn setup_refusal(our_uid: u32, home: &Path, args: &[String]) -> Option<String> {
+    let whose = match home_as(our_uid, home) {
+        RunAs::Me => return None,
+        RunAs::Account(uid) => format!("is uid {uid}'s own home"),
+        RunAs::Nobody => "is not root's own home".to_string(),
+    };
+    let command: String = args
+        .iter()
+        .map(|arg| {
+            if arg.contains(char::is_whitespace) {
+                format!(" '{arg}'")
+            } else {
+                format!(" {arg}")
+            }
+        })
+        .collect();
+    Some(format!(
+        "HOME ({}) {whose}, and root writes no files there that its account could then not \
+         change: run `aterm pkg shell-setup{command}` as that account",
+        home.display()
+    ))
+}
+
 fn ours_already(program: &Path) -> bool {
     let (Ok(exe), Ok(resolved)) = (
         std::env::current_exe().and_then(std::fs::canonicalize),
@@ -365,9 +363,7 @@ fn ours_already(program: &Path) -> bool {
     resolved == exe || bundle.is_some_and(|bundle| resolved.starts_with(bundle))
 }
 
-/// Whether no account but root can replace `program`: it and every directory above it, as
-/// spelled and as its links resolve, are root's, and no group or other may write one (but a
-/// sticky directory, where only an entry's owner may replace it).
+/// Whether `program` and every ancestor (spelled and resolved) can only be modified by root.
 fn roots_alone(program: &Path) -> bool {
     let resolved = std::fs::canonicalize(program).ok();
     [Some(program.to_path_buf()), resolved]
@@ -391,11 +387,6 @@ fn roots_alone(program: &Path) -> bool {
         })
 }
 
-/// Whether an entry with this owner, group and mode is one no account but root can change, for
-/// [`roots_alone`]: root's, and writable by no group but root's and by no other, unless it is
-/// a sticky directory (only an entry's owner may replace that entry). A link's own mode grants
-/// nothing (Linux reports 0777 for every one); its parent directory, the next ancestor, decides
-/// who may replace it.
 const fn root_only_entry(uid: u32, gid: u32, mode: u32, dir: bool, link: bool) -> bool {
     if link {
         return uid == 0;
@@ -404,15 +395,11 @@ const fn root_only_entry(uid: u32, gid: u32, mode: u32, dir: bool, link: bool) -
     uid == 0 && (sticky || mode & 0o002 == 0) && (sticky || gid == 0 || mode & 0o020 == 0)
 }
 
-/// sudo's exit status when it will not run a command as `uid` for root ([`TRUE`]), `None` when
-/// it will.
 fn sudo_refuses(uid: u32) -> Option<i32> {
     let rc = run_quietly(Path::new(SUDO), &as_account_argv(uid, Path::new(TRUE), &[]));
     (rc != 0).then_some(rc)
 }
 
-/// Whether an entry of the store directory is one the store lanes place (its `aterm` asked
-/// as `run_as` says).
 fn store_entry_is_ours(path: &Path, run_as: RunAs) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -426,7 +413,6 @@ fn store_entry_is_ours(path: &Path, run_as: RunAs) -> bool {
     }
 }
 
-/// Remove `path` as `rm -rf` does: a symlink itself, a directory with all it holds.
 fn remove(path: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() {
@@ -436,14 +422,89 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Whether anything (a dangling symlink too) is at `path`.
 fn present(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-/// The sweep's tally and its two channels.
+/// The one account among the owners of the folders on the way to a path: `Ok(None)` when root
+/// owns them all, `Err(())` when two accounts do.
+fn way_account(owners: impl IntoIterator<Item = u32>) -> Result<Option<u32>, ()> {
+    let mut account = None;
+    for uid in owners.into_iter().filter(|&uid| uid != 0) {
+        match account {
+            Some(seen) if seen != uid => return Err(()),
+            _ => account = Some(uid),
+        }
+    }
+    Ok(account)
+}
+
+/// [`way_account`] of the folders above `path`, spelled and resolved: whoever owns one can swap
+/// what lies below it between a root sweep's look and its act.
+fn account_on_the_way(path: &Path) -> Result<Option<u32>, ()> {
+    let parent = path.parent().unwrap_or(path);
+    let resolved = std::fs::canonicalize(parent).ok();
+    let folders: Vec<PathBuf> = [Some(parent.to_path_buf()), resolved]
+        .into_iter()
+        .flatten()
+        .flat_map(|dir| dir.ancestors().map(Path::to_path_buf).collect::<Vec<_>>())
+        .filter(|at| !at.as_os_str().is_empty())
+        .collect();
+    way_account(
+        folders
+            .iter()
+            .filter_map(|at| std::fs::symlink_metadata(at).ok().map(|m| m.uid())),
+    )
+}
+
+fn two_accounts() -> std::io::Error {
+    std::io::Error::other("two accounts own folders on the way to it, and root acts as neither")
+}
+
+/// `path` opened with `opts` when it is a regular file and, under root, one owned by the account
+/// owning the way to it (root when none does): a link or a swapped folder then never makes
+/// root's read hang on a pipe or its write land in another owner's file.
+fn open_checked(
+    path: &Path,
+    opts: &mut std::fs::OpenOptions,
+    root: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = opts
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let opened = file.metadata()?;
+    let owner = if root {
+        Some(
+            account_on_the_way(path)
+                .map_err(|()| two_accounts())?
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
+    if !opened.is_file() || owner.is_some_and(|owner| opened.uid() != owner) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not a regular file of the account it is for",
+        ));
+    }
+    Ok(file)
+}
+
+/// `path`'s text, from a regular file only: a pipe behind a link is refused, not waited on. Reading
+/// needs no owner (only what a sweep writes does), so root still sees a block it may not rewrite.
+fn read_checked(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    open_checked(path, std::fs::OpenOptions::new().read(true), false)?.read_to_string(&mut text)?;
+    Ok(text)
+}
+
 struct Sweep<'w> {
     dry: bool,
+    /// How a root sweep runs a command as an account; `None` when the sweep is not root's.
+    as_root: Option<fn(&Path, &[OsString]) -> i32>,
     removed: usize,
     skipped: usize,
     kept: usize,
@@ -462,22 +523,26 @@ impl Sweep<'_> {
         let _ = writeln!(self.out, "atpkg: {line}");
     }
 
-    /// Remove what is ours, or say what a real run would.
     fn rm(&mut self, path: &Path, label: &str) {
         if self.dry {
             let act = self.act();
             self.say(&format!("{act} {label}: {}", path.display()));
         } else {
-            match remove(path) {
+            match self.unlink(path, true) {
                 Ok(()) => self.say(&format!("removed {label}: {}", path.display())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.say(&format!("gone already: {label}: {}", path.display()));
                     return;
                 }
-                Err(_) => {
+                Err(e) => {
+                    let why = if self.as_root.is_some() {
+                        format!("cannot remove: {e}")
+                    } else {
+                        "cannot remove, try sudo".to_string()
+                    };
                     let _ = writeln!(
                         self.err,
-                        "atpkg: SKIPPED {label} (cannot remove, try sudo): {}",
+                        "atpkg: SKIPPED {label} ({why}): {}",
                         path.display()
                     );
                     self.skipped += 1;
@@ -488,13 +553,47 @@ impl Sweep<'_> {
         self.removed += 1;
     }
 
-    /// The one SKIPPED line for what is not ours.
+    /// Remove `path`: everything in it when `tree`, else only an empty folder. Under root it goes
+    /// as the account owning a folder on the way to it (by root itself only when none does), so
+    /// what that account swaps in mid-sweep is never something only root could remove.
+    fn unlink(&self, path: &Path, tree: bool) -> std::io::Result<()> {
+        let own = || {
+            if tree {
+                remove(path)
+            } else {
+                std::fs::remove_dir(path)
+            }
+        };
+        let Some(run) = self.as_root else {
+            return own();
+        };
+        let uid = match account_on_the_way(path) {
+            Ok(None) => return own(),
+            Ok(Some(uid)) => uid,
+            Err(()) => return Err(two_accounts()),
+        };
+        std::fs::symlink_metadata(path)?;
+        let (program, args): (&str, &[&str]) = if tree {
+            (RM, &["-rf", "--"])
+        } else {
+            (RMDIR, &["--"])
+        };
+        let mut argv = as_account_argv(uid, Path::new(program), args);
+        argv.push(path.into());
+        let rc = run(Path::new(SUDO), &argv);
+        if present(path) {
+            return Err(std::io::Error::other(format!(
+                "uid {uid}, which owns a folder on the way to it, could not (exit {rc})"
+            )));
+        }
+        Ok(())
+    }
+
     fn skip(&mut self, path: &str, reason: &str) {
         let _ = writeln!(self.err, "atpkg: SKIPPED {path} — {reason}");
         self.skipped += 1;
     }
 
-    /// What is laid for the whole account.
     fn rm_shared(&mut self, path: &Path, label: &str) {
         if self.outsider.is_some() {
             self.say(&format!("left in place: {label}: {}", path.display()));
@@ -506,7 +605,6 @@ impl Sweep<'_> {
     }
 }
 
-/// Whether `bundle` is outside a scoped run's scope.
 fn outside_scope(p: &Places, bundle: &Path) -> bool {
     let Some(scope) = &p.install_dir else {
         return false;
@@ -518,12 +616,10 @@ fn outside_scope(p: &Places, bundle: &Path) -> bool {
     !entry
 }
 
-/// Whether `bundle` is another aterm than the scope's on this account.
 fn other_aterm(p: &Places, bundle: &Path) -> bool {
     bundle.is_dir() && outside_scope(p, bundle) && bundle_is_ours(bundle)
 }
 
-/// The first aterm.app other than the scope's that runs on this HOME's toolchain store, or `None`.
 fn scope_outsider(p: &Places) -> Option<PathBuf> {
     let mut cands = vec![p.home.join("Applications/aterm.app")];
     if home_is_the_accounts(aterm_uds::peer::our_uid(), &p.home) {
@@ -537,7 +633,6 @@ fn scope_outsider(p: &Places) -> Option<PathBuf> {
     cands.into_iter().find(|b| other_aterm(p, b))
 }
 
-/// The bundle whose helper step 0 may delegate to.
 fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
     p.app_dirs()
         .iter()
@@ -548,11 +643,8 @@ fn uninstall_bundle(p: &Places) -> Option<PathBuf> {
         })
 }
 
-/// Where the Caffeine mug keeps the copies of the app it runs from: `<label>/<id>/X.app`
-/// ([`aterm_uds::deadline::RAN`], [`sweep_caffeine_code`]).
 const CAFFEINE_CODE: &str = "caffeine-code.noindex";
 
-/// What `aterm caffeine` keeps in the support dir.
 const CAFFEINE_FILES: [&str; 5] = [
     CAFFEINE_CODE,
     "caffeine",
@@ -561,14 +653,10 @@ const CAFFEINE_FILES: [&str; 5] = [
     "caffeine.bridge",
 ];
 
-/// The line a self-uninstall adds to the toolset decline its own sweep recorded but left for an
-/// aterm it kept.
 const SWEPT_DECLINE_TAG: &str = "# Recorded by aterm pkg self-uninstall for an aterm it kept.";
 
-/// The prefix of every launchd label `aterm caffeine` makes, its login plists' names.
 const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.caffeine";
 
-/// Retire the going builds' startup jobs and the running mug through their own command.
 fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
     sweep_caffeine_with(
         s,
@@ -632,8 +720,6 @@ fn sweep_caffeine_with(
     };
     let mut supported = false;
     let mut failed = Vec::new();
-    // Root with no account to ask as runs a helper only as [`runs_as`] lets it, and keeps
-    // every other for its steps.
     helpers.retain(|(app, aterm)| {
         if run_as(aterm) != RunAs::Nobody {
             return true;
@@ -663,7 +749,6 @@ fn sweep_caffeine_with(
             }
         }
     }
-    // A file at the store's name is a helper once it answers as aterm, asked as above.
     helpers.retain(|(_, aterm)| *aterm != stored || answers_as_aterm(aterm, run_as(aterm)));
     for (app, aterm) in helpers {
         if s.dry {
@@ -729,9 +814,6 @@ fn sweep_caffeine_with(
         return failed;
     }
     let lock = support.join("caffeine.lock");
-    // The lock alone, with no login plist, needs no aterm to stop a mug: the hold below finds
-    // the lock free (no mug, so the rendezvous stays as after any sweep) or held (a mug, kept).
-    // Not for root with no account, which holds no lock in another account's directory.
     let lone_lock = (our_uid != 0 || account.is_some())
         && !login_plist
         && files.iter().all(|path| *path == lock);
@@ -766,9 +848,6 @@ fn sweep_caffeine_with(
     failed
 }
 
-/// Remove the mug's code directory `code` at `now` as the mug's own sweep does: all of it but a
-/// copy no mug said it ran from that is younger than the first-exec hang
-/// ([`aterm_uds::deadline::copy_may_go`]).
 fn sweep_caffeine_code(s: &mut Sweep<'_>, code: &Path, now: std::time::SystemTime) {
     sweep_caffeine_code_with(
         s,
@@ -785,7 +864,6 @@ struct CaffeineCodePlan {
     keep: Vec<(PathBuf, Duration)>,
 }
 
-/// Admit the complete tree before removing any of it.
 fn caffeine_code_plan_with(
     code: &Path,
     now: std::time::SystemTime,
@@ -901,7 +979,6 @@ fn sweep_caffeine_code_with(
     }
 }
 
-/// Hold the physical.
 fn caffeine_cleanup_hold(
     path: &Path,
     account: Option<(u32, u32)>,
@@ -938,7 +1015,6 @@ fn caffeine_cleanup_hold(
     Some(held)
 }
 
-/// The account a sweep of `home` asks the Caffeine helpers as, with its group.
 fn caffeine_account(our_uid: u32, home: &Path) -> Option<(u32, u32)> {
     if our_uid != 0 {
         return None;
@@ -948,28 +1024,23 @@ fn caffeine_account(our_uid: u32, home: &Path) -> Option<(u32, u32)> {
     (owner.uid() != 0 && same_file(&own, home)).then(|| (owner.uid(), owner.gid()))
 }
 
-/// Whether `home` is an account's own home, so `/Applications` serves it: this process's
-/// account's, or under root (sudo keeps the person's HOME) its owner's ([`caffeine_account`]).
 fn home_is_the_accounts(our_uid: u32, home: &Path) -> bool {
     caffeine_account(our_uid, home).is_some()
         || aterm_uds::account::home_of(our_uid).is_some_and(|acct| same_file(&acct, home))
 }
 
-/// What runs a Caffeine helper step as `uid`.
 const SUDO: &str = "/usr/bin/sudo";
-/// What a root sweep asks sudo to run first, to tell sudo's refusal from a helper's.
 const TRUE: &str = "/usr/bin/true";
-/// What makes a missing Caffeine lock as its account ([`make_as_account`]).
 const TOUCH: &str = "/usr/bin/touch";
+const RM: &str = "/bin/rm";
+const RMDIR: &str = "/bin/rmdir";
 
-/// Make the empty file `path` as `uid`, through [`SUDO`] ([`caffeine_cleanup_hold`]).
 fn make_as_account(path: &Path, uid: u32) -> bool {
     let mut argv = as_account_argv(uid, Path::new(TOUCH), &[]);
     argv.push(path.into());
     run_quietly(Path::new(SUDO), &argv) == 0
 }
 
-/// `sudo`'s arguments for `aterm args` as `uid` ([`SUDO`]).
 fn as_account_argv(uid: u32, aterm: &Path, args: &[&str]) -> Vec<OsString> {
     let mut argv: Vec<OsString> = ["-n", "-H", "-u"].into_iter().map(OsString::from).collect();
     argv.push(format!("#{uid}").into());
@@ -979,7 +1050,6 @@ fn as_account_argv(uid: u32, aterm: &Path, args: &[&str]) -> Vec<OsString> {
     argv
 }
 
-/// Run the Caffeine helper `aterm args` quietly ([`caffeine_account`]).
 fn run_helper(
     aterm: &Path,
     args: &[&str],
@@ -992,7 +1062,6 @@ fn run_helper(
     }
 }
 
-/// How the sweep names the helper step [`run_helper`] runs.
 fn helper_line(aterm: &Path, args: &[&str], account: Option<(u32, u32)>) -> String {
     let step = format!("{} {}", aterm.display(), args.join(" "));
     match account {
@@ -1001,7 +1070,6 @@ fn helper_line(aterm: &Path, args: &[&str], account: Option<(u32, u32)>) -> Stri
     }
 }
 
-/// Run `program args`, its stdio `/dev/null`.
 fn run_quietly(program: &Path, args: &[impl AsRef<OsStr>]) -> i32 {
     aterm_uds::spawnfd::command(program)
         .args(args)
@@ -1012,7 +1080,7 @@ fn run_quietly(program: &Path, args: &[impl AsRef<OsStr>]) -> i32 {
         .map_or(127, |st| st.code().unwrap_or(128))
 }
 
-/// Everything install.sh placed, swept.
+/// Remove every artifact `install.sh` placed under `p`.
 pub fn self_uninstall(
     p: &Places,
     man_src: Option<&Path>,
@@ -1034,6 +1102,11 @@ fn self_uninstall_with_caffeine(
     let outsider = p.install_dir.as_ref().and_then(|_| scope_outsider(p));
     let mut s = Sweep {
         dry,
+        as_root: if aterm_uds::peer::our_uid() == 0 {
+            Some(run_quietly)
+        } else {
+            None
+        },
         removed: 0,
         skipped: 0,
         kept: 0,
@@ -1042,10 +1115,11 @@ fn self_uninstall_with_caffeine(
         out,
         err,
     };
+    let root = s.as_root.is_some();
     let support = p.support();
     let decline = support.join("pkg/declined");
-    let decline_tagged = std::fs::read_to_string(&decline)
-        .is_ok_and(|text| text.lines().any(|line| line == SWEPT_DECLINE_TAG));
+    let decline_tagged =
+        read_checked(&decline).is_ok_and(|text| text.lines().any(|line| line == SWEPT_DECLINE_TAG));
     let decline_before = present(&decline) && !decline_tagged;
     let app_dirs = p.app_dirs();
 
@@ -1069,8 +1143,6 @@ fn self_uninstall_with_caffeine(
                 s.removed += 1;
                 swept = true;
             } else {
-                // Root runs the account's atpkg as the account, and none for another's home
-                // or one an account could replace ([`runs_as`]).
                 let run_as = runs_as(aterm_uds::peer::our_uid(), &p.home, &atpkg);
                 let refused = match run_as {
                     RunAs::Me => None,
@@ -1181,11 +1253,9 @@ fn self_uninstall_with_caffeine(
             app.is_dir() && bundle_is_ours(&app)
         });
         if !app_left {
-            let _ = std::fs::remove_file(&decline);
+            let _ = s.unlink(&decline, true);
         } else if !decline_tagged {
-            let tagged = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&decline)
+            let tagged = open_checked(&decline, std::fs::OpenOptions::new().append(true), root)
                 .and_then(|mut file| writeln!(file, "{SWEPT_DECLINE_TAG}"));
             if let Err(e) = tagged {
                 s.say(&format!(
@@ -1315,7 +1385,7 @@ fn self_uninstall_with_caffeine(
                 s.say(&format!("{act} empty support dir: {}", support.display()));
                 s.removed += 1;
             }
-        } else if std::fs::remove_dir(&support).is_ok() {
+        } else if s.unlink(&support, false).is_ok() {
             s.say(&format!("removed empty support dir: {}", support.display()));
             s.removed += 1;
         }
@@ -1367,7 +1437,6 @@ fn self_uninstall_with_caffeine(
     s.skipped == 0
 }
 
-/// Remove a command link.
 fn rm_link(s: &mut Sweep<'_>, p: &Places, link: &Path, label: &str) {
     match link_bundle(link) {
         Some(b) if other_aterm(p, &b) => {
@@ -1382,7 +1451,6 @@ fn rm_link(s: &mut Sweep<'_>, p: &Places, link: &Path, label: &str) {
     }
 }
 
-/// The entries of `dir`, sorted, the dot-named ones after the rest (a shell glob's order).
 fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -1392,18 +1460,13 @@ fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
     names.into_iter().map(|n| dir.join(n)).collect()
 }
 
-/// Why step 3 leaves the store as it is, when it does ([`sweep_store`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StoreLeft {
-    /// No directory is there.
     Absent,
-    /// It is a PATH directory, not a store of its own.
     PathDir,
-    /// It cannot be listed.
     Unlisted,
 }
 
-/// Whether step 3 leaves the store as it is ([`StoreLeft`]).
 fn store_left(p: &Places) -> Option<StoreLeft> {
     let store = &p.store_dir;
     if !store.is_dir() {
@@ -1417,7 +1480,6 @@ fn store_left(p: &Places) -> Option<StoreLeft> {
     }
 }
 
-/// Step 3 of [`self_uninstall`] ([`sweep_caffeine`]).
 fn sweep_store(s: &mut Sweep<'_>, p: &Places, caffeine_kept: &[PathBuf]) {
     let store = &p.store_dir;
     match store_left(p) {
@@ -1441,7 +1503,6 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, caffeine_kept: &[PathBuf]) {
     }
     let aterm = store.join("aterm");
     let run_as = runs_as(aterm_uds::peer::our_uid(), &p.home, &aterm);
-    // What the store holds is judged by asking its aterm; one this sweep may not ask leaves it.
     let unasked = match run_as {
         _ if !is_executable_file(&aterm) || caffeine_kept.contains(&aterm) => None,
         RunAs::Nobody => Some(NOT_AS_ROOT.to_string()),
@@ -1497,7 +1558,6 @@ fn sweep_store(s: &mut Sweep<'_>, p: &Places, caffeine_kept: &[PathBuf]) {
     }
 }
 
-/// Step 8 of [`self_uninstall`].
 fn sweep_path_blocks(s: &mut Sweep<'_>, p: &Places) {
     let mut rcs: Vec<PathBuf> = Vec::new();
     for rc in [
@@ -1513,11 +1573,12 @@ fn sweep_path_blocks(s: &mut Sweep<'_>, p: &Places) {
             rcs.push(rc);
         }
     }
+    let root = s.as_root.is_some();
     for rc in rcs {
         if !rc.is_file() {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&rc) else {
+        let Ok(text) = read_checked(&rc) else {
             continue;
         };
         if !text.contains(PATH_BLOCK_START) {
@@ -1542,11 +1603,8 @@ fn sweep_path_blocks(s: &mut Sweep<'_>, p: &Places) {
         }
         match without_block(&text) {
             Some(kept)
-                if std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&rc)
-                    .and_then(|mut f| f.write_all(kept.as_bytes()))
+                if open_checked(&rc, std::fs::OpenOptions::new().write(true), root)
+                    .and_then(|mut f| f.set_len(0).and_then(|()| f.write_all(kept.as_bytes())))
                     .is_ok() =>
             {
                 s.say(&format!("removed PATH block: {}", rc.display()));
@@ -1560,8 +1618,6 @@ fn sweep_path_blocks(s: &mut Sweep<'_>, p: &Places) {
     }
 }
 
-/// `text` without the lines from an exact [`PATH_BLOCK_START`] line to the next exact
-/// [`PATH_BLOCK_END`] line.
 fn without_block(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut dropping = false;
@@ -1595,7 +1651,6 @@ pub(crate) fn rc_target(p: &Places, env: &ShellEnv) -> Option<PathBuf> {
     }
 }
 
-/// The toolset hook for `shell`, which atpkg writes ([`crate::hooks::HOOK_BASENAME`]).
 fn hook_of(p: &Places, shell: &str) -> PathBuf {
     p.home.join(format!(
         ".aterm/shell.d/{}.{shell}",
@@ -1603,7 +1658,7 @@ fn hook_of(p: &Places, shell: &str) -> PathBuf {
     ))
 }
 
-/// What `shell-setup` is asked to do.
+/// Options for [`shell_setup`].
 #[derive(Clone, Debug, Default)]
 pub struct Setup {
     /// Wire the managed PATH block.
@@ -1624,7 +1679,7 @@ pub struct Setup {
     pub dry_run: bool,
 }
 
-/// `aterm pkg shell-setup`.
+/// Execute `aterm pkg shell-setup`.
 pub fn shell_setup(
     p: &Places,
     env: &ShellEnv,
@@ -1665,7 +1720,6 @@ pub fn shell_setup(
     ok
 }
 
-/// The PATH line of a plan ([`wire_path`]).
 fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
     let line = match rc_target(p, env) {
         None => format!(
@@ -1698,7 +1752,6 @@ fn plan_path(p: &Places, env: &ShellEnv, coming: bool, out: &mut dyn Write) {
     let _ = writeln!(out, "atpkg: {line}");
 }
 
-/// The CLI link directory leads an inherited bundle.
 fn path_block(p: &Places, env: &ShellEnv) -> String {
     let hook = hook_of(p, env.shell_name());
     let body = if env.shell_name() == "fish" {
@@ -1726,7 +1779,6 @@ fn path_block(p: &Places, env: &ShellEnv) -> String {
     format!("{PATH_BLOCK_START}\n{body}{PATH_BLOCK_END}\n")
 }
 
-/// Replace only the exact managed section, preserving every byte around it.
 fn profile_with_path_block(text: &str, block: &str) -> Result<String, &'static str> {
     let (mut start, mut end, mut offset) = (None, None, 0);
     for line in text.split_inclusive('\n') {
@@ -1754,7 +1806,6 @@ fn profile_with_path_block(text: &str, block: &str) -> Result<String, &'static s
     }
 }
 
-/// Append or upgrade only the managed profile block, keeping the user's other text.
 fn wire_path(
     p: &Places,
     env: &ShellEnv,
@@ -1858,10 +1909,8 @@ fn wire_path(
     true
 }
 
-/// A man page to install.
 type Page = (String, OsString, Cow<'static, [u8]>);
 
-/// `src`'s `*.[1-9]` pages (a checkout's `man/`).
 fn checkout_pages(src: &Path) -> Vec<Page> {
     sorted_entries(src)
         .into_iter()
@@ -1881,7 +1930,6 @@ fn checkout_pages(src: &Path) -> Vec<Page> {
         .collect()
 }
 
-/// The pages this binary carries ([`CARRIED_MAN_PAGES`]).
 fn carried_pages() -> Vec<Page> {
     CARRIED_MAN_PAGES
         .iter()
@@ -1889,12 +1937,10 @@ fn carried_pages() -> Vec<Page> {
         .collect()
 }
 
-/// `dir` and its missing ancestors, made as [`create_dir_all_unshared`] makes them.
 fn made_dir(dir: &Path) -> std::io::Result<()> {
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o755)
 }
 
-/// `bytes` as `dir/name`, mode 644, `dir` made first ([`made_dir`]).
 fn write_644(dir: &Path, name: &OsStr, bytes: &[u8]) -> std::io::Result<()> {
     let dest = dir.join(name);
     made_dir(dir)
@@ -1902,8 +1948,6 @@ fn write_644(dir: &Path, name: &OsStr, bytes: &[u8]) -> std::io::Result<()> {
         .and_then(|()| std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)))
 }
 
-/// Write `pages` (from `from`, as a plan names it) into the man tree's section directories (mode
-/// 644), and say when `$MANPATH` is set and omits the tree.
 fn install_man_pages(
     p: &Places,
     env: &ShellEnv,
@@ -1952,7 +1996,6 @@ fn install_man_pages(
     }
 }
 
-/// The completion files `shell-setup` writes and the sweep removes: `(shell, front door, path)`.
 fn completion_entries(p: &Places) -> [(&'static str, bool, PathBuf); 6] {
     let zsh = p.xdg_data.join("zsh/site-functions");
     let bash = p.xdg_data.join("bash-completion/completions");
@@ -1967,7 +2010,6 @@ fn completion_entries(p: &Places) -> [(&'static str, bool, PathBuf); 6] {
     ]
 }
 
-/// The paths of [`completion_entries`].
 fn completion_files(p: &Places) -> Vec<PathBuf> {
     completion_entries(p)
         .into_iter()
@@ -1975,7 +2017,6 @@ fn completion_files(p: &Places) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Publish generated, non-secret setup text through a file this call created.
 fn write_setup_file(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = crate::platform::open_create_new_write(tmp, 0o666)?;
     let written = file.write_all(bytes);
@@ -1987,7 +2028,6 @@ fn write_setup_file(tmp: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()
         })
 }
 
-/// Generate the completions with `exe` and write each where its shell loads it from.
 fn install_completions(
     p: &Places,
     env: &ShellEnv,
@@ -2089,7 +2129,6 @@ fn install_completions(
     }
 }
 
-/// Whether `path` may ride the desktop entry's `Exec=` line UNQUOTED: absolute.
 fn desktop_exec_path_ok(path: &Path) -> bool {
     path.to_str().is_some_and(|p| {
         p.starts_with('/')
@@ -2098,9 +2137,6 @@ fn desktop_exec_path_ok(path: &Path) -> bool {
     })
 }
 
-/// Tell launchers a desktop entry came or went now rather than at their next rescan, through
-/// the program `$PATH` names when `run_as` says this process runs it ([`runs_as`]: under sudo,
-/// `$PATH` is the person's).
 fn refresh_desktop_database(env: &ShellEnv, xdg_data: &Path, run_as: impl Fn(&Path) -> RunAs) {
     if let Some(update) = env.on_path("update-desktop-database")
         && run_as(&update) == RunAs::Me
@@ -2111,10 +2147,8 @@ fn refresh_desktop_database(env: &ShellEnv, xdg_data: &Path, run_as: impl Fn(&Pa
     }
 }
 
-/// An icon to install.
 type Icon = (String, Cow<'static, [u8]>);
 
-/// The `<size>/apps/aterm.png` icons of the hicolor tree `dir` (a checkout's).
 fn checkout_icons(dir: &Path) -> Vec<Icon> {
     sorted_entries(dir)
         .into_iter()
@@ -2130,7 +2164,6 @@ fn checkout_icons(dir: &Path) -> Vec<Icon> {
         .collect()
 }
 
-/// The icons this binary carries ([`HICOLOR_ICONS`]).
 fn carried_icons() -> Vec<Icon> {
     #[cfg(target_os = "linux")]
     let carried = HICOLOR_ICONS
@@ -2142,7 +2175,6 @@ fn carried_icons() -> Vec<Icon> {
     carried
 }
 
-/// The Linux desktop identity ([`DESKTOP_MARKER`]).
 fn install_desktop_entry(
     p: &Places,
     env: &ShellEnv,
@@ -2238,7 +2270,6 @@ fn install_desktop_entry(
     }
 }
 
-/// The places of this process: `$HOME`.
 fn process_places() -> Option<Places> {
     let home = aterm_types::dirs::home_dir()?;
     let env_dir = |name: &str| {
@@ -2253,7 +2284,6 @@ fn process_places() -> Option<Places> {
     ))
 }
 
-/// A location flag's value.
 fn take_dir(
     flag: &str,
     it: &mut std::slice::Iter<'_, String>,
@@ -2268,8 +2298,7 @@ fn take_dir(
     }
 }
 
-/// `aterm pkg self-uninstall [--dry-run] [--install-dir <dir>] [--bin-dir <dir>] [--store-dir
-/// <dir>] [--man-root <dir>] [--man <dir>]`.
+/// CLI entry point for `aterm pkg self-uninstall`.
 pub fn self_uninstall_verb(rest: &[String]) -> ExitCode {
     const VERB: &str = "self-uninstall";
     let Some(mut places) = process_places() else {
@@ -2312,14 +2341,17 @@ pub fn self_uninstall_verb(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `aterm pkg shell-setup [--path] [--completions] [--man <dir> | --own-man] [--desktop [--icons
-/// <dir>]] [--toolset-coming] [--dry-run] [--bin-dir <dir>] [--man-root <dir>]`.
+/// CLI entry point for `aterm pkg shell-setup`.
 pub fn shell_setup_verb(rest: &[String]) -> ExitCode {
     const VERB: &str = "shell-setup";
     let Some(mut places) = process_places() else {
         eprintln!("atpkg {VERB}: HOME is unset — no profile to wire");
         return ExitCode::from(2);
     };
+    if let Some(why) = setup_refusal(aterm_uds::peer::our_uid(), &places.home, rest) {
+        eprintln!("atpkg {VERB}: {why}");
+        return ExitCode::FAILURE;
+    }
     let mut setup = Setup::default();
     let mut it = rest.iter();
     while let Some(arg) = it.next() {

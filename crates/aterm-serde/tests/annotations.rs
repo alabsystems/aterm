@@ -9,12 +9,11 @@
     clippy::cast_lossless,
     clippy::derive_partial_eq_without_eq,
     clippy::from_over_into,
-    // Clippy bug: https://github.com/rust-lang/rust-clippy/issues/7422
     clippy::nonstandard_macro_braces,
     clippy::too_many_lines,
     clippy::trivially_copy_pass_by_ref,
     clippy::type_repetition_in_bounds,
-    clippy::uninlined_format_args,
+    clippy::uninlined_format_args
 )]
 
 use crate::support::{
@@ -160,8 +159,6 @@ fn test_collect_other() {
     );
 }
 
-// Upstream's test_partially_untagged_enum_desugared, kept on its desugared
-// half: aterm writes `untagged` on containers only, never on a variant.
 #[test]
 fn test_untagged_enum_holding_a_tagged_enum() {
     mod tagged {
@@ -473,7 +470,6 @@ mod flatten {
         );
     }
 
-    // Regression test for https://github.com/serde-rs/serde/issues/1904
     #[test]
     fn flatten_any_after_flatten_struct() {
         #[derive(PartialEq, Debug)]
@@ -867,10 +863,8 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // data
                         Token::Str("Unit"), // variant
                         Token::Unit,
-                        // extra
                         Token::Str("extra_key"),
                         Token::Str("extra value"),
                         Token::MapEnd,
@@ -880,10 +874,8 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // extra
                         Token::Str("extra_key"),
                         Token::Str("extra value"),
-                        // data
                         Token::Str("Unit"), // variant
                         Token::Unit,
                         Token::MapEnd,
@@ -901,13 +893,11 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // data
                         Token::Str("Newtype"), // variant
                         Token::Map { len: Some(1) },
                         Token::Str("key"),
                         Token::Str("value"),
                         Token::MapEnd,
-                        // extra
                         Token::Str("extra_key"),
                         Token::Str("extra value"),
                         Token::MapEnd,
@@ -917,10 +907,8 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // extra
                         Token::Str("extra_key"),
                         Token::Str("extra value"),
-                        // data
                         Token::Str("Newtype"), // variant
                         Token::Map { len: Some(1) },
                         Token::Str("key"),
@@ -967,12 +955,10 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // x
                         Token::Str("typeX"),
                         Token::Str("B"),
                         Token::Str("b"),
                         Token::I32(1),
-                        // y
                         Token::Str("typeY"),
                         Token::Str("D"),
                         Token::Str("d"),
@@ -984,12 +970,10 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // y
                         Token::Str("typeY"),
                         Token::Str("D"),
                         Token::Str("d"),
                         Token::I32(2),
-                        // x
                         Token::Str("typeX"),
                         Token::Str("B"),
                         Token::Str("b"),
@@ -1029,10 +1013,8 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // x
                         Token::Str("typeX"),
                         Token::Str("A"),
-                        // y
                         Token::Str("typeY"),
                         Token::Str("B"),
                         Token::Str("c"),
@@ -1044,12 +1026,10 @@ mod flatten {
                     &value,
                     &[
                         Token::Map { len: None },
-                        // y
                         Token::Str("typeY"),
                         Token::Str("B"),
                         Token::Str("c"),
                         Token::U32(0),
-                        // x
                         Token::Str("typeX"),
                         Token::Str("A"),
                         Token::MapEnd,

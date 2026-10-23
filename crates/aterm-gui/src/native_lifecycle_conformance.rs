@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for native Settings singleton activation and async routing.
-//!
-//! These traces drive the genuine [`crate::App`] Settings host, stable native runtime
-//! identities and the versioned config reducer. Projections are reconstructed from those
-//! independent lanes, never copied from the model action or a single router verdict.
+//! Conformance tests for native Settings singleton activation and async routing.
 
 #![cfg(test)]
 
@@ -63,8 +59,6 @@ fn active_is_settings(app: &App, wid: WindowId) -> bool {
         .is_some_and(|tab| settings_instance_for_view(app, tab.focus).is_some())
 }
 
-/// Headless twin of the production `WindowEvent::Focused(true)` branch: the same App
-/// bookkeeping seams, minus the OS event object.
 fn focus_logical_window(app: &mut App, wid: WindowId) {
     assert!(app.windows.contains_key(&wid));
     if let Some(previous) = app.frontmost_window
@@ -107,8 +101,6 @@ fn singleton_project(
         i64::try_from(settings_views_in_window(app, windows[1])).expect("bounded views"),
     );
     state.insert("requesting_window", facts.requesting_window);
-    // Read off the App, whoever asked: the frontmost window, when its active tab
-    // is Settings. A request that raised another window projects as that window.
     let focused_window = (1..)
         .zip(windows)
         .find(|&(_, wid)| app.frontmost_window == Some(wid) && active_is_settings(app, wid))
@@ -201,8 +193,6 @@ fn real_app_settings_activation_conforms_in_two_windows_and_rejects_duplicates()
     assert_eq!(settings_views_in_window(&app, two), 1);
     assert!(app.structural_invariants_ok());
 
-    // Negative control: "open means allocate" creates a second controller and a second
-    // implicit view in the requesting window.
     let mut duplicate = before_repeat_two.clone();
     duplicate.insert("opens", before_repeat_two["opens"] + 1);
     duplicate.insert("settings_instances", 2);
@@ -213,9 +203,6 @@ fn real_app_settings_activation_conforms_in_two_windows_and_rejects_duplicates()
     assert!(!model.check_invariant("SingletonInstance", &duplicate));
     assert!(!model.check_invariant("OneImplicitViewWindowTwo", &duplicate));
 
-    // A cross-window focus steal (the model's `Buggy=1` OpenTwo raises the window
-    // already showing Settings instead of the requester) projects as
-    // `(requesting 2, focused 1)`, so it cannot pass as a successful OpenTwo.
     let mut stolen_focus = after_repeat_two;
     stolen_focus.insert("focused_window", 1);
     assert_eq!(admits(&model, &before_repeat_two, &stolen_focus), None);
@@ -296,8 +283,6 @@ impl AsyncHarness {
         let settings_view = ViewId::from_stored(1);
         let mut settings_state = SettingsViewState::from_snapshot(&config_snapshot)
             .expect("Settings consumes the same canonical config snapshot");
-        // Shipping provenance has no website; this harness adds one so the optional
-        // OpenExternal reply lifecycle can run.
         settings_state.about.add_test_site("example.test");
         runtime
             .attach_view(
@@ -307,8 +292,6 @@ impl AsyncHarness {
             )
             .expect("Settings view");
 
-        // A second live view of a different app: the crossed-sink control
-        // needs an identity that is live on its own and still not this reply's.
         let mut documents = crate::test_document_store();
         let document = documents.open("mem://async-conformance".into(), "alpha".into());
         let markdown_instance = runtime
@@ -383,8 +366,6 @@ impl AsyncHarness {
         }
     }
 
-    /// Deliver one `ExternalOpenFinished` through the genuine router and
-    /// reducer, and count a reduction only if the reducer changed the view.
     fn deliver_external(
         &mut self,
         operation: crate::native_app::OperationId,
@@ -583,8 +564,6 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
     let Some(PendingReply::View(reply)) = harness.pending.as_ref() else {
         panic!("view reply");
     };
-    // Both halves live on their own: the Markdown view's identity, as owner and sink, is a
-    // current reply proof...
     let markdown = CompletionSink::View {
         instance: harness.markdown_instance,
         view: harness.markdown_view,
@@ -601,7 +580,6 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
         harness.runtime.completion_is_current(&aligned),
         "the crossed sink's identity is live by itself"
     );
-    // ...and crossing it with the Settings owner is not.
     let mut crossed = reply.clone();
     crossed.sink = markdown;
     assert!(
@@ -626,9 +604,6 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
     let PendingReply::View(reply) = reply else {
         unreachable!();
     };
-    // Redelivering the consumed reply through the real router and reducer, with an
-    // outcome that would change the feedback: `finish_external` finds no pending
-    // operation and the view is untouched (no model step).
     harness.deliver_external(
         reply.operation,
         ExternalOpenOutcome::Denied {
@@ -638,8 +613,6 @@ fn router_rejects_crossed_sink_and_model_catches_wrong_or_duplicate_delivery() {
     assert_eq!(harness.settings_feedback(), feedback);
     assert_eq!(harness.project(&model), completed);
 
-    // Negative control: the reducer without that guard reduces the reply a
-    // second time.
     let mut duplicate_reduction = completed.clone();
     duplicate_reduction.insert("reduced", 2);
     assert_eq!(

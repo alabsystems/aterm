@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! What a lane says: its transcript (stdout at a terminal, the lane's log file under a
-//! unit), the decision table, and the once-a-day notification per message (`osascript` on
-//! macOS, nothing elsewhere). Each lane renders its own report (`ALAB-SYNC.md`,
-//! `READY.md`) from its typed state.
+//! Lane transcripts, table formatting, and once-per-day notifications.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -12,7 +9,7 @@ use std::sync::Mutex;
 
 use crate::error::{Error, Result};
 
-/// A log grows to this, then keeps its newest [`LOG_KEEP`] bytes (a lane runs for months).
+/// Maximum log size before trimming to [`LOG_KEEP`] bytes.
 pub const LOG_MAX: u64 = 8 * 1024 * 1024;
 /// What a trimmed log keeps.
 pub const LOG_KEEP: u64 = 2 * 1024 * 1024;
@@ -22,15 +19,13 @@ pub const LOG_KEEP: u64 = 2 * 1024 * 1024;
 pub enum Sink {
     /// stdout (a person at a terminal).
     Stdout,
-    /// Appended to this log file (a unit: launchd and systemd capture only what fails
-    /// before the log opens).
+    /// Appended to this log file.
     File(PathBuf),
     /// Nowhere else (tests read [`Transcript::lines`]).
     Memory,
 }
 
-/// One run's transcript. Every line is kept, so a test asserts on what was said and a
-/// lane can quote its own table into a report.
+/// One run's transcript.
 #[derive(Debug)]
 pub struct Transcript {
     me: &'static str,
@@ -39,8 +34,7 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// A transcript prefixed `<me>: `, written to `sink`. A log file over [`LOG_MAX`] is
-    /// trimmed to its newest [`LOG_KEEP`] bytes first.
+    /// A transcript prefixed `<me>: `, written to `sink`.
     #[must_use]
     pub fn new(me: &'static str, sink: Sink) -> Self {
         if let Sink::File(path) = &sink {
@@ -80,8 +74,6 @@ impl Transcript {
         match &self.sink {
             Sink::Stdout => println!("{line}"),
             Sink::File(path) => {
-                // The log is the transcript of record; a write that fails is said on stderr
-                // (the unit's capture), never allowed to stop the run.
                 let ok = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -145,7 +137,6 @@ impl Notifier for Osascript {
         if !cfg!(target_os = "macos") {
             return;
         }
-        // AppleScript string literals: a quote or backslash would end the literal.
         let clean = |s: &str| -> String {
             s.chars()
                 .filter(|c| *c != '"' && *c != '\\')
@@ -188,7 +179,7 @@ impl Notifier for Recorded {
     }
 }
 
-/// The UTC day `now_unix` falls on, `YYYYMMDD` — the once-a-day key.
+/// The UTC day `now_unix` falls on (`YYYYMMDD`).
 #[must_use]
 pub fn utc_day(now_unix: i64) -> String {
     let secs = u64::try_from(now_unix).unwrap_or(0);
@@ -196,9 +187,7 @@ pub fn utc_day(now_unix: i64) -> String {
     stamp[..10].replace('-', "")
 }
 
-/// Show `message` unless it was already shown on this UTC day. The day's messages live in
-/// `<dir>/notified-<day>`, one per line; other days' files are removed. A dry run shows
-/// nothing and records nothing.
+/// Show `message` unless it was already shown on this UTC day.
 pub fn notify_once(
     notifier: &dyn Notifier,
     title: &str,

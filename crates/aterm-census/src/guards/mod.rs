@@ -20,6 +20,7 @@ mod doc_sentence;
 mod doors;
 mod eager_drop;
 mod export_content;
+mod generated;
 mod github;
 mod graph;
 mod installer;
@@ -98,6 +99,7 @@ pub const GUARDS: &[Rule] = &[
     github::GH_SPAWN,
     github::AGH_FX,
     rules::LICENCE_HEADER,
+    generated::GENERATED_SEAL,
 ];
 
 /// The guards' outcome over one tree.

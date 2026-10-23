@@ -206,7 +206,7 @@ impl<'a> Parser<'a> {
 
     /// Everything from the end of a value or header to the start of the next
     /// line: whitespace, an optional comment, and the terminator itself, which
-    /// belongs to the suffix (see the `edit` module docs).
+    /// belongs to the suffix.
     fn eat_line_end(&mut self) -> Result<()> {
         self.eat_ws();
         if self.peek() == Some(b'#') {

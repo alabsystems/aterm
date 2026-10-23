@@ -228,6 +228,12 @@ impl App {
 }
 
 /// THE MOVE FROM `was` TO `face` IS A LANDING'S END, to be recorded once:
+///
+/// * to [`TaskFace::Landed`] from a face the window KNEW, never from "unknown" (`None`): landed
+///   right after unknown restates a landing an earlier loop or process made, so every new
+///   landing is a move from a face its loop told first.
+///
+/// No other move is an end.
 #[must_use]
 pub(crate) const fn is_an_end(was: Option<TaskFace>, face: TaskFace) -> bool {
     match face {

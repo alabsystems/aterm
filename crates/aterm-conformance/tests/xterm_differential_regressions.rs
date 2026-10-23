@@ -6,10 +6,7 @@
 
 use aterm_conformance::{Screen, run};
 
-/// xterm resetCharsets() does `initCharset(screen, 1, nrc_ASCII)`: G0-G3
-/// all default to ASCII at VT100+ level. (DEC Special Graphics is the
-/// default only in VT52 graphics mode.) SO (LS1) with no prior SCS must
-/// therefore print plain text, not box-drawing glyphs.
+/// G0-G3 default to ASCII at VT100+ level (`resetCharsets`), so SO (LS1) without a prior SCS prints plain text.
 #[test]
 fn g1_defaults_to_ascii_so_prints_plain_text() {
     let s = run(b"\x0ex");
@@ -17,14 +14,9 @@ fn g1_defaults_to_ascii_so_prints_plain_text() {
     assert_eq!(s.cursor(), (0, 1));
 }
 
-/// xterm CASE_TAB -> TabToNextStop() (tabs.c) only calls set_cur_col and
-/// never touches screen->do_wrap: a TAB issued while autowrap is pending
-/// leaves the cursor AT the right margin with the wrap still pending, so
-/// the next printable wraps to the next row instead of overprinting the
-/// last column.
+/// TAB (`TabToNextStop`) preserves pending autowrap (`do_wrap`), so the next printable wraps to the next row.
 #[test]
 fn ht_preserves_pending_wrap_next_printable_wraps() {
-    // 80 chars fill row 0 and arm pending-wrap; TAB must not disarm it.
     let mut input: Vec<u8> = std::iter::repeat_n(b'a', 80).collect();
     input.extend_from_slice(b"\tZ");
     let s = run(&input);
@@ -37,9 +29,7 @@ fn ht_preserves_pending_wrap_next_printable_wraps() {
     assert_eq!(s.cursor(), (1, 1));
 }
 
-/// The cursor itself stays at the right margin after such a TAB (xterm
-/// leaves it there with do_wrap set; TabToNextStop finds no stop past the
-/// last column).
+/// TAB at pending wrap keeps the cursor at the right margin with `do_wrap` set.
 #[test]
 fn ht_at_pending_wrap_keeps_cursor_at_margin() {
     let input: Vec<u8> = std::iter::repeat_n(b'a', 80)
@@ -49,8 +39,7 @@ fn ht_at_pending_wrap_keeps_cursor_at_margin() {
     assert_eq!(s.cursor(), (0, 79), "cursor stays at the right margin");
 }
 
-/// Tab-riding to the last stop then printing produces xterm's layout (j at col
-/// 79; k/l on the next row), not an overprint of col 79.
+/// Tab-riding to the last stop then printing wraps after column 79 rather than overprinting it.
 #[test]
 fn ht_ride_to_last_stop_matches_xterm_layout() {
     let s = run(b"\ta\tb\tc\td\te\tf\tg\th\ti\tj\tk\tl");
@@ -62,9 +51,7 @@ fn ht_ride_to_last_stop_matches_xterm_layout() {
     assert_eq!(s.cursor(), (1, 9));
 }
 
-/// xterm srm_OPT_ALTBUF_CURSOR SET (charproc.c) = CursorSave + ToAlternate +
-/// ClearScreen — none of which moves the cursor. The single cursor is
-/// shared by both buffers; entering the 1049 alt screen must not home it.
+/// Entering mode 1049 (`srm_OPT_ALTBUF_CURSOR`) saves the cursor and clears the alt screen without homing the cursor.
 #[test]
 fn mode_1049_enter_keeps_cursor_position() {
     let s = run(b"4\x1b[?1049h");
@@ -74,11 +61,7 @@ fn mode_1049_enter_keeps_cursor_position() {
     assert_eq!(s2.screen(), "", "alt screen is still cleared on enter");
 }
 
-/// xterm CASE_DECSTBM (charproc.c) guards both set_tb_margins and
-/// CursorSet(0,0) behind `if (bot > top)`: a region that is empty or
-/// inverted after defaulting changes nothing — not the margins, not the
-/// cursor. A top at/past the screen bottom is invalid once the bottom
-/// defaults to the last row (CSI 28r or CSI 114r on 24 rows).
+/// DECSTBM ignores empty or inverted regions (`bot <= top`), leaving margins and cursor position unchanged.
 #[test]
 fn invalid_decstbm_is_fully_ignored() {
     for (name, input) in [
@@ -93,12 +76,9 @@ fn invalid_decstbm_is_fully_ignored() {
     }
 }
 
-/// An invalid DECSTBM must also leave a previously set region in force —
-/// xterm does not reset to full screen on the invalid request.
+/// An invalid DECSTBM leaves a previously set scroll region active.
 #[test]
 fn invalid_decstbm_keeps_previous_region() {
-    // Valid region rows 5..10 (1-based), then an invalid request, then LF
-    // churn from the region bottom: scrolling stays confined to the region.
     let mut s = Screen::new(24, 80);
     s.feed(b"\x1b[5;10r"); // valid: homes cursor
     s.feed(b"\x1b[20;3r"); // invalid: ignored entirely
@@ -111,19 +91,14 @@ fn invalid_decstbm_keeps_previous_region() {
     assert_eq!(s.cursor(), (9, 6), "cursor pinned at region bottom row");
 }
 
-/// Valid DECSTBM still sets margins and homes (xterm: CursorSet(0,0) inside
-/// the `bot > top` arm) — the guard must not break the valid path.
+/// A valid DECSTBM sets the scroll region and homes the cursor.
 #[test]
 fn valid_decstbm_still_sets_region_and_homes() {
     let s = run(b"\x1b[10;20Hmid\x1b[4;14r");
     assert_eq!(s.cursor(), (0, 0), "valid DECSTBM homes the cursor");
 }
 
-/// xterm xtermIndex (util.c): `cur_row > bot_marg` means CursorDown, not a
-/// scroll — and CursorDown clamps at max_row. So autowrap on the BOTTOM
-/// SCREEN row while the cursor sits below the scroll region neither scrolls
-/// the display nor moves down: output wraps to column 0 of the same last
-/// row and overwrites it in place.
+/// Autowrap on the bottom screen row below the scroll region wraps to column 0 of the same row without scrolling (`xtermIndex`).
 #[test]
 fn autowrap_below_scroll_region_at_bottom_row_does_not_scroll() {
     let s = run(b"\x1b[4;12r\x1b[24;75Habcdefghij");
@@ -136,8 +111,7 @@ fn autowrap_below_scroll_region_at_bottom_row_does_not_scroll() {
     assert_eq!(s.cursor(), (23, 4));
 }
 
-/// LF below the region at the last screen row is the same xterm logic
-/// (CursorDown clamped at max_row): no scroll, no move.
+/// LF on the bottom screen row below the scroll region clamps at `max_row` without scrolling.
 #[test]
 fn lf_below_scroll_region_at_bottom_row_does_not_scroll() {
     let s = run(b"\x1b[4;12r\x1b[24;1Hlast\ntail");
@@ -149,10 +123,7 @@ fn lf_below_scroll_region_at_bottom_row_does_not_scroll() {
     assert_eq!(s.cursor(), (23, 8));
 }
 
-/// xterm CASE_REP (charproc.c) does `dotext(xw, screen->gsets[curgl],
-/// lastchar)`: the RAW last received character is replayed through the GL
-/// charset in effect AT REPEAT TIME. Designating DEC Special Graphics
-/// between the print and the REP therefore changes the repeated glyph.
+/// REP (`CASE_REP`) replays the raw last character through the GL charset active at repeat time.
 #[test]
 fn rep_translates_raw_char_through_current_charset() {
     let s = run(b"x\x1b(0\x1b[3b");
@@ -164,9 +135,7 @@ fn rep_translates_raw_char_through_current_charset() {
     assert_eq!(s.cursor(), (0, 4));
 }
 
-/// The converse direction: a glyph printed under DEC graphics repeats as
-/// plain ASCII once the charset is switched back (raw char re-translated,
-/// not the produced glyph).
+/// A character printed under DEC Special Graphics repeats as ASCII after switching GL back to `ESC ( B`.
 #[test]
 fn rep_after_charset_switch_back_repeats_ascii() {
     let s = run(b"\x1b(0q\x1b(B\x1b[3b");
@@ -177,8 +146,7 @@ fn rep_after_charset_switch_back_repeats_ascii() {
     );
 }
 
-/// REP with no charset games still repeats the char verbatim (the fast
-/// ASCII fill path must stay correct under the passthrough gate).
+/// REP under default ASCII repeats the previous character verbatim.
 #[test]
 fn rep_plain_ascii_bulk_path_still_repeats() {
     let s = run(b"X\x1b[9b");
@@ -186,14 +154,9 @@ fn rep_plain_ascii_bulk_path_still_repeats() {
     assert_eq!(s.cursor(), (0, 10));
 }
 
-/// xterm DECSC_FLAGS = (ATTRIBUTES|ORIGIN|PROTECTED) (cursor.c) — WRAPAROUND
-/// is not among them, so DECRC neither restores a saved autowrap state nor
-/// resets it when nothing was saved. (The VT510 "wrap flag" DECSC saves is
-/// the PENDING-wrap state: xterm `sc->wrap_flag = screen->do_wrap`.)
+/// Unsaved DECRC does not modify `DECAWM` (`DECSC_FLAGS` excludes `WRAPAROUND`).
 #[test]
 fn unsaved_decrc_leaves_decawm_unchanged() {
-    // DECAWM off, then unsaved DECRC, then text past the margin: autowrap
-    // must still be off (cursor pinned at the right margin, no wrap).
     let mut input = b"\x1b[?7l\x1b8\x1b[1;55H".to_vec();
     input.extend(std::iter::repeat_n(b' ', 27));
     let s = run(&input);
@@ -204,8 +167,7 @@ fn unsaved_decrc_leaves_decawm_unchanged() {
     );
 }
 
-/// Saved DECSC/DECRC likewise must not restore DECAWM: turn autowrap off
-/// between the save and the restore — it stays off.
+/// Saved DECSC/DECRC does not restore `DECAWM`.
 #[test]
 fn saved_decrc_does_not_restore_decawm() {
     let mut input = b"\x1b7\x1b[?7l\x1b8\x1b[1;55H".to_vec();
@@ -215,8 +177,7 @@ fn saved_decrc_does_not_restore_decawm() {
     assert_eq!(s.row(1), "", "no wrapped output on row 1");
 }
 
-/// The unsaved-DECRC defaults (xterm CursorRestoreFlags with sc->saved ==
-/// False) still apply: reset charsets, clear ORIGIN, home the cursor.
+/// Unsaved DECRC resets charsets, clears `ORIGIN`, and homes the cursor.
 #[test]
 fn unsaved_decrc_still_resets_origin_and_homes() {
     let s = run(b"\x1b[5;15r\x1b[?6h\x1b[3;3Hx\x1b8Z");
@@ -224,11 +185,7 @@ fn unsaved_decrc_still_resets_origin_and_homes() {
     assert_eq!(s.row(0), "Z", "ORIGIN cleared: home is screen-absolute");
 }
 
-/// xterm srm_OPT_ALTBUF_CURSOR SET does CursorSave(xw) into the same
-/// per-buffer slot DECSC uses (screen->sc[whichBuf]), and the RESET-side
-/// CursorRestore reads it without consuming (sc->saved stays True). A bare
-/// DECRC after a 1049 round trip therefore restores the 1049-saved cursor —
-/// it does not reset to defaults.
+/// Mode 1049 shares the per-buffer DECSC slot without consuming `sc->saved` on exit, so a subsequent bare DECRC restores that cursor.
 #[test]
 fn bare_decrc_after_1049_round_trip_restores_saved_cursor() {
     let s = run(b" \x1b[?1049h\x1b[?1049l\x1b8 ");
@@ -239,31 +196,20 @@ fn bare_decrc_after_1049_round_trip_restores_saved_cursor() {
     );
 }
 
-/// And a DECSC before 1049 is overwritten by the 1049 enter-save (same
-/// slot), exactly as in xterm.
+/// Entering mode 1049 overwrites a prior DECSC save in the primary buffer's slot.
 #[test]
 fn mode_1049_save_overwrites_decsc_slot() {
-    // DECSC at (0,4); move to (4,9); 1049 enter saves (4,9) over the slot.
     let s = run(b"main\x1b7\x1b[5;10H\x1b[?1049h\x1b[?1049l\x1b8X");
     assert_eq!(s.cursor(), (4, 10), "ESC 8 lands at the 1049-saved spot");
 }
 
-/// LF is a cursor-down and always resets the deferred wrap (xterm CursorDown
-/// ResetWrap, as in xterm.js), including the at-bottom LF that scrolls. So an
-/// LF after a full bottom row scrolls exactly once and clears the pending
-/// wrap; the next printable overwrites the last column. Only the explicit
-/// SU/SD CSI ops preserve the flag (xtermScroll `save_wrap`). Mirrors the
-/// aterm-grid test `each_operation_keeps_or_consumes_the_parked_wrap`.
+/// A scrolling LF at the bottom row scrolls once and clears pending wrap (`CursorDown` `ResetWrap`), so the next printable overwrites the last column.
 #[test]
 fn scrolling_lf_clears_pending_wrap() {
-    // Fill the bottom row to arm pending-wrap, LF scrolls once + clears the flag,
-    // '!' overwrites the last column (no wrap, no second scroll).
     let mut input = b"\x1b[24;1H".to_vec();
     input.extend(std::iter::repeat_n(b'x', 80));
     input.extend_from_slice(b"\n!");
     let s = run(&input);
-    // The x-row scrolled up exactly once (to row 22); the cleared wrap means '!'
-    // overwrites the last column of the bottom row rather than wrapping to col 0.
     assert_eq!(s.row(22), "x".repeat(80), "x row scrolled up exactly once");
     assert_eq!(
         s.row(23),
@@ -273,9 +219,7 @@ fn scrolling_lf_clears_pending_wrap() {
     assert_eq!(s.cursor(), (23, 79));
 }
 
-/// xterm CursorDown ends with ResetWrap: an LF that only moves the cursor
-/// clears the pending wrap, so the next printable overwrites the last
-/// column of the new row instead of wrapping.
+/// A non-scrolling LF clears pending wrap, so the next printable overwrites the last column of the new row.
 #[test]
 fn moving_lf_clears_pending_wrap() {
     let mut input: Vec<u8> = std::iter::repeat_n(b'x', 80).collect();
@@ -285,8 +229,7 @@ fn moving_lf_clears_pending_wrap() {
     assert_eq!(s.row(2), "", "nothing wrapped to row 2");
 }
 
-/// Under DECSLRM left/right margins, xterm's `xtermIndex` still runs
-/// `CursorDown` before `xtermScroll`, clearing the pending wrap on a scrolling LF.
+/// Under DECSLRM margins, a scrolling LF still clears pending wrap before scrolling.
 #[test]
 fn margined_scrolling_lf_clears_pending_wrap() {
     let s = run(b"\x1b[?69h\x1b[2;5s\x1b[24;5Ha\nZ");
@@ -295,7 +238,7 @@ fn margined_scrolling_lf_clears_pending_wrap() {
     assert_eq!(s.cursor(), (23, 4));
 }
 
-/// SU (CSI S) also goes through xtermScroll and preserves the flag.
+/// SU (`CSI S`) preserves pending wrap (`xtermScroll` `save_wrap`).
 #[test]
 fn su_preserves_pending_wrap() {
     let mut input: Vec<u8> = std::iter::repeat_n(b'x', 80).collect();
@@ -305,10 +248,7 @@ fn su_preserves_pending_wrap() {
     assert_eq!(s.cursor(), (1, 1));
 }
 
-/// xterm arms `do_wrap` whenever a print fills to the margin regardless of
-/// WRAPAROUND (charproc.c dotext: `screen->do_wrap = need_wrap`), and
-/// srm_DECAWM only flips the mode bit. Filling the line with autowrap OFF
-/// and then re-enabling it makes the next printable wrap.
+/// Filling a row to the margin with `DECAWM` off still arms `do_wrap`, so re-enabling `DECAWM` wraps the next printable.
 #[test]
 fn margin_fill_with_decawm_off_arms_wrap_for_later() {
     let mut input = b"\x1b[?7l".to_vec();
@@ -319,9 +259,7 @@ fn margin_fill_with_decawm_off_arms_wrap_for_later() {
     assert_eq!(s.cursor(), (1, 1));
 }
 
-/// With autowrap still off, the armed flag is consumed flag-only at the
-/// next print (xterm: `do_wrap = False;` without WrapLine) — output keeps
-/// overstriking the last column.
+/// With `DECAWM` off, an armed `do_wrap` is cleared without wrapping on the next print, overstriking the last column.
 #[test]
 fn margin_fill_with_decawm_off_overstrikes_without_wrap() {
     let mut input = b"\x1b[?7l".to_vec();
@@ -333,8 +271,7 @@ fn margin_fill_with_decawm_off_overstrikes_without_wrap() {
     assert_eq!(s.cursor(), (0, 79));
 }
 
-/// Disabling DECAWM does not discard an armed wrap either: the flag
-/// survives the mode toggle and is consumed flag-only by the next print.
+/// Toggling `DECAWM` off and back on preserves an armed `do_wrap`.
 #[test]
 fn decawm_reset_does_not_clear_armed_wrap() {
     let mut input: Vec<u8> = std::iter::repeat_n(b'x', 80).collect();
@@ -344,10 +281,7 @@ fn decawm_reset_does_not_clear_armed_wrap() {
     assert_eq!(s.cursor(), (1, 1));
 }
 
-/// xterm keeps the margins in the shared TScreen (top_marg/bot_marg):
-/// ToAlternate/FromAlternate (modes 47/1047/1049) do not reset them. RI at
-/// row 0 with a region starting at row 1 must not scroll — the cursor is
-/// above the region — even right after entering the alt screen.
+/// Scroll margins (`top_marg`/`bot_marg`) persist across alternate-screen switches (modes 47/1047/1049).
 #[test]
 fn scroll_region_persists_into_alt_screen() {
     let s = run(b"\x1b[2;3r\x1b[?1049h!\x1bM");
@@ -359,8 +293,7 @@ fn scroll_region_persists_into_alt_screen() {
     assert_eq!(s.cursor(), (0, 1));
 }
 
-/// The reverse direction: a region set while IN the alt screen stays in
-/// force after exiting (xterm shared-TScreen margins).
+/// A scroll region set in the alternate screen remains active after exiting to the primary screen.
 #[test]
 fn scroll_region_set_in_alt_screen_persists_after_exit() {
     let s = run(b"\x1b[?47h\x1b[2;3r\x1b[?47l!\x1bM");

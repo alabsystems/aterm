@@ -91,7 +91,8 @@ pub(crate) struct X11Presenter {
     _window: Arc<Window>,
 }
 
-// SAFETY: The connection is libxcb's, which is thread-safe; the segment is owned.
+// SAFETY: the connection is libxcb's, which is thread-safe; the segment is
+// owned. The presenter moves between threads only with its window state.
 unsafe impl Send for X11Presenter {}
 
 /// Pixel layouts supported by the X11 presenter.

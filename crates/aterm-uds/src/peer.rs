@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who is on the other end of a connected Unix-domain socket, as the kernel
-//! recorded it: the peer's effective uid ([`peer_uid`]) and, on Darwin, its
-//! audit token ([`peer_audit_token`]), which Security.framework checks code
-//! identity by without trusting a possibly recycled pid.
-//!
-//! Both answer `None` on any failure; every caller treats that as a refusal.
+//! Connected Unix-domain socket peer credentials ([`peer_uid`] and [`peer_audit_token`]).
 
 use crate::CtlStream;
 
-/// The connected peer's effective uid, or `None` when the kernel will not say (the peer
-/// vanished, or no peer-credential primitive is wired here). Darwin: `getpeereid(2)`.
+/// Return the connected peer's effective uid via `getpeereid(2)`, or `None` on failure.
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `getpeereid(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn peer_uid(stream: &CtlStream) -> Option<u32> {
     use std::os::fd::AsRawFd as _;
@@ -28,15 +21,12 @@ pub fn peer_uid(stream: &CtlStream) -> Option<u32> {
     (rc == 0).then_some(uid)
 }
 
-/// Linux: `SO_PEERCRED` (`struct ucred { pid, uid, gid }`, three 32-bit
-/// fields) on the x86-64/aarch64 ABIs whose option numbers this crate vouches
-/// for (see `fdpass`).
+/// Return the connected peer's effective uid via `SO_PEERCRED`, or `None` on failure.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[must_use]
-// Skip: bottoms out at the `getsockopt(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn peer_uid(stream: &CtlStream) -> Option<u32> {
     use std::os::fd::AsRawFd as _;
@@ -69,7 +59,7 @@ pub fn peer_uid(stream: &CtlStream) -> Option<u32> {
     Some(u32::from_ne_bytes(cred.get(4..8)?.try_into().ok()?))
 }
 
-/// Everywhere else: no primitive wired, so the caller cannot verify and refuses.
+/// Return `None` where no peer-credential primitive is wired.
 #[cfg(not(any(
     target_vendor = "apple",
     all(
@@ -85,7 +75,6 @@ pub fn peer_uid(_stream: &CtlStream) -> Option<u32> {
 /// This process's effective uid, the only uid the peer checks admit.
 #[cfg(unix)]
 #[must_use]
-// Skip: bottoms out at the `geteuid` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn our_uid() -> u32 {
     unsafe extern "C" {
@@ -95,22 +84,12 @@ pub fn our_uid() -> u32 {
     unsafe { geteuid() }
 }
 
-/// A Darwin `audit_token_t`: eight 32-bit words naming a process (its ids, its pid and its pid
-/// version, which changes when the pid is reused or its image replaced). Its one use is
-/// Security.framework's guest lookup, which names a process by it rather than by a pid that
-/// may have been recycled.
-///
-/// [`peer_audit_token`] answers for the process that last used the connection, as it is when
-/// asked, not the one that `connect(2)`ed (measured 2026-10-03); an `exec` at that pid moves
-/// the pid version. A caller that must know whom it trusted reads it once, checks that one,
-/// and compares any later read with it (as `aterm-gui`'s handoff rendezvous does); it still
-/// cannot tell from it who else holds the connection.
+/// Darwin `audit_token_t` (eight 32-bit words) identifying a peer process and its pid version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditToken(pub [u32; 8]);
 
 impl AuditToken {
-    /// The token's bytes in memory order, as `SecCodeCopyGuestWithAttributes`
-    /// takes them inside a `CFData`.
+    /// Return the token's bytes in native memory order.
     #[inline]
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 32] {
@@ -128,8 +107,7 @@ impl AuditToken {
         self.0[5]
     }
 
-    /// The pid version the token names (`audit_token_to_pidversion`: word 7):
-    /// the generation of the process at [`Self::pid`].
+    /// The pid version the token names (`audit_token_to_pidversion`: word 7).
     #[inline]
     #[must_use]
     pub const fn pid_version(&self) -> u32 {
@@ -137,11 +115,9 @@ impl AuditToken {
     }
 }
 
-/// The connected peer's audit token (`LOCAL_PEERTOKEN`) as of this call (see [`AuditToken`]).
-/// Darwin only; elsewhere `None`, which a code-identity check reads as "cannot verify".
+/// Return the connected peer's Darwin `LOCAL_PEERTOKEN` audit token, or `None` on failure.
 #[cfg(target_vendor = "apple")]
 #[must_use]
-// Skip: bottoms out at the `getsockopt(2)` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn peer_audit_token(stream: &CtlStream) -> Option<AuditToken> {
     use std::os::fd::AsRawFd as _;
@@ -154,7 +130,6 @@ pub fn peer_audit_token(stream: &CtlStream) -> Option<AuditToken> {
             len: *mut u32,
         ) -> i32;
     }
-    // sys/un.h: SOL_LOCAL 0, LOCAL_PEERTOKEN 6, sizeof(audit_token_t) 32.
     const SOL_LOCAL: i32 = 0;
     const LOCAL_PEERTOKEN: i32 = 6;
     let mut raw = [0u8; 32];
@@ -180,7 +155,7 @@ pub fn peer_audit_token(stream: &CtlStream) -> Option<AuditToken> {
     Some(AuditToken(words))
 }
 
-/// See the Darwin twin.
+/// Return `None` on non-Darwin platforms.
 #[cfg(not(target_vendor = "apple"))]
 #[must_use]
 pub fn peer_audit_token(_stream: &CtlStream) -> Option<AuditToken> {
@@ -189,7 +164,6 @@ pub fn peer_audit_token(_stream: &CtlStream) -> Option<AuditToken> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    /// On a pair this process made, the uid is ours and (Darwin) the token names our pid.
     #[test]
     fn a_socketpair_names_this_process() {
         let (a, _b) = crate::CtlStream::pair().expect("socketpair");
@@ -210,7 +184,6 @@ mod tests {
                 &token.to_bytes()[28..32],
                 &token.pid_version().to_ne_bytes()
             );
-            // Nothing used the connection between the reads: the same answer.
             assert_eq!(super::peer_audit_token(&a), Some(token));
         }
         let _ = a;

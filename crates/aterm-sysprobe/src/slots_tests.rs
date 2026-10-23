@@ -1208,6 +1208,31 @@ mod live {
         );
     }
 
+    /// A READING THAT MUST BE NEW ([`REREAD`]) is taken once the last is a paired gap old, where
+    /// the armed cadence hands the last one back. NEGATIVE CONTROL: the same reads at the armed
+    /// period keep the last reading.
+    #[test]
+    fn a_reread_reads_anew_past_the_paired_gap() {
+        let dir = aterm_tempfile::tempdir().expect("scratch dir");
+        let slots = dir.path().join("build-slot");
+        std::fs::create_dir(&slots).expect("the slot dir");
+        std::fs::write(slots.join("slot-0"), b"").expect("a free slot");
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for (period, anew) in [(PERIOD, false), (REREAD, true)] {
+            let mut reader = SlotReader::new(slots.clone());
+            let first = reader.read_within(at(0), now_us(), &CALM, period);
+            assert_eq!(counts_of(&first).n, 1, "{first:?}");
+            std::fs::write(slots.join("slot-1"), b"").expect("a second slot");
+            let inside = reader.read_within(at(999), now_us(), &CALM, period);
+            assert_eq!(inside, first, "inside the paired gap: the last reading");
+            let past = reader.read_within(at(1_000), now_us(), &CALM, period);
+            assert_eq!(counts_of(&past).n, if anew { 2 } else { 1 }, "{period:?}");
+            assert_eq!(reader.read_at(), Some(at(if anew { 1_000 } else { 0 })));
+            std::fs::remove_file(slots.join("slot-1")).expect("the second slot gone");
+        }
+    }
+
     #[test]
     fn a_lock_held_with_no_record_to_show_it_is_never_free() {
         let me = std::process::id();

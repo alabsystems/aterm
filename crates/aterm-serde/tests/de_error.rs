@@ -57,7 +57,6 @@ enum Enum {
 fn test_i8() {
     let test = assert_de_tokens_error::<i8>;
 
-    // from signed
     test(
         &[Token::I16(-129)],
         "invalid value: integer `-129`, expected i8",
@@ -83,7 +82,6 @@ fn test_i8() {
         "invalid value: integer `128`, expected i8",
     );
 
-    // from unsigned
     test(
         &[Token::U8(128)],
         "invalid value: integer `128`, expected i8",
@@ -106,7 +104,6 @@ fn test_i8() {
 fn test_i16() {
     let test = assert_de_tokens_error::<i16>;
 
-    // from signed
     test(
         &[Token::I32(-32769)],
         "invalid value: integer `-32769`, expected i16",
@@ -124,7 +121,6 @@ fn test_i16() {
         "invalid value: integer `32768`, expected i16",
     );
 
-    // from unsigned
     test(
         &[Token::U16(32768)],
         "invalid value: integer `32768`, expected i16",
@@ -143,7 +139,6 @@ fn test_i16() {
 fn test_i32() {
     let test = assert_de_tokens_error::<i32>;
 
-    // from signed
     test(
         &[Token::I64(-2147483649)],
         "invalid value: integer `-2147483649`, expected i32",
@@ -153,7 +148,6 @@ fn test_i32() {
         "invalid value: integer `2147483648`, expected i32",
     );
 
-    // from unsigned
     test(
         &[Token::U32(2147483648)],
         "invalid value: integer `2147483648`, expected i32",
@@ -168,7 +162,6 @@ fn test_i32() {
 fn test_i64() {
     let test = assert_de_tokens_error::<i64>;
 
-    // from unsigned
     test(
         &[Token::U64(9223372036854775808)],
         "invalid value: integer `9223372036854775808`, expected i64",
@@ -179,7 +172,6 @@ fn test_i64() {
 fn test_u8() {
     let test = assert_de_tokens_error::<u8>;
 
-    // from signed
     test(&[Token::I8(-1)], "invalid value: integer `-1`, expected u8");
     test(
         &[Token::I16(-1)],
@@ -206,7 +198,6 @@ fn test_u8() {
         "invalid value: integer `256`, expected u8",
     );
 
-    // from unsigned
     test(
         &[Token::U16(256)],
         "invalid value: integer `256`, expected u8",
@@ -225,7 +216,6 @@ fn test_u8() {
 fn test_u16() {
     let test = assert_de_tokens_error::<u16>;
 
-    // from signed
     test(
         &[Token::I8(-1)],
         "invalid value: integer `-1`, expected u16",
@@ -251,7 +241,6 @@ fn test_u16() {
         "invalid value: integer `65536`, expected u16",
     );
 
-    // from unsigned
     test(
         &[Token::U32(65536)],
         "invalid value: integer `65536`, expected u16",
@@ -266,7 +255,6 @@ fn test_u16() {
 fn test_u32() {
     let test = assert_de_tokens_error::<u32>;
 
-    // from signed
     test(
         &[Token::I8(-1)],
         "invalid value: integer `-1`, expected u32",
@@ -288,7 +276,6 @@ fn test_u32() {
         "invalid value: integer `4294967296`, expected u32",
     );
 
-    // from unsigned
     test(
         &[Token::U64(4294967296)],
         "invalid value: integer `4294967296`, expected u32",
@@ -299,7 +286,6 @@ fn test_u32() {
 fn test_u64() {
     let test = assert_de_tokens_error::<u64>;
 
-    // from signed
     test(
         &[Token::I8(-1)],
         "invalid value: integer `-1`, expected u64",
@@ -322,7 +308,6 @@ fn test_u64() {
 fn test_u128() {
     let test = assert_de_tokens_error::<u128>;
 
-    // from signed
     test(
         &[Token::I8(-1)],
         "invalid value: integer `-1`, expected u128",
@@ -345,7 +330,6 @@ fn test_u128() {
 fn test_usize() {
     let test = assert_de_tokens_error::<usize>;
 
-    // from signed
     test(
         &[Token::I8(-1)],
         "invalid value: integer `-1`, expected usize",

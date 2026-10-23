@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unreached-instance census comparing live `aterm` processes with [`crate::local_instances`].
+//! The census of this user's aterm processes, read from one kernel table: the window and
+//! headless instances no published socket reaches ([`crate::local_instances`]), and every other
+//! aterm program. A process is aterm by its executable, never by its name or arguments, and the
+//! census reads nothing on disk.
+#![cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the census reads a Unix process table; elsewhere only its types and tests use the rest"
+    )
+)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use aterm_types::control_socket::{SocketDirective, socket_directive};
+use aterm_uds::holders::Exe;
+use aterm_uds::process::{Lineage, ProcessBirth};
 
-/// One process-table row, as `ps` gives it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcRow {
-    /// The process id.
-    pub pid: u32,
-    /// Its real user id.
-    pub uid: u32,
-    /// Its age, as `ps`'s POSIX `etime` spells it: `[[dd-]hh:]mm:ss`.
-    pub etime: String,
-    /// The program: on macOS `ps`'s `comm` is the path it was started by (it may hold spaces).
-    pub program: String,
-    /// The whole command line, arguments joined by spaces.
-    pub command: String,
-}
+use crate::Parent;
 
 /// One instance no published socket reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,13 +30,37 @@ pub struct Unreached {
     pub pid: u32,
     /// How long it has run, in words (`11d 22h`, `3h 05m`, `42s`).
     pub age: String,
-    /// Its command line, as `ps` printed it.
+    /// Its launch words, joined by spaces: its arguments before the `-e` payload, then the
+    /// payload's flag and `…` when it has one, each control character escaped.
     pub command: String,
     /// Started with its control socket switched off (`--no-control-sock`, `--control-sock 0|off`).
     pub socketless: bool,
 }
 
-/// The census: how many instances were counted, and which of them nothing reaches.
+/// One aterm process of this user that is no window or headless instance: a broker, a bridge, a
+/// client verb.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Program {
+    /// The process id.
+    pub pid: u32,
+    /// `aterm <verb>[ <sub>]` when the front door's verb table names its verb, else its
+    /// executable's file name (`aterm?` when that is no plain word).
+    pub name: String,
+    /// How long it has run, in words.
+    pub age: String,
+    /// Its launcher exited and launchd adopted it (`Parent::Adopted`). That is a fact, not a
+    /// verdict: aterm detaches some passes of its own on purpose, and whether a supervisor names
+    /// this pid is not read here.
+    pub adopted: bool,
+    /// Its executable sits under a build's `target*` directory.
+    pub build: bool,
+    /// The kernel says its executable's file was unlinked since it started: Linux marks such an
+    /// image, and macOS names none, so there such a process is not counted at all.
+    pub deleted: bool,
+}
+
+/// The census: how many instances were counted, which of them nothing reaches, and the other
+/// aterm programs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Census {
     /// The rendezvous directory that was read, for the words.
@@ -44,19 +69,230 @@ pub struct Census {
     pub instances: usize,
     /// The ones no published socket names, oldest first.
     pub unreached: Vec<Unreached>,
+    /// The other aterm processes of this user but this one, oldest first.
+    pub programs: Vec<Program>,
 }
 
-/// Take the census of this machine, now.
+/// What the front door does with a word in argv[1] (`aterm <word>`): aterm-cli hands the census
+/// its verb table as a function from a word to this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verb {
+    /// It opens a window, in this process when no running instance takes the request
+    /// (`new-tab`, `new-window`, `split-pane`).
+    Window,
+    /// It runs as the program `aterm <verb>`.
+    Program,
+}
+
+/// The executable image a process runs, as the kernel names it ([`image_of`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Image {
+    /// The path it was started from.
+    pub(crate) path: PathBuf,
+    /// The kernel marks that file unlinked since (Linux's ` (deleted)`). macOS names no unlinked
+    /// image at all, so there an unlinked one is no [`Image`].
+    pub(crate) deleted: bool,
+}
+
+impl Image {
+    /// The image whose path the kernel's reader gave as `path`.
+    fn named(path: PathBuf) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(path) = unmarked(&path) {
+            return Self {
+                path,
+                deleted: true,
+            };
+        }
+        Self {
+            path,
+            deleted: false,
+        }
+    }
+}
+
+/// `pid`'s image ([`aterm_uds::holders::exe_of`]): the one reader the census and
+/// `ForeignFacts` judge a process by. `None` when the kernel names none, which proves
+/// nothing.
+pub(crate) fn image_of(pid: u32) -> Option<Image> {
+    match aterm_uds::holders::exe_of(pid) {
+        Exe::At(path) => Some(Image::named(path)),
+        Exe::Unnamed | Exe::Exited => None,
+    }
+}
+
+/// `link` without the ` (deleted)` Linux's `/proc/<pid>/exe` appends once its file is unlinked;
+/// `None` when it carries no such mark.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn unmarked(link: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = link.as_os_str().as_bytes().strip_suffix(b" (deleted)")?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+/// One process of this user, as the census's table lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) pid: u32,
+    pub(crate) ppid: Option<u32>,
+    pub(crate) birth: Option<ProcessBirth>,
+    pub(crate) age_s: Option<u64>,
+    /// Whether it has a controlling terminal; `None` when that was not read.
+    pub(crate) terminal: Option<bool>,
+}
+
+/// The kernel reads the census makes; the shipped arm is [`LiveKernel`], a test hands a fake.
+pub(crate) trait Kernel {
+    /// This user's processes (macOS: `kproc::records`, this process's uid, no zombies; Linux:
+    /// `holders::uid_pids` with `read_process_parent`, the wall-clock birth and `stat`'s
+    /// terminal); `None` when the table cannot be read.
+    fn listed(&self) -> Option<Vec<Listed>>;
+    /// `pid`'s executable image ([`image_of`]).
+    fn exe(&self, pid: u32) -> Option<Image>;
+    /// Whether `pid` is held at macOS's program check
+    /// ([`aterm_uds::process::at_program_check`]); `None` when unread.
+    fn held(&self, pid: u32) -> Option<bool>;
+    /// `pid`'s argument words ([`aterm_uds::process::read_process_argv`]), asked only of a
+    /// process proven aterm by its executable and not held at the program check.
+    fn argv(&self, pid: u32) -> Option<Vec<OsString>>;
+    /// `pid`'s lineage ([`aterm_uds::process::read_lineage`]), asked only when its parent is 1.
+    fn lineage(&self, pid: u32) -> Option<Lineage>;
+    /// launchd's pid version ([`aterm_uds::process::launchd_idversion`]).
+    fn launchd_version(&self) -> Option<i32>;
+}
+
+/// The shipped [`Kernel`]: `aterm_sysprobe::kproc` on macOS, `/proc` elsewhere, and
+/// `aterm_uds`'s process readers.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LiveKernel;
+
+#[cfg(unix)]
+impl Kernel for LiveKernel {
+    #[cfg(target_os = "macos")]
+    fn listed(&self) -> Option<Vec<Listed>> {
+        let records = aterm_sysprobe::kproc::records()?;
+        let uid = records.iter().find(|r| r.pid == std::process::id())?.uid;
+        let now = unix_now();
+        Some(
+            records
+                .into_iter()
+                .filter(|r| r.uid == uid && !r.zombie && r.pid > 0)
+                .map(|r| Listed {
+                    pid: r.pid,
+                    ppid: Some(r.ppid),
+                    birth: Some(ProcessBirth {
+                        seconds: r.start_s,
+                        microseconds: u64::from(r.start_us),
+                    }),
+                    age_s: now.and_then(|now| now.checked_sub(r.start_s)),
+                    terminal: Some(r.tty.is_some()),
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn listed(&self) -> Option<Vec<Listed>> {
+        let clocks = crate::graph_hygiene::Clocks::default();
+        let pids = aterm_uds::holders::uid_pids().ok()?;
+        let read = |pid: u32| {
+            let p = i32::try_from(pid).ok();
+            Listed {
+                pid,
+                ppid: p.and_then(aterm_uds::process::read_process_parent),
+                birth: p
+                    .and_then(|p| crate::graph_hygiene::read_birth(p, &clocks))
+                    .map(|b| b.at),
+                age_s: None,
+                terminal: std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| stat_terminal(&stat)),
+            }
+        };
+        Some(read_then_aged(pids, read, unix_now))
+    }
+
+    fn exe(&self, pid: u32) -> Option<Image> {
+        image_of(pid)
+    }
+
+    fn held(&self, pid: u32) -> Option<bool> {
+        aterm_uds::process::at_program_check(i32::try_from(pid).ok()?)
+    }
+
+    fn argv(&self, pid: u32) -> Option<Vec<OsString>> {
+        aterm_uds::process::read_process_argv(i32::try_from(pid).ok()?)
+    }
+
+    fn lineage(&self, pid: u32) -> Option<Lineage> {
+        aterm_uds::process::read_lineage(i32::try_from(pid).ok()?)
+    }
+
+    fn launchd_version(&self) -> Option<i32> {
+        aterm_uds::process::launchd_idversion()
+    }
+}
+
+/// The rows `read` makes of `pids`, aged against `now`, which is read after every row: a birth
+/// is placed on the wall clock through a pairing with the boot clock its first read makes, and a
+/// `now` read before that pairing can be a second behind a birth placed on it.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn read_then_aged(
+    pids: Vec<u32>,
+    read: impl FnMut(u32) -> Listed,
+    now: impl FnOnce() -> Option<u64>,
+) -> Vec<Listed> {
+    let rows: Vec<Listed> = pids.into_iter().map(read).collect();
+    let now = now();
+    rows.into_iter()
+        .map(|row| Listed {
+            age_s: now
+                .zip(row.birth)
+                .and_then(|(now, b)| now.checked_sub(b.seconds)),
+            ..row
+        })
+        .collect()
+}
+
+/// Whether the process a `/proc/<pid>/stat` line describes has a controlling terminal: its
+/// `tty_nr`, the fifth field after the command's closing parenthesis, is not 0.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn stat_terminal(stat: &str) -> Option<bool> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let tty: i64 = rest.split_ascii_whitespace().nth(4)?.parse().ok()?;
+    Some(tty != 0)
+}
+
+/// Now, unix seconds.
+#[cfg(unix)]
+fn unix_now() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Take the census of this machine, now. `verbs` says what the front door does with a word in
+/// argv[1] (`aterm <verb>`), which names a program or opens a window.
 ///
 /// # Errors
 /// Returns an error if the rendezvous directory or process table cannot be read.
 #[cfg(unix)]
-pub fn window_census() -> Result<Census, String> {
+pub fn window_census(verbs: &dyn Fn(&str) -> Option<Verb>) -> Result<Census, String> {
     let (outcome, targets) = crate::inspect_fleet();
     let targets = targets.into_iter().map(crate::Target::listed).collect();
     let (dir, published) = published_in(outcome, targets)?;
-    let table = process_table()?;
-    census_of(&table, std::process::id(), &published, dir)
+    census_of(&LiveKernel, std::process::id(), &published, dir, verbs)
+}
+
+/// Off Unix there is no process table read here; the census says so rather than guessing.
+///
+/// # Errors
+/// Always: the census runs on macOS and Linux only.
+#[cfg(not(unix))]
+pub fn window_census(_verbs: &dyn Fn(&str) -> Option<Verb>) -> Result<Census, String> {
+    Err("macOS and Linux only".to_string())
 }
 
 /// What the rendezvous walk says is published ([`crate::inspect_fleet`]).
@@ -87,83 +323,236 @@ fn published_in(
     }
 }
 
-/// Off Unix there is no `ps` to read; the census says so rather than guessing.
+/// Computes the census over a kernel's table, this process's pid, and the published pids.
 ///
 /// # Errors
-/// Always: the census reads `ps`, so it runs on macOS and Linux only.
-#[cfg(not(unix))]
-pub fn window_census() -> Result<Census, String> {
-    Err("macOS and Linux only".to_string())
-}
-
-/// Computes the census over an explicit process table, caller pid, and published pids.
-///
-/// # Errors
-/// `own_pid` has no row in `table`, so the user to count for is unknown.
-pub fn census_of(
-    table: &[ProcRow],
+/// The table cannot be read, or holds no row for `own_pid`, so it is not this user's.
+pub(crate) fn census_of(
+    k: &impl Kernel,
     own_pid: u32,
     published: &BTreeSet<u32>,
     dir: String,
+    verbs: &dyn Fn(&str) -> Option<Verb>,
 ) -> Result<Census, String> {
-    let uid = table
-        .iter()
-        .find(|row| row.pid == own_pid)
-        .map(|row| row.uid)
-        .ok_or_else(|| "this process is missing from the process table".to_string())?;
+    let listed = k
+        .listed()
+        .ok_or_else(|| "the process table could not be read".to_string())?;
+    if !listed.iter().any(|row| row.pid == own_pid) {
+        return Err("this process is missing from the process table".to_string());
+    }
+    let mut launchd = None;
     let mut instances = 0;
     let mut unreached: Vec<(u64, Unreached)> = Vec::new();
-    for row in table.iter().filter(|row| row.uid == uid) {
-        let Some(args) = window_args(row) else {
+    let mut programs: Vec<(u64, Program)> = Vec::new();
+    for row in listed.iter().filter(|row| row.pid != own_pid) {
+        let Some(image) = k.exe(row.pid) else {
             continue;
         };
-        instances += 1;
-        if published.contains(&row.pid) {
+        let exe = image.path.as_path();
+        if !is_aterm(exe) {
             continue;
         }
-        let secs = etime_secs(&row.etime);
-        unreached.push((
-            secs.unwrap_or(0),
-            Unreached {
+        // Reading a program's arguments while macOS's program check holds it can block until
+        // the check lets it go, so a held one is named by its executable.
+        let words: Option<Vec<String>> = (k.held(row.pid) != Some(true))
+            .then(|| k.argv(row.pid))
+            .flatten()
+            .map(|argv| {
+                argv.iter()
+                    .map(|w| w.to_string_lossy().into_owned())
+                    .collect()
+            });
+        let age = row.age_s.map_or_else(|| "?".to_string(), age_words);
+        let window = words
+            .as_deref()
+            .filter(|words| alias_verb(exe, words, verbs).is_none())
+            .and_then(|words| window_args(exe, words, row.terminal, verbs));
+        if let Some(args) = window {
+            instances += 1;
+            if !published.contains(&row.pid) {
+                unreached.push((
+                    row.age_s.unwrap_or(0),
+                    Unreached {
+                        pid: row.pid,
+                        age,
+                        command: launch_words(words.as_deref().unwrap_or_default(), args.len()),
+                        socketless: socket_off(&args),
+                    },
+                ));
+            }
+            continue;
+        }
+        let (lineage, launchd) = if row.ppid == Some(1) {
+            (
+                k.lineage(row.pid),
+                *launchd.get_or_insert_with(|| k.launchd_version()),
+            )
+        } else {
+            (None, None)
+        };
+        let parent = Parent::of(row.ppid, lineage.as_ref(), row.birth, launchd);
+        programs.push((
+            row.age_s.unwrap_or(0),
+            Program {
                 pid: row.pid,
-                age: secs.map_or_else(|| row.etime.clone(), age_words),
-                command: row.command.clone(),
-                socketless: socket_off(&args),
+                name: program_name(exe, words.as_deref().unwrap_or_default(), verbs),
+                age,
+                adopted: parent == Parent::Adopted,
+                build: in_build_dir(exe),
+                deleted: image.deleted,
             },
         ));
     }
     unreached.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.pid.cmp(&b.1.pid)));
+    programs.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.pid.cmp(&b.1.pid)));
     Ok(Census {
         dir,
         instances,
         unreached: unreached.into_iter().map(|(_, u)| u).collect(),
+        programs: programs.into_iter().map(|(_, p)| p).collect(),
     })
 }
 
-/// The arguments of `row` when it is a window-mode aterm instance, else `None`.
-fn window_args(row: &ProcRow) -> Option<Vec<&str>> {
-    let base = row.program.rsplit('/').next().unwrap_or(&row.program);
-    if base != "aterm" && !base.starts_with("aterm-") {
-        return None;
-    }
-    let rest = match row.command.strip_prefix(row.program.as_str()) {
-        Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => r,
-        _ => row
-            .command
-            .split_once(char::is_whitespace)
-            .map_or("", |(_, r)| r),
+/// The file name of `path`, when it is UTF-8.
+fn file_name(path: &Path) -> Option<&str> {
+    path.file_name()?.to_str()
+}
+
+/// Whether `exe` is an aterm executable: its file name is `aterm` or `aterm-*` (a test binary's
+/// `aterm_pty-…` is not), the rule `ForeignFacts` judges by.
+pub(crate) fn is_aterm(exe: &Path) -> bool {
+    file_name(exe).is_some_and(|name| name == "aterm" || name.starts_with("aterm-"))
+}
+
+/// Whether `exe` sits under a build's target directory: an ancestor named `target*` (`target`,
+/// `target.noindex`), read from the path alone.
+fn in_build_dir(exe: &Path) -> bool {
+    exe.ancestors()
+        .skip(1)
+        .filter_map(file_name)
+        .any(|name| name.starts_with("target"))
+}
+
+/// The verb an `aterm-<verb>` name dispatches to (argv[0]'s or the executable's), when `verbs`
+/// names it: `aterm-link` is `aterm link`.
+fn alias_verb<'a>(
+    exe: &'a Path,
+    argv: &'a [String],
+    verbs: &dyn Fn(&str) -> Option<Verb>,
+) -> Option<&'a str> {
+    let argv0 = argv.first().and_then(|a| file_name(Path::new(a)));
+    [argv0, file_name(exe)]
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.strip_prefix("aterm-"))
+        .find(|verb| verbs(verb).is_some())
+}
+
+/// What a program is called: `aterm <verb>[ <sub>]` when its verb is found (an `aterm-<verb>`
+/// name, else argv[1]), `<sub>` its next word when that is a plain lowercase word; else its
+/// executable's file name.
+fn program_name(exe: &Path, argv: &[String], verbs: &dyn Fn(&str) -> Option<Verb>) -> String {
+    let (verb, rest) = match alias_verb(exe, argv, verbs) {
+        Some(verb) => (Some(verb), argv.get(1..)),
+        None => match argv.get(1) {
+            Some(word) if verbs(word).is_some() => (Some(word.as_str()), argv.get(2..)),
+            _ => (None, None),
+        },
     };
-    let args: Vec<&str> = rest
-        .split_whitespace()
+    let Some(verb) = verb else {
+        return exe_word(exe);
+    };
+    match rest.and_then(<[String]>::first).filter(|w| is_sub_word(w)) {
+        Some(sub) => format!("aterm {verb} {sub}"),
+        None => format!("aterm {verb}"),
+    }
+}
+
+/// A sub-verb word: `^[a-z][a-z0-9-]{0,23}$`.
+fn is_sub_word(word: &str) -> bool {
+    let mut chars = word.chars();
+    word.len() <= 24
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The executable's file name when it is a plain word (`^[A-Za-z0-9._+-]{1,32}$`), else
+/// `aterm?`.
+fn exe_word(exe: &Path) -> String {
+    file_name(exe)
+        .filter(|name| {
+            (1..=32).contains(&name.len())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        })
+        .unwrap_or("aterm?")
+        .to_string()
+}
+
+/// The launch flags of an aterm process when it is a window or headless instance, else `None`:
+/// its arguments before the `-e` payload, routed as the front door routes them. The window
+/// aliases (`aterm-gui`, `aterm-windowed`, by argv[0] or the executable) always open one; a
+/// first word opens one only when it is a window verb; else a window flag (`--window`,
+/// `--headless`, `--diagnose`) or no controlling terminal (the front door's "stdin is no
+/// terminal": a Finder, `open` or launchd start) opens one, unless the session is forced
+/// (`--session`, or argv[0] `aterm-cli`).
+fn window_args<'a>(
+    exe: &Path,
+    argv: &'a [String],
+    terminal: Option<bool>,
+    verbs: &dyn Fn(&str) -> Option<Verb>,
+) -> Option<Vec<&'a str>> {
+    let argv0 = argv.first().and_then(|a| file_name(Path::new(a)));
+    let alias = [argv0, file_name(exe)]
+        .into_iter()
+        .flatten()
+        .any(|name| matches!(name, "aterm-gui" | "aterm-windowed"));
+    let args: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .map(String::as_str)
         .take_while(|a| !matches!(*a, "-e" | "--command" | "--"))
         .collect();
-    let in_bundle = row.program.contains(".app/Contents/MacOS/");
-    let window = base == "aterm-gui"
-        || args.iter().any(|a| matches!(*a, "--headless" | "--window"))
-        || (in_bundle && args.is_empty());
-    let verb = args.first().is_some_and(|a| !a.starts_with('-'));
-    let session = args.contains(&"--session");
-    (window && !verb && !session).then_some(args)
+    let window = alias
+        || match args.first() {
+            Some(word) if !word.starts_with('-') => verbs(word) == Some(Verb::Window),
+            _ => {
+                let session = argv0 == Some("aterm-cli") || args.contains(&"--session");
+                !session
+                    && (args
+                        .iter()
+                        .any(|a| matches!(*a, "--window" | "--headless" | "--diagnose"))
+                        || terminal == Some(false))
+            }
+        };
+    window.then_some(args)
+}
+
+/// What the census says of an instance's command line: argv[0] and its `flags` launch flags,
+/// then the payload's flag and `…` when a payload follows (the session's own command is not
+/// repeated), each control character escaped so the words cannot steer the terminal they are
+/// printed to.
+fn launch_words(argv: &[String], flags: usize) -> String {
+    let mut said: Vec<String> = argv.iter().take(1 + flags).map(|w| escaped(w)).collect();
+    if let Some(payload) = argv.get(1 + flags) {
+        said.push(escaped(payload));
+        said.push("…".to_string());
+    }
+    said.join(" ")
+}
+
+/// `word` with each control character (`ESC`, `CR`, a C1 code) written as its Rust escape.
+fn escaped(word: &str) -> String {
+    word.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Whether `args` switched the control socket off ([`socket_directive`]).
@@ -174,25 +563,6 @@ fn socket_off(args: &[&str]) -> bool {
         .and_then(|i| args.get(i + 1).copied());
     let off = args.contains(&"--no-control-sock").then_some("1");
     socket_directive(value, off) == SocketDirective::Disabled
-}
-
-/// `ps`'s `etime` (`[[dd-]hh:]mm:ss`) in seconds; `None` for anything else.
-fn etime_secs(etime: &str) -> Option<u64> {
-    let (days, clock) = match etime.trim().split_once('-') {
-        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
-        None => (0, etime.trim()),
-    };
-    let mut parts = clock.split(':').rev();
-    let secs: u64 = parts.next()?.parse().ok()?;
-    let mins: u64 = parts.next().unwrap_or("0").parse().ok()?;
-    let hours: u64 = parts.next().unwrap_or("0").parse().ok()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    days.checked_mul(86_400)?
-        .checked_add(hours.checked_mul(3_600)?)?
-        .checked_add(mins.checked_mul(60)?)?
-        .checked_add(secs)
 }
 
 /// An age in the two largest units: `11d 22h`, `3h 05m`, `4m 12s`, `42s`.
@@ -209,140 +579,185 @@ fn age_words(secs: u64) -> String {
     }
 }
 
-/// The process table, from two `ps` reads joined by pid.
-///
-/// # Errors
-/// Returns an error if `ps` fails or produces no parseable rows.
-#[cfg(unix)]
-fn process_table() -> Result<Vec<ProcRow>, String> {
-    let identity = ps(&["-o", "pid=", "-o", "uid=", "-o", "etime=", "-o", "comm="])?;
-    let commands = ps(&["-o", "pid=", "-o", "command="])?;
-    let rows = join_ps(&identity, &commands);
-    if rows.is_empty() {
-        return Err("the process table read back empty".to_string());
-    }
-    Ok(rows)
-}
-
-/// One `ps -A -ww` read with the given columns, as text.
-#[cfg(unix)]
-fn ps(columns: &[&str]) -> Result<String, String> {
-    let program = ["/bin/ps", "/usr/bin/ps"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or("ps");
-    let out = aterm_uds::spawnfd::command(program)
-        .args(["-A", "-ww"])
-        .args(columns)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .map_err(|e| format!("the process table could not be read (`ps`: {e})"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "the process table could not be read (`ps` exited {})",
-            out.status
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Join the two `ps` reads ([`process_table`]) into rows; pure.
-#[cfg(any(unix, test))]
-fn join_ps(identity: &str, commands: &str) -> Vec<ProcRow> {
-    /// The first whitespace-separated word and the rest, trimmed at the front.
-    fn word(s: &str) -> Option<(&str, &str)> {
-        let s = s.trim_start();
-        let end = s.find(char::is_whitespace)?;
-        Some((&s[..end], s[end..].trim_start()))
-    }
-    let command_of: std::collections::HashMap<u32, &str> = commands
-        .lines()
-        .filter_map(|line| {
-            let (pid, rest) = word(line)?;
-            Some((pid.parse().ok()?, rest.trim_end()))
-        })
-        .collect();
-    identity
-        .lines()
-        .filter_map(|line| {
-            let (pid, rest) = word(line)?;
-            let pid: u32 = pid.parse().ok()?;
-            let (uid, rest) = word(rest)?;
-            let (etime, program) = word(rest)?;
-            Some(ProcRow {
-                pid,
-                uid: uid.parse().ok()?,
-                etime: etime.to_string(),
-                program: program.trim_end().to_string(),
-                command: (*command_of.get(&pid)?).to_string(),
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
 
-    fn row(pid: u32, uid: u32, etime: &str, program: &str, command: &str) -> ProcRow {
-        ProcRow {
-            pid,
-            uid,
-            etime: etime.to_string(),
-            program: program.to_string(),
-            command: command.to_string(),
+    /// launchd's pid version in the fake table.
+    const LAUNCHD: i32 = 4_100;
+
+    /// One process of the fake table.
+    struct Row {
+        listed: Listed,
+        exe: Option<Image>,
+        argv: Option<Vec<String>>,
+        lineage: Option<Lineage>,
+        held: bool,
+    }
+
+    /// A process table with the reads the census makes of it, recording which pids it was asked
+    /// the arguments of.
+    #[derive(Default)]
+    struct Fake {
+        rows: Vec<Row>,
+        launchd: Option<i32>,
+        unreadable: bool,
+        argv_asked: RefCell<BTreeSet<u32>>,
+    }
+
+    impl Fake {
+        fn with(rows: Vec<Row>) -> Self {
+            Self {
+                rows,
+                launchd: Some(LAUNCHD),
+                ..Self::default()
+            }
+        }
+
+        fn row(&self, pid: u32) -> Option<&Row> {
+            self.rows.iter().find(|r| r.listed.pid == pid)
         }
     }
 
-    /// A reduced process table.
-    fn table() -> Vec<ProcRow> {
+    impl Kernel for Fake {
+        fn listed(&self) -> Option<Vec<Listed>> {
+            (!self.unreadable).then(|| self.rows.iter().map(|r| r.listed).collect())
+        }
+        fn exe(&self, pid: u32) -> Option<Image> {
+            self.row(pid)?.exe.clone()
+        }
+        fn held(&self, pid: u32) -> Option<bool> {
+            self.row(pid).map(|r| r.held)
+        }
+        fn argv(&self, pid: u32) -> Option<Vec<OsString>> {
+            self.argv_asked.borrow_mut().insert(pid);
+            let words = self.row(pid)?.argv.as_ref()?;
+            Some(words.iter().map(OsString::from).collect())
+        }
+        fn lineage(&self, pid: u32) -> Option<Lineage> {
+            self.row(pid)?.lineage
+        }
+        fn launchd_version(&self) -> Option<i32> {
+            self.launchd
+        }
+    }
+
+    /// When the fake's processes were born: `age_s` before this second.
+    const NOW: u64 = 1_790_000_000;
+
+    /// Pid `pid`, `age_s` old, child of `ppid`, running `exe` with `argv`, on a terminal.
+    fn proc(pid: u32, ppid: u32, age_s: u64, exe: &str, argv: &[&str]) -> Row {
+        Row {
+            listed: Listed {
+                pid,
+                ppid: Some(ppid),
+                birth: Some(ProcessBirth {
+                    seconds: NOW - age_s,
+                    microseconds: u64::from(pid),
+                }),
+                age_s: Some(age_s),
+                terminal: Some(true),
+            },
+            exe: Some(Image {
+                path: PathBuf::from(exe),
+                deleted: false,
+            }),
+            argv: Some(argv.iter().map(ToString::to_string).collect()),
+            lineage: None,
+            held: false,
+        }
+    }
+
+    /// `row` started with no controlling terminal (by Finder, `open` or launchd).
+    fn detached(mut row: Row) -> Row {
+        row.listed.terminal = Some(false);
+        row
+    }
+
+    /// `row` adopted by launchd (its parent 1), with a lineage of its own birth naming its
+    /// launcher's pid version `launcher_version`.
+    fn under_launchd(mut row: Row, launcher_version: Option<i32>) -> Row {
+        row.listed.ppid = Some(1);
+        row.lineage = launcher_version.map(|launcher_version| Lineage {
+            identity: aterm_uds::process::Identity {
+                pid: i32::try_from(row.listed.pid).expect("pid"),
+                birth: row.listed.birth.expect("a birth"),
+                idversion: 90_000,
+            },
+            uniqueid: u64::from(row.listed.pid),
+            parent: 1,
+            pgid: row.listed.pid,
+            launcher_version,
+            tty: None,
+        });
+        row
+    }
+
+    const ATERM: &str = "/opt/aterm/bin/aterm";
+    const BUNDLE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
+
+    /// The front door's verbs, as far as these tables use them.
+    fn verbs(word: &str) -> Option<Verb> {
+        match word {
+            "link" | "ctl" | "doctor" | "pkg" => Some(Verb::Program),
+            "new-window" | "new-tab" => Some(Verb::Window),
+            _ => None,
+        }
+    }
+
+    /// A reduced process table of this user: this process (`aterm doctor`, pid 100), a
+    /// published window, an unreached headless instance, a test binary, and three front-door
+    /// sessions or clients.
+    fn table() -> Vec<Row> {
         vec![
-            row(
-                100,
-                501,
-                "01:00",
-                "/opt/aterm/bin/aterm",
-                "/opt/aterm/bin/aterm doctor",
-            ),
-            row(
-                7641,
-                501,
-                "01-11:48:49",
-                "/Applications/aterm.app/Contents/MacOS/aterm",
-                "/Applications/aterm.app/Contents/MacOS/aterm --window",
-            ),
-            row(
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            proc(7641, 1, 128_929, BUNDLE, &[BUNDLE, "--window"]),
+            proc(
                 67548,
-                501,
-                "11-22:32:03",
-                "./aterm-before",
-                "./aterm-before --headless",
+                50,
+                1_031_523,
+                "/w/aterm-before",
+                &["./aterm-before", "--headless"],
             ),
-            row(
+            proc(
                 19235,
-                501,
-                "03-22:46:46",
+                50,
+                341_206,
                 "/w/target/debug/deps/aterm_pty-8a8f4252995814f9",
-                "/w/target/debug/deps/aterm_pty-8a8f4252995814f9 --headless",
+                &[
+                    "/w/target/debug/deps/aterm_pty-8a8f4252995814f9",
+                    "--headless",
+                ],
             ),
-            row(300, 501, "05:00", "aterm", "aterm"),
-            row(301, 501, "00:02", "aterm", "aterm ctl --sock /x windows"),
-            row(302, 501, "00:09", "aterm", "aterm --session --headless"),
-            row(400, 502, "09:00", "aterm", "aterm --headless"),
+            proc(300, 50, 300, ATERM, &["aterm"]),
+            proc(
+                301,
+                50,
+                2,
+                ATERM,
+                &["aterm", "ctl", "--sock", "/x", "windows"],
+            ),
+            proc(302, 50, 9, ATERM, &["aterm", "--session", "--headless"]),
         ]
     }
 
-    /// The published window is reached, the orphan is named with its age and
-    /// command line, and nothing else is counted (test binary, session, client
-    /// verb, forced session, other user's instance, doctor).
+    fn census(k: &Fake, published: &[u32]) -> Census {
+        let published = published.iter().copied().collect();
+        census_of(k, 100, &published, "/run/aterm".into(), &verbs).expect("census")
+    }
+
+    /// The published window is reached, the headless instance nothing publishes is named with
+    /// its age and argument words, and nothing else is an instance (a test binary, a session, a
+    /// client verb, a forced session, this doctor).
     #[test]
     fn it_names_the_unreached_instance_and_ignores_the_reached_one() {
-        let published = BTreeSet::from([7641]);
-        let census = census_of(&table(), 100, &published, "/run/aterm".into()).expect("census");
-        assert_eq!(census.instances, 2, "{census:?}");
+        let k = Fake::with(table());
+        let c = census(&k, &[7641]);
+        assert_eq!(c.instances, 2, "{c:?}");
         assert_eq!(
-            census.unreached,
+            c.unreached,
             vec![Unreached {
                 pid: 67548,
                 age: "11d 22h".to_string(),
@@ -350,88 +765,413 @@ mod tests {
                 socketless: false,
             }]
         );
-        let both = BTreeSet::from([7641, 67548]);
-        let census = census_of(&table(), 100, &both, "/run/aterm".into()).expect("census");
-        assert_eq!((census.instances, census.unreached.len()), (2, 0));
+        let c = census(&k, &[7641, 67548]);
+        assert_eq!((c.instances, c.unreached.len()), (2, 0));
+        let programs: Vec<(u32, &str)> = c
+            .programs
+            .iter()
+            .map(|p| (p.pid, p.name.as_str()))
+            .collect();
+        assert_eq!(
+            programs,
+            [(300, "aterm"), (302, "aterm"), (301, "aterm ctl")],
+            "the sessions and the client are programs, oldest first"
+        );
     }
 
-    /// Nothing is guessed: without its own row the census cannot say whose
-    /// processes to count, and says so.
+    /// aterm is the process whose executable is aterm's, whatever its argv[0] says: a shell
+    /// calling itself `aterm` is not counted, an aterm called `x` is, and a test binary or a
+    /// process whose executable the kernel cannot name is not. Arguments are read only of a
+    /// proven aterm.
+    #[test]
+    fn an_aterm_program_is_known_by_its_executable_not_its_name() {
+        let mut unnamed = proc(503, 50, 40, ATERM, &["aterm", "--headless"]);
+        unnamed.exe = None;
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            proc(500, 50, 40, "/bin/bash", &["aterm", "--headless"]),
+            proc(501, 50, 40, ATERM, &["x", "--headless"]),
+            proc(
+                502,
+                50,
+                40,
+                "/w/target/debug/deps/aterm_pty-8a8f4252995814f9",
+                &["aterm", "--headless"],
+            ),
+            unnamed,
+        ]);
+        let c = census(&k, &[]);
+        assert_eq!(c.instances, 1, "{c:?}");
+        let unreached: Vec<u32> = c.unreached.iter().map(|u| u.pid).collect();
+        assert_eq!(unreached, [501]);
+        assert!(c.programs.is_empty(), "{c:?}");
+        assert_eq!(
+            *k.argv_asked.borrow(),
+            BTreeSet::from([501]),
+            "only a proven aterm's arguments are read"
+        );
+        assert!(!is_aterm(Path::new("/bin/zsh")));
+        assert!(!is_aterm(Path::new("/x/atermx")));
+        assert!(is_aterm(Path::new("/repo/target/debug/aterm-gui")));
+    }
+
+    /// A program macOS's program check holds has its arguments read by no one (a read can block
+    /// until the check lets it go): it is a program named by its executable.
+    #[test]
+    fn a_held_program_s_arguments_are_never_read() {
+        let mut held = proc(900, 50, 30, ATERM, &["aterm", "--headless"]);
+        held.held = true;
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            held,
+            proc(901, 50, 30, ATERM, &["aterm", "--headless"]),
+        ]);
+        let c = census(&k, &[]);
+        assert!(
+            !k.argv_asked.borrow().contains(&900),
+            "a held program's arguments were read: {c:?}"
+        );
+        assert_eq!(c.instances, 1, "{c:?}");
+        let names: Vec<(u32, &str)> = c
+            .programs
+            .iter()
+            .map(|p| (p.pid, p.name.as_str()))
+            .collect();
+        assert_eq!(names, [(900, "aterm")], "{c:?}");
+    }
+
+    /// A program is named by the front door's verb and its next plain word, from argv or an
+    /// `aterm-<verb>` name; a word the verb table does not hold names nothing, and this process
+    /// is left out.
+    #[test]
+    fn verbs_are_counted_by_their_words() {
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            proc(
+                600,
+                50,
+                10,
+                ATERM,
+                &[ATERM, "link", "broker", "/r/b.sock", "/r/b.log"],
+            ),
+            proc(
+                601,
+                50,
+                10,
+                "/w/target/debug/aterm-link",
+                &["/w/target/debug/aterm-link", "broker", "/r/b.sock"],
+            ),
+            proc(
+                602,
+                50,
+                10,
+                ATERM,
+                &["aterm", "link", "serve", "--fleet", "f"],
+            ),
+            proc(
+                603,
+                50,
+                10,
+                ATERM,
+                &["aterm", "ctl", "--sock", "x", "await"],
+            ),
+            proc(604, 50, 10, ATERM, &["aterm", "frobnicate"]),
+            proc(605, 50, 10, ATERM, &["aterm-ctl", "status"]),
+            proc(606, 50, 10, ATERM, &["aterm", "link", "Broker;rm"]),
+            proc(
+                607,
+                50,
+                10,
+                "/opt/bin/aterm-dev build",
+                &["/opt/bin/aterm-dev build"],
+            ),
+            proc(
+                608,
+                50,
+                10,
+                "/w/target/debug/aterm-lab",
+                &["aterm-lab", "instance"],
+            ),
+        ]);
+        let c = census(&k, &[]);
+        let names: BTreeMap<u32, &str> = c
+            .programs
+            .iter()
+            .map(|p| (p.pid, p.name.as_str()))
+            .collect();
+        let said: Vec<&str> = names.values().copied().collect();
+        assert!(!said.contains(&"aterm frobnicate"), "{names:?}");
+        assert!(!said.contains(&"aterm doctor"), "{names:?}");
+        assert_eq!(
+            names,
+            BTreeMap::from([
+                (600, "aterm link broker"),
+                (601, "aterm link broker"),
+                (602, "aterm link serve"),
+                (603, "aterm ctl"),
+                (604, "aterm"),
+                (605, "aterm ctl status"),
+                (606, "aterm link"),
+                (607, "aterm?"),
+                (608, "aterm-lab"),
+            ])
+        );
+        assert_eq!(c.instances, 0, "{c:?}");
+    }
+
+    /// Only a program launchd adopted after its launcher exited is adopted: one launchd started
+    /// itself, one whose lineage is unread, and one with a live launcher are not. aterm's own
+    /// detached pass (a shell that ran it in the background and exited) is adopted too, a fact
+    /// the row states without calling it a leftover.
+    #[test]
+    fn an_adopted_program_is_said_and_a_launchd_started_one_is_not() {
+        let broker = |pid| {
+            proc(
+                pid,
+                4_000,
+                20,
+                ATERM,
+                &[ATERM, "link", "broker", "/r/b.sock"],
+            )
+        };
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            under_launchd(broker(700), Some(31)),
+            under_launchd(broker(701), Some(LAUNCHD)),
+            under_launchd(broker(702), None),
+            broker(703),
+            under_launchd(
+                proc(704, 4_000, 80, BUNDLE, &[BUNDLE, "pkg", "update"]),
+                Some(77),
+            ),
+        ]);
+        let c = census(&k, &[]);
+        let by_pid: BTreeMap<u32, &Program> = c.programs.iter().map(|p| (p.pid, p)).collect();
+        assert!(by_pid[&700].adopted, "adopted: {c:?}");
+        assert!(!by_pid[&701].adopted, "launchd started it: {c:?}");
+        assert!(!by_pid[&702].adopted, "unjudged: {c:?}");
+        assert!(!by_pid[&703].adopted, "its launcher lives: {c:?}");
+        assert!(
+            by_pid[&704].adopted && by_pid[&704].name == "aterm pkg update",
+            "{c:?}"
+        );
+        let mut unread = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            under_launchd(broker(700), Some(31)),
+        ]);
+        unread.launchd = None;
+        assert!(
+            !census(&unread, &[]).programs[0].adopted,
+            "launchd's version unread proves nothing"
+        );
+    }
+
+    /// A program run from a build's `target*` directory says so from its path alone, and one
+    /// whose image the kernel marks deleted says that; nothing on disk is looked at.
+    #[test]
+    fn a_build_and_a_deleted_binary_are_said() {
+        let broker = |pid, exe: &str| proc(pid, 50, 20, exe, &[exe, "link", "broker"]);
+        let mut gone = broker(801, "/w/gone/target/debug/aterm");
+        gone.exe = Some(Image {
+            path: PathBuf::from("/w/gone/target/debug/aterm"),
+            deleted: true,
+        });
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            broker(800, "/w/wt/target/debug/aterm"),
+            gone,
+            broker(802, BUNDLE),
+            broker(803, "/w/wt/target.noindex/release/aterm-link"),
+        ]);
+        let c = census(&k, &[]);
+        let by_pid: BTreeMap<u32, &Program> = c.programs.iter().map(|p| (p.pid, p)).collect();
+        assert!(by_pid[&800].build && !by_pid[&800].deleted, "{c:?}");
+        assert!(by_pid[&801].build && by_pid[&801].deleted, "{c:?}");
+        assert!(!by_pid[&802].build && !by_pid[&802].deleted, "{c:?}");
+        assert!(by_pid[&803].build, "{c:?}");
+        assert!(
+            !in_build_dir(Path::new("/target")),
+            "the file itself is no directory"
+        );
+    }
+
+    /// Linux's `exe` link of an unlinked file ends ` (deleted)`: the census takes the mark off,
+    /// so the process is still known by its file name and is said to run a deleted binary.
+    #[cfg(unix)]
+    #[test]
+    fn linux_s_deleted_mark_is_taken_off_the_executable() {
+        assert_eq!(
+            unmarked(Path::new("/w/wt/target/debug/aterm (deleted)")),
+            Some(PathBuf::from("/w/wt/target/debug/aterm"))
+        );
+        assert_eq!(unmarked(Path::new("/w/wt/target/debug/aterm")), None);
+        let image = unmarked(Path::new("/w/aterm-link (deleted)")).expect("marked");
+        assert!(is_aterm(&image), "{}", image.display());
+        assert_eq!(exe_word(&image), "aterm-link");
+    }
+
+    /// Nothing is guessed: without its own row the census cannot say the table is this user's,
+    /// and a table that cannot be read is no census.
     #[test]
     fn a_census_without_its_own_row_is_not_taken() {
-        census_of(&table(), 99_999, &BTreeSet::new(), String::new()).expect_err("no own row");
+        let k = Fake::with(table());
+        census_of(&k, 99_999, &BTreeSet::new(), String::new(), &verbs).expect_err("no own row");
+        let mut unreadable = Fake::with(table());
+        unreadable.unreadable = true;
+        census_of(&unreadable, 100, &BTreeSet::new(), String::new(), &verbs).expect_err("no table");
     }
 
-    /// Window mode is read as the front door reads it: before the `-e` payload
-    /// only, a verb or `--session` wins, the `aterm-gui` name and a bare bundle
-    /// launch are windows, and a disabled socket is reported.
+    /// Window mode is read from the argument words as the front door routes them: before the
+    /// `-e` payload only; a window alias always opens one; a first word only when it is a window
+    /// verb; else a window flag, or no controlling terminal, unless the session is forced. A path
+    /// with spaces is one word, and a disabled socket is reported.
     #[test]
     fn window_mode_is_read_from_the_launch_flags() {
-        let is_window = |program: &str, command: &str| {
-            window_args(&row(1, 1, "00:01", program, command)).is_some()
+        let routed = |exe: &str, argv: &[&str], terminal: Option<bool>| {
+            let words: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            window_args(Path::new(exe), &words, terminal, &verbs).is_some()
         };
-        assert!(is_window("aterm", "aterm --headless --columns 80"));
-        assert!(is_window("aterm-gui", "aterm-gui"));
+        let is_window = |exe: &str, argv: &[&str]| routed(exe, argv, Some(true));
+        let started_alone = |exe: &str, argv: &[&str]| routed(exe, argv, Some(false));
         assert!(is_window(
-            "/Applications/aterm.app/Contents/MacOS/aterm",
-            "/Applications/aterm.app/Contents/MacOS/aterm"
+            ATERM,
+            &["aterm", "--headless", "--columns", "80"]
         ));
-        assert!(!is_window("aterm", "aterm -e sh -c 'aterm --headless'"));
-        assert!(!is_window("aterm", "aterm -- --window"));
-        assert!(!is_window("aterm", "aterm pkg doctor --window"));
-        assert!(!is_window("aterm-link", "aterm-link serve --fleet f"));
-        assert!(!is_window("zsh", "zsh -c aterm --headless"));
-        assert!(is_window(
-            "/Users//a/Library/Application Support/aterm/bin/aterm",
-            "/Users//a/Library/Application Support/aterm/bin/aterm --headless"
+        assert!(is_window(ATERM, &["aterm", "--diagnose"]));
+        assert!(is_window("/w/aterm-gui", &["aterm-gui"]));
+        assert!(is_window(ATERM, &["aterm-gui"]), "the alias name");
+        assert!(
+            is_window(ATERM, &["aterm-windowed"]),
+            "the windowed image's name"
+        );
+        assert!(is_window(ATERM, &["aterm", "new-window"]), "a window verb");
+        assert!(is_window(ATERM, &["aterm-gui", "new-tab", "-d", "/w"]));
+        assert!(started_alone(BUNDLE, &[BUNDLE]));
+        assert!(
+            started_alone(BUNDLE, &[BUNDLE, "--no-control-sock"]),
+            "a window's flags keep it a window"
+        );
+        assert!(
+            !is_window(BUNDLE, &["aterm"]),
+            "a bare `aterm` typed on a terminal is a session, whatever its executable"
+        );
+        assert!(
+            !routed(ATERM, &["aterm"], None),
+            "an unread terminal proves nothing"
+        );
+        assert!(!started_alone(ATERM, &["aterm", "--session"]));
+        assert!(
+            !started_alone(ATERM, &["aterm-cli"]),
+            "the forced session's name"
+        );
+        let spaced = "/Users//a/My Apps/aterm.app/Contents/MacOS/aterm";
+        assert!(
+            started_alone(spaced, &[spaced]),
+            "a bundle path with a space"
+        );
+        assert!(!is_window(
+            ATERM,
+            &["aterm", "-e", "sh", "-c", "aterm --headless"]
         ));
-        assert!(is_window("aterm", "/usr/local/bin/aterm --headless"));
+        assert!(!is_window(ATERM, &["aterm", "--", "--window"]));
+        assert!(!started_alone(
+            ATERM,
+            &["aterm", "pkg", "doctor", "--window"]
+        ));
+        assert!(!is_window(
+            "/w/aterm-link",
+            &["aterm-link", "serve", "--fleet", "f"]
+        ));
+        let support = "/Users//a/Library/Application Support/aterm/bin/aterm";
+        assert!(is_window(support, &[support, "--headless"]));
+        assert!(is_window(ATERM, &["/usr/local/bin/aterm", "--headless"]));
 
-        let socketless = |command: &str| {
-            let r = row(1, 1, "00:01", "aterm", command);
-            socket_off(&window_args(&r).expect("a window"))
+        let socketless = |argv: &[&str]| {
+            let words: Vec<String> = argv.iter().map(ToString::to_string).collect();
+            socket_off(
+                &window_args(Path::new(ATERM), &words, Some(true), &verbs).expect("a window"),
+            )
         };
-        assert!(socketless("aterm --headless --no-control-sock"));
-        assert!(socketless("aterm --headless --control-sock off"));
-        assert!(socketless("aterm --headless --control-sock 0"));
-        assert!(!socketless("aterm --headless --control-sock /tmp/a.sock"));
-        assert!(!socketless("aterm --headless"));
+        assert!(socketless(&["aterm", "--headless", "--no-control-sock"]));
+        assert!(socketless(&[
+            "aterm",
+            "--headless",
+            "--control-sock",
+            "off"
+        ]));
+        assert!(socketless(&["aterm", "--headless", "--control-sock", "0"]));
+        assert!(!socketless(&[
+            "aterm",
+            "--headless",
+            "--control-sock",
+            "/tmp/a.sock"
+        ]));
+        assert!(!socketless(&["aterm", "--headless"]));
     }
 
-    /// `ps`'s two reads join by pid; a row in only one read is skipped, and a
-    /// program with spaces keeps them.
+    /// A window opened by a window verb, one Finder started with its flags, and a bare `aterm`
+    /// session on a terminal whose executable is the bundle's are each counted as what the
+    /// front door made of them.
     #[test]
-    fn the_two_ps_reads_join_by_pid() {
-        let identity = "  7641   501 01-11:48:49 /Applications/aterm.app/Contents/MacOS/aterm\n\
-                        72325   501       19:30 /Users//a/Library/Application Support/x/targo\n\
-                           12   501       00:01 gone\n";
-        let commands = " 7641 /Applications/aterm.app/Contents/MacOS/aterm --window\n\
-                        72325 /Users//a/Library/Application Support/x/targo --unverified test\n";
-        let rows = join_ps(identity, commands);
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0].pid, 7641);
-        assert_eq!(rows[0].etime, "01-11:48:49");
-        assert_eq!(
-            rows[0].program,
-            "/Applications/aterm.app/Contents/MacOS/aterm"
-        );
-        assert_eq!(
-            rows[1].program,
-            "/Users//a/Library/Application Support/x/targo"
-        );
-        assert_eq!(
-            rows[1].command,
-            "/Users//a/Library/Application Support/x/targo --unverified test"
-        );
+    fn a_window_is_counted_by_the_front_door_s_route() {
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            proc(1001, 50, 50, ATERM, &["aterm", "new-window", "-d", "/w"]),
+            detached(proc(1002, 1, 40, BUNDLE, &[BUNDLE, "--no-control-sock"])),
+            proc(1003, 50, 30, BUNDLE, &["aterm"]),
+        ]);
+        let c = census(&k, &[1001]);
+        assert_eq!(c.instances, 2, "{c:?}");
+        let unreached: Vec<(u32, bool)> =
+            c.unreached.iter().map(|u| (u.pid, u.socketless)).collect();
+        assert_eq!(unreached, [(1002, true)], "{c:?}");
+        let programs: Vec<(u32, &str)> = c
+            .programs
+            .iter()
+            .map(|p| (p.pid, p.name.as_str()))
+            .collect();
+        assert_eq!(programs, [(1003, "aterm")], "{c:?}");
     }
 
-    /// What is published per rendezvous answer: a directory's pids (a graph
-    /// entry's placeholder 0 is no pid); a missing directory publishes nothing,
-    /// so every instance is unreached; an unresolvable or unreadable one is not
-    /// a census.
+    /// An unreached instance's words are its launch flags: the session's command after `-e` is
+    /// cut, and a control character in what is shown is escaped, so the row cannot write to the
+    /// terminal of whoever reads it.
+    #[test]
+    fn an_unreached_instance_s_words_are_its_escaped_launch_flags() {
+        let k = Fake::with(vec![
+            proc(100, 50, 60, ATERM, &[ATERM, "doctor"]),
+            proc(
+                1100,
+                50,
+                20,
+                ATERM,
+                &[
+                    "aterm",
+                    "--headless",
+                    "--working-directory",
+                    "/w/\u{1b}]52;c;eA==\u{7}\r\n",
+                    "-e",
+                    "sh",
+                    "-c",
+                    "LOGIN=secret run",
+                ],
+            ),
+        ]);
+        let c = census(&k, &[]);
+        let said = &c.unreached[0].command;
+        assert_eq!(
+            said, "aterm --headless --working-directory /w/\\u{1b}]52;c;eA==\\u{7}\\r\\n -e …",
+            "{c:?}"
+        );
+        assert!(!said.chars().any(char::is_control), "{said:?}");
+        assert!(!said.contains("secret"), "{said:?}");
+    }
+
+    /// What is published per rendezvous answer: a directory's pids (a graph entry's placeholder
+    /// 0 is no pid); a missing directory publishes nothing, so every instance is unreached; an
+    /// unresolvable or unreadable one is not a census.
     #[test]
     fn a_missing_directory_publishes_nothing_and_an_unreadable_one_is_not_measured() {
-        use std::path::PathBuf;
         let targets = vec![
             (7641, "/r/aterm-7641.sock".to_string()),
             (0, "/x".to_string()),
@@ -449,8 +1189,8 @@ mod tests {
         };
         let (dir, published) = published_in(missing, Vec::new()).expect("missing is an answer");
         assert!(published.is_empty());
-        let census = census_of(&table(), 100, &published, dir).expect("census");
-        let pids: Vec<u32> = census.unreached.iter().map(|u| u.pid).collect();
+        let c = census_of(&Fake::with(table()), 100, &published, dir, &verbs).expect("census");
+        let pids: Vec<u32> = c.unreached.iter().map(|u| u.pid).collect();
         assert_eq!(
             pids,
             [67548, 7641],
@@ -465,11 +1205,10 @@ mod tests {
         published_in(crate::DirOutcome::Unresolvable, Vec::new()).expect_err("not measured");
     }
 
-    /// A foreign instance (private socket, found through its graph entry) is published, so
-    /// the census counts it as reached and never names it.
+    /// A foreign instance (private socket, found through its graph entry) is published, so the
+    /// census counts it as reached and never names it.
     #[test]
     fn a_published_foreign_instance_counts_as_reached() {
-        use std::path::PathBuf;
         let targets = vec![
             (7641, "/r/aterm-7641.sock".to_string()),
             (67548, "/var/folders/xy/T/at.Q1/a.sock".to_string()),
@@ -480,45 +1219,101 @@ mod tests {
         };
         let (dir, published) = published_in(found, targets).expect("found");
         assert!(published.contains(&67548), "the graph entry publishes it");
-        let census = census_of(&table(), 100, &published, dir).expect("census");
-        assert_eq!((census.instances, census.unreached.len()), (2, 0));
+        let c = census_of(&Fake::with(table()), 100, &published, dir, &verbs).expect("census");
+        assert_eq!((c.instances, c.unreached.len()), (2, 0));
     }
 
     /// Ages read the way a person reads them, oldest first in the census.
     #[test]
     fn ages_are_words_and_the_oldest_comes_first() {
-        assert_eq!(
-            etime_secs("11-22:32:03"),
-            Some(11 * 86_400 + 22 * 3_600 + 32 * 60 + 3)
-        );
-        assert_eq!(etime_secs("19:30"), Some(19 * 60 + 30));
-        assert_eq!(etime_secs("1:02:03"), Some(3_723));
-        assert_eq!(etime_secs("bad"), None);
-        assert_eq!(etime_secs(&u64::MAX.to_string()), Some(u64::MAX));
-        for overflow in [
-            format!("{}-00:00:00", u64::MAX),
-            format!("{}:00:00", u64::MAX),
-            format!("{}:00", u64::MAX),
-            format!("1:{}", u64::MAX),
-        ] {
-            assert_eq!(etime_secs(&overflow), None, "{overflow}");
-        }
         assert_eq!(age_words(11 * 86_400 + 22 * 3_600 + 5), "11d 22h");
         assert_eq!(age_words(3 * 3_600 + 5 * 60), "3h 05m");
         assert_eq!(age_words(4 * 60 + 12), "4m 12s");
         assert_eq!(age_words(42), "42s");
 
         let mut t = table();
-        t.push(row(
+        t.push(proc(
             68000,
-            501,
-            "00:05",
-            "aterm",
-            "aterm --headless --no-control-sock",
+            50,
+            5,
+            ATERM,
+            &["aterm", "--headless", "--no-control-sock"],
         ));
-        let census = census_of(&t, 100, &BTreeSet::from([7641]), String::new()).expect("census");
-        let pids: Vec<u32> = census.unreached.iter().map(|u| u.pid).collect();
+        let c = census(&Fake::with(t), &[7641]);
+        let pids: Vec<u32> = c.unreached.iter().map(|u| u.pid).collect();
         assert_eq!(pids, [67548, 68000]);
-        assert!(census.unreached[1].socketless);
+        assert!(c.unreached[1].socketless);
+        assert_eq!(c.unreached[1].age, "5s");
+    }
+
+    /// A process born the moment before the table was read has an age: the clock `now` reads
+    /// is read after the rows, whose births the first row's read places on it.
+    #[test]
+    fn a_process_born_as_the_table_is_read_has_an_age() {
+        let clock = std::cell::Cell::new(NOW);
+        let read = |pid: u32| {
+            clock.set(clock.get() + 1);
+            Listed {
+                pid,
+                ppid: Some(1),
+                birth: Some(ProcessBirth {
+                    seconds: clock.get(),
+                    microseconds: 0,
+                }),
+                age_s: None,
+                terminal: None,
+            }
+        };
+        let rows = read_then_aged(vec![7, 8], read, || Some(clock.get()));
+        let ages: Vec<Option<u64>> = rows.iter().map(|r| r.age_s).collect();
+        assert_eq!(ages, [Some(1), Some(0)], "{rows:?}");
+    }
+
+    /// `/proc/<pid>/stat`'s `tty_nr` says whether a process has a controlling terminal, read
+    /// after the command's last parenthesis (a command may hold one).
+    #[test]
+    fn a_stat_line_s_terminal_is_its_tty_number() {
+        assert_eq!(
+            stat_terminal("4711 (zsh) S 4700 4711 4711 34817 4711 4194560 0"),
+            Some(true)
+        );
+        assert_eq!(
+            stat_terminal("4712 (a) b) S 1 4712 4712 0 -1 4194560 0"),
+            Some(false)
+        );
+        assert_eq!(stat_terminal("4713 (cut"), None);
+    }
+
+    /// Live: the shipped table lists this process with its real parent, and the kernel names
+    /// its executable, a test binary that is not aterm.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_live_table_lists_this_process() {
+        let me = std::process::id();
+        let listed = LiveKernel.listed().expect("the table reads");
+        let row = listed
+            .iter()
+            .find(|r| r.pid == me)
+            .expect("this process is listed");
+        assert_eq!(row.ppid, Some(std::os::unix::process::parent_id()));
+        assert!(row.birth.is_some() && row.age_s.is_some(), "{row:?}");
+        assert!(row.terminal.is_some(), "{row:?}");
+        let image = LiveKernel
+            .exe(me)
+            .expect("this process's executable is named");
+        assert!(!image.deleted, "{image:?}");
+        assert!(!is_aterm(&image.path), "{}", image.path.display());
+        assert_eq!(
+            LiveKernel.held(me),
+            at_program_check_here(),
+            "this process runs"
+        );
+    }
+
+    /// What [`LiveKernel::held`] answers for a running process here: not held on macOS, unread
+    /// elsewhere.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn at_program_check_here() -> Option<bool> {
+        cfg!(target_os = "macos").then_some(false)
     }
 }

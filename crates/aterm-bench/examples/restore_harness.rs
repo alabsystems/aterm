@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// Session-restore latency harness: a pane restore replays a serialized ANSI
-// snapshot into a fresh engine (the aterm-wasm `serialize` contract), and this
-// times exactly that, fresh engine plus full replay.
-//
-//   targo --unverified run --release -q -p aterm-bench --example restore_harness
-//   -> {"restore_median_hz":...,"restore_median_mbps":...,"payload_bytes":...,
-//       "history_lines":...,"n":...,"warmup":...}
-//
-// The payload is built with the same grid calls (`get_history_line` +
-// `row_ansi_text_screen`) and layout as `AtermTerminal::serialize`; the wasm
-// lane of `verify perf` times the real export end to end.
+// Session-restore latency harness: replays a serialized ANSI snapshot into a fresh engine.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -20,20 +10,11 @@ use aterm_core::terminal::{Terminal, TerminalBuilder};
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
-
-/// History depth of the snapshot: a healthy working session, ~2x the daemon's
-/// 5k default cap.
 const HISTORY_LINES: usize = 10_000;
-
-/// Ring holds source + restored history without truncation, keeping the replay
-/// workload identical across iterations.
 const RING_LINES: usize = 20_000;
-
 const N_ITERS: usize = 7;
 const WARMUP: usize = 2;
 
-/// Deterministic session-shaped fill: shell-ish lines with SGR color runs so
-/// the replay exercises the SGR path, not just plain text.
 fn fill_corpus() -> Vec<u8> {
     let mut out = Vec::with_capacity(HISTORY_LINES * 64);
     for line in 0..HISTORY_LINES {
@@ -61,8 +42,6 @@ fn fill_corpus() -> Vec<u8> {
     out
 }
 
-/// Build the replayable snapshot with the exact `AtermTerminal::serialize`
-/// layout (see the module header): history + scroll-off + viewport + cursor.
 fn snapshot(term: &Terminal) -> Vec<u8> {
     let grid = term.grid();
     let history = grid.scrollback_lines();
@@ -110,8 +89,6 @@ fn median(samples: &[f64]) -> f64 {
 }
 
 fn main() {
-    // Source session: fill, then snapshot once (snapshot cost is the serialize
-    // side; this lane fences the restore side).
     let corpus = fill_corpus();
     let mut source = TerminalBuilder::new()
         .size(ROWS, COLS)
@@ -121,7 +98,6 @@ fn main() {
     let payload = snapshot(&source);
     let history = source.grid().scrollback_lines();
 
-    // One timed restore: fresh engine + full replay (the product's cold path).
     let one_restore = || -> f64 {
         let mut fresh = TerminalBuilder::new()
             .size(ROWS, COLS)

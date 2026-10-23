@@ -21,7 +21,6 @@ fn key(event_type: KeyEventType) -> InputEvent {
     }
 }
 
-/// A bare modifier / lock key press at the seam.
 fn modifier_press(key: Key) -> InputEvent {
     InputEvent::Key {
         key,
@@ -90,7 +89,6 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
         .clone();
     {
         let mut t = term_lock(&term);
-        // Enough output to build scrollback, then scroll into history and select.
         t.process("x\r\n".repeat(64).as_bytes());
         t.scroll_to_top();
         assert_ne!(t.grid().display_offset(), 0, "viewport is in history");
@@ -101,8 +99,6 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
         t.text_selection_mut().complete_selection();
         assert!(t.text_selection().has_selection());
     }
-    // Release first: no snap, no deselect (a legacy release also encodes
-    // nothing, so the event is a no-op at the PTY).
     let _ = app.input(wid, key(KeyEventType::Release), Source::Human);
     {
         let t = term_lock(&term);
@@ -112,7 +108,6 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
             "release must not deselect"
         );
     }
-    // Repeat (the same held press continuing): neither.
     let _ = app.input(wid, key(KeyEventType::Repeat), Source::Human);
     {
         let t = term_lock(&term);
@@ -122,9 +117,6 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
             "repeat must not deselect"
         );
     }
-    // Inert: every bare modifier and lock key, each on its own. None may
-    // move the viewport or drop the highlight (⌘-C must have something to
-    // copy).
     for k in [
         Key::Named(NamedKey::SuperLeft),
         Key::Named(NamedKey::SuperRight),
@@ -149,7 +141,6 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
             "bare {k:?} must not clear the selection"
         );
     }
-    // Press: snaps to the live bottom and clears the selection in one pass.
     let _ = app.input(wid, key(KeyEventType::Press), Source::Human);
     let t = term_lock(&term);
     assert_eq!(t.grid().display_offset(), 0, "press snaps to bottom");
@@ -173,7 +164,6 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
         ("👨‍👩‍👧‍👦", 2),
         ("中", 2),
         ("中🙂", 4),
-        // Spacing vowel signs take a cell of their own; a ZWJ folds into its base.
         ("\u{915}\u{93f}\u{924}\u{93e}\u{92c}", 5),
         ("\u{2764}\u{200d}\u{1f525}", 1),
     ] {
@@ -263,14 +253,9 @@ fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
                 .cursor_mut()
                 .trail
                 .tick(Some((0, 0)), seed, &trail_cfg, &mut trail_out);
-            // Simulate swallowed older movement gestures. Ctrl-K is newer,
-            // stationary input and must supersede them without replacing
-            // them with another move licence.
             arm_glow(&mut ws.fx.cursor_mut().glow, seed);
             ws.fx.cursor_mut().trail.note_user_gesture(seed);
         }
-        // The headless PTY peer may already be closed; the supersession under
-        // test is a pre-egress side effect.
         let _ = app.input(wid, ctrl_k.clone(), Source::Human);
         let moved = Instant::now();
         let ws = app.windows.get_mut(&wid).unwrap();
@@ -439,24 +424,8 @@ fn failed_inline_key_write_revokes_every_new_movement_licence() {
         );
         assert!(glow_out.is_empty() && trail_out.is_empty());
     }
-    // A key that never reached the PTY clears the movement licence
-    // (`SwallowedKeyClearsLicense`, proved by aterm-spec's registry sweep).
 }
 
-/// A key QUEUED to the session's ordered writer (every key on Windows, where that
-/// writer is the ConPTY writer; on unix a key behind a draining paste) whose write
-/// then FAILS. Its enqueue kept the press credit, since a queued key's bytes will
-/// reach the wire; these never will, so the writer publishes a FAILED receipt and
-/// the render prelude takes the credit back (`revoke_failed_delivery`), as a failed
-/// inline write's dispatch does at once
-/// ([`failed_inline_key_write_revokes_every_new_movement_licence`]).
-///
-/// Driven on the ConPTY route on this host (`force_conpty_route_for_test`), against
-/// the headless stub's invalid sink. CONTROL: with the prelude never run, the typed
-/// glyph's credit, which the enqueue kept, funds the program's own later `+1` as the
-/// key's echo, which is what every such key did before this edge existed. Enter and
-/// Tab bank no credit a one-cell move could spend; for them the test pins that the
-/// failed receipt is read and nothing funds the move.
 #[test]
 fn failed_queued_key_write_revokes_its_press_credit() {
     use std::time::Duration;
@@ -516,8 +485,6 @@ fn failed_queued_key_write_revokes_its_press_credit() {
             app.config.cursor_trail_style = Some("rainbow kitty".to_string());
             let glow_cfg = app.glow_config();
             let session = app.front_terminal(wid).unwrap().session;
-            // The seed frame: the caret at (0,0), and the window's delivery
-            // baseline, without which the prelude applies nothing.
             app.cursor_frame(wid, CursorFxInputs::sample_for_test(Instant::now()))
                 .expect("seed");
             let _route = super::paste_order::force_conpty_route_for_test();
@@ -526,8 +493,6 @@ fn failed_queued_key_write_revokes_its_press_credit() {
                 crate::input::InputOutcome::Ok,
                 "FIFO admission: handed to the session's ordered writer ({event:?})"
             );
-            // The key's dispatch is no later than this; every instant below is
-            // placed after it, however long the writer thread takes.
             let dispatched = Instant::now();
             let sink = app.pool.get(session).unwrap().ctx.sink.clone();
             super::paste_order::await_drain_for_test(&sink);

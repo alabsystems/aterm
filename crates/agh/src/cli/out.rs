@@ -109,7 +109,8 @@ pub(crate) fn with_verb_help(error: Error, verb: &str) -> Error {
 ///
 /// # Errors
 ///
-/// Returns a `Kind::Usage` error when any projection or format flag is set.
+/// Returns a `Kind::Usage` error when `--fields`, `--jq` or `--raw` is set, or `--format` is not
+/// `json`.
 pub(crate) fn refuse_projection_flags(verb: &str, opts: &OutputOpts) -> Result<()> {
     if opts.fields.is_some() || opts.jq.is_some() || opts.raw || opts.format != Format::Json {
         return Err(Error::usage(format!(
@@ -130,7 +131,6 @@ pub(crate) fn check_opts(verb: &str, opts: &OutputOpts) -> Result<()> {
         .map_err(|e| with_verb_help(e, verb))
 }
 
-/// `--fields` and `--jq`, parsed and compiled, with the `--raw` rule checked.
 struct Plan {
     fields: Option<Vec<FieldPath>>,
     program: Option<jq::Program>,
@@ -155,7 +155,6 @@ impl Plan {
     }
 }
 
-/// A list answer's bytes, with the receipt's completeness notes filled in.
 fn render_list(
     noun: Noun,
     items: &[Value],
@@ -174,8 +173,6 @@ fn render_list(
     render_items(noun, items, &plan, opts)
 }
 
-/// A download's rows as Download objects, with the receipt's `digest` and `written` notes
-/// (one file) or its `files` count.
 fn render_files(rows: &[FileWritten], receipt: &mut Receipt, opts: &OutputOpts) -> Result<Vec<u8>> {
     let plan = Plan::of(opts)?;
     if let [one] = rows {
@@ -193,7 +190,6 @@ fn render_files(rows: &[FileWritten], receipt: &mut Receipt, opts: &OutputOpts) 
     render_items(Noun::Download, &items, &plan, opts)
 }
 
-/// One downloaded file as a Download object.
 fn download_row(row: &FileWritten) -> Value {
     let mut map = Map::new();
     map.insert("asset_id".into(), Value::from(row.asset_id));
@@ -212,7 +208,6 @@ fn download_row(row: &FileWritten) -> Value {
     Value::Object(map)
 }
 
-/// Validates `--fields`, when given, against `sample`.
 fn validate(noun: Noun, plan: &Plan, sample: Option<&Value>) -> Result<()> {
     match &plan.fields {
         Some(fields) => project::validate_fields(noun, fields, sample),
@@ -220,7 +215,6 @@ fn validate(noun: Noun, plan: &Plan, sample: Option<&Value>) -> Result<()> {
     }
 }
 
-/// Projects `source` using `--fields`, the whole value, or `defaults`.
 fn projection(noun: Noun, source: &Value, plan: &Plan, defaults: &[FieldPath]) -> Value {
     match &plan.fields {
         Some(fields) => project::project(source, fields),
@@ -229,7 +223,6 @@ fn projection(noun: Noun, source: &Value, plan: &Plan, defaults: &[FieldPath]) -
     }
 }
 
-/// Returns the column paths for `tsv` and `text` rendering.
 fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) -> Vec<FieldPath> {
     if let Some(fields) = &plan.fields {
         return fields.clone();
@@ -256,14 +249,12 @@ fn columns(noun: Noun, plan: &Plan, defaults: Vec<FieldPath>, values: &[Value]) 
     columns
 }
 
-/// `--raw`'s line for one projected value.
 fn raw_line(projected: &Value, plan: &Plan) -> String {
     let path = plan.fields.as_ref().and_then(|f| f.first());
     let value = path.map_or(Value::Null, |path| project::value_at(projected, path));
     format!("{}\n", format::cell(&value))
 }
 
-/// An `Object` answer's bytes.
 fn render_object(noun: Noun, value: &Value, plan: &Plan, opts: &OutputOpts) -> Result<Vec<u8>> {
     let by_rows =
         plan.fields.is_some() || opts.raw || matches!(opts.format, Format::Tsv | Format::Text);
@@ -294,7 +285,6 @@ fn render_object(noun: Noun, value: &Value, plan: &Plan, opts: &OutputOpts) -> R
     Ok(format::render(&values, false, opts.format, opts.header, &columns).into_bytes())
 }
 
-/// An `Items` answer's bytes.
 fn render_items(noun: Noun, items: &[Value], plan: &Plan, opts: &OutputOpts) -> Result<Vec<u8>> {
     let defaults = project::defaults(noun);
     let mut sample = items
@@ -340,7 +330,6 @@ pub fn fail(ctx: &mut Ctx, verb: &str, error: &Error) -> u8 {
     error.exit()
 }
 
-/// Writes `text` to stderr, applying `aterm_codec::tty::safe` when `ctx.stderr_is_terminal`.
 fn write_stderr(ctx: &mut Ctx, text: &str) {
     let text = if ctx.stderr_is_terminal {
         aterm_codec::tty::safe(text.as_bytes())

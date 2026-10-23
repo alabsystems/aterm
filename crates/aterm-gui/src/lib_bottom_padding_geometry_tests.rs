@@ -27,7 +27,6 @@ fn asymmetric_row_fit_is_the_inverse_of_visible_frame_height() {
         }
     }
 
-    // Negative control: the symmetric `pad_split` inverse loses a row at this height.
     let exact = 24 * 14 + 2 + 12;
     assert_eq!(asymmetric_pad_cells(exact, 2, 12, 14), 24);
     assert_eq!(aterm_render::pad_split(exact, 12, 14).cells, 23);
@@ -59,8 +58,6 @@ fn gpu_crop_alignment_is_exact_for_every_parity_and_crop_direction() {
         }
     }
 
-    // Odd removed padding + odd row remainder is where a fixed ceil(delta/2)
-    // compensation is one pixel wrong.
     let (pad, pad_top, grid_height) = (11, 2, 100);
     let raw_height = grid_height + 2 * pad;
     let visible_height = visible_frame_height(raw_height, pad, pad_top);
@@ -72,16 +69,12 @@ fn gpu_crop_alignment_is_exact_for_every_parity_and_crop_direction() {
     assert_eq!((pad - pad_top).div_ceil(2), 5);
 }
 
-/// Drives the real clamp and crop helpers over the model's whole bounded lattice and validates
-/// one Crop transition through the tiered conformance validator.
 #[test]
 fn visible_pad_crop_shipping_helpers_conform_to_model() {
     let model = aterm_models_render::visible_pad_crop_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let choices = model.successors("ChooseGeometry", &model.init_state());
     assert_eq!(choices.len(), 4 * 5 * 4 * 3, "complete bounded lattice");
-    // The projected `pad_top` is this renderer's clamp: the CPU backend's own, and the one
-    // the GPU renderer's `pad_top`/`set_pad_top` delegate to.
     let Some(mut renderer) =
         aterm_render::Renderer::from_system(16.0, aterm_render::Theme::default())
     else {
@@ -101,9 +94,6 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
         let rendered_top = renderer.pad_top();
         let raw_height = grid + head + 2 * pad;
 
-        // The CPU present crops with `Backend::pad_top`, the renderer's own.
-        // Two columns, each pixel its row number: a crop that strode by rows
-        // instead of rows × width would land the wrong row at an edge.
         let rows =
             |height: usize| -> Vec<u32> { (0..height as u32).flat_map(|row| [row, row]).collect() };
         let mut cpu = Frame {
@@ -128,9 +118,6 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
         assert_eq!(cpu.pixels.first().copied(), Some(0));
         assert_eq!(cpu.pixels.last().copied(), Some((cpu.height - 1) as u32));
 
-        // The GPU may crop removed rows above the raw source to align a centred
-        // destination, but its exposed height and edge algebra match the CPU's
-        // for every parity.
         let destination_height = cpu.height.saturating_add((grid + head) % 3);
         let crop_top = gpu_visible_crop_top(raw_height, destination_height, pad, top);
         let mut gpu = Frame {
@@ -162,7 +149,6 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
             );
             assert!(ok, "real Crop transition must conform\n{evidence}");
 
-            // Negative control: the uncropped raw frame leaves a `2*pad - top` bottom.
             let exposed_raw = project_visible_pad_crop(
                 pad,
                 request,
@@ -187,8 +173,6 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
             validated_fixture = true;
         }
 
-        // Negative control for `VisibleTopMatchesRendererTop` (the `Buggy=1` Crop): an
-        // unclamped top through the real GPU path, where the renderer still clamps.
         if pad == 2 && request == 4 && grid == 1 && head == 0 {
             let slipped_top = request;
             renderer.set_pad_top(slipped_top);
@@ -261,7 +245,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
         base_y: 25,
         ..FirePatch::default()
     }];
-    // Renderer-offset/grid-relative streams must not be double-shifted.
     input.nova_add = vec![GlowQuad {
         y: 30,
         alpha: 0,
@@ -293,8 +276,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     assert!(try_shift_window_absolute_effects_y(&mut input, -7));
     assert_eq!(input, original, "+crop/-crop must restore every byte");
 
-    // An impossible source shift degrades without moving effects, and does
-    // so before mutation, so restoration can never corrupt coordinates.
     let mut invalid = RenderInput::empty();
     invalid.cursor_glow_add = vec![GlowQuad {
         y: u16::MAX,
@@ -309,7 +290,6 @@ fn gpu_effect_shift_covers_only_absolute_streams_and_restores_exactly() {
     );
 }
 
-/// An fx layer of one rect, the ramp `c0 → c1` across it.
 fn fx_rect_layer(
     id: u64,
     (x, y, w, h): (i32, i32, u16, u16),
@@ -331,13 +311,6 @@ fn fx_rect_layer(
     )
 }
 
-/// THE TRANSPORT SHIFT MOVES THE FX THAT ARE WINDOW PIXELS (design §4.4): a
-/// Window-space layer's offset and clip and every occluder move by the GPU
-/// source shift, unbounded edges stay unbounded, a Grid-space layer (which
-/// follows `grid_top`) stays put, and `+crop` then `-crop` restores every
-/// byte. A shift that would push a bounded edge onto an unbounded sentinel
-/// (and so not reverse exactly) is refused before any mutation, the u16
-/// streams included.
 #[test]
 fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
     use aterm_core::render::{FxSpace, PxRect};
@@ -384,7 +357,6 @@ fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
     assert!(try_shift_window_absolute_effects_y(&mut input, -7));
     assert_eq!(input, original, "+crop/-crop must restore every byte");
 
-    // A bounded edge that would saturate cannot reverse: refused, unmoved.
     let mut edge = original.clone();
     edge.fx_occluders[0].y1 = i32::MAX - 3;
     let before = edge.clone();
@@ -392,15 +364,6 @@ fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
     assert_eq!(edge, before, "preflight rejects without partial mutation");
 }
 
-/// THE TRANSPORT KEEPS WINDOW FX REGISTERED WITH GRID FX under a pad crop:
-/// the CPU renderer in the raw geometry `configure_visible_y` gives the GPU
-/// (`pad_top` raised by the crop, so the grid sits `crop` rows lower), a
-/// Window-space layer authored in visible pixels over the same grid pixels as
-/// a Grid-space one, and an occluder authored in visible pixels cutting both:
-/// after the transport shift the two frames are byte-identical.
-///
-/// CONTROLS: without the shift the Window layer lands `crop` rows high, and
-/// an occluder left unshifted cuts other pixels of the Grid layer.
 #[test]
 fn gpu_transport_keeps_window_fx_registered_with_grid_fx() {
     use aterm_core::render::{FxSpace, PxRect};
@@ -420,7 +383,6 @@ fn gpu_transport_keeps_window_fx_registered_with_grid_fx() {
     let mut t = aterm_core::terminal::Terminal::new(4, 12);
     t.process(b"\x1b[?25lfx over text\r\nsecond row");
     let base = t.cell_frame(4, 12);
-    // The visible frame's grid origin, where the host authors window pixels.
     let (gx, gy) = (pad as i32, (visible_top + head) as i32);
     let item = (0, 0, (6 * cw) as u16, (2 * ch) as u16);
     let mut grid = fx_rect_layer(1, item, FxSpace::Grid);

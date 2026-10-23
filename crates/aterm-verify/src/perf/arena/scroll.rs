@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `scroll` lane (ARENA-SCROLL, windowed): fill 100k+ lines, then drive a
-//! wheel-scrub and page sweep and a jump-to-top over the control socket and
-//! read the frame pacing back (`max_frame_gap_ms`, `slow_frames`,
-//! `max_frame_render_ms`, render p99). Frame pacing is observable only in a
-//! real window; the headless engine half is the `scroll-scrub` floor lane.
-//!
-//! The aterm side is scripted here. The ghostty side is owner-manual by rule
-//! zero (screen-record a matched scrub and frame-analyse it: its scrollback
-//! exposes no metrics verb), so the ledger leaves it a row.
+//! The windowed `scroll` arena lane: 100k+ line fill, scrub sweep, and jump-to-top.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -68,10 +60,6 @@ fn field(v: &Value, key: &str) -> String {
         .map_or_else(|| "?".into(), |f| format!("{f}"))
 }
 
-/// The lane's scratch `aterm.toml`: retention above the fill, no restored
-/// window, the update and package lanes off, and the audible bell off (this
-/// window is never the owner's terminal, so a BEL its shell rings must not
-/// play their alert sound).
 const CONFIG: &str = "scrollback_lines = 200000\nrestore_session = false\nbell_sound = false\n\n\
                       [update]\nenabled = false\n[packages]\nenabled = false\n";
 
@@ -81,7 +69,6 @@ pub(crate) fn run(args: &Args) -> LaneRun {
 }
 
 fn run_inner(args: &Args) -> Result<String, Halt> {
-    // Deeper than the 100k tiered limit, so the cold (compressed) tier is deep.
     let lines = args.fill_lines.unwrap_or(120_000);
     let steps = args.scrub_steps.unwrap_or(250);
     let (machine, ledgers) = preflight(args.dev_smoke)?;
@@ -98,7 +85,6 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
         private(d)?;
     }
-    // Retention above the fill is configuration, set before launch.
     std::fs::write(config.join("aterm/aterm.toml"), CONFIG)
         .map_err(|e| format!("could not write the config: {e}"))?;
     let sock = sockets.sock("scroll.sock")?;
@@ -120,7 +106,6 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let mut group = Group::spawn(&mut cmd)?;
     await_socket(&mut group, &sock, Duration::from_secs(60))?;
     let c = |verb: &[&str]| ctl_out(&aterm.bin, &sock, verb);
-    // The shell is up and quiet: an event, not a settle.
     c(&["await", "idle", "1000", "timeout=60000"])?;
     let backend = json(&c(&["metrics", "--json"])?)?
         .get("backend")
@@ -129,9 +114,7 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
         .to_string();
     eprintln!("backend: {backend}");
 
-    // A trailing literal backslash-n is the socket's Enter.
     c(&["send", &format!("cat {}\\n", fill.display())])?;
-    // The fill is done when the output has been quiet for two seconds.
     c(&["await", "idle", "2000", "timeout=600000"])?;
     let depth_lines = depth(&c(&["scroll"])?);
     eprintln!(
@@ -155,7 +138,6 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let t0 = Instant::now();
     c(&["scroll", "top"])?;
     let jump_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    // Force a full visible-row decode of the oldest cold tier.
     let shot = root.join("top.png");
     let _ = c(&["image", &shot.display().to_string()]);
     let jump = json(&c(&["metrics", "--json"])?)?;
@@ -207,9 +189,6 @@ mod tests {
         assert_eq!(fill_line(66), fill_line(0).replacen('0', "66", 1));
     }
 
-    /// The lane's window starts with the audible bell off (aterm's default
-    /// is on) and its retention above the fill, as one document aterm's
-    /// parser reads.
     #[test]
     fn the_scroll_window_starts_with_the_audible_bell_off() {
         let doc = aterm_toml::from_str::<aterm_toml::Value>(CONFIG).expect("one document");

@@ -19,9 +19,13 @@ use aterm_objc::{
     msg, msg_super, sel,
 };
 
-/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes, minted unchecked.
+/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes, minted
+/// unchecked: libtest runs every test on a worker (even under `--test-threads=1`), where
+/// `MainThread::new()` answers `None`. Every class here touches no AppKit state and is
+/// instantiated and released on one worker, so its `Ivars` drop on the thread that made them.
 fn mtm() -> aterm_objc::MainThread {
-    // SAFETY: see the doc comment above.
+    // SAFETY: libtest runs tests off the main thread; these classes touch no AppKit state and drop
+    // their `Ivars` on the thread that made them.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
@@ -125,7 +129,9 @@ declare_class! {
         @sel(superHash)
         fn super_hash(&self) -> usize {
             let sup = self.super_receiver();
-            // SAFETY: `-hash` is `-(NSUInteger)hash`.
+            // SAFETY: `-hash` is `-(NSUInteger)hash`, exactly the prototype
+            // below, and `sup` names this class's superclass as the place to
+            // start lookup.
             unsafe {
                 let f: unsafe extern "C-unwind" fn(*const ObjcSuper, Sel) -> usize = msg_super();
                 f(&raw const sup, sel!(hash))
@@ -149,7 +155,8 @@ fn probe(drops: &Arc<AtomicUsize>) -> aterm_objc::Retained<Probe> {
 fn messages_reach_the_rust_bodies_through_objc_msg_send() {
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = probe(&drops);
-    // SAFETY: every prototype below is the exact C signature of the selector declared above.
+    // SAFETY: every prototype below is the exact C signature of the selector declared above, and
+    // `obj` is a live instance of the class that declares it.
     unsafe {
         let void0: unsafe extern "C-unwind" fn(Id, Sel) = msg();
         let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
@@ -194,7 +201,8 @@ fn the_super_send_starts_above_this_class() {
 #[test]
 fn the_type_encodings_are_what_the_runtime_reports() {
     let cls = Probe::class();
-    // SAFETY: runtime method/encoding queries on a registered class.
+    // SAFETY: runtime method/encoding queries on a registered class; the returned string is owned
+    // by the runtime and outlives the read.
     let encoding = |name: &'static CStr| -> String {
         unsafe extern "C" {
             fn class_getInstanceMethod(cls: ClassPtr, sel: Sel) -> *const std::ffi::c_void;
@@ -357,7 +365,7 @@ fn the_conformance_claim_is_readable_and_is_the_classs_own() {
 
     let drops = Arc::new(AtomicUsize::new(0));
     let obj = probe(&drops);
-    // SAFETY: `-conformsToProtocol:` is `B@:@`.
+    // SAFETY: `-conformsToProtocol:` is `B@:@`; `obj` is live and protocol objects are immortal.
     let conforms: Bool = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ProtocolPtr) -> Bool = msg();
         f(

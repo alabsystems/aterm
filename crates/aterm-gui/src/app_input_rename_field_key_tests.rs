@@ -5,7 +5,6 @@ use super::find_field_key_tests::{character, named, type_str};
 use crate::{App, WindowId};
 use aterm_window::keyboard::{ModifiersState, NamedKey};
 
-/// An app with the in-grid strip on and an editor open over its active tab.
 fn app_editing() -> (App, WindowId) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -30,7 +29,6 @@ fn pin(app: &App, session: u64) -> Option<String> {
         .clone()
 }
 
-/// Typing lands in the field, not the shell; ⏎ commits it as the pin.
 #[test]
 fn typing_edits_the_field_and_return_commits_the_pin() {
     let (mut app, wid) = app_editing();
@@ -42,7 +40,6 @@ fn typing_edits_the_field_and_return_commits_the_pin() {
     assert_eq!(app.rename_edit_session(wid), None, "the editor closed");
 }
 
-/// ⎋ cancels, and its `"\u{1b}"` text payload never becomes content.
 #[test]
 fn escape_cancels_and_types_nothing() {
     let (mut app, wid) = app_editing();
@@ -51,13 +48,10 @@ fn escape_cancels_and_types_nothing() {
     assert_eq!(app.rename_edit_session(wid), None, "⎋ closed the editor");
     assert_eq!(pin(&app, 0), None, "and wrote nothing");
 
-    // Reopening starts from the (still unset) pin, not from what was typed.
     assert!(app.begin_active_session_rename(wid));
     assert_eq!(field(&app, wid), Some((String::new(), 0)));
 }
 
-/// ⇥ commits, like every other way of leaving a field, and leaves no tab
-/// character behind.
 #[test]
 fn tab_commits_rather_than_typing_a_tab() {
     let (mut app, wid) = app_editing();
@@ -66,8 +60,6 @@ fn tab_commits_rather_than_typing_a_tab() {
     assert_eq!(pin(&app, 0).as_deref(), Some("ci"));
 }
 
-/// The field keymap is the find bar's: ^A/^E/^K/⌫ and the arrows mean in a
-/// pin what they mean in a query.
 #[test]
 fn the_field_speaks_the_shared_single_line_keymap() {
     let (mut app, wid) = app_editing();
@@ -89,8 +81,6 @@ fn the_field_speaks_the_shared_single_line_keymap() {
     assert_eq!(field(&app, wid), Some(("r".to_string(), 1)), "^E");
 }
 
-/// A bare modifier is neither content nor an exit; otherwise ⇧ before a
-/// capital would settle the edit and send the next character to the shell.
 #[test]
 fn a_bare_shift_does_not_end_the_edit() {
     let (mut app, wid) = app_editing();
@@ -103,9 +93,6 @@ fn a_bare_shift_does_not_end_the_edit() {
     );
 }
 
-/// A key the field does not own commits what was typed and falls through, so
-/// its command runs against a settled world: the same rule
-/// `divert_menu_action_around_rename` applies to menu commands.
 #[test]
 fn an_unowned_key_settles_the_edit_and_does_not_swallow_itself() {
     let (mut app, wid) = app_editing();
@@ -124,10 +111,6 @@ fn an_unowned_key_settles_the_edit_and_does_not_swallow_itself() {
     );
 }
 
-/// The bound paste chord stays in the field: this gate claims `ctrl+v` (the
-/// seeded Windows/Linux chord) rather than settling the edit, which would let
-/// `on_key`'s keybinding block write the clipboard to the PTY. The clipboard's
-/// content is not asserted (this reads the real pasteboard).
 #[test]
 fn a_bound_paste_chord_pastes_into_the_field_instead_of_the_pty() {
     let (mut app, wid) = app_editing();
@@ -148,8 +131,6 @@ fn a_bound_paste_chord_pastes_into_the_field_instead_of_the_pty() {
     );
     assert_eq!(pin(&app, 0), None, "and nothing was committed");
 
-    // Only Paste is claimed: an app-level bound action still settles the edit
-    // and falls through, exactly as an unbound key does.
     assert!(
         !app.on_key_rename_mode(wid, ModifiersState::CONTROL, &character("t")),
         "ctrl+t is New Tab, not a field edit"
@@ -158,8 +139,6 @@ fn a_bound_paste_chord_pastes_into_the_field_instead_of_the_pty() {
     assert!(pin(&app, 0).is_some(), "keeping what was typed");
 }
 
-/// A `[key_sequences]` raw-byte chord is an unowned key like any other: through
-/// the whole `on_key`, it commits the pin first and only then sends its bytes.
 #[test]
 fn a_key_sequence_chord_settles_the_edit_before_its_bytes_are_sent() {
     let (mut app, wid) = app_editing();
@@ -194,8 +173,6 @@ fn a_key_sequence_chord_settles_the_edit_before_its_bytes_are_sent() {
     );
 }
 
-/// A held key repeats against the session captured at press time, and a repeat
-/// that outlives its editor is dropped rather than replayed into a later field.
 #[test]
 fn a_held_key_repeats_against_the_renamed_session_only() {
     let (mut app, wid) = app_editing();
@@ -216,15 +193,12 @@ fn a_held_key_repeats_against_the_renamed_session_only() {
     ));
     assert_eq!(field(&app, wid), Some(("ab".to_string(), 2)));
 
-    // A repeat naming a session that is no longer being edited is refused.
     assert!(
         !app.apply_local_repeat_action(wid, crate::LocalRepeatAction::Rename { session: 99, edit })
     );
     assert_eq!(field(&app, wid), Some(("ab".to_string(), 2)));
 }
 
-/// Composed text (CJK, macOS ⌥-dead keys) belongs to the field too. It
-/// arrives as an IME commit, not `KeyEvent::text`, so it needs its own branch.
 #[test]
 fn an_ime_commit_lands_in_the_field_not_the_shell() {
     let (mut app, wid) = app_editing();

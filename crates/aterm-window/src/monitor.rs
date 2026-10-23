@@ -8,6 +8,8 @@
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::platform_impl;
 
+// LOCAL PATCH (aterm): video modes serve only exclusive fullscreen, which no aterm crate asks for;
+// `VideoModeHandle` and `video_modes` are Windows-only.
 /// Describes a fullscreen video mode of a monitor.
 #[cfg(windows_platform)]
 #[derive(Clone, PartialEq, Eq, Hash)]

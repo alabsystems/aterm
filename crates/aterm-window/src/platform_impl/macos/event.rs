@@ -10,6 +10,9 @@ use aterm_objc::send::{
     send_id, send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_u16, send_usize,
 };
 
+// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
+// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
+// and its framework bindings.
 use crate::keyboard::SmolStr;
 use aterm_objc::cf::{CFDataGetBytePtr, CFDataRef, CFRelease};
 use aterm_objc::{autoreleasepool, class, run_on_main, sel, CGPoint, Id, Obj};
@@ -121,7 +124,8 @@ impl CurrentLayout {
     /// The selected keyboard layout (`TISCopyCurrentKeyboardLayoutInputSource`), or `None`
     /// when it has no Unicode key table.
     fn copy() -> Option<CurrentLayout> {
-        // SAFETY: both calls take and return Carbon references: the source is +1.
+        // SAFETY: both calls take and return Carbon references: the source is +1 (released in
+        // `Drop`), and the layout data is owned by it, so it lives as long as `source` does.
         unsafe {
             let source = ffi::TISCopyCurrentKeyboardLayoutInputSource();
             if source.is_null() {
@@ -187,7 +191,8 @@ pub(crate) fn option_only_character(key: PhysicalKey, shift: bool) -> Option<cha
 
 fn get_logical_key_char(ns_event: Id, modifierless_chars: &str) -> Key {
     let string = autoreleasepool(|_| {
-        // SAFETY: `ns_event` is the live `NSEvent` the caller borrows for the whole of this call.
+        // SAFETY: `ns_event` is the live `NSEvent` the caller borrows for the whole of this call,
+        // and the cast matches the read encoding.
         unsafe { seam::nsstring_to_rust(send_id(ns_event, sel!(charactersIgnoringModifiers))) }
     });
     if string.is_empty() {
@@ -430,7 +435,9 @@ pub(super) fn event_mods(event: Id) -> Modifiers {
 }
 
 pub(super) fn dummy_event() -> Option<Obj> {
-    // SAFETY: the receiver is the live `NSEvent` class object and the argument list is.
+    // SAFETY: the receiver is the live `NSEvent` class object and the argument list is the
+    // prototype `send_id_usize_point_usize_f64_isize_id_i16_isize_isize` names, read from
+    // `method_getTypeEncoding` — note `subtype:` is a SIGNED short.
     let raw = unsafe {
         send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
             class(c"NSEvent").as_id(),

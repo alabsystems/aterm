@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A class may claim a protocol no loaded image registered, and the claim then holds: the crate
-//! registers a name-only protocol rather than skipping the claim or panicking. Only an image whose
-//! `__objc_protolist` carries a protocol registers it, and a Rust binary has none; AppKit
-//! registers `NSApplicationDelegate` on some macOS releases (26) and not on others (14.4.1).
-//!
-//! Nothing here depends on the host's macOS: the first two tests use a name no image carries, the
-//! third a name libobjc carries, and the fourth reports which way this host went.
+//! Runtime registration tests for declared protocols not carried by loaded images.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -22,7 +16,6 @@ use aterm_objc::{
     protocol_or_register, protocols_registered_by_aterm, sel,
 };
 
-/// `+conformsToProtocol:`, which `-[NSObject conformsToProtocol:]` forwards to the class.
 fn conforms(cls: ClassPtr, name: &'static CStr) -> bool {
     let proto = protocol(name);
     if proto.is_null() {
@@ -36,12 +29,9 @@ fn conforms(cls: ClassPtr, name: &'static CStr) -> bool {
     }
 }
 
-/// A protocol name no image in any process carries.
 const NEVER_CARRIED: &CStr = c"ATermObjcProtocolNoImageCarries";
 
 declare_class! {
-    /// Claims a protocol that is absent from the process until this crate
-    /// supplies it.
     struct ClaimsAbsent: NSObject {
         const NAME: &str = "ATermObjcClaimsAbsentProtocol";
         type Ivars = ();
@@ -50,7 +40,6 @@ declare_class! {
 }
 
 declare_class! {
-    /// A second claimant of the same absent protocol: the registration is shared.
     struct AlsoClaimsAbsent: NSObject {
         const NAME: &str = "ATermObjcAlsoClaimsAbsentProtocol";
         type Ivars = ();
@@ -59,7 +48,6 @@ declare_class! {
 }
 
 declare_class! {
-    /// The application delegate's claim, as `crates/aterm-window`'s `app_state.rs` makes it.
     struct ClaimsAppDelegate: NSObject {
         const NAME: &str = "ATermObjcClaimsNSApplicationDelegate";
         type Ivars = ();
@@ -129,11 +117,8 @@ fn a_protocol_the_host_registers_is_never_re_registered() {
         !protocols_registered_by_aterm().contains(&c"NSObject"),
         "NSObject is libobjc's, not this crate's"
     );
-    // No count check: sibling tests push into the process-global registry in parallel.
 }
 
-/// A class claiming `NSApplicationDelegate` with AppKit loaded builds and conforms, whichever
-/// side supplies the protocol on this host.
 #[test]
 fn the_application_delegate_claim_builds_on_this_host_and_is_true() {
     unsafe extern "C" {

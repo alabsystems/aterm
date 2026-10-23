@@ -2,13 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A rapid width sweep that returns to the original column count restores the original wrap
-//! topology: the same viewport and history rows, the prompt directly under its content.
+//! Rapid width-sweep reflow round-trip tests.
 
 use super::super::super::*;
 
-/// A full physical snapshot of the buffer: history rows (oldest first), then
-/// viewport rows, each as (text, wrapped) with trailing blanks trimmed.
 fn physical_snapshot(grid: &Grid) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     for i in 0..grid.scrollback_lines() {
@@ -28,8 +25,6 @@ fn physical_snapshot(grid: &Grid) -> Vec<(String, bool)> {
     out
 }
 
-/// Join the snapshot into logical lines across all boundaries (history and
-/// viewport alike): a wrapped row continues the previous physical row.
 fn logical_lines(snapshot: &[(String, bool)]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (text, wrapped) in snapshot {
@@ -42,7 +37,6 @@ fn logical_lines(snapshot: &[(String, bool)]) -> Vec<String> {
     out
 }
 
-/// Write `text` with autowrap through the grid's own write path, as live output does.
 fn type_line(grid: &mut Grid, text: &str) {
     for c in text.chars() {
         grid.write_char_wrap(c);
@@ -54,8 +48,6 @@ fn feed(grid: &mut Grid) {
     grid.carriage_return();
 }
 
-/// Filler history, one long wrapped logical line at the bottom of the viewport,
-/// then a prompt row. Returns the long line.
 fn build_sweep_grid(grid: &mut Grid) -> String {
     for i in 0..8u16 {
         type_line(grid, &format!("filler-{i}"));
@@ -68,7 +60,6 @@ fn build_sweep_grid(grid: &mut Grid) -> String {
     long
 }
 
-/// A rapid width sweep, ending where it began.
 const SWEEP: [u16; 6] = [24, 16, 9, 13, 21, 30];
 
 fn sweep(grid: &mut Grid) {
@@ -78,13 +69,11 @@ fn sweep(grid: &mut Grid) {
     }
 }
 
-/// A 6×30 grid over a tiered store (the GUI's configuration).
 fn tiered_grid() -> Grid {
     let scrollback = Scrollback::new(1000, 10_000, 10_000_000);
     Grid::with_tiered_scrollback(6, 30, 32, scrollback)
 }
 
-/// The GUI's width step: detach the tiered store, rewrap (inline here), re-attach.
 fn offloaded_resize(grid: &mut Grid, w: u16) {
     match grid.resize_offloading_scrollback(6, w) {
         Some(job) => grid.reattach_reflowed_scrollback(job.reflow()),
@@ -93,8 +82,6 @@ fn offloaded_resize(grid: &mut Grid, w: u16) {
     grid.assert_invariants();
 }
 
-/// Build the sweep shape in `grid`, [`sweep`] it, and require the exact
-/// pre-sweep physical topology back.
 fn assert_sweep_restores_wrap_topology(mut grid: Grid) {
     let long = build_sweep_grid(&mut grid);
 
@@ -117,22 +104,16 @@ fn assert_sweep_restores_wrap_topology(mut grid: Grid) {
     );
 }
 
-/// Every physical row, history and viewport, matches the pre-sweep snapshot: no permanent split at
-/// the history/viewport boundary, no blank band before the prompt.
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_ring() {
     assert_sweep_restores_wrap_topology(Grid::with_scrollback(6, 30, 1000));
 }
 
-/// The same sweep over a tiered store.
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_tiered() {
     assert_sweep_restores_wrap_topology(tiered_grid());
 }
 
-/// Mid-line spaces survive the sweep: a space at a chunk boundary is a trailing blank of a
-/// continued row (outside `row.len()`), so merges and Row->Line seams carry continued rows at full
-/// width.
 #[test]
 fn width_sweep_preserves_spaces_at_chunk_boundaries() {
     let mut grid = Grid::with_scrollback(6, 30, 1000);
@@ -150,8 +131,6 @@ fn width_sweep_preserves_spaces_at_chunk_boundaries() {
     );
 }
 
-/// The GUI's resize path (detach, rewrap, re-attach with the deficit fill per step) settles on
-/// the pre-sweep topology.
 #[test]
 fn width_sweep_round_trip_restores_wrap_topology_offloaded() {
     let mut grid = tiered_grid();
@@ -174,8 +153,6 @@ fn width_sweep_round_trip_restores_wrap_topology_offloaded() {
     );
 }
 
-/// The settled content sequence without trailing blank rows, independent of
-/// the history/viewport seam.
 fn settled_content(grid: &Grid) -> Vec<(String, bool)> {
     let mut snap = physical_snapshot(grid);
     while snap.last().is_some_and(|(t, w)| t.is_empty() && !w) {
@@ -184,8 +161,6 @@ fn settled_content(grid: &Grid) -> Vec<(String, bool)> {
     snap
 }
 
-/// An offloaded width step with a scrolled-back reader matches the never-scrolled resize: the
-/// belt lift reads content rows (`row_at_screen`), so the boundary-straddling line rewraps whole.
 #[test]
 fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
     let build = || {
@@ -194,8 +169,6 @@ fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
         grid
     };
 
-    // The deep shrink pushes the long line's head into history, so its tail is
-    // the viewport's leading continuation belt at the second step.
     let steps = [9u16, 26];
 
     let mut reference = build();
@@ -219,8 +192,6 @@ fn offloaded_resize_while_scrolled_back_matches_unscrolled_topology() {
     );
 }
 
-/// The trailing-blank count captured at detach is counted over content rows, so a scrolled-back
-/// reader does not undercount a genuine erased band for the re-attach fill to refill.
 #[test]
 fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
     let mut grid = tiered_grid();
@@ -228,7 +199,6 @@ fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
         type_line(&mut grid, &format!("filler-{i}"));
         feed(&mut grid);
     }
-    // An erased band: ED 0 from viewport row 2; filler-4/filler-5 remain at rows 0-1.
     grid.move_cursor_to(2, 0);
     grid.erase_to_end_of_screen();
     assert_eq!(grid.row(0).unwrap().to_string().trim_end(), "filler-4");
@@ -252,8 +222,6 @@ fn offloaded_resize_while_scrolled_back_keeps_erased_band_blank() {
     }
 }
 
-/// ED 2 + cursor home during the offloaded reflow window invalidates the
-/// deficit fill armed at detach, so no pre-clear history returns.
 #[test]
 fn clear_mid_flight_does_not_resurrect_history_offloaded() {
     let mut grid = tiered_grid();
@@ -263,7 +231,6 @@ fn clear_mid_flight_does_not_resurrect_history_offloaded() {
         .resize_offloading_scrollback(6, 40)
         .expect("tiered store must detach on a width change");
 
-    // `clear`'s ED 2 + CUP mid-flight; not ED 3, so history survives.
     grid.erase_screen();
     grid.move_cursor_to(0, 0);
 
@@ -283,12 +250,9 @@ fn clear_mid_flight_does_not_resurrect_history_offloaded() {
     );
 }
 
-/// An early-wrapped wide char leaves its last-column cell unwritten; the grow
-/// merge joins the halves without padding that hole.
 #[test]
 fn early_wrap_pad_preserves_real_trailing_spaces() {
     use crate::CellFlags;
-    // Real trailing spaces before the one-cell early-wrap hole are content and survive.
     let mut grid = Grid::new(5, 10);
     type_line(&mut grid, "ABCDEF   "); // cols 0..=8: text + three real spaces
     grid.write_wide_char_wrap_styled(
@@ -323,7 +287,6 @@ fn early_wrap_pad_preserves_real_trailing_spaces() {
 fn grow_merges_early_wrapped_wide_char_without_phantom_space() {
     use crate::CellFlags;
     let mut grid = Grid::new(5, 10);
-    // The wide char cannot start at col 9: it early-wraps and col 9 stays unwritten.
     type_line(&mut grid, "ABCDEFGHI");
     grid.write_wide_char_wrap_styled(
         '世',
@@ -358,8 +321,6 @@ fn grow_merges_early_wrapped_wide_char_without_phantom_space() {
     );
 }
 
-/// The same early-wrap hole across the history boundary: full-width
-/// materialization of the ring head skips the unwritten cell.
 #[test]
 fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
     use crate::CellFlags;
@@ -371,7 +332,6 @@ fn early_wrapped_wide_char_survives_sweep_across_history_boundary() {
         crate::PackedColor::DEFAULT_BG,
         CellFlags::empty(),
     );
-    // The head scrolls into ring history; the wide-char tail stays at the viewport top.
     feed(&mut grid);
     feed(&mut grid);
     assert!(grid.scrollback_lines() >= 1, "sanity: head is in history");

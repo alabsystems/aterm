@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A deterministic fuzz: a 64-bit LCG with fixed seeds instead of `rand`, so the corpus is
-//! the same on every machine and run, a failure reproduces from its seed, and a lucky draw
-//! cannot turn the test green.
-//!
-//! 1. Generated documents: well-formed TOML from every construct in the spec. The value
-//!    half must accept, and the document half reproduce the text byte for byte.
-//! 2. Mutations: one to three characters of a generated document replaced with
-//!    interesting ones. Where the value half accepts, the document half must reproduce the
-//!    text.
-//! 3. Noise: strings drawn from the punctuation alphabet, which exercise the error paths.
-//!
-//! The alphabet holds multi-byte characters, which can land inside a fixed-width window (a
-//! `\u` escape). Phases 2 and 3 work on whole characters so the input stays valid UTF-8,
-//! and every rejection's span must sit on character boundaries.
+//! Deterministic TOML round-trip, mutation, and error-span fuzz tests.
 
-/// A 64-bit linear congruential generator (Knuth's MMIX constants). Chosen over
-/// `rand` for exactly one reason: a fixed seed here means a fixed corpus, on
-/// every machine, forever. `typed`'s round-trip properties draw from it too.
+/// A 64-bit linear congruential generator (Knuth's MMIX constants).
 pub(crate) struct Lcg(u64);
 
 impl Lcg {
@@ -42,7 +27,6 @@ impl Lcg {
         options[self.below(options.len() as u32) as usize]
     }
 
-    /// One character out of an alphabet that may hold multi-byte ones.
     fn pick_char(&mut self, options: &str) -> char {
         let count = options.chars().count() as u32;
         options
@@ -150,9 +134,6 @@ fn generate(rng: &mut Lcg) -> String {
             name.push_str(&level.to_string());
         }
         let array = rng.below(4) == 0;
-        // A header may only be written once, and an array-of-tables header may
-        // only be repeated. Tracking that here keeps the generator inside the
-        // spec instead of testing the duplicate-key path by accident.
         if !array && used_tables.contains(&name) {
             continue;
         }
@@ -192,9 +173,6 @@ fn emit_pair(rng: &mut Lcg, out: &mut String, used: &mut Vec<String>) {
         key.push_str(rng.pick(WHITESPACE));
         key.push_str(rng.pick(BARE_KEYS));
     }
-    // Uniqueness is decided on the spelling, which is coarser than the spec's (two
-    // spellings can name one key); dropping a collision keeps the generator inside
-    // valid TOML.
     let identity = key.replace([' ', '\t'], "");
     if used.iter().any(|u| {
         u == &identity
@@ -247,14 +225,9 @@ fn generated_documents_parse_and_round_trip() {
     );
 }
 
-/// The TOML punctuation alphabet, plus a 2-, a 3- and a 4-byte character, a BOM, and DEL.
-/// Each width matters: a 2-byte character only splits a `\u` window with three digits
-/// before it, a 4-byte one a window with one.
 const INTERESTING_CHARS: &str =
     "[]{}=.,'\"#\\\n\r \t0189abeExXoO_+-:zZTtuU\u{e9}\u{20ac}\u{1f600}\u{feff}\u{7f}";
 
-/// `crates/aterm-gui` slices the source with ranges from the public `Error::span()`, so a
-/// span ending inside a character panics there; every rejection here is held to it.
 fn span_is_char_aligned(source: &str, error: &aterm_toml::Error) -> Result<(), String> {
     let Some(span) = error.span() else {
         return Ok(());
@@ -272,8 +245,6 @@ fn single_character_mutations_round_trip_or_refuse_cleanly() {
     let mut rng = Lcg::new(0x_D15A_57E4);
     let mut divergences = Vec::new();
     for case in 0..4_000u32 {
-        // Whole characters, not bytes, so the result stays valid UTF-8 with a multi-byte
-        // alphabet.
         let mut source: Vec<char> = generate(&mut rng).chars().collect();
         if source.is_empty() {
             continue;
@@ -345,9 +316,6 @@ fn punctuation_noise_never_panics() {
     eprintln!("noise: 20000 inputs, {accepted} of them accidentally valid TOML");
 }
 
-/// A multi-byte character inside a `\u`/`\U` escape's fixed-width digit window. Each count
-/// of hex digits before the intruder and each intruder width lands `pos + 4` (or `pos + 8`)
-/// at a different place inside the character, so the grid is spelled out, not sampled.
 #[test]
 fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
     for (marker, digits) in [('u', 4usize), ('U', 8usize)] {
@@ -357,8 +325,6 @@ fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
                 escape.push(marker);
                 escape.extend(core::iter::repeat_n('0', lead));
                 escape.push(intruder);
-                // Enough trailing digits that the window is never short: the
-                // length guard must not be what saves us here.
                 escape.push_str("00000041");
 
                 let document = format!("x = \"{escape}\"\n");
@@ -366,7 +332,6 @@ fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
                 let error = ours.expect_err(&format!("{document:?} must be rejected"));
                 span_is_char_aligned(&document, &error).expect("boundary-safe span");
 
-                // The same bytes through every other public entry point.
                 assert!(document.parse::<aterm_toml::edit::DocumentMut>().is_err());
                 assert!(document.parse::<aterm_toml::Table>().is_err());
                 let bare = format!("\"{escape}\"");
@@ -378,7 +343,6 @@ fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
     }
 }
 
-/// `u32::from_str_radix` accepts a leading `+`; TOML 1.0's `4HEXDIG` does not.
 #[test]
 fn a_signed_unicode_escape_is_not_four_hex_digits() {
     for document in [

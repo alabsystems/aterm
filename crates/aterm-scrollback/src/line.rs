@@ -639,7 +639,7 @@ impl From<&str> for Line {
 impl std::fmt::Display for Line {
     #[cfg_attr(trust_verify, trust::skip)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `write_str`, not `write!`: no `format_args!` expansion for the `verify
+        // `write_str`, not `write!`: no `format_args!` expansion for the `ship
         // trust` lane to fail closed on.
         f.write_str(&String::from_utf8_lossy(self.as_bytes()))
     }

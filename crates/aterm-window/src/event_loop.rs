@@ -5,6 +5,10 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
+//!
+//! LOCAL PATCH (aterm): the Android, iOS, Orbital and Web arms and the `rwh_05` impls are cut. An
+//! item marked `#[cfg(windows_platform)]` is API no aterm crate calls (custom cursors, device-event
+//! filters, owned display handles, the control-flow getter), which no other backend implements.
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,6 +179,8 @@ impl<T> rwh_06::HasDisplayHandle for EventLoop<T> {
     }
 }
 
+// LOCAL PATCH (aterm): no `AsFd`/`AsRawFd` for the X11 and Wayland loops: they wait in a `poll(2)`
+// over several descriptors, and no aterm crate embeds the loop.
 impl ActiveEventLoop {
     /// Create the window.
     #[inline]

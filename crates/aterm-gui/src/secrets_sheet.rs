@@ -67,7 +67,8 @@ impl App {
                     .as_ref()
                     .map(|w| crate::platform::ns_window_of(w))
                     .filter(|id| !id.is_null())
-                    // SAFETY: live NSWindow borrowed on the main thread.
+                    // SAFETY: a live NSWindow borrowed on the main thread; `-window` is +0,
+                    // retained into an owning `Obj`.
                     .and_then(|id| unsafe { Obj::retain(id) })
                     .map(|ns_window| (*wid, ns_window))
             });
@@ -166,9 +167,11 @@ impl App {
             appkit::send_v_id(accessory.id(), sel!(addSubview:), field.id());
             (url, accessory)
         };
-        // SAFETY: standard NSAlert and event-queue calls on the main thread; `-setAccessoryView:`
-        // retains the accessory, and `-beginSheetModalForWindow:completionHandler:` copies the
-        // block.
+        // SAFETY: standard NSAlert and event-queue calls on the main thread, as the askpass
+        // sheet's: text setters copy, `-addButtonWithTitle:` returns the +0 button the alert
+        // owns, `-setAccessoryView:` retains the accessory, and
+        // `-beginSheetModalForWindow:completionHandler:` copies the block. The field and
+        // panel are retained for the App to hold.
         let (panel, input_fence) = crate::askpass::PROMPT_INPUT.present(|| unsafe {
             let past = appkit::send_id(class(c"NSDate").as_id(), sel!(distantPast));
             if past.is_null() {

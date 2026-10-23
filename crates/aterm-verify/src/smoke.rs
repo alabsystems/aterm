@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The plumbing the GUI smoke stands on. Unix only, like the smoke
-//! (`crate::smoke_stages`).
+//! Plumbing for the Unix GUI smoke (`crate::smoke_stages`).
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// macOS's `sockaddr_un.sun_path` ceiling. Every smoke socket path must stay
-/// under it, which is why the smoke lives in `/tmp` and not in `$TMPDIR`.
+/// macOS `sockaddr_un.sun_path` byte ceiling.
 pub const SUN_LEN: usize = 104;
 
-/// Pull `<field>=<digits>` out of a metrics reply. The field must follow
-/// whitespace, so `max_frames=9` is not a reading of `frames`, and the last
-/// occurrence wins.
+/// Pulls the last whitespace-preceded `<field>=<digits>` out of a metrics reply.
 #[must_use]
 pub fn metric_u64(line: &str, field: &str) -> Option<u64> {
     let needle = format!("{field}=");
@@ -35,14 +31,10 @@ pub fn metric_u64(line: &str, field: &str) -> Option<u64> {
             found = Some(digits);
         }
     }
-    // Saturating rather than failing: an absurd counter is still a counter, and
-    // the comparisons that use this are one-sided floors and ceilings.
     found.map(|d| d.parse::<u64>().unwrap_or(u64::MAX))
 }
 
-/// Pull the whole-millisecond part of `<field>=<digits>.<frac>`, the last
-/// occurrence. Without the decimal point or the digits it yields nothing, which
-/// the caller reports as unparseable metrics rather than a latency finding.
+/// Pulls the whole-millisecond part of the last `<field>=<digits>.<frac>` reading.
 #[must_use]
 pub fn metric_ms_whole(line: &str, field: &str) -> Option<u64> {
     let needle = format!(" {field}=");
@@ -62,8 +54,7 @@ pub fn metric_ms_whole(line: &str, field: &str) -> Option<u64> {
     found.map(|d| d.parse::<u64>().unwrap_or(u64::MAX))
 }
 
-/// Send `-<sig>` to `pid` with `/bin/kill`, so this crate needs no `libc`.
-/// Returns whether the signal was delivered, and anything the tool said.
+/// Sends `-<sig>` to `pid` via `/bin/kill` and returns `(delivered, stderr)`.
 #[must_use]
 pub fn signal(pid: u32, sig: &str) -> (bool, String) {
     let killer = if Path::new("/bin/kill").exists() {
@@ -86,14 +77,8 @@ pub fn signal(pid: u32, sig: &str) -> (bool, String) {
     }
 }
 
-/// Retire and reap one exact child without giving a broken shutdown path the
-/// power to hang the run: TERM, then two seconds, then KILL. Returns
-/// `(ok, stderr_from_kill)`.
-///
-/// Success is a clean exit or death by a signal this function sent: a child
-/// that failed on its own (or died of someone else's signal) is a failed
-/// teardown, because the smoke's conclusions depend on the process it launched
-/// being the process it measured.
+/// Retires and reaps `child` (TERM, 2s wait, then KILL), returning `(ok, stderr_from_kill)`.
+/// Succeeds only on exit 0 or death by a signal sent here.
 pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
     use std::os::unix::process::ExitStatusExt;
 
@@ -159,10 +144,7 @@ pub(crate) fn exited_on_its_own(pid: u32) -> bool {
     }
 }
 
-/// Whether the console session's screen is locked: `CGSSessionScreenIsLocked`
-/// in `ioreg -n Root -d1`'s console users. A locked screen is why no window can
-/// come forward, so a smoke that could not do so says that instead of a guess.
-/// `false` when it cannot be read.
+/// Whether the console session's screen is locked (`CGSSessionScreenIsLocked` in `ioreg`).
 #[must_use]
 pub fn screen_locked() -> bool {
     Command::new("/usr/sbin/ioreg")
@@ -172,22 +154,14 @@ pub fn screen_locked() -> bool {
         .is_ok_and(|out| reads_locked(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// [`screen_locked`]'s reading of `ioreg`'s text.
+/// Checks whether `ioreg` output reports a locked screen.
 #[must_use]
 pub fn reads_locked(ioreg: &str) -> bool {
     ioreg.contains("\"CGSSessionScreenIsLocked\"=Yes")
 }
 
-/// Bring exactly the launched GUI process to the front without Accessibility or
-/// Apple-events permission. A background launch does not activate its AppKit
-/// process, and measured behind the caller's terminal Metal reports `Occluded`
-/// and the run reads `frames=0`. Waits until NSWorkspace reports this pid as
-/// frontmost, re-issuing `activate` ([`ACTIVATE_REISSUE_SECS`]) up to
-/// [`ACTIVATE_DEADLINE_SECS`], then fails closed.
-///
-/// The program runs from a file, never `swift -e`: `-e` is a swift-driver flag,
-/// and the Command Line Tools' Swift on macOS 13 (no swift-driver) runs nothing
-/// and exits 1.
+/// Brings `pid` to the front via AppKit, re-issuing `activate` up to
+/// [`ACTIVATE_DEADLINE_SECS`] until `NSWorkspace` reports it frontmost.
 #[must_use]
 pub fn activate_macos_gui_pid(pid: u32) -> bool {
     const SWIFT: &str = "/usr/bin/swift";
@@ -201,7 +175,6 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
     if std::fs::write(&script, ACTIVATE_SWIFT).is_err() {
         return false;
     }
-    // The budget travels as arguments, so the Swift holds no copy of it to drift.
     let ok = Command::new(SWIFT)
         .arg(&script)
         .arg(pid.to_string())
@@ -225,8 +198,6 @@ pub(crate) const ACTIVATE_DEADLINE_SECS: u32 = 12;
 /// loses a race against a contended WindowServer is not a refusal.
 pub(crate) const ACTIVATE_REISSUE_SECS: u32 = 2;
 
-/// The activation program: `<pid> <deadline secs> <reissue secs>`, the last two
-/// handed over from the two constants above.
 const ACTIVATE_SWIFT: &str = r#"
 import AppKit
 import Foundation
@@ -250,8 +221,7 @@ while Date() < deadline {
 exit(3)
 "#;
 
-/// The last 80 lines of a smoke's child log, indented under the ladder. Empty
-/// when there is nothing to show.
+/// Returns the last 80 lines of a smoke child log, indented under the ladder.
 #[must_use]
 pub fn smoke_log_tail(label: &str, path: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -271,7 +241,7 @@ pub fn smoke_log_tail(label: &str, path: &Path) -> String {
     out
 }
 
-/// Is this path a bound unix socket (or a symlink to one)?
+/// Whether `path` is a bound Unix socket or symlink.
 #[must_use]
 pub fn is_socket_or_symlink(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
@@ -280,11 +250,7 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Is the control socket at `path` listening? A connect the kernel takes into
-/// the backlog, dropped at once, as the server's own `socket_is_live` probe.
-/// The socket file ([`is_socket_or_symlink`]) is not that signal: `bind(2)`
-/// creates it before `listen(2)`, and a client that dials in between is
-/// refused (`ECONNREFUSED`), a window a loaded machine widens.
+/// Whether the control socket at `path` is listening (accepts a connection).
 #[must_use]
 pub fn socket_listening(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
@@ -308,9 +274,7 @@ mod tests {
         assert_eq!(metric_u64("OK frames=0", "frames"), Some(0));
         assert_eq!(metric_u64("OK frames=", "frames"), None);
         assert_eq!(metric_u64("OK", "frames"), None);
-        // The last occurrence wins.
         assert_eq!(metric_u64("OK frames=3 frames=9", "frames"), Some(9));
-        // The latency reading needs its decimal point.
         let m = "OK frames=31 max_input_present_ms=12.480 sync_rel_timeout=0 ";
         assert_eq!(metric_ms_whole(m, "max_input_present_ms"), Some(12));
         assert_eq!(
@@ -341,10 +305,6 @@ mod tests {
         assert!(noise.is_empty(), "teardown must be quiet: {noise}");
     }
 
-    /// The bound is a minute, half the life of the `sleep` the child execs,
-    /// which ignores TERM (the disposition survives the exec) and so ends only
-    /// by the KILL. The child reports its trap before it is retired, so the TERM
-    /// cannot kill the shell first and leave the KILL path untested.
     #[test]
     fn a_child_that_ignores_term_is_killed_within_the_budget() {
         use std::io::BufRead as _;

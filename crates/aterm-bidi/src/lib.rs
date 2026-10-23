@@ -641,7 +641,8 @@ fn fold_cells_and_resolve(
     );
 }
 
-/// Resolve the UAX #9 embedding level of every character in `text` (see the crate docs for the scope; removed X9 characters take the level before them).
+/// Resolve the UAX #9 embedding level of every character in `text` (rules P1–L1 over one
+/// line; removed X9 characters take the level before them).
 #[must_use]
 pub fn resolve_levels(text: &[char], base: BaseDirection) -> Vec<u8> {
     let (classes, brackets) = classes_and_brackets(text);

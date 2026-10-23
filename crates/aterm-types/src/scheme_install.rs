@@ -50,7 +50,10 @@ impl std::error::Error for InstallError {}
 /// Convert the theme at `path` and write it into `theme_dir` as `<id>.conf`.
 ///
 /// # Errors
-/// [`InstallError::Refused`] on an invalid request, or [`InstallError::Failed`] on I/O failure.
+/// [`InstallError::Refused`] before anything is read when `path` is a URL or the id is unusable;
+/// [`InstallError::Exists`] for an existing theme of that id without `replace`;
+/// [`InstallError::Failed`] when the file cannot be read or converted, the result does not read
+/// back unchanged, `theme_dir` is `None` or holds `<id>.conf` in another case, or the write fails.
 pub fn install_theme_file(
     path: &Path,
     name: Option<&str>,

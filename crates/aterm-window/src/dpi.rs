@@ -5,6 +5,11 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! UI scaling: positions and sizes in physical or logical pixels.
+//!
+//! LOCAL PATCH (aterm): upstream re-exports the `dpi` crate; this is the part of it aterm uses.
+//! Gone: the `LogicalUnit`/`PhysicalUnit`/`PixelUnit` and inset types, the
+//! `from_logical`/`from_physical` constructors, the `[x, y]` array conversions, and the `serde`,
+//! `mint` and `no_std` support. `tests/recorded_answers.rs` holds what the package answered.
 
 /// A pixel coordinate type: a primitive number that converts through `f64`.
 pub trait Pixel: Copy + Into<f64> {

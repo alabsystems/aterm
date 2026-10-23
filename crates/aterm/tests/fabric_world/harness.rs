@@ -224,9 +224,25 @@ struct Reaped(Child);
 
 impl Drop for Reaped {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        kill_reaped(&mut self.0);
     }
+}
+
+/// `SIGKILL` `child` and reap it within [`DEADLINE`]; one still there then is left unreaped, since whether a program macOS's program check holds takes its signal is unmeasured.
+fn kill_reaped(child: &mut Child) {
+    let _ = child.kill();
+    let _ = aterm_spec::wait::within(DEADLINE, Duration::from_millis(10), || {
+        child.try_wait().ok().flatten()
+    });
+}
+
+/// The words a wait on `pid`, a child this test spawned, ends the test COULD NOT RUN with when it ran out at [`DEADLINE`] while macOS's program check holds the child ([`aterm_uds::deadline::held_words`]); asked before the child is killed, so any other silence stays the test's failure.
+fn held_at_deadline(pid: u32) -> Option<String> {
+    aterm_uds::deadline::held_words(
+        pid,
+        DEADLINE,
+        aterm_uds::process::at_program_check(i32::try_from(pid).unwrap_or(0)),
+    )
 }
 
 fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
@@ -255,8 +271,14 @@ pub fn wait_output_within(child: Child, what: &str) -> std::process::Output {
     let mut child = Reaped(child);
     let stdout = child.0.stdout.take().map(drain);
     let stderr = child.0.stderr.take().map(drain);
-    let status = until(&format!("{what} to exit"), || {
+    let status = aterm_spec::wait::within(DEADLINE, Duration::from_millis(10), || {
         child.0.try_wait().ok().flatten()
+    })
+    .unwrap_or_else(|| {
+        if let Some(words) = held_at_deadline(child.0.id()) {
+            aterm_uds::host::could_not_run(words);
+        }
+        panic!("timed out after {DEADLINE:?} waiting for: {what} to exit")
     });
     let read = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>, pipe: &str| {
         rx.map_or_else(Vec::new, |rx| {
@@ -283,7 +305,7 @@ pub fn broker_client(sock: impl AsRef<Path>) -> Client {
     Client::from_stream(s)
 }
 
-/// Reads the first line `child` prints on its piped stdout, bounded by [`DEADLINE`].
+/// Reads the first line `child` prints on its piped stdout, bounded by [`DEADLINE`]; a child macOS's program check still holds then ends the test COULD NOT RUN ([`aterm_uds::deadline::held_words`]).
 pub fn first_line_within(child: &mut OwnedChild, what: &str) -> String {
     use std::io::BufRead;
     let out = child.stdout.take().expect("the child's stdout is piped");
@@ -294,8 +316,11 @@ pub fn first_line_within(child: &mut OwnedChild, what: &str) -> String {
         let _ = tx.send(line);
     });
     rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
-        let _ = child.kill();
-        let _ = child.wait();
+        let held = held_at_deadline(child.id());
+        aterm_uds::deadline::kill_within(child, DEADLINE);
+        if let Some(words) = held {
+            aterm_uds::host::could_not_run(words);
+        }
         panic!("timed out after {DEADLINE:?} waiting for: {what}")
     })
 }
@@ -341,6 +366,9 @@ pub struct BrokerChild {
 
 /// Spawns `aterm link broker <args>…` armed with a [`aterm_uds::lifeline::Lifeline`], at test
 /// pace ([`FAST_TIMERS`]): it sees a poisoned log or a cut lifeline within its fast wake.
+///
+/// # Panics
+/// The lifeline's FIFO in `dir` could not be set up, or the spawn failed.
 pub fn spawn_broker(
     dir: &Path,
     args: &[&str],
@@ -362,7 +390,8 @@ pub fn identity_of(pid: u32) -> Option<aterm_uds::process::Identity> {
     aterm_uds::process::read_identity(i32::try_from(pid).ok()?)
 }
 
-/// Terminates the bridge `state/pid` names through [`aterm_uds::process::end_proven`].
+/// Ends the bridge `state/pid` names through [`aterm_uds::process::end_proven`] only if `launcher`
+/// started it and it runs the [`aterm`] under test; otherwise leaves it alone.
 pub fn end_bridge(state: &Path, launcher: Option<aterm_uds::process::Identity>) {
     use aterm_uds::process::{END_GRACE, EndControlLive, Identity, end_proven, pid_alive};
     let Some(pid) = std::fs::read_to_string(state.join("pid"))
@@ -1523,8 +1552,11 @@ impl World {
             })
         }));
         waited.unwrap_or_else(|why| {
-            let _ = child.kill();
-            let _ = child.wait();
+            let held = held_at_deadline(child.id());
+            kill_reaped(child);
+            if let Some(words) = held {
+                aterm_uds::host::could_not_run(words);
+            }
             std::panic::resume_unwind(why)
         })
     }
@@ -1541,9 +1573,13 @@ impl World {
             })
         }));
         waited.unwrap_or_else(|why| {
+            let held = held_at_deadline(child.id());
             let _ = child.kill();
             if let Err(cleanup) = end_owned_child(child) {
                 eprintln!("instance readiness cleanup: {cleanup}");
+            }
+            if let Some(words) = held {
+                aterm_uds::host::could_not_run(words);
             }
             std::panic::resume_unwind(why)
         })

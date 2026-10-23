@@ -260,6 +260,27 @@ struct Mock {
     input_unread_at: Option<Instant>,
     /// When, on the run's clock, the first `send` arrived.
     first_send_at: Option<Instant>,
+    /// Every `text` read, on the run's clock: the script's screen it served and when.
+    read_times: Vec<(usize, Instant)>,
+    /// Every `key` request, on the run's clock: the request and when it arrived.
+    key_times: Vec<(String, Instant)>,
+    /// When, on the run's clock, the supervisor's attention was first set.
+    attention_at: Option<Instant>,
+    /// An `await idle <ms>` of this many ms never latches: it runs its whole timeout on the
+    /// run's clock and times out (a screen that never holds still that long).
+    idle_never_for: Option<&'static str>,
+    /// For this long after the first `send` on the run's clock, the screen does not move: every
+    /// read serves the screen the write found at its seq, and an `await seq` sits until then.
+    unmoved_after_send: Option<Duration>,
+    /// Every `lease` request, on the run's clock: the request and when it arrived.
+    lease_times: Vec<(String, Instant)>,
+    /// A settle that latches says a seq one before the read after it (`OK idle <seq>`): the
+    /// screen moved between the latch and the read.
+    idle_latch_behind: bool,
+    /// The generation `(epoch, seq)` a read of the script's screen `i` reports, its `"seq"`
+    /// and `"gen"`, in place of `1.<seq>` at the mock's seq: a grid entered since (an
+    /// alternate screen, a reset), whose own seq restarted.
+    screen_gens: BTreeMap<usize, (u64, u64)>,
     cursor_row: Option<usize>,
     tail_replies: VecDeque<String>,
     agent_zone: Option<usize>,
@@ -786,6 +807,14 @@ impl Mock {
             input_after: Vec::new(),
             input_unread_at: None,
             first_send_at: None,
+            read_times: Vec::new(),
+            key_times: Vec::new(),
+            attention_at: None,
+            idle_never_for: None,
+            unmoved_after_send: None,
+            lease_times: Vec::new(),
+            idle_latch_behind: false,
+            screen_gens: BTreeMap::new(),
             cursor_row: None,
             tail_replies: VecDeque::new(),
             agent_zone: None,
@@ -1149,9 +1178,42 @@ impl Mock {
         self.scrollback.get_or_insert_with(Vec::new);
         self.alt_screen.get_or_insert(false);
     }
+    /// How much longer the screen stays as the first `send` found it ([`Self::unmoved_after_send`]).
+    fn unmoved_for(&self) -> Option<Duration> {
+        let (hold, sent) = self.unmoved_after_send.zip(self.first_send_at)?;
+        hold.checked_sub(run_since(self.waits.as_deref(), sent))
+            .filter(|left| !left.is_zero())
+    }
+    /// The content seq the next read will carry ([`Self::screen_json`]): the
+    /// screen it serves again while one is held, else the next.
+    fn next_read_seq(&self) -> u64 {
+        let redrawn = self
+            .redrawn_after_reads
+            .is_some_and(|n| self.reads.len() >= n);
+        let last = self.screens.len().saturating_sub(1);
+        let (i, seq) = if self.card_debounce.is_some() || self.held() && !redrawn {
+            (self.served.saturating_sub(1).min(last), self.seq)
+        } else {
+            (self.served.min(last), self.seq + 1)
+        };
+        self.screen_gens.get(&i).map_or(seq, |&(_, s)| s)
+    }
+    /// A settle's latch (`OK idle <seq>`): the seq of the read after it, so that read shows
+    /// the screen the settle latched on, or one before it ([`Self::idle_latch_behind`]).
+    fn idle_latched(&self) -> String {
+        let seq = self.next_read_seq();
+        let seq = if self.idle_latch_behind {
+            seq.saturating_sub(1)
+        } else {
+            seq
+        };
+        format!("OK idle {seq}\n")
+    }
     fn held(&self) -> bool {
-        self.turn_releases
-            .is_some_and(|i| self.served == i + 1 && !self.turned)
+        self.unmoved_for().is_some()
+            || self
+                .turn_releases
+                .is_some_and(|i| self.served == i + 1 && !self.turned)
             || self
                 .key_releases
                 .is_some_and(|i| self.served == i + 1 && !self.keyed)
@@ -1224,8 +1286,9 @@ impl Mock {
                     2
                 }
             });
+        let (epoch, seq) = self.screen_gens.get(&i).copied().unwrap_or((1, self.seq));
         let generation = if self.sends_gen {
-            format!(",\"gen\":\"1.{}\"", self.seq)
+            format!(",\"gen\":\"{epoch}.{seq}\"")
         } else {
             String::new()
         };
@@ -1252,6 +1315,7 @@ impl Mock {
             (None, _) => self.human.remove(0),
         };
         self.reads.push((i, stamp));
+        self.read_times.push((i, run_now(self.waits.as_deref())));
         if let Some((_, &n)) = self.human_seq_from.range(..=self.reads.len()).next_back() {
             self.human_seq = Some(n);
         }
@@ -1282,7 +1346,7 @@ impl Mock {
             rows.join(","),
             self.screens[i].len(),
             self.pane_cols.unwrap_or(120),
-            self.seq
+            seq
         )
     }
     fn exiting(&self) -> bool {
@@ -1552,6 +1616,7 @@ impl Mock {
         let nap = asked.min(self.stall_sleep.unwrap_or(Duration::from_millis(2)));
         let open = self.panel.as_ref().is_some_and(|p| p.at == PanelAt::Open);
         let repaints = self.panel.as_ref().is_some_and(|p| p.repaints);
+        let idle = self.idle_latched();
         let latched = match tail.first() {
             Some(&"seq") => tail
                 .get(1)
@@ -1569,7 +1634,7 @@ impl Mock {
                     .and_then(|ms| ms.parse::<u64>().ok())
                     .map_or(Duration::ZERO, Duration::from_millis);
                 idle_nap(self.waits.as_deref(), still, nap);
-                ok("OK idle\n")
+                ok(&idle)
             }),
             _ => None,
         };
@@ -1802,6 +1867,7 @@ impl Mock {
             .and_then(|ms| ms.parse::<u64>().ok())
             .map_or(Duration::ZERO, Duration::from_millis);
         let nap = asked.min(self.stall_sleep.unwrap_or(Duration::from_millis(2)));
+        let idle = self.idle_latched();
         let latched = match tail.first() {
             Some(&"seq") => tail
                 .get(1)
@@ -1819,7 +1885,7 @@ impl Mock {
                     .and_then(|ms| ms.parse::<u64>().ok())
                     .map_or(Duration::ZERO, Duration::from_millis);
                 idle_nap(self.waits.as_deref(), still, nap);
-                Some(ok("OK idle\n"))
+                Some(ok(&idle))
             }
             _ => None,
         };
@@ -1988,6 +2054,10 @@ impl Mock {
         }
         if self.dead_after_turns.is_some_and(|n| self.turns > n) {
             return Ok(err("exited"));
+        }
+        if verb == "lease" {
+            self.lease_times
+                .push((line.clone(), run_now(self.waits.as_deref())));
         }
         if let Some(r) = self
             .verb_replies
@@ -2180,6 +2250,18 @@ impl Mock {
                     .get(1)
                     .and_then(|n| n.parse::<u64>().ok())
                     .is_some_and(|n| n > self.seq);
+                if let Some(left) = self.unmoved_for() {
+                    let asked = tail
+                        .iter()
+                        .position(|a| *a == "timeout")
+                        .and_then(|i| tail.get(i + 1))
+                        .and_then(|ms| ms.parse::<u64>().ok())
+                        .map_or(Duration::ZERO, Duration::from_millis);
+                    run_nap(self.waits.as_deref(), asked.min(left));
+                    if left > asked {
+                        return Ok(timeout());
+                    }
+                }
                 if self.held() {
                     let asked = tail
                         .iter()
@@ -2204,6 +2286,20 @@ impl Mock {
                     return Ok(ok("OK seq\n"));
                 }
                 Ok(self.stall(tail))
+            }
+            "await"
+                if tail.first() == Some(&"idle")
+                    && self.idle_never_for.is_some()
+                    && tail.get(1).copied() == self.idle_never_for =>
+            {
+                let asked = tail
+                    .iter()
+                    .position(|a| *a == "timeout")
+                    .and_then(|i| tail.get(i + 1))
+                    .and_then(|ms| ms.parse::<u64>().ok())
+                    .unwrap_or(0);
+                run_nap(self.waits.as_deref(), Duration::from_millis(asked));
+                Ok(timeout())
             }
             "await" if tail.first() == Some(&"idle") && !self.idle_after.is_empty() => {
                 let asked = tail
@@ -2260,9 +2356,11 @@ impl Mock {
                     self.served += 1;
                     self.seq += 1;
                 }
-                Ok(ok("OK idle\n"))
+                Ok(ok(&self.idle_latched()))
             }
             "key" => {
+                self.key_times
+                    .push((line.clone(), run_now(self.waits.as_deref())));
                 if self.card_debounce.is_some() {
                     self.reactive_index();
                 }
@@ -2555,6 +2653,8 @@ impl Mock {
                     }
                     match (tail.first(), keyed) {
                         (Some(&"set"), true) => {
+                            self.attention_at
+                                .get_or_insert_with(|| run_now(self.waits.as_deref()));
                             if let Some(word) = self.questions_after_badge.take() {
                                 self.questions = word;
                             }
@@ -2575,6 +2675,10 @@ impl Mock {
                     }
                 }
                 Ok(r)
+            }
+            "await" if tail.first() == Some(&"idle") => {
+                let latched = self.idle_latched();
+                Ok(self.replies.pop_front().unwrap_or_else(|| ok(&latched)))
             }
             _ => Ok(self.replies.pop_front().unwrap_or_else(|| ok("OK\n"))),
         }
@@ -3862,7 +3966,7 @@ impl Ctl for MarkFake {
 
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v6";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v7";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -3879,7 +3983,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v6".to_string());
+            .queue("act word=approve rule=read-only.classify-v7".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -3931,7 +4035,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v6",
+            "@s-9 mark - act word=approve rule=read-only.classify-v7",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -4082,7 +4186,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v6",
+            "mark - act word=approve rule=read-only.classify-v7",
         ],
         "{:?}",
         m.requests
@@ -5022,7 +5126,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v6")
+        Some("mark - act word=approve rule=read-only.classify-v7")
     );
 }
 

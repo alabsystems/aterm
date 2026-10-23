@@ -68,7 +68,7 @@ pub struct BusSpace {
     ep: u32,
     records: BTreeMap<u64, (u64, Rec)>,
     /// Records outside this build's bus class, by seq: each one's `ms`, held
-    /// and never folded (the module doc: unknown is not hostile).
+    /// and never folded (a newer writer's bus class may be wider than this reader's).
     unknown: BTreeMap<u64, u64>,
     covers: Vec<(u64, u64, &'static str)>,
     snap: Option<Rec>,

@@ -1,26 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The compile and scan bounds, and the API contract the call sites rely on. Patterns are
-//! user input, so no pattern or pattern-haystack pair may take unbounded memory, stack or
-//! time.
+//! Compile and scan bound tests for `aterm-regex`.
 
 use std::time::{Duration, Instant};
 
 use aterm_regex::{Error, Regex, RegexBuilder};
 
-/// The limits `aterm-observe` and `aterm-search` pass. 128 KiB (~2,048 instructions)
-/// because the program size is also the per-row scan constant; it refuses the amplifiers
-/// outright (see [`the_worst_program_under_the_ceiling_still_scans_a_row_promptly`]).
 const SIZE_LIMIT: usize = 128 * 1024;
 const DFA_SIZE_LIMIT: usize = 1 << 20;
-/// The pattern-length ceiling both entry points enforce ahead of compilation.
 const MAX_PATTERN_LEN: usize = 1024;
-
-/// A bound on work that must finish, where the regression it catches never
-/// does (an exponential search, four billion instructions emitted, a quadratic
-/// rescan of megabytes): a hang detector of a minute, never a latency budget
-/// (AGENTS.md): a whole-workspace test run is a loaded machine.
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 fn bounded(pattern: &str) -> Result<Regex, Error> {
@@ -30,8 +19,6 @@ fn bounded(pattern: &str) -> Result<Regex, Error> {
         .build()
 }
 
-/// `(a{200}){200}`: thirteen bytes, forty thousand instructions. Compiles under the
-/// default limit and is refused at 128 KiB, as `aterm-observe`'s own test expects.
 #[test]
 fn the_amplifier_pattern_is_rejected_under_the_bounded_builder() {
     let amplifier = "(a{200}){200}";
@@ -46,8 +33,6 @@ fn the_amplifier_pattern_is_rejected_under_the_bounded_builder() {
     }
 }
 
-/// A pattern at the callers' length ceiling still compiles under their size
-/// ceiling — the two bounds have to leave a usable pattern space between them.
 #[test]
 fn a_pattern_at_the_length_ceiling_still_compiles() {
     let at_cap = "a".repeat(MAX_PATTERN_LEN);
@@ -55,7 +40,6 @@ fn a_pattern_at_the_length_ceiling_still_compiles() {
     let re = bounded(&at_cap).expect("1024 literals fit comfortably under 128 KiB");
     assert!(re.is_match(&at_cap));
 
-    // So does the alternation-heavy shape `aterm-search`'s size-limit test uses.
     let alternatives: Vec<String> = (0..100).map(|i| format!("alt{i:05}x")).collect();
     let pattern = alternatives.join("|");
     assert!(pattern.len() <= MAX_PATTERN_LEN);
@@ -64,9 +48,6 @@ fn a_pattern_at_the_length_ceiling_still_compiles() {
     assert!(!re.is_match("prefix alt00042y suffix"));
 }
 
-/// A counted repeat whose body emits nothing stops at its fixed point instead of replaying
-/// `min` times without charging the ceiling (`(?:(?:){4294967295}){4294967295}` would
-/// never finish). The collapse keeps the answer: an empty match at every boundary.
 #[test]
 fn an_empty_body_repeat_collapses_instead_of_spinning() {
     let started = Instant::now();
@@ -92,7 +73,6 @@ fn an_empty_body_repeat_collapses_instead_of_spinning() {
             .find_iter(haystack)
             .map(|m| (m.start(), m.end()))
             .collect();
-        // The empty match at every code-point boundary.
         assert_eq!(
             mine,
             [(0, 0), (1, 1), (2, 2), (4, 4)],
@@ -107,8 +87,6 @@ fn an_empty_body_repeat_collapses_instead_of_spinning() {
     );
 }
 
-/// The ceiling stops the compiler while it emits: a pattern asking for four billion
-/// instructions fails promptly.
 #[test]
 fn an_unbounded_repetition_count_fails_fast_instead_of_allocating() {
     let started = Instant::now();
@@ -130,7 +108,6 @@ fn an_unbounded_repetition_count_fails_fast_instead_of_allocating() {
     );
 }
 
-/// The size limit decides what compiles, in both directions.
 #[test]
 fn the_size_limit_is_the_thing_that_decides() {
     let pattern = "(a{50}){50}"; // 2,500 instructions
@@ -150,7 +127,6 @@ fn the_size_limit_is_the_thing_that_decides() {
     );
 }
 
-/// `dfa_size_limit` is accepted and changes nothing about what compiles.
 #[test]
 fn dfa_size_limit_is_accepted_and_inert() {
     let pattern = "(a{50}){50}";
@@ -159,8 +135,6 @@ fn dfa_size_limit_is_accepted_and_inert() {
     assert!(builder.dfa_size_limit(usize::MAX).build().is_ok());
 }
 
-/// Deep nesting is an error, not a stack overflow: the parser is iterative, but the tree
-/// and its `Drop` are not.
 #[test]
 fn deeply_nested_patterns_are_rejected_rather_than_overflowing() {
     for depth in [300usize, 5_000, 100_000] {
@@ -170,19 +144,15 @@ fn deeply_nested_patterns_are_rejected_rather_than_overflowing() {
             .to_string();
         assert!(err.contains("nests more than"), "depth {depth}: {err}");
     }
-    // Just under the cap still compiles and still matches.
     let pattern = format!("{}a{}", "(".repeat(200), ")".repeat(200));
     let re = Regex::new(&pattern).expect("200 levels is inside the cap");
     assert_eq!(re.find("xax").map(|m| m.range()), Some(1..2));
 
-    // Stacked quantifiers nest the tree too, and are capped the same way.
     let stars = format!("a{}", "*".repeat(100_000));
     let err = Regex::new(&stars).expect_err("100k stacked stars must be refused");
     assert!(err.to_string().contains("nests more than"));
 }
 
-/// Deep nesting is dropped without overflow on a 256 KiB stack, where a recursive `Drop`
-/// would fail.
 #[test]
 fn nesting_is_bounded_on_a_small_stack() {
     let handle = std::thread::Builder::new()
@@ -198,7 +168,6 @@ fn nesting_is_bounded_on_a_small_stack() {
     assert_eq!(handle.join().expect("no stack overflow"), "survived");
 }
 
-/// No exponential blow-up: `(a|a)*b` and friends finish against long runs of `a`.
 #[test]
 fn pathological_patterns_finish_promptly() {
     for (pattern, n) in [
@@ -206,7 +175,6 @@ fn pathological_patterns_finish_promptly() {
         ("(a*)*b", 20_000),
         ("(a+)+b", 20_000),
         ("(a|aa)+b", 20_000),
-        // The textbook exponential case: 199 `a`s can never satisfy 200 + 200.
         ("(?:a?){200}a{200}", 199),
         ("a*a*a*a*a*b", 20_000),
     ] {
@@ -225,7 +193,6 @@ fn pathological_patterns_finish_promptly() {
     }
 }
 
-/// Nested quantifiers over a run that does eventually match are linear too.
 #[test]
 fn adversarial_matching_input_is_also_linear() {
     let re = Regex::new("(a+)+b+").expect("compiles");
@@ -242,8 +209,6 @@ fn adversarial_matching_input_is_also_linear() {
     }
 }
 
-/// The thread-local scratch cache must not leak state between patterns, between
-/// haystacks, or between threads.
 #[test]
 fn the_scratch_cache_is_reused_without_leaking_state() {
     let a = Regex::new(r"\d+").expect("compiles");
@@ -252,7 +217,6 @@ fn the_scratch_cache_is_reused_without_leaking_state() {
         assert_eq!(a.find("xx 42 yy").map(|m| m.as_str()), Some("42"));
         assert_eq!(b.find("xx 42 yy").map(|m| m.as_str()), Some("xx"));
     }
-    // Interleaved iterators over different programs share one cache.
     let mut ia = a.find_iter("1 22 333");
     let mut ib = b.find_iter("a bb ccc");
     assert_eq!(ia.next().map(|m| m.as_str()), Some("1"));
@@ -263,9 +227,6 @@ fn the_scratch_cache_is_reused_without_leaking_state() {
     assert_eq!(ib.count(), 1);
 }
 
-/// `find_iter` over a long haystack is linear, not quadratic: over 2.8 MB a rescan per
-/// match would be ~7 × 10^10 bytes, minutes even on a fast machine, so the hang detector
-/// tells the two apart.
 #[test]
 fn scanning_a_long_haystack_is_linear() {
     let re = Regex::new(r"\b[0-9a-f]{7,40}\b").expect("compiles");
@@ -282,8 +243,6 @@ fn scanning_a_long_haystack_is_linear() {
     }
 }
 
-/// Multi-byte haystacks: offsets are bytes, always on code-point boundaries, and
-/// `.` never matches half a code point.
 #[test]
 fn offsets_are_byte_offsets_on_code_point_boundaries() {
     let text = "e\u{301}\u{4f60}\u{597d}\u{1F600}z";
@@ -297,7 +256,6 @@ fn offsets_are_byte_offsets_on_code_point_boundaries() {
             );
         }
     }
-    // `.` is one code point, not one byte.
     let dot = Regex::new(".").expect("compiles");
     assert_eq!(
         dot.find_iter(text).map(|m| m.len()).collect::<Vec<_>>(),
@@ -305,12 +263,8 @@ fn offsets_are_byte_offsets_on_code_point_boundaries() {
     );
 }
 
-/// The 128 KiB ceiling bounds the per-row scan cost (program size × row length): it
-/// refuses the amplifiers outright, and the heaviest programs it admits still finish a
-/// full row. The step budget (`step_budget_tests` in `src/lib.rs`) bounds the rest.
 #[test]
 fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
-    // Refused outright under 128 KiB.
     for pattern in ["(?:x?){2000}z", "(?:x|x|x|x|x|x|x|x){400}z"] {
         assert!(
             pattern.len() <= MAX_PATTERN_LEN,
@@ -322,7 +276,6 @@ fn the_worst_program_under_the_ceiling_still_scans_a_row_promptly() {
         );
     }
 
-    // Admitted: just under the ceiling, on a full row.
     let row = "x".repeat(4096);
     for pattern in ["(?:x?){1020}z", "(?:x|x|x|x|x|x|x|x){100}z"] {
         let Ok(re) = bounded(pattern) else { continue };

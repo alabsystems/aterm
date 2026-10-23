@@ -3,11 +3,8 @@
 
 //! Bounded admission for config-referenced visual-effect files.
 //!
-//! A manifest path is no proof of a normal file: a FIFO can park `open`, a device can stream
-//! without end, and a path can be swapped between a metadata check and a second open. So: one
-//! open, non-blocking where the platform has the flag, checks on the opened handle, and a read
-//! of at most the limit plus one sentinel byte. Unix and Windows refuse a final-component
-//! link/reparse point.
+//! Opens once with non-blocking and no-follow semantics where available, verifies the opened
+//! handle is a regular file, and reads at most `max_bytes` plus one sentinel byte.
 
 use std::io::{self, Read as _};
 use std::path::Path;
@@ -27,8 +24,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Test-only RAII counter of open attempts for one exact absolute path. Thread-local so
-/// parallel tests do not see each other's opens; `Rc` keeps the guard on its thread.
+/// Test-only RAII counter of open attempts for an exact absolute path.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub struct OpenProbeGuard {
@@ -87,8 +83,7 @@ fn note_open_attempt(path: &Path) {
     });
 }
 
-/// Maximum size of a user-supplied Sparkle Words lexicon override: the Toy Pack ceiling
-/// ([`crate::spec::MAX_TOY_PACK_BYTES`]), a hard bound on file I/O and parser input.
+/// Maximum size of a user-supplied Sparkle Words lexicon override ([`crate::spec::MAX_TOY_PACK_BYTES`]).
 pub const MAX_SPARKLE_LEXICON_BYTES: usize = 256 * 1024;
 
 #[inline]
@@ -137,10 +132,6 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
 
 /// Windows' reparse-point flag stands in for `O_NOFOLLOW`; the attribute is checked on the
 /// opened handle before any byte is read.
-/// Backup semantics let a directory open too, so the handle check refuses it
-/// as not regular, as on unix; without it `CreateFileW` answers a directory
-/// with `ERROR_ACCESS_DENIED`, and a toy pack path naming a folder read
-/// "unreadable (Access is denied.)".
 #[cfg(windows)]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -189,10 +180,7 @@ fn check_observed_size(observed_len: u64, max_bytes: usize) -> io::Result<usize>
         .min(max_bytes))
 }
 
-/// Read a same-handle regular file into a bounded byte vector.
-///
-/// Metadata only rejects early: the `max + 1` sentinel read is authoritative, so a file that
-/// grows after `fstat` cannot exceed the allocation or reach a parser truncated at the limit.
+/// Read a same-handle regular file into a byte vector bounded by `max_bytes`.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let (file, observed_len) = open_regular(path)?;
     let reserve_len = check_observed_size(observed_len, max_bytes)?;
@@ -229,9 +217,7 @@ const fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
     hash.finish()
 }
 
-/// Fingerprint contents already admitted through [`read_bounded_regular_utf8`]; equal to
-/// [`fingerprint_bounded_regular_utf8`] on the same bytes, without reopening the path (no ABA
-/// race).
+/// Fingerprint UTF-8 contents already admitted through [`read_bounded_regular_utf8`].
 #[inline]
 #[must_use]
 pub const fn fingerprint_admitted_utf8(contents: &str) -> u64 {
@@ -248,8 +234,7 @@ fn invalid_utf8() -> io::Error {
     )
 }
 
-/// Hash an admitted UTF-8 feed without allocating its contents, under the same admission rules
-/// as [`read_bounded_regular_utf8`]. UTF-8 split across read buffers is carried over.
+/// Hash an admitted UTF-8 feed without allocating its contents.
 pub fn fingerprint_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<u64> {
     let (mut file, observed_len) = open_regular(path)?;
     let _ = check_observed_size(observed_len, max_bytes)?;

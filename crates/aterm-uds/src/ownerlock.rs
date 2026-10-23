@@ -1,38 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who holds a file's owner lock: the probe the PTY keeper reads a dead window's crash marker
-//! with (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.4 row 3), on the same files as aterm-gui's
-//! `crash_signal::markers::probe`. It opens read-only without following a symlink or blocking
-//! on a FIFO, tries `flock(LOCK_EX|LOCK_NB)`, and unlocks a lock it took before closing,
-//! through std (`File::try_lock`, `File::unlock`) so the workspace's flock lint sees it
-//! (`clippy.toml`).
-//!
-//! A marker's owner holds `LOCK_EX` for its whole life and the kernel drops it when the owner
-//! dies, so a lock this probe can take says no process holds the marker open.
-//!
-//! `LOCK_UN` before `close` matters: `flock` binds to the open file description, so a child
-//! forked during the probe would otherwise keep the lock on its inherited copy and the next
-//! probe would read the marker as live.
+//! Non-blocking `flock` owner-lock probe for crash marker files.
 
 use std::path::Path;
 
-/// What trying a file's owner lock says.
+/// Result of probing a file's owner lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
-    /// Someone holds it: a live process has the file open with the lock.
+    /// A live process holds the lock.
     Live,
     /// The lock was free.
     Dead,
-    /// The file could not be opened or locked for another reason (missing, a
-    /// symlink, nonregular file, a platform with no wiring): no evidence either way.
+    /// The file could not be opened or locked as a regular file, or this platform has no wiring.
     Unknown,
 }
 
-/// Probe `path`'s owner lock without waiting. See the module docs.
+/// Probes `path`'s owner lock without blocking.
 #[must_use]
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-// Skip: the body is `probe_while_locked`'s, which bottoms out at FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn probe(path: &Path) -> Owner {
     probe_while_locked(path, || {})
@@ -41,11 +27,9 @@ pub fn probe(path: &Path) -> Owner {
 /// [`probe`], running `while_locked` while the probe's own descriptor holds the lock (never,
 /// when the lock was not free). The tests fork there to check that the `LOCK_UN` happens.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-// Skip: bottoms out at std's `open`/`flock` FFI calls.
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe_while_locked(path: &Path, while_locked: impl FnOnce()) -> Owner {
     use std::os::unix::fs::OpenOptionsExt as _;
-    // std adds O_CLOEXEC to every open.
     #[cfg(target_vendor = "apple")]
     const FLAGS: i32 = 0x0100 /* O_NOFOLLOW */ | 0x0004 /* O_NONBLOCK */;
     #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
@@ -65,8 +49,6 @@ fn probe_while_locked(path: &Path, while_locked: impl FnOnce()) -> Owner {
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
         return Owner::Unknown;
     }
-    // `try_lock` is `flock(LOCK_EX|LOCK_NB)` here, and only EWOULDBLOCK is
-    // `WouldBlock`.
     #[expect(
         clippy::disallowed_methods,
         reason = "a probe: a lock it takes is let go by unlock() before its close"
@@ -90,8 +72,6 @@ pub fn probe(_path: &Path) -> Owner {
     Owner::Unknown
 }
 
-// Two attributes, not `cfg(all(test, ..))`: the wasm-process census masks unshipped items only
-// by the exact spelling `#[cfg(test)]`, and this module spawns a thread.
 #[cfg(test)]
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(crate) mod tests {
@@ -103,22 +83,16 @@ pub(crate) mod tests {
         fn write(fd: i32, buf: *const core::ffi::c_void, count: usize) -> isize;
     }
 
-    /// The holder lets go as the probe does, `LOCK_UN` then close: a bare close frees the lock
-    /// only when no copy of the description remains, and a sibling test's spawn may hold one.
     fn release(file: std::fs::File) {
         file.unlock().expect("LOCK_UN");
         drop(file);
     }
 
-    /// What the parked child execs once let go (NixOS has no `/usr/bin/true`).
     const SHELL: &str = "/bin/sh";
 
     /// A child parked between `fork` and `exec`, holding a copy of every descriptor this
     /// process had open: the state a sibling test's `pre_exec` spawn puts this process in for
     /// milliseconds at a time, made deterministic.
-    ///
-    /// [`Parked::release`] lets it go and returns its exit status; `Drop` lets it go on every
-    /// other path. The child always ends by exec'ing `/bin/sh -c 'exit 0'`.
     pub(crate) struct Parked {
         ours: std::os::unix::net::UnixStream,
         spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>>,
@@ -143,8 +117,8 @@ pub(crate) mod tests {
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
                 // SAFETY: runs in the forked child before `exec` and calls only the
-                // async-signal-safe `write(2)` and `read(2)`, on a descriptor the parent keeps
-                // open (`theirs`, alive until `status` returns).
+                // async-signal-safe `write(2)` and `read(2)`, on a descriptor the parent keeps open
+                // (`theirs`, alive until `status` returns).
                 unsafe {
                     cmd.pre_exec(move || {
                         let mut byte = 0u8;
@@ -157,7 +131,6 @@ pub(crate) mod tests {
                 drop(theirs);
                 status
             });
-            // Built before the wait, so `Drop` lets go of a child that never parks.
             let mut parked = Self {
                 ours,
                 spawner: Some(spawner),
@@ -183,8 +156,6 @@ pub(crate) mod tests {
             }
         }
 
-        /// Answer the child's read, then end the stream so a read that missed the byte sees
-        /// end of file. A child that already exited needs nothing.
         fn let_go(&mut self) {
             let _ = self.ours.write_all(b"g");
             let _ = self.ours.shutdown(std::net::Shutdown::Write);
@@ -200,9 +171,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Held through another open is `Live`, released is `Dead` (while a forked child holds a
-    /// copy of the holder's descriptor), missing or a symlink is `Unknown`, and a FIFO is
-    /// answered without waiting for a writer (`Unknown` on Darwin, whose `flock` refuses one).
     #[test]
     fn the_probe_reads_the_owner_lock() {
         let dir = std::env::temp_dir().join(format!("ownerlock-{}", std::process::id()));
@@ -242,8 +210,6 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A child forked between the probe's `flock` and its `LOCK_UN` holds the probe's open
-    /// file description, and the next probe still reads `Dead`.
     #[test]
     fn a_child_forked_mid_probe_does_not_keep_the_probes_lock() {
         let dir = std::env::temp_dir().join(format!("ownerlock-mid-{}", std::process::id()));

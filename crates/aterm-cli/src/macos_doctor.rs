@@ -196,12 +196,12 @@ fn save_automatic_plan(root: &Path, selected: Selection) -> Result<(), String> {
 }
 
 fn authorized_selection(root: &Path) -> Result<Option<Selection>, String> {
-    authorized_selection_with_flush(root, durable_directory)
+    authorized_selection_with_flush(root, durable_name)
 }
 
 fn authorized_selection_with_flush(
     root: &Path,
-    flush: impl FnMut(&Path) -> std::io::Result<()>,
+    flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Option<Selection>, String> {
     let path = root.join("automatic-plan.json");
     let bytes = match std::fs::read(&path) {
@@ -276,7 +276,6 @@ fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
     )
 }
 
-/// [`apply_on_first_run_at`] on `sys` and `host`, as `build` at `now`.
 fn apply_on_first_run_with(
     root: &Path,
     sys: &dyn System,
@@ -433,12 +432,12 @@ pub fn first_run_finished() -> Result<bool, String> {
 }
 
 fn first_run_complete(root: &Path) -> Result<bool, String> {
-    first_run_complete_with_flush(root, durable_directory)
+    first_run_complete_with_flush(root, durable_name)
 }
 
 fn first_run_complete_with_flush(
     root: &Path,
-    flush: impl FnMut(&Path) -> std::io::Result<()>,
+    flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<bool, String> {
     let path = root.join("first-run.json");
     let bytes = match std::fs::read(&path) {
@@ -487,31 +486,22 @@ fn automatic_retry_due(
     Ok(age.map_or(true, |age| age >= std::time::Duration::from_secs(60)))
 }
 
-/// What a held item's row says once its automatic tries are spent ([`Host::hold`]).
 const HELD: &str = "aterm tried this by itself and it did not take, so it will not try again on its own; Apply in System State, or run aterm doctor --apply, to try again";
 
-/// Message shown between the first and last automatic retry.
 const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own when ten minutes have passed, on setup's next try or at aterm's next launch; Apply in System State, or run aterm doctor --apply, to try now";
 
-/// What a setting says that an automatic pass of this run found as wanted.
 const SETTLED: &str = "aterm set this once in this setup and it has changed since, so setup leaves it; Apply in System State, or run aterm doctor --apply, to set it again";
 
-/// Message shown when non-withheld keys settled and Notification Center awaits [`follow_up_at`].
-const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's own step for it, whose row says how that went; aterm set the rest once in this setup and leaves it as it is now; Apply in System State, or run aterm doctor --apply, to set it all now";
+const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's own step for it, whose row says how that went; Apply in System State, or run aterm doctor --apply, to clear it now";
 
-/// How many times an automatic pass of one build makes a change that does not verify.
 const TRIES: u32 = 2;
 
-/// How long after a try that did not verify the next one may come.
 const SECOND_TRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// How many builds' failed tries the record keeps.
 const HELD_BUILDS: usize = 16;
 
-/// The record of what this run's automatic passes did by themselves ([`automatic_pass`]).
 const HELD_RECORD: &str = "automatic-held.json";
 
-/// Run one unattended setup pass.
 fn automatic_pass(
     host: &mut dyn Host,
     root: &Path,
@@ -534,13 +524,11 @@ fn automatic_pass(
     Ok(pass.report)
 }
 
-/// `now` in seconds since the epoch, as the records keep a try's time.
 fn epoch_secs(now: std::time::SystemTime) -> u64 {
     now.duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
 }
 
-/// The tries a record keeps ([`Failed`]) in its `entries`.
 fn load_tries(entries: &Value, bad: &dyn Fn() -> String) -> Result<Vec<Failed>, String> {
     entries
         .as_array()
@@ -560,7 +548,33 @@ fn load_tries(entries: &Value, bad: &dyn Fn() -> String) -> Result<Vec<Failed>, 
         .collect()
 }
 
-/// `failed`, as a record keeps it.
+/// `ids` as this build names them, each once, in order: an id an older aterm recorded is the
+/// items it stands for now ([`aterm_machines::init_preferences::current_ids`]; `withheld`
+/// for the follow-up's record).
+fn current_ids(ids: Vec<String>, withheld: bool) -> Vec<String> {
+    let mut current = Vec::new();
+    for id in ids {
+        for now in aterm_machines::init_preferences::current_ids(&id, withheld) {
+            if !current.contains(&now) {
+                current.push(now);
+            }
+        }
+    }
+    current
+}
+
+/// `failed` with each item as this build names it ([`current_ids`]).
+fn current_tries(failed: Vec<Failed>, withheld: bool) -> Vec<Failed> {
+    failed
+        .into_iter()
+        .flat_map(|f| {
+            aterm_machines::init_preferences::current_ids(&f.item, withheld)
+                .into_iter()
+                .map(move |item| Failed { item, ..f.clone() })
+        })
+        .collect()
+}
+
 fn tries_json(failed: &[Failed]) -> Vec<Value> {
     failed
         .iter()
@@ -568,7 +582,6 @@ fn tries_json(failed: &[Failed]) -> Vec<Value> {
         .collect()
 }
 
-/// Items held back by `failed` in a pass of `build` at `now`.
 fn held_back(failed: &[Failed], build: &str, now: u64) -> Vec<(String, Hold)> {
     failed
         .iter()
@@ -586,7 +599,6 @@ fn held_back(failed: &[Failed], build: &str, now: u64) -> Vec<(String, Hold)> {
         .collect()
 }
 
-/// Count a try of each of `items` by `build` at `now` in `failed` ([`HELD_BUILDS`]).
 fn count_tries(failed: &mut Vec<Failed>, build: &str, now: u64, items: &[String]) {
     for item in items {
         match failed
@@ -642,7 +654,6 @@ struct Failed {
 }
 
 impl Automatic {
-    /// The record of setup run `revision`.
     fn load(root: &Path, revision: u64) -> Result<Self, String> {
         let path = root.join(HELD_RECORD);
         let bytes = match std::fs::read(&path) {
@@ -666,7 +677,10 @@ impl Automatic {
             .map(|item| item.as_str().map(str::to_owned).ok_or_else(bad))
             .collect::<Result<_, _>>()?;
         let failed = load_tries(&record["failed"], &bad)?;
-        Ok(Self { settled, failed })
+        Ok(Self {
+            settled: current_ids(settled, false),
+            failed: current_tries(failed, false),
+        })
     }
 
     fn save(&self, root: &Path, revision: u64) -> Result<(), String> {
@@ -679,7 +693,6 @@ impl Automatic {
         )
     }
 
-    /// What a pass of `build` at `now` leaves alone ([`SETTLED_OWED`], [`SETTLED`], [`held_back`]).
     fn holds(&self, build: &str, now: u64, owed: &Withheld) -> Vec<(String, Hold)> {
         let mut holds: Vec<(String, Hold)> = self
             .settled
@@ -709,7 +722,6 @@ impl Automatic {
         holds
     }
 
-    /// Add what a pass of `build` at `now` did; whether the record changed.
     fn add(&mut self, build: &str, now: u64, pass: &Pass) -> bool {
         let before = (self.settled.len(), self.failed.clone());
         for item in &pass.settled {
@@ -742,7 +754,6 @@ enum PersonScope {
 }
 
 impl PersonScope {
-    /// The refusal fixed for the life of the process ([`lasting_scope_refusal`]).
     fn lasting(self) -> Option<String> {
         match self {
             Self::Refused(why) => Some(why),
@@ -761,7 +772,6 @@ fn person_scope() -> PersonScope {
     )
 }
 
-/// The pure half of [`person_scope`].
 fn scope_of(
     private: bool,
     uid: u32,
@@ -813,7 +823,8 @@ fn account_home(uid: u32) -> Result<PathBuf, String> {
     let mut storage = vec![0u8; 65_536];
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
     let mut found = std::ptr::null_mut();
-    // SAFETY: the result and scratch buffers are live and exclusively borrowed for the call.
+    // SAFETY: the result and scratch buffers are live and exclusively borrowed
+    // for the call; getpwuid_r's strings point into storage until copied below.
     let status = unsafe {
         libc::getpwuid_r(
             uid,
@@ -841,7 +852,6 @@ fn account_home(uid: u32) -> Result<PathBuf, String> {
 struct HeldLock(std::fs::File);
 
 impl HeldLock {
-    /// Sample an existing profile pass without creating state or waiting for it.
     fn profile_active(root: &Path) -> Result<bool, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let file = match std::fs::OpenOptions::new()
@@ -946,25 +956,16 @@ trait Host {
     fn selection(&self) -> Selection {
         Selection::all().workstation()
     }
-    /// Full Disk Access status measured for this process.
     fn full_disk_access(&self) -> Option<bool>;
-    /// Make later passes run the settings `selected` checks (its workstation part).
     fn select(&mut self, selected: Selection);
     fn read(&mut self, target: &Target) -> Result<Option<PValue>, String>;
     fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String>;
-    /// The before-images of what `group`'s pass ([`WorkstationGroup::Withheld`]).
     fn preference_changes(&mut self, group: WorkstationGroup) -> Result<Vec<Saved>, String>;
-    /// The items whose change the apply passes since the last call reached, in run order.
     fn attempts(&mut self) -> Vec<Attempt>;
-    /// Items left in their target state by apply passes since the last call.
     fn settled(&mut self) -> Vec<String>;
-    /// Items with container keys skipped for lack of Full Disk Access since the last call.
     fn withheld(&mut self) -> Vec<String>;
-    /// Leave `items` alone in later passes, each as its [`Hold`] says.
     fn hold(&mut self, items: &[(String, Hold)]);
-    /// The items later passes leave alone ([`Host::hold`]), by id.
     fn held(&self) -> Vec<String>;
-    /// Record a change in the run's converge journal before it is made.
     fn journal(
         &mut self,
         id: &str,
@@ -972,7 +973,9 @@ trait Host {
         to: &str,
         revert: Option<&str>,
     ) -> Result<(), String>;
-    fn restart(&mut self, name: &str) -> Result<(), String>;
+    /// Relaunch `name`, and return once it runs again and what it reads of `reads` has
+    /// settled, so a read-back after it reads what the relaunched process kept.
+    fn restart(&mut self, name: &str, reads: &[&Target]) -> Result<(), String>;
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String>;
     fn restore_runtime(&mut self, saved: &[Saved]) -> Vec<Row>;
 }
@@ -988,14 +991,11 @@ struct Attempt {
     preferences: Vec<Saved>,
 }
 
-/// The shared items of one group's pass ([`aterm_machines::init::prepare_workstation_selected`]).
 type Prepare =
     Box<dyn FnMut(&dyn System, WorkstationGroup, Selection) -> Result<Workstation, String>>;
 
-/// The `defaults` client every preference read and write of the doctor's own runs.
 const DEFAULTS: &str = "/usr/bin/defaults";
 
-/// The doctor's host ([`System`]).
 struct NativeHost {
     sys: Box<dyn System>,
     prepare: Prepare,
@@ -1010,7 +1010,6 @@ struct NativeHost {
 }
 
 impl NativeHost {
-    /// The profile on this Mac ([`withheld`]).
     fn new() -> Self {
         Self::over(
             Box::new(aterm_machines::port::Live::new().with_full_disk_access(full_disk_access())),
@@ -1018,14 +1017,12 @@ impl NativeHost {
         )
     }
 
-    /// The settings `selected` checks, on this Mac.
     fn selected(selected: Selection) -> Self {
         let mut host = Self::new();
         host.selected = selected.workstation();
         host
     }
 
-    /// The profile on `sys`, its items from `prepare`.
     fn over(sys: Box<dyn System>, prepare: Prepare) -> Self {
         Self {
             sys,
@@ -1040,12 +1037,10 @@ impl NativeHost {
         }
     }
 
-    /// Whether this pass reads `target` where macOS shows it ([`Saved::granted`]).
     fn granted(&self, target: &Target) -> bool {
         !contained(target) || self.sys.full_disk_access() == Some(true)
     }
 
-    /// `group`'s pass, leaving alone what this host holds.
     fn prepare(&mut self, group: WorkstationGroup) -> Result<Workstation, String> {
         let mut prepared = (self.prepare)(self.sys.as_ref(), group, self.selected)?;
         prepared.hold(&self.held);
@@ -1169,14 +1164,39 @@ impl Host for NativeHost {
         }
     }
 
-    fn restart(&mut self, name: &str) -> Result<(), String> {
-        let uid = aterm_uds::peer::our_uid().to_string();
-        let killall = Cmd::new("/usr/bin/killall").args(["-u", uid.as_str(), name]);
-        match self.sys.run(&killall) {
-            Ok(ran) if ran.success() || ran.status == Some(1) => Ok(()),
-            Ok(ran) => Err(format!("restart {name}: {}", ran.describe())),
-            Err(e) => Err(format!("restart {name}: {e}")),
+    /// The shared items' own relaunch ([`aterm_machines::init_activation::relaunch_reading`]),
+    /// journaled first by the caller (`refresh`).
+    fn restart(&mut self, name: &str, reads: &[&Target]) -> Result<(), String> {
+        let user = own_account(self.sys.euid());
+        let keys: Vec<aterm_machines::items::defaults::Target> = reads
+            .iter()
+            .map(|target| {
+                if target.host {
+                    aterm_machines::items::defaults::Target::host(
+                        &target.domain,
+                        &target.key,
+                        &user,
+                    )
+                } else {
+                    aterm_machines::items::defaults::Target::user(
+                        &target.domain,
+                        &target.key,
+                        &user,
+                    )
+                }
+            })
+            .collect();
+        let answer = aterm_machines::init_activation::relaunch_reading(
+            self.sys.as_ref(),
+            &user,
+            name,
+            &keys,
+        );
+        // What it now holds is what it settled on, not what was read before it.
+        for target in reads {
+            self.domains.remove(&(target.domain.clone(), target.host));
         }
+        answer.map_err(|why| format!("restart {name}: {why}"))
     }
 
     fn workstation(&mut self, group: WorkstationGroup, apply: bool) -> Result<Vec<Row>, String> {
@@ -1336,7 +1356,6 @@ impl Host for NativeHost {
     }
 }
 
-/// The row that says the journal refused the lines of changes made anyway.
 fn journal_refused(refused: &[String]) -> Row {
     Row {
         name: "Change journal".into(),
@@ -1416,7 +1435,7 @@ fn save_backup(path: &Path, keys: &[Saved]) -> Result<(), String> {
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
-    write_json_with_flush(path, value, durable_directory)
+    write_json_with_flush(path, value, durable_name)
 }
 
 fn durable_directory(directory: &Path) -> std::io::Result<()> {
@@ -1425,15 +1444,54 @@ fn durable_directory(directory: &Path) -> std::io::Result<()> {
     sys.durable_dir(directory)
 }
 
+/// Publish `entry`, a name in `directory`: flush the directory, unless this process already
+/// flushed it while it was the same directory and `entry` named the same file there. A record
+/// written again is a new file (a rename over it), and a directory put in place of another is
+/// a new directory, so either is flushed again; a directory's other names are not this flush's
+/// business. A name moved away and back in between is the one change this cannot see, and
+/// nothing moves a doctor record or its directories. Every doctor pass reads and writes its
+/// records through here: flushing each one's whole chain to `/` every time made the passes
+/// queue on the shared directories' locks.
+fn durable_name(directory: &Path, entry: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    type Identity = (u64, u64);
+    static PUBLISHED: std::sync::Mutex<BTreeMap<PathBuf, (Identity, Identity)>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let published = || {
+        PUBLISHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let identity = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|meta| (meta.dev(), meta.ino()))
+    };
+    // Read before the flush: a file named after it is not one the flush published.
+    let named = identity(directory).zip(identity(entry));
+    if named.is_some() && published().get(entry) == named.as_ref() {
+        return Ok(());
+    }
+    durable_directory(directory)?;
+    if let Some(named) = named {
+        published().insert(entry.to_path_buf(), named);
+    }
+    Ok(())
+}
+
+/// Flush every directory from `path`'s parent to `/`, each with the name in it on the way to
+/// `path`.
 fn flush_record_with(
     path: &Path,
-    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+    mut flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or("doctor record has no parent directory")?;
+    let mut entry = path;
     for directory in parent.ancestors() {
-        flush(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+        flush(directory, entry).map_err(|e| format!("{}: {e}", directory.display()))?;
+        entry = directory;
     }
     Ok(())
 }
@@ -1441,7 +1499,7 @@ fn flush_record_with(
 fn write_json_with_flush(
     path: &Path,
     value: &Value,
-    flush: impl FnMut(&Path) -> std::io::Result<()>,
+    flush: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
@@ -1484,7 +1542,6 @@ fn append_workstation(
     }
 }
 
-/// A pass a person asked for (`doctor --apply`, `--check`, `--restore`), as this build, now.
 fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, String> {
     execute_pass(
         host,
@@ -1496,7 +1553,6 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
     .map(|pass| pass.report)
 }
 
-/// A profile pass's report.
 struct Pass {
     report: Report,
     unverified: Vec<String>,
@@ -1513,7 +1569,6 @@ impl From<Report> for Pass {
     }
 }
 
-/// A profile pass of `build` at `now` (seconds since the epoch) ([`TRIES`]).
 fn execute_pass(
     host: &mut dyn Host,
     root: &Path,
@@ -1609,7 +1664,6 @@ fn execute_pass(
     })
 }
 
-/// Apply preference changes for `group`, rolling back any unverified items.
 fn apply_preferences(
     host: &mut dyn Host,
     root: &Path,
@@ -1667,6 +1721,9 @@ fn apply_preferences(
         .into_iter()
         .filter(|target| !activated.contains(target))
         .collect();
+    let mut put_back = Vec::new();
+    // The rollback's `restored` row, by its place in the report, and the keys it names.
+    let mut restored_row: Option<(usize, Vec<String>)> = None;
     if !rollback.is_empty() {
         let mut errors = Vec::new();
         if full_profile {
@@ -1699,6 +1756,7 @@ fn apply_preferences(
                 Ok(wrote) => {
                     if wrote {
                         restored.push(previous.target.describe());
+                        put_back.push((previous.target.clone(), previous.value.clone()));
                     }
                     wrote
                 }
@@ -1713,13 +1771,11 @@ fn apply_preferences(
         }
         if !restored.is_empty() {
             restored.reverse();
+            restored_row = Some((report.rows.len(), restored.clone()));
             report.rows.push(Row {
                 name: "Preference rollback".into(),
                 status: "restored".into(),
-                detail: format!(
-                    "the value before this pass is back for what did not verify: {}",
-                    restored.join(", ")
-                ),
+                detail: rolled_back(&restored),
             });
         }
         if !left.is_empty() {
@@ -1744,6 +1800,28 @@ fn apply_preferences(
     if refresh(host, &reload.iter().collect::<Vec<_>>(), report) && full_profile {
         settle_pending_refresh(host, root)?;
     }
+    // Read the rollback back once each reader is up again: one that wrote its own value
+    // over the original as it started did not keep it, and is named as that alone, not
+    // also as back.
+    let lost = not_retained(host, &put_back);
+    if !lost.is_empty() {
+        if let Some((at, restored)) = restored_row {
+            let kept: Vec<String> = restored
+                .into_iter()
+                .filter(|name| !lost.contains(name))
+                .collect();
+            if kept.is_empty() {
+                report.rows.remove(at);
+            } else {
+                report.rows[at].detail = rolled_back(&kept);
+            }
+        }
+        report.rows.push(Row {
+            name: "Preference rollback".into(),
+            status: "error".into(),
+            detail: format!("{NOT_RETAINED}: {}", lost.join(", ")),
+        });
+    }
     if let Err(detail) = record_withheld(root, &left_alone, &reached, &unverified, turn) {
         report.rows.push(Row {
             name: "Settings waiting for Full Disk Access".into(),
@@ -1754,7 +1832,6 @@ fn apply_preferences(
     Ok((unverified, settled))
 }
 
-/// Record of items whose container keys were skipped for lack of Full Disk Access.
 const WITHHELD_RECORD: &str = "withheld-preferences.json";
 
 /// What [`WITHHELD_RECORD`] holds.
@@ -1766,7 +1843,6 @@ struct Withheld {
     failed: Vec<Failed>,
 }
 
-/// What [`WITHHELD_RECORD`] holds ([`initial::revision_at`]).
 fn load_withheld(root: &Path) -> Result<Withheld, String> {
     let path = root.join(WITHHELD_RECORD);
     let bytes = match std::fs::read(&path) {
@@ -1786,14 +1862,16 @@ fn load_withheld(root: &Path) -> Result<Withheld, String> {
         .iter()
         .map(|item| item.as_str().map(str::to_owned).ok_or_else(bad))
         .collect::<Result<_, _>>()?;
-    let mut failed = load_tries(&record["failed"], &bad)?;
+    let mut failed = current_tries(load_tries(&record["failed"], &bad)?, true);
     if record["revision"].as_u64() != initial::revision_at(root).ok() {
         failed.clear();
     }
-    Ok(Withheld { items, failed })
+    Ok(Withheld {
+        items: current_ids(items, true),
+        failed,
+    })
 }
 
-/// Save [`WITHHELD_RECORD`] as `record`.
 fn save_withheld(root: &Path, record: &Withheld) -> Result<(), String> {
     if !record.items.is_empty() {
         return write_json(
@@ -1811,7 +1889,6 @@ fn save_withheld(root: &Path, record: &Withheld) -> Result<(), String> {
     }
 }
 
-/// Drop from [`WITHHELD_RECORD`] the items a pass reached as wanted.
 fn record_withheld(
     root: &Path,
     left_alone: &[String],
@@ -1845,7 +1922,6 @@ fn record_withheld(
     save_withheld(root, &record)
 }
 
-/// Apply previously withheld container keys once Full Disk Access is granted.
 fn follow_up_at(
     root: &Path,
     host: &mut dyn Host,
@@ -1917,7 +1993,6 @@ pub fn finish_withheld_preferences<S>(
     )
 }
 
-/// [`finish_withheld_preferences`] of `root` ([`follow_up_at`]).
 fn follow_up_finished_at<S, H: Host>(
     root: &Path,
     reserve: impl FnOnce() -> S,
@@ -1939,7 +2014,6 @@ fn follow_up_finished_at<S, H: Host>(
     follow_up_at(root, &mut host, build, now)
 }
 
-/// [`follow_up_at`] for a caller that holds the profile lock.
 fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
     if load_withheld(root)?.items.is_empty() {
         return Ok(None);
@@ -1952,7 +2026,6 @@ fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
     )
 }
 
-/// Reason a saved container key without Full Disk Access cannot be restored.
 fn unknown_original(saved: &Saved) -> Option<String> {
     (contained(&saved.target) && !saved.granted && saved.value.is_none()).then(|| {
         format!(
@@ -1963,12 +2036,10 @@ fn unknown_original(saved: &Saved) -> Option<String> {
     })
 }
 
-/// Whether `target` is in another app's sandbox container.
 fn contained(target: &Target) -> bool {
     aterm_machines::items::defaults::contained(&target.domain)
 }
 
-/// Retain in `pending-refresh.json` only targets still withheld for lack of Full Disk Access.
 fn settle_pending_refresh(host: &dyn Host, root: &Path) -> Result<(), String> {
     let kept: Vec<Target> = pending_refresh(root)?
         .into_iter()
@@ -1981,12 +2052,10 @@ fn settle_pending_refresh(host: &dyn Host, root: &Path) -> Result<(), String> {
     }
 }
 
-/// Reason `target` is withheld in this pass.
 fn withheld(host: &dyn Host, target: &Target) -> Option<String> {
     aterm_machines::items::defaults::withheld(&target.domain, host.full_disk_access())
 }
 
-/// Message when Restore skips a container key for lack of Full Disk Access.
 fn restore_waits(target: &Target) -> String {
     format!(
         "{} is in another app's container, which macOS opens only to a process whose app holds \
@@ -1999,7 +2068,6 @@ fn restore_waits(target: &Target) -> String {
     )
 }
 
-/// Put `target` back to `value`, journaled before the write.
 fn restore_one(
     host: &mut dyn Host,
     target: &Target,
@@ -2028,7 +2096,6 @@ fn restore_one(
     }
 }
 
-/// The journal id of a restore of `target`.
 fn restore_id(target: &Target) -> String {
     format!(
         "doctor.restore.{}{}.{}",
@@ -2038,7 +2105,6 @@ fn restore_id(target: &Target) -> String {
     )
 }
 
-/// The `defaults` command that sets `target` to `value` ([`NativeHost::write`]).
 fn defaults_cmd(target: &Target, value: Option<&PValue>) -> Cmd {
     let mut cmd = Cmd::new(DEFAULTS);
     if target.host {
@@ -2052,7 +2118,6 @@ fn defaults_cmd(target: &Target, value: Option<&PValue>) -> Cmd {
     }
 }
 
-/// `target` and the value it holds, as a journal line names it.
 fn shown(target: &Target, value: Option<&PValue>) -> String {
     format!(
         "{} = {}",
@@ -2111,6 +2176,7 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
         });
     }
     let mut refused = Vec::new();
+    let mut put_back = Vec::new();
     for item in saved.iter().rev() {
         let why = unknown_original(item)
             .or_else(|| withheld(host, &item.target).map(|_| restore_waits(&item.target)));
@@ -2123,11 +2189,16 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
             continue;
         }
         match restore_one(host, &item.target, item.value.as_ref(), &mut refused) {
-            Ok(_) => report.rows.push(Row {
-                name: item.target.describe(),
-                status: "restored".into(),
-                detail: "original value restored".into(),
-            }),
+            Ok(wrote) => {
+                if wrote {
+                    put_back.push((item.target.clone(), item.value.clone()));
+                }
+                report.rows.push(Row {
+                    name: item.target.describe(),
+                    status: "restored".into(),
+                    detail: "original value restored".into(),
+                });
+            }
             Err((_, detail)) => report.rows.push(Row {
                 name: item.target.describe(),
                 status: "error".into(),
@@ -2140,6 +2211,18 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
     }
     if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) {
         settle_pending_refresh(host, root)?;
+    }
+    // Read back once each reader is up again: a reader that wrote its own value over the
+    // original as it started did not keep it.
+    for name in not_retained(host, &put_back) {
+        if let Some(row) = report
+            .rows
+            .iter_mut()
+            .find(|row| row.name == name && row.status == "restored")
+        {
+            row.status = "error".into();
+            row.detail = NOT_RETAINED.into();
+        }
     }
     report.rows.extend(host.restore_runtime(&saved));
     Ok(report)
@@ -2201,7 +2284,47 @@ fn clear_pending_refresh(root: &Path) -> Result<(), String> {
     }
 }
 
-/// Relaunch the consumers of `targets`, each journaled first.
+/// This process's own account, whose processes the doctor relaunches: its name from the
+/// account database (its uid, which `killall -u` also takes, when none names it).
+fn own_account(uid: u32) -> aterm_machines::model::User {
+    aterm_machines::model::User {
+        name: aterm_uds::account::user_name(uid).unwrap_or_else(|| uid.to_string()),
+        uid,
+        gid: 20,
+        home: aterm_uds::account::home_of(uid)
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        shell: String::new(),
+        admin: false,
+    }
+}
+
+/// Of `put_back` (each key and the value a rollback or a Restore wrote back), the keys
+/// that no longer read that value once their readers were relaunched and up again
+/// ([`refresh`]): a reader that wrote its own over it as it started.
+fn not_retained(host: &mut dyn Host, put_back: &[(Target, Option<PValue>)]) -> Vec<String> {
+    put_back
+        .iter()
+        .filter(|(target, value)| {
+            host.read(target)
+                .map_or(true, |now| !same_optional(now.as_ref(), value.as_ref()))
+        })
+        .map(|(target, _)| target.describe())
+        .collect()
+}
+
+/// What the rollback's `restored` row says of the keys `restored` names.
+fn rolled_back(restored: &[String]) -> String {
+    format!(
+        "the value before this pass is back for what did not verify: {}",
+        restored.join(", ")
+    )
+}
+
+/// What a key that did not keep the value put back says.
+const NOT_RETAINED: &str =
+    "written back, but its reader, once relaunched, no longer reads the original value";
+
 fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> bool {
     let targets: Vec<&Target> = targets
         .iter()
@@ -2211,10 +2334,12 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
     let mut refreshed = true;
     let mut refused = Vec::new();
     for process in aterm_machines::init_activation::RELAUNCHED {
-        let affected = targets
+        let reads: Vec<&Target> = targets
             .iter()
-            .any(|t| aterm_machines::init_activation::readers(&t.domain).contains(&process));
-        if !affected {
+            .copied()
+            .filter(|t| aterm_machines::init_activation::readers(&t.domain).contains(&process))
+            .collect();
+        if reads.is_empty() {
             continue;
         }
         let id = format!("doctor.relaunch.{process}");
@@ -2226,7 +2351,7 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
         ) {
             refused.push(format!("{id}: {why}"));
         }
-        if let Err(detail) = host.restart(process) {
+        if let Err(detail) = host.restart(process, &reads) {
             refreshed = false;
             report.rows.push(Row {
                 name: format!("Reload {process}"),
@@ -2250,6 +2375,7 @@ fn refresh(host: &mut dyn Host, targets: &[&Target], report: &mut Report) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_machines::port::Ran;
 
     /// Fake doctor host backed by in-memory [`wanted`] keys.
     #[derive(Default)]
@@ -2276,7 +2402,7 @@ mod tests {
         dies_in_preferences: bool,
         /// An apply pass of the preference group panics once its items wrote.
         dies_after_item_writes: bool,
-        /// The doctor's own writes.
+        /// The doctor's own writes (a rollback, a Restore) panic.
         dies_in_doctor_writes: bool,
         restarts: Vec<String>,
         account_passes: usize,
@@ -2292,22 +2418,23 @@ mod tests {
         full_disk_access: Option<bool>,
         /// Whether the widgets row also clears Notification Center's widget list.
         notification_center: bool,
+        /// The Window Manager's widget key is of Notification Center's item: an item that
+        /// leaves one key for want of the grant and reaches another, as init's widgets row
+        /// did before each catalog row became its own item, whose tries the doctor counts
+        /// whichever pass makes them.
+        bundles: bool,
         withheld: Vec<String>,
     }
 
     impl Fake {
-        /// The item a wanted key belongs to, as the fake's rows and attempts name it.
         fn item(&self, target: &Target) -> String {
-            if contained(target)
-                || (self.notification_center && target.domain == "com.apple.WindowManager")
-            {
+            if contained(target) || (self.bundles && target.domain == "com.apple.WindowManager") {
                 WIDGETS.into()
             } else {
                 target.describe()
             }
         }
 
-        /// The items in run order, each with its keys and what each should hold.
         fn items(&self) -> Vec<(String, Vec<(Target, PValue)>)> {
             let mut items: Vec<(String, Vec<(Target, PValue)>)> = Vec::new();
             for (target, value) in self.wants() {
@@ -2320,7 +2447,6 @@ mod tests {
             items
         }
 
-        /// The setting whose row writes `target`.
         fn setting(target: &Target) -> Setting {
             if target.domain == "com.apple.dock" {
                 Setting::Dock
@@ -2329,13 +2455,11 @@ mod tests {
             }
         }
 
-        /// How many times an item's own activation relaunched `process`.
         fn relaunches(&self, process: &str) -> usize {
             let event = format!("relaunch {process}");
             self.events.iter().filter(|e| **e == event).count()
         }
 
-        /// The keys this host's items want ([`wanted`]).
         fn wants(&self) -> Vec<(Target, PValue)> {
             let mut keys = wanted();
             if self.notification_center {
@@ -2344,12 +2468,10 @@ mod tests {
             keys
         }
 
-        /// Whether this pass reaches `target`.
         fn reaches(&self, target: &Target) -> bool {
             !contained(target) || self.full_disk_access == Some(true)
         }
 
-        /// Writes and relaunches, the changes a pass makes outside aterm's own records.
         fn changes(&self) -> usize {
             self.events
                 .iter()
@@ -2357,7 +2479,6 @@ mod tests {
                 .count()
         }
 
-        /// Write `target` as a shared item or the doctor does.
         fn put(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String> {
             self.writes.push(target.clone());
             self.events.push(format!("write {}", target.describe()));
@@ -2372,7 +2493,6 @@ mod tests {
             Ok(())
         }
 
-        /// How a pass holds `item`, if it does.
         fn hold_of(&self, item: &str) -> Option<Hold> {
             self.held
                 .iter()
@@ -2453,7 +2573,8 @@ mod tests {
             }
         }
 
-        /// [`Withholding::widgets`] with the Dock selected too.
+        /// [`Withholding::widgets`] with the Dock selected too, its change never verifying (the
+        /// Dock wrote its own tiles back over it), so the Workstation stage stays pending.
         pub(super) fn widgets_and_a_dock_that_never_verifies() -> Self {
             let mut doctor = Self::widgets();
             doctor.host.failing = vec![wanted()[0].0.clone()];
@@ -2463,6 +2584,7 @@ mod tests {
         /// [`Withholding::widgets`] whose first change does not verify.
         pub(super) fn widgets_whose_first_try_does_not_verify() -> Self {
             let mut doctor = Self::widgets();
+            doctor.host.bundles = true;
             doctor.host.fail_once = true;
             doctor
         }
@@ -2482,7 +2604,6 @@ mod tests {
             follow_up_at(root, &mut self.host, self.build, self.now)
         }
 
-        /// `by` goes by.
         fn wait(&mut self, by: std::time::Duration) {
             self.now += by;
         }
@@ -2573,9 +2694,18 @@ mod tests {
         lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         /// What it answers for this process's Full Disk Access.
         full_disk_access: Option<bool>,
+        /// What it answers for the commands a test models, and which pids it says are alive.
+        model: Option<std::sync::Arc<dyn Model>>,
     }
 
-    /// [`Inert`]'s journal.
+    /// The commands and processes a test models over an [`Inert`] system.
+    pub(super) trait Model: Send + Sync {
+        /// Its answer to `cmd`; `None` refuses it, as the inert system does.
+        fn answer(&self, cmd: &Cmd) -> Option<Ran>;
+        /// Whether `pid` is alive.
+        fn alive(&self, pid: u32) -> bool;
+    }
+
     struct InertJournal(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     impl aterm_converge::Journal for InertJournal {
@@ -2604,9 +2734,18 @@ mod tests {
         impl System for Inert {
             fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
                 self.calls.lock().unwrap().push(cmd.display());
+                if let Some(ran) = self.model.as_ref().and_then(|model| model.answer(cmd)) {
+                    return Ok(ran);
+                }
                 Err(RunFailed::Refused(
                     "an inert test system runs nothing".into(),
                 ))
+            }
+            fn run_complete_stdout(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+                self.run(cmd)
+            }
+            fn pid_alive(&self, pid: u32) -> bool {
+                self.model.as_ref().is_some_and(|model| model.alive(pid))
             }
             fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
                 self.run(cmd).map(|ran| ran.status)
@@ -2661,18 +2800,15 @@ mod tests {
         }
     }
 
-    /// Notification Center's widget list, which lives in its app container.
     const NC: &str = "com.apple.notificationcenterui";
 
     /// The shared widgets item's id.
-    pub(super) const WIDGETS: &str = "init.widgets@alice";
+    pub(super) const WIDGETS: &str = "consumer.widgets.notification-center@alice";
 
-    /// Whether `call` reads, writes or relaunches Notification Center or its preferences.
     fn touches_notification_center(call: &str) -> bool {
         call.contains(NC) || call.contains("NotificationCenter")
     }
 
-    /// A doctor host over an [`Inert`] system whose Full Disk Access is `full_disk_access`.
     fn inert_host(
         full_disk_access: Option<bool>,
         items: fn() -> Vec<Box<dyn aterm_machines::items::Item>>,
@@ -2797,7 +2933,6 @@ mod tests {
         }
     }
 
-    /// Snapshot of files in `root` excluding the backup and withheld record.
     fn setup_records(root: &Path) -> BTreeMap<String, Vec<u8>> {
         std::fs::read_dir(root)
             .unwrap()
@@ -2813,6 +2948,260 @@ mod tests {
                 !["original-preferences.json", WITHHELD_RECORD].contains(&name.as_str())
             })
             .collect()
+    }
+
+    /// A Dock under management: once relaunched it takes a second to start, then shows the
+    /// pins it is given whatever was written, as the 2026-10-21 managed Dock did. `defaults`
+    /// reads and writes its one domain, and `pgrep`, `launchctl print`, `killall` and
+    /// `sleep` act on it.
+    #[derive(Default)]
+    struct ManagedDock(std::sync::Mutex<ManagedState>);
+
+    #[derive(Default)]
+    struct ManagedState {
+        prefs: Vec<(String, PValue)>,
+        pid: u32,
+        /// The sleeps left until a relaunched Dock is past its start.
+        starting: Option<u32>,
+        kills: usize,
+    }
+
+    /// One pin of `label`, with the GUID a Dock gives a tile it loaded.
+    fn loaded_pin(label: &str, guid: i64) -> PValue {
+        PValue::Dict(vec![
+            ("GUID".into(), PValue::Int(guid)),
+            (
+                "tile-data".into(),
+                PValue::Dict(vec![("file-label".into(), PValue::Str(label.into()))]),
+            ),
+        ])
+    }
+
+    /// The pins management gives the Dock.
+    fn managed_pins() -> PValue {
+        PValue::Array(vec![loaded_pin("Managed", 7)])
+    }
+
+    impl Model for ManagedDock {
+        fn answer(&self, cmd: &Cmd) -> Option<Ran> {
+            let args: Vec<String> = cmd
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let mut dock = self.0.lock().unwrap();
+            match (cmd.program.to_str()?, args.as_slice()) {
+                (DEFAULTS, ["export", "com.apple.dock", "-"]) => {
+                    let entries = dock.prefs.clone();
+                    Some(Ran::ok(&plist::document(&PValue::Dict(entries))))
+                }
+                (DEFAULTS, ["write", "com.apple.dock", key, fragment]) => {
+                    let value = plist::parse(fragment.as_bytes()).ok()?;
+                    dock.prefs.retain(|(k, _)| k != key);
+                    dock.prefs.push(((*key).into(), value));
+                    Some(Ran::ok(""))
+                }
+                ("/usr/bin/pgrep", ["-u", _, "-x", "Dock"]) => {
+                    Some(Ran::ok(&format!("{}\n", dock.pid)))
+                }
+                ("/bin/launchctl", ["print", _]) => Some(Ran::ok("")),
+                ("/usr/bin/killall", ["-u", _, "Dock"]) => {
+                    dock.pid += 1;
+                    dock.starting = Some(1);
+                    dock.kills += 1;
+                    Some(Ran::ok(""))
+                }
+                ("/bin/sleep", ["1"]) => {
+                    if let Some(left) = dock.starting.as_mut() {
+                        *left = left.saturating_sub(1);
+                        if *left == 0 {
+                            dock.starting = None;
+                            dock.prefs.retain(|(k, _)| k != "persistent-apps");
+                            dock.prefs.push(("persistent-apps".into(), managed_pins()));
+                        }
+                    }
+                    Some(Ran::ok(""))
+                }
+                _ => None,
+            }
+        }
+
+        fn alive(&self, pid: u32) -> bool {
+            self.0.lock().unwrap().pid == pid
+        }
+    }
+
+    /// The doctor's relaunch after it puts a value back waits, as the shared items' own
+    /// does, until the relaunched reader runs again and what it reads has settled, so the
+    /// read-back after it reads what the reader kept: a managed Dock that shows its own pins
+    /// over the original a second into its start is reported as not keeping it. Negative
+    /// control: a read right after the bare kill the doctor's relaunch was races the Dock's
+    /// start and reads the original back, as if it were kept.
+    #[test]
+    fn a_restores_read_back_waits_for_the_relaunched_reader_to_settle() {
+        let pins = Target::new("com.apple.dock", "persistent-apps");
+        let original = PValue::Array(vec![loaded_pin("Mail", 1)]);
+        let dock = std::sync::Arc::new(ManagedDock::default());
+        {
+            let mut state = dock.0.lock().unwrap();
+            state.pid = 100;
+            state.prefs.push((
+                "persistent-apps".into(),
+                PValue::Array(vec![loaded_pin("aterm", 2)]),
+            ));
+        }
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        save_backup(
+            &root.path().join("original-preferences.json"),
+            &[Saved {
+                target: pins.clone(),
+                value: Some(original.clone()),
+                granted: true,
+            }],
+        )
+        .unwrap();
+        let inert = Inert {
+            full_disk_access: Some(true),
+            model: Some(std::sync::Arc::clone(&dock) as std::sync::Arc<dyn Model>),
+            ..Inert::default()
+        };
+        let mut host = NativeHost::over(
+            Box::new(inert),
+            Box::new(|_, _, _| Ok(Workstation::of(Vec::new()))),
+        );
+        let report = execute(&mut host, root.path(), Action::Restore).expect("restore");
+        let row = report
+            .rows
+            .iter()
+            .find(|row| row.name == pins.describe())
+            .unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.detail.as_str()),
+            ("error", NOT_RETAINED),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            !report.rows.iter().any(|row| row.name == "Reload Dock"),
+            "{}",
+            report.to_text()
+        );
+        assert_eq!(dock.0.lock().unwrap().kills, 1);
+
+        let racing = ManagedDock::default();
+        racing.0.lock().unwrap().pid = 100;
+        let write = defaults_cmd(&pins, Some(&original));
+        racing.answer(&write).unwrap();
+        let kill = Cmd::new("/usr/bin/killall").args(["-u", "501", "Dock"]);
+        racing.answer(&kill).unwrap();
+        let export = Cmd::new(DEFAULTS).args(["export", "com.apple.dock", "-"]);
+        let read = plist::parse_domain(&racing.answer(&export).unwrap().stdout).unwrap();
+        assert_eq!(read, [("persistent-apps".to_owned(), Ok(original))]);
+    }
+
+    /// A shared item that pins the Dock and never verifies, whose before-image of the
+    /// Dock's pins, `.0`, the doctor's rollback puts back.
+    struct Repinned(PValue);
+
+    impl aterm_machines::items::Item for Repinned {
+        fn id(&self) -> String {
+            "init.test.repinned".into()
+        }
+        fn family(&self) -> &'static str {
+            "test"
+        }
+        fn title(&self) -> String {
+            "init.test.repinned".into()
+        }
+        fn probe(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> aterm_machines::model::Probe {
+            aterm_machines::model::Probe::Change {
+                from: "a".into(),
+                to: "b".into(),
+            }
+        }
+        fn apply(&self, _: &dyn System, _: &aterm_machines::items::Ctx) -> Result<(), String> {
+            Ok(())
+        }
+        fn preference_changes(
+            &self,
+            _: &dyn System,
+            _: &aterm_machines::items::Ctx,
+        ) -> Result<
+            Vec<(
+                aterm_machines::items::defaults::Target,
+                aterm_machines::model::Read<PValue>,
+            )>,
+            String,
+        > {
+            let alice = aterm_machines::model::User {
+                name: "alice".into(),
+                uid: 501,
+                gid: 20,
+                home: "/Users//alice".into(),
+                shell: "/bin/zsh".into(),
+                admin: false,
+            };
+            Ok(vec![(
+                aterm_machines::items::defaults::Target::user(
+                    "com.apple.dock",
+                    "persistent-apps",
+                    &alice,
+                ),
+                aterm_machines::model::Read::Value(self.0.clone()),
+            )])
+        }
+    }
+
+    /// The rollback of a change that did not verify reads each key it put back once its
+    /// reader is up again: a managed Dock that shows its own pins over the original a second
+    /// into its start is reported, in one `error` row, as not keeping them, and the pins
+    /// are not also listed as back. Negative control: without that read-back the report
+    /// says the pins are back and nothing more.
+    #[test]
+    fn a_rollback_its_relaunched_reader_did_not_keep_is_reported_once_as_not_kept() {
+        let pins = Target::new("com.apple.dock", "persistent-apps");
+        let original = PValue::Array(vec![loaded_pin("Mail", 1)]);
+        let dock = std::sync::Arc::new(ManagedDock::default());
+        {
+            let mut state = dock.0.lock().unwrap();
+            state.pid = 100;
+            state.prefs.push((
+                "persistent-apps".into(),
+                PValue::Array(vec![loaded_pin("aterm", 2)]),
+            ));
+        }
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let inert = Inert {
+            full_disk_access: Some(true),
+            model: Some(std::sync::Arc::clone(&dock) as std::sync::Arc<dyn Model>),
+            ..Inert::default()
+        };
+        let before = original.clone();
+        let mut host = NativeHost::over(
+            Box::new(inert),
+            Box::new(move |_, group, _| {
+                Ok(Workstation::of(if group == WorkstationGroup::Preferences {
+                    vec![Box::new(Repinned(before.clone())) as Box<dyn aterm_machines::items::Item>]
+                } else {
+                    Vec::new()
+                }))
+            }),
+        );
+        let report = execute(&mut host, root.path(), Action::Apply).expect("apply");
+        let rollback: Vec<(&str, &str)> = report
+            .rows
+            .iter()
+            .filter(|row| row.name == "Preference rollback")
+            .map(|row| (row.status.as_str(), row.detail.as_str()))
+            .collect();
+        let lost = format!("{NOT_RETAINED}: {}", pins.describe());
+        assert_eq!(rollback, [("error", lost.as_str())], "{}", report.to_text());
+        assert_eq!(dock.0.lock().unwrap().kills, 1, "{}", report.to_text());
     }
 
     #[test]
@@ -2881,6 +3270,54 @@ mod tests {
         assert_eq!(doctor.notification_center_writes(), 1);
         assert!(Withholding::withheld(root.path()).is_empty());
         assert!(doctor.follow_up(root.path()).unwrap().is_none());
+    }
+
+    /// aterm 0.118.0 and older recorded their one widgets item, `init.widgets@<user>`: for the
+    /// follow-up, which with the grant still reads it as Notification Center's row, clears
+    /// that list once and drops the record; and as settled, which holds each of the three
+    /// widget rows as it is. Negative control: loading the follow-up record's ids as written
+    /// runs no follow-up, and drops the record with the list as it was.
+    #[test]
+    fn a_follow_up_an_older_aterm_recorded_still_clears_notification_center() {
+        let mut widgets = Selection::none();
+        widgets.set(Setting::Widgets, true);
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_automatic_setup_at(root.path(), widgets).unwrap();
+        record_withheld(
+            root.path(),
+            &["init.widgets@alice".to_owned()],
+            &[],
+            &[],
+            (BUILD, 0),
+        )
+        .unwrap();
+        let mut doctor = Withholding::widgets();
+        doctor.grant();
+        let follow_up = doctor
+            .follow_up(root.path())
+            .unwrap()
+            .expect("the grant is held");
+        assert!(!follow_up.needs_attention(), "{}", follow_up.to_text());
+        assert!(doctor.notification_center_cleared());
+        assert_eq!(doctor.notification_center_writes(), 1);
+        assert!(Withholding::withheld(root.path()).is_empty());
+        let revision = initial::revision_at(root.path()).unwrap();
+        write_json(
+            &root.path().join(HELD_RECORD),
+            &json!({
+                "profile": PROFILE, "revision": revision,
+                "settled": ["init.widgets@alice"], "failed": [],
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            Automatic::load(root.path(), revision).unwrap().settled,
+            [
+                "consumer.widgets.desktop@alice",
+                "consumer.widgets.stage-manager@alice",
+                WIDGETS,
+            ]
+        );
     }
 
     #[test]
@@ -3004,7 +3441,6 @@ mod tests {
     #[test]
     fn a_finished_setups_follow_up_holds_the_busy_slot_while_it_may_hold_the_profile_lock() {
         use std::cell::{Cell, RefCell};
-        /// The slot: at its release, whether the profile lock was free and the record empty.
         struct Slot<'a> {
             root: &'a Path,
             released: &'a RefCell<Vec<(bool, bool)>>,
@@ -3360,7 +3796,6 @@ mod tests {
         }
     }
 
-    /// A shared item that changes Notification Center's widget list and never verifies.
     struct Contained;
 
     impl aterm_machines::items::Item for Contained {
@@ -3412,7 +3847,6 @@ mod tests {
         }
     }
 
-    /// Shared item that is already in state and optionally reports a withheld container key.
     struct LeftAlone(bool);
 
     impl aterm_machines::items::Item for LeftAlone {
@@ -3479,7 +3913,6 @@ mod tests {
     }
 
     impl Bundled {
-        /// Whether `flag` is set.
         fn on(flag: &std::sync::atomic::AtomicBool) -> bool {
             flag.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -3822,7 +4255,6 @@ mod tests {
     }
 
     impl Scripted {
-        /// `wanted[i]`: whether the `i`th probe reads as wanted.
         fn new(id: &'static str, wanted: &[bool]) -> Self {
             use aterm_machines::model::Probe;
             let probes = wanted
@@ -3969,7 +4401,6 @@ mod tests {
         Target::new(NC, "widgets")
     }
 
-    /// A widget list with a widget in it.
     fn populated() -> PValue {
         PValue::Dict(vec![
             ("vers".into(), PValue::Int(1)),
@@ -3980,7 +4411,6 @@ mod tests {
         ])
     }
 
-    /// A widget list with no widget.
     fn cleared() -> PValue {
         PValue::Dict(vec![
             ("vers".into(), PValue::Int(1)),
@@ -4076,7 +4506,7 @@ mod tests {
                 })
                 .collect())
         }
-        fn restart(&mut self, name: &str) -> Result<(), String> {
+        fn restart(&mut self, name: &str, _reads: &[&Target]) -> Result<(), String> {
             self.restarts.push(name.into());
             self.events.push(format!("restart {name}"));
             if self.fail_restart_once {
@@ -4379,21 +4809,21 @@ mod tests {
             json!({"profile": PROFILE, "state": "applied", "accounts_verified": true}),
         ] {
             assert!(
-                write_json_with_flush(&marker, &value, |_| Err(std::io::Error::other(
+                write_json_with_flush(&marker, &value, |_, _| Err(std::io::Error::other(
                     "failed directory flush"
                 )))
                 .is_err()
             );
             assert!(marker.exists(), "the rename is visible even on failure");
             assert!(
-                first_run_complete_with_flush(root.path(), |_| Err(std::io::Error::other(
+                first_run_complete_with_flush(root.path(), |_, _| Err(std::io::Error::other(
                     "still not durable"
                 )))
                 .is_err()
             );
             let mut reached_root = false;
             assert!(
-                first_run_complete_with_flush(root.path(), |directory| {
+                first_run_complete_with_flush(root.path(), |directory, _| {
                     reached_root |= directory.parent().is_none();
                     Ok(())
                 })
@@ -4409,18 +4839,18 @@ mod tests {
             write_json_with_flush(
                 &plan,
                 &json!({"profile":PROFILE,"selection":Selection::all().bits()}),
-                |_| Err(std::io::Error::other("failed plan flush"))
+                |_, _| Err(std::io::Error::other("failed plan flush"))
             )
             .is_err()
         );
         assert!(
-            authorized_selection_with_flush(root.path(), |_| Err(std::io::Error::other(
+            authorized_selection_with_flush(root.path(), |_, _| Err(std::io::Error::other(
                 "still not durable"
             )))
             .is_err()
         );
         assert_eq!(
-            authorized_selection_with_flush(root.path(), |_| Ok(())).unwrap(),
+            authorized_selection_with_flush(root.path(), |_, _| Ok(())).unwrap(),
             Some(Selection::all())
         );
     }
@@ -4640,7 +5070,6 @@ mod tests {
         assert!(report.backup.exists());
     }
 
-    /// The worker's clock, `minutes` after a fixed start.
     fn at(minutes: u64) -> std::time::SystemTime {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000 + minutes * 60)
     }
@@ -5234,7 +5663,7 @@ mod tests {
             .join("backup.json");
         let value = json!({"profile": PROFILE, "keys": []});
         let mut attempted = Vec::new();
-        let refused = write_json_with_flush(&record, &value, |directory| {
+        let refused = write_json_with_flush(&record, &value, |directory, _| {
             attempted.push(directory.to_path_buf());
             if directory == root.path() {
                 Err(std::io::Error::other("injected ancestor flush refusal"))
@@ -5250,7 +5679,7 @@ mod tests {
             "failure after publication is retained as failure"
         );
         let mut reached_root = false;
-        write_json_with_flush(&record, &value, |directory| {
+        write_json_with_flush(&record, &value, |directory, _| {
             reached_root |= directory.parent().is_none();
             Ok(())
         })
@@ -5258,6 +5687,41 @@ mod tests {
         assert!(
             reached_root,
             "existing ancestor entries also need publication"
+        );
+    }
+
+    #[test]
+    fn a_published_name_is_flushed_again_only_once_it_or_its_directory_is_another() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let doctor = root.path().join("doctor");
+        let record = doctor.join("first-run.json");
+        std::fs::create_dir(&doctor).expect("doctor dir");
+        std::fs::write(&record, b"{}").expect("record");
+        let flushes = aterm_durable::seam::Recording::start();
+        flush_record_with(&record, durable_name).expect("first");
+        assert!(
+            flushes.take().len() >= 3,
+            "the record's, the doctor dir's and the scratch dir's names are new"
+        );
+        flush_record_with(&record, durable_name).expect("again");
+        assert_eq!(flushes.take(), [], "every name on the way is as published");
+        std::fs::write(doctor.join("next"), b"{}").expect("next");
+        std::fs::rename(doctor.join("next"), &record).expect("rewrite");
+        flush_record_with(&record, durable_name).expect("rewritten");
+        assert_eq!(
+            flushes.take().len(),
+            1,
+            "a record written again: its directory"
+        );
+        std::fs::rename(&doctor, root.path().join("old")).expect("move away");
+        std::fs::create_dir(&doctor).expect("new doctor dir");
+        std::fs::rename(root.path().join("old").join("first-run.json"), &record)
+            .expect("the same record, in the new directory");
+        flush_record_with(&record, durable_name).expect("replaced");
+        assert_eq!(
+            flushes.take().len(),
+            2,
+            "a directory put in place of another: it, and the scratch dir naming it"
         );
     }
 

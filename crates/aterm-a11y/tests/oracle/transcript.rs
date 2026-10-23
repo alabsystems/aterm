@@ -1,37 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The semantics oracle's output: every scenario of the corpus played on
-//! the bus-free AT-SPI semantics, and everything the publisher can ask of
-//! them written down, the same source compiled twice.
-//!
-//! `tests/recorder` compiles this file against registry
-//! `accesskit_atspi_common` 0.19.0 (with `accesskit_consumer` 0.37.0 under
-//! it), which wrote `tests/recorded/`; the replay in `src/atspi/oracle.rs`
-//! against aterm-a11y's own semantics, which must write the same. Both see
-//! it as a sibling of `model`, `sem` and `corpus` modules; `sem` names the
-//! application context's handle `SharedApp`, the one type the two sides
-//! spell differently.
-//!
-//! After each step it writes:
-//!
-//! * the step's events, from the adapter callback: registrations, object,
-//!   window and cache events, sorted (the registry crates emit them in hash
-//!   order, which differs from run to run, so a step's events are a set);
-//! * the tree: the application root, every cache item and, for every node,
-//!   each `Accessible`, `Action`, `Component`, `Hyperlink`, `Selection` and
-//!   `Value` answer the publisher serves;
-//! * the text: each `Text` answer at every offset (and one past either end)
-//!   and every granularity, and at points across the node;
-//! * the actions: what every action-producing call returns and the action
-//!   requests it hands the window.
-//!
-//! The recording keeps the events as text and each other block as a 64-bit
-//! FNV-1a digest of its text, so it stays small; `--full` (recorder) and a
-//! failing replay print the text itself.
-//!
-//! The blank-line table ([`blank_line_answer`]) is apart: one row per text
-//! offset and granularity of each of the corpus's blank-line documents.
+//! Semantics oracle transcript generator shared by `tests/recorder` and `src/atspi/oracle.rs`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -45,7 +15,6 @@ use super::sem::{
     PlatformRoot, Property, Rect as AtspiRect, ScrollType, SharedApp, WindowBounds, WindowEvent,
 };
 
-/// What the callback and the action handler write to.
 type Sink = Arc<Mutex<Vec<String>>>;
 
 fn push(sink: &Sink, line: String) {
@@ -56,10 +25,6 @@ fn drain(sink: &Sink) -> Vec<String> {
     std::mem::take(&mut *sink.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Compare semantic node names in this single-tree corpus (`TreeId::ROOT`).
-/// Registry graft indices are always 0 here; aterm's exported incarnation uses
-/// that low word for object lifetime instead. Wire-path/held-object tests cover
-/// those identities separately; this oracle compares the same model-node names.
 fn nid(id: NodeId) -> String {
     format!("n{}", u128::from(id) >> 64)
 }
@@ -168,7 +133,6 @@ fn object_event(event: &ObjectEvent) -> String {
     }
 }
 
-/// The window's action handler: each request, written down.
 struct Requests {
     sink: Sink,
 }
@@ -204,7 +168,6 @@ fn request_text(request: &ActionRequest) -> String {
     )
 }
 
-/// One step's written blocks.
 struct StepText {
     events: Vec<String>,
     tree: String,
@@ -212,7 +175,6 @@ struct StepText {
     actions: String,
 }
 
-/// `Ok` as its value, `Err` as the error's text.
 fn res<T: std::fmt::Debug, E: std::fmt::Display>(r: Result<T, E>) -> String {
     match r {
         Ok(v) => format!("{v:?}"),
@@ -246,7 +208,6 @@ const SCROLLS: [ScrollType; 7] = [
     ScrollType::Anywhere,
 ];
 
-/// Points around and inside `r` (window coordinates) for hit tests.
 fn points(r: Option<AtspiRect>) -> Vec<(i32, i32)> {
     let mut out = vec![(0, 0), (-5, -5)];
     if let Some(r) = r.filter(|r| r.width >= 0 && r.height >= 0) {
@@ -261,7 +222,6 @@ fn points(r: Option<AtspiRect>) -> Vec<(i32, i32)> {
     out
 }
 
-/// One window's adapter while open.
 struct Window {
     adapter: Adapter,
 }
@@ -332,7 +292,6 @@ impl Player {
         }
     }
 
-    /// Everything the publisher can ask, after a step.
     fn probe(&self) -> StepText {
         let mut events = drain(&self.events);
         events.sort();
@@ -386,7 +345,6 @@ impl Player {
             self.probe_text(&node, &at, &mut text);
             self.probe_actions(&node, &at, &mut actions);
         }
-        // The registry's application id, written as an AT-SPI registry would.
         let _ = writeln!(
             actions,
             "root set_id {} then {}",
@@ -769,7 +727,6 @@ pub(crate) fn play(scenario: Scenario, full: bool) -> String {
             }
         }
     }
-    // The windows close as the application exits.
     let names: Vec<usize> = player.windows.keys().copied().collect();
     for window in names {
         player.windows.remove(&window);

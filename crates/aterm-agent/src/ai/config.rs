@@ -369,7 +369,14 @@ pub fn read(text: &str) -> (Local, Vec<String>) {
     (local, notes)
 }
 
-/// Reads a fleet document ([`super::fleet::meta`]).
+/// Reads a fleet document. Only text that is not TOML, or a schema this build does not
+/// read, refuses it: anything else it cannot use is a note, so a document written for a
+/// newer build still applies here. Its `seq` and `valid_until` are the fetch's
+/// ([`super::fleet::meta`]).
+///
+/// # Errors
+///
+/// Why it is refused, in one line.
 pub fn read_fleet(text: &str) -> Result<(Fleet, Vec<String>), String> {
     let doc = aterm_toml::from_str::<Value>(text).map_err(|_| "not TOML".to_string())?;
     let table = doc.as_table().ok_or("not a table")?;
@@ -457,7 +464,12 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Reads the fleet document at `path`, bounded.
+/// Reads the fleet document at `path`, bounded; a symbolic link is followed (the owner's
+/// synced dotfiles are often one). With `key`, its `<path>.sig` must verify under it.
+///
+/// # Errors
+///
+/// Why it is not read or refused, in one line.
 pub fn load_fleet(path: &Path, key: Option<&str>) -> Result<(Fleet, Vec<String>), String> {
     let bytes = read_private(path, FLEET_MAX_BYTES)?;
     if let Some(key) = key {
@@ -471,7 +483,8 @@ pub fn load_fleet(path: &Path, key: Option<&str>) -> Result<(Fleet, Vec<String>)
     read_fleet(&text)
 }
 
-/// Reads the fleet document `source` names: a file as [`load_fleet`] reads it.
+/// Reads the fleet document `source` names: a file as [`load_fleet`] reads it; a URL's as
+/// the cache under `ai_dir` holds it, verified again under `key` ([`super::fleet::held`]).
 pub fn load_source(
     source: &FleetSource,
     key: Option<&str>,

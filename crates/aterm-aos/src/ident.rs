@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Identities: domain-separated SHA-256 digests, versioned artifacts, and the task identity that
-//! binds them.
+//! Domain-separated SHA-256 digests, versioned artifacts, and task identity types.
 
 use core::fmt;
 
@@ -39,8 +38,7 @@ impl Digest {
         s
     }
 
-    /// The first 12 hex digits: enough to tell digests apart in a status line, never an identity
-    /// check.
+    /// First 12 lowercase hex digits of the digest.
     #[must_use]
     pub fn short(&self) -> String {
         let mut s = String::with_capacity(12);
@@ -76,8 +74,7 @@ pub(crate) fn len_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// Streaming form of [`Digest::of`]: the same bytes reach the hash, so
-/// `builder(domain).part(a).part(b).finish() == Digest::of(domain, &[a, b])`.
+/// Streaming form of [`Digest::of`].
 pub(crate) struct DigestBuilder(Sha256);
 
 impl DigestBuilder {
@@ -104,7 +101,7 @@ impl DigestBuilder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ArtifactKind {
-    /// The task: what is being hosted (e.g. the momentum glow of one window).
+    /// Hosted task identifier.
     Task = 1,
     /// One implementation of the task's step function.
     Code = 2,
@@ -144,7 +141,7 @@ impl ArtifactKind {
 pub struct ArtifactId {
     /// What the artifact is.
     pub kind: ArtifactKind,
-    /// Its name (e.g. `demo-stranded-settle`).
+    /// Artifact name (`demo-stranded-settle`).
     pub name: String,
     /// Its version.
     pub version: u32,
@@ -153,8 +150,7 @@ pub struct ArtifactId {
 }
 
 impl ArtifactId {
-    /// `digest = Digest::of(b"aterm-aos-artifact-v1\0", [kind, name, version, descriptor])`, with
-    /// `kind` as its byte and `version` as u32 LE.
+    /// Computes the [`ArtifactId`] digest over `kind`, `name`, `version`, and `descriptor`.
     #[must_use]
     pub fn new(kind: ArtifactKind, name: &str, version: u32, descriptor: &[u8]) -> ArtifactId {
         let digest = Digest::of(

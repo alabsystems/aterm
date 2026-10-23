@@ -29,7 +29,8 @@ pub enum Source {
     /// The pinned notification (`wall.disk_full`).
     Notification,
     /// A failed command's output (`wall.disk_full.tool` and its kin, or
-    /// [`TOOL_HEAD_BEFORE_2_1_309`]).
+    /// [`TOOL_HEAD_BEFORE_2_1_309`]), or a command not started
+    /// (`wall.disk_full.pre_start`).
     ToolOutput,
     /// A goal cleared by it (`wall.disk_full.goal`).
     GoalCleared,
@@ -225,6 +226,9 @@ fn result_head(rows: &[String], i: usize) -> Option<&str> {
 /// a footer row under it. A 2.1.309 head counts only with its directory
 /// phrase in the notice's rows.
 fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
+    if vendor && let Some(found) = pre_start(rows, i) {
+        return Some(found);
+    }
     let heads = [
         const { crate::anchors::anchor_text("wall.disk_full.tool") },
         const { crate::anchors::anchor_text("wall.disk_full.tool_inodes") },
@@ -268,6 +272,83 @@ fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
         }
     };
     Some(DiskFull {
+        code,
+        source: Source::ToolOutput,
+        row: i,
+        message: seg.to_string(),
+    })
+}
+
+/// A row of an error result's message under its `⎿` row: exactly five
+/// columns in. Claude Code wraps an error result's message by word and
+/// opens each row after the first on a word (MEASURED:
+/// `prompt::fixtures::TOOL_ERROR_AUTO_MODE_2_1_309`), so a row that opens on
+/// a space is no row of a message.
+fn message_row(row: &str) -> bool {
+    row.strip_prefix(RESULT_BODY)
+        .is_some_and(|text| !text.is_empty() && !text.starts_with(' '))
+}
+
+/// The notice of a command Claude Code did not start (2.1.309): the result
+/// of a call that threw before it spawned, drawn on the vendor's `⎿` row as
+/// `Error: ` and the notice, the rest of it on the [`message_row`]s under
+/// it. Joined across those rows with one space each, it must be the
+/// bundle's template, only the code and the directory free:
+/// `wall.disk_full.pre_start`, then `wall.disk_full.pre_start_full` and
+/// ENOSPC or `wall.disk_full.pre_start_quota` and EDQUOT (the bundle draws
+/// no other pair), `)`, `wall.disk_full.pre_start_volume`, the directory,
+/// `wall.disk_full.tool_dir`, `wall.disk_full.pre_start_ran`, ` ` and
+/// `wall.disk_full.free_space`, all of it (the measured error result is
+/// drawn whole, every row of its message).
+///
+/// A command that prints the same words gets them wrapped by column, not by
+/// word (MEASURED: `prompt::fixtures::TOOL_PRESTART_PRINTED_2_1_309`): a row
+/// broken inside a word joins with a space the template lacks, and a row
+/// that opens on the space ends the join short, so either leaves the
+/// template unmatched. What still reads is a column wrap whose every break
+/// falls just after a space, or inside the directory: rows a word wrap
+/// would also draw, told apart only by the pane's wrap width, which this
+/// reader does not model.
+fn pre_start(rows: &[String], i: usize) -> Option<DiskFull> {
+    let seg = result_row(crate::text::trim_end(&rows[i]))?.strip_prefix(FAILED_RESULT)?;
+    let joined = std::iter::once(seg)
+        .chain(
+            rows[i + 1..]
+                .iter()
+                .take_while(|r| message_row(r))
+                .map(|r| crate::text::trim(r)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let said =
+        joined.strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start") })?;
+    let (code, rest) = [
+        (
+            const { crate::anchors::anchor_text("wall.disk_full.pre_start_full") },
+            Code::Enospc,
+        ),
+        (
+            const { crate::anchors::anchor_text("wall.disk_full.pre_start_quota") },
+            Code::Edquot,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(words, code)| {
+        let rest = said
+            .strip_prefix(words)?
+            .strip_prefix(code.as_str())?
+            .strip_prefix(')')?;
+        Some((code, rest))
+    })?;
+    let rest = rest
+        .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start_volume") })?;
+    let (dir, rest) =
+        rest.split_once(const { crate::anchors::anchor_text("wall.disk_full.tool_dir") })?;
+    let advice = rest
+        .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start_ran") })?
+        .strip_prefix(' ')?;
+    let whole = advice == const { crate::anchors::anchor_text("wall.disk_full.free_space") };
+    (!dir.is_empty() && whole).then(|| DiskFull {
         code,
         source: Source::ToolOutput,
         row: i,

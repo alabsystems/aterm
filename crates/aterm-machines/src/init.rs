@@ -970,7 +970,7 @@ pub fn run_initial_spotlight(
 /// Apply System State's Secrets stage.
 ///
 /// # Errors
-/// The context names no one user, or the journal cannot be resolved.
+/// The context names no one user, or the journal cannot be resolved; nothing was changed.
 pub fn run_initial_secrets(
     sys: &dyn System,
     ctx: &Ctx,
@@ -1425,10 +1425,10 @@ mod tests {
         );
     }
 
-    /// The widgets row reads only its own domains: with Full Disk Access, the Window
-    /// Manager's and Notification Center's (three keys); without it (refused or not
-    /// measured), the Window Manager's alone (two keys), and no command names Notification
-    /// Center's container.
+    /// The widgets rows (the `[consumer]` catalog's three, one key each) read only their
+    /// own domains: with Full Disk Access, the Window Manager's and Notification Center's
+    /// (three keys); without it (refused or not measured), the Window Manager's alone (two
+    /// keys), and no command names Notification Center's container.
     #[test]
     fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
         let who = user("alice", 501);
@@ -1448,13 +1448,26 @@ mod tests {
             selected.set(Setting::Widgets, true);
             let items =
                 workstation_items_selected(&context, WorkstationGroup::All, selected).unwrap();
-            assert_eq!(items.len(), 1);
-            let snapshots = items[0].preference_changes(&sys, &context).unwrap();
-            assert_eq!(snapshots.len(), keys, "{full_disk_access:?}");
-            assert!(matches!(
-                items[0].probe(&sys, &context),
-                Probe::Change { .. } | Probe::Deferred { .. }
-            ));
+            let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
+            assert_eq!(
+                ids,
+                [
+                    "consumer.widgets.desktop@alice",
+                    "consumer.widgets.stage-manager@alice",
+                    "consumer.widgets.notification-center@alice"
+                ]
+            );
+            let mut snapshots = 0;
+            for item in &items {
+                snapshots += item.preference_changes(&sys, &context).unwrap().len();
+            }
+            assert_eq!(snapshots, keys, "{full_disk_access:?}");
+            for item in &items[..2] {
+                assert!(matches!(
+                    item.probe(&sys, &context),
+                    Probe::Change { .. } | Probe::Deferred { .. }
+                ));
+            }
             let calls = sys.calls();
             for call in &calls {
                 assert!(
@@ -1519,14 +1532,17 @@ mod tests {
                 .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
                 .unwrap()
                 .rows;
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].outcome, Outcome::Ok, "{:?}", rows[0]);
+            assert_eq!(rows.len(), 3);
+            assert!(
+                rows.iter().all(|row| row.outcome == Outcome::Ok),
+                "{rows:?}"
+            );
             let granted = full_disk_access == Some(true);
             assert_eq!(
-                rows[0].title.contains("Full Disk Access"),
+                rows[2].title.contains("Full Disk Access"),
                 !granted,
                 "{}",
-                rows[0].title
+                rows[2].title
             );
             assert_eq!(
                 sys.calls()
@@ -1539,11 +1555,10 @@ mod tests {
         }
     }
 
-    /// The follow-up group builds, of the selected rows, only an item for each row with
-    /// keys in another app's container, under its row's id and reaching those keys alone:
-    /// for the widgets and the Dock, one widgets item whose snapshot, plan and apply read
-    /// Notification Center's widget list and no Window Manager or Dock key, and its run
-    /// withholds nothing with the grant.
+    /// The follow-up group builds, of the selected rows, only an item for each key in
+    /// another app's container, under its row's id: for the widgets and the Dock,
+    /// Notification Center's widgets row, whose snapshot, plan and apply read its widget
+    /// list and no Window Manager or Dock key, and its run withholds nothing with the grant.
     #[test]
     fn the_withheld_group_reaches_only_the_keys_a_pass_without_the_grant_left_alone() {
         assert_eq!(
@@ -1599,8 +1614,8 @@ mod tests {
         assert_eq!(
             rows,
             [(
-                "init.widgets@alice",
-                "No widgets in Notification Center",
+                "consumer.widgets.notification-center@alice",
+                "No Notification Center widgets",
                 Outcome::Planned
             )]
         );
@@ -1624,7 +1639,7 @@ mod tests {
         let run = pass
             .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
             .unwrap();
-        assert_eq!(run.withheld, ["init.widgets@alice"]);
+        assert_eq!(run.withheld, ["consumer.widgets.notification-center@alice"]);
         let sys = console(Some(true));
         sys.on(
             "alice$ /usr/bin/defaults export com.apple.WindowManager -",

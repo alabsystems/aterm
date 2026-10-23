@@ -167,7 +167,8 @@ impl Rig {
         let armed = markers::arm(self.logs(), self.id.pid, self.id.nanos, MarkerOwner::App)
             .expect("marker armed");
         assert!(armed.locked, "the marker's owner lock is held");
-        // SAFETY: `arm` returns a descriptor it opened for this call and nobody else owns.
+        // SAFETY: `arm` returns a descriptor it opened for this call and nobody
+        // else owns; the `OwnedFd` closes it exactly once.
         let lock = unsafe { OwnedFd::from_raw_fd(armed.fd) };
         self.marker = Some((armed.path, Some(lock)));
         self.booted = true;
@@ -224,7 +225,8 @@ impl Rig {
                 std::fs::remove_file(&*path).expect("a live run's marker is under its name");
             }
             if let Some(lock) = lock.take() {
-                // SAFETY: `flock` on the descriptor the rig holds open until it drops right after.
+                // SAFETY: `flock` on the descriptor the rig holds open until
+                // it drops right after; LOCK_UN never waits.
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "the release: LOCK_UN before the descriptor closes"

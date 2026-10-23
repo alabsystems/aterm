@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The missing-font class drain. A poll-based host (web/wasm) cannot read
-//! font files, so the renderer reports which injectable face class a
-//! `.notdef` char needed and the host fetches only that class: an ASCII-only
-//! session never pays for the emoji/CJK payload.
-//!
-//! Deterministic on any machine: `Renderer::from_bytes` leaves the lazy
-//! system-font path lists empty and every test disables the runtime resolver,
-//! as a web host does.
+//! Missing-font class drain and late face injection tests.
 
 use aterm_render::{FaceId, MISSING_FONT_CLASS_EMOJI, MISSING_FONT_CLASS_TEXT, Renderer, Theme};
 
@@ -30,15 +23,10 @@ fn nerd_symbols() -> Vec<u8> {
 
 fn renderer() -> Renderer {
     let mut r = Renderer::from_bytes(&dejavu(), 18.0, Theme::default()).expect("fixture parses");
-    // Machine-independent `.notdef`: never consult the system resolver, as on
-    // wasm.
     r.set_runtime_font_discovery(false);
     r
 }
 
-/// Which class each kind of probe reports: nothing for covered and procedural
-/// chars, TEXT for a text miss, EMOJI from both the text and the emoji dispatch
-/// paths, and the union when several classes miss before a drain.
 #[test]
 fn each_miss_reports_its_own_class() {
     type Probe = fn(&mut Renderer);
@@ -106,7 +94,6 @@ fn injecting_the_missing_face_stops_the_class() {
     assert_eq!(r.take_missing_font_classes(), MISSING_FONT_CLASS_TEXT);
     r.set_fallback_bytes(&nerd_symbols())
         .expect("nerd face parses");
-    // The installer cleared the per-char memos, so the char re-probes.
     let key = r.glyph_key(branch);
     assert_eq!(key.source, FaceId::Fallback, "served by the injected face");
     assert_eq!(r.take_missing_font_classes(), 0);

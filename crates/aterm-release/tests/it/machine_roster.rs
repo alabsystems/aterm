@@ -517,7 +517,7 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
             roster_path.display()
         ),
     );
-    let creds = sign::ReleaseCredentials::load(&profile).expect("loads");
+    let creds = sign::ReleaseCredentials::load(&profile, None).expect("loads");
     assert_eq!(creds.machine_id(), Some("m3"));
     assert_eq!(creds.machine_roster(), Some(roster_path.as_path()));
     let read = machines::RosterDocument::read(creds.machine_roster().unwrap()).expect("reads");
@@ -535,6 +535,88 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
     assert!(
         !rendered.contains(&pkcs8_b64()),
         "the private key must never render"
+    );
+    clean(&dir);
+}
+
+/// One profile serves every Mac the secrets vault hands it to: a `~/` roster is read under
+/// that Mac's home, any other value is the path as written, and a `~/` roster with no home,
+/// or a relative one, is refused rather than read from the working directory.
+#[test]
+fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
+    let dir = tempdir("tilde-roster");
+    let document = roster_doc(&[], &MASTER);
+    let roster_dir = dir.join(".aterm/roster");
+    std::fs::create_dir_all(&roster_dir).unwrap();
+    std::fs::write(roster_dir.join("aterm-machines.toml"), &document.bytes).unwrap();
+    std::fs::write(
+        roster_dir.join("aterm-machines.toml.sig"),
+        &document.signature,
+    )
+    .unwrap();
+
+    let named = |roster: &str| {
+        write_profile(
+            &dir,
+            &format!(
+                "signing_key = \"{}\"\nmachine_roster = \"{roster}\"\n",
+                pkcs8_b64()
+            ),
+        )
+    };
+
+    let profile = named("~/.aterm/roster/aterm-machines.toml");
+    let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
+    assert_eq!(
+        creds.machine_roster(),
+        Some(roster_dir.join("aterm-machines.toml").as_path())
+    );
+    let read = machines::RosterDocument::read(creds.machine_roster().unwrap()).expect("reads");
+    assert_eq!(
+        read, document,
+        "the roster and its sibling signature, under this home"
+    );
+
+    let other_home = dir.join("elsewhere");
+    let creds = sign::ReleaseCredentials::load(&profile, Some(&other_home)).expect("loads");
+    assert_eq!(
+        creds.machine_roster(),
+        Some(
+            other_home
+                .join(".aterm/roster/aterm-machines.toml")
+                .as_path()
+        ),
+        "the same profile names the roster under each home it is loaded in"
+    );
+
+    let refused = sign::ReleaseCredentials::load(&profile, None)
+        .expect_err("a ~/ roster with no home must refuse");
+    assert!(refused.contains("HOME"), "{refused}");
+    for relative in ["", "relative/home"] {
+        let refused = sign::ReleaseCredentials::load(&profile, Some(Path::new(relative)))
+            .expect_err("a ~/ roster under a relative home must refuse");
+        assert!(refused.contains("HOME"), "{relative:?}: {refused}");
+    }
+
+    let profile = named("~//.aterm/roster/aterm-machines.toml");
+    let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
+    assert_eq!(
+        creds.machine_roster(),
+        Some(roster_dir.join("aterm-machines.toml").as_path()),
+        "`~//r` is still under the home, as a shell reads it"
+    );
+
+    let absolute = roster_dir.join("aterm-machines.toml");
+    let profile = named(&absolute.display().to_string());
+    let creds = sign::ReleaseCredentials::load(&profile, Some(&other_home)).expect("loads");
+    assert_eq!(creds.machine_roster(), Some(absolute.as_path()));
+
+    let profile = named("~someone/aterm-machines.toml");
+    let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
+    assert_eq!(
+        creds.machine_roster(),
+        Some(Path::new("~someone/aterm-machines.toml")),
+        "only `~/` names this home"
     );
     clean(&dir);
 }
@@ -557,7 +639,7 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
             roster_path.display()
         ),
     );
-    let creds = sign::ReleaseCredentials::load(&profile).expect("loads");
+    let creds = sign::ReleaseCredentials::load(&profile, None).expect("loads");
     let master = pk(&MASTER);
     let masters = [master.as_str()];
     let verdict =
@@ -590,7 +672,7 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
             dir.join("gone.toml").display()
         ),
     );
-    let creds = sign::ReleaseCredentials::load(&orphan).expect("loads");
+    let creds = sign::ReleaseCredentials::load(&orphan, None).expect("loads");
     publish::signing_verdict(Some(&creds), &anchors(&masters, None))
         .expect_err("a named-but-missing roster must refuse");
     clean(&dir);

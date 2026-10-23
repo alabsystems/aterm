@@ -349,6 +349,8 @@ pub(crate) fn encode_tail(
     t: GlTailIn<'_>,
 ) -> Result<GlTailOut, String> {
     let (w, h) = t.dims;
+    // A frame no present followed leaves what its resize replaced.
+    live.dev.free_retired();
     let stage_started = aterm_time::Instant::now();
     let drawing = t.inst.fx_instances() > 0;
     let (fx_atlas_bytes, fx_palette) = match live.sync_fx(&t.fx.atlas, drawing).and_then(|b| {
@@ -408,8 +410,10 @@ pub(crate) fn encode_tail(
         .is_none_or(|o| o.w != w || o.h != h || !o.tex.on(&live.dev));
     if recreate {
         let (format, alias) = offscreen_format(&live.dev);
-        let tex = live.dev.texture_2d(format, w, h, alias)?;
-        win.gl_offscreen = Some(GlOffscreen { tex, w, h });
+        let mut tex = win.gl_offscreen.take().map(|o| o.tex);
+        live.dev
+            .texture_2d_resizing(&mut tex, format, w, h, alias)?;
+        win.gl_offscreen = tex.map(|tex| GlOffscreen { tex, w, h });
     }
     let (load0, scissor) = frame_load_and_scissor(
         t.scope,
@@ -808,6 +812,9 @@ pub(crate) struct GlTrayCard {
     pub(crate) w: u32,
     pub(crate) h: u32,
     pub(crate) pixels: Vec<u8>,
+    /// Which upload made it (`GpuRenderer::tray_uploads` after it): a card
+    /// with the same serial shows the same pixels.
+    pub(crate) serial: u64,
 }
 
 impl GpuRenderer {
@@ -1090,6 +1097,7 @@ impl GpuRenderer {
                 w: t.pw,
                 h: t.ph,
                 pixels,
+                serial: self.tray_uploads,
             });
         }
         let tu = Self::gl_post_uniform(

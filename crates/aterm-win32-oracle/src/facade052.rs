@@ -1,6 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//! `oracle-052`.
+//! `oracle-052`: crates/aterm-windows-sys-052, the windows-sys 0.52 facade
+//! ring reads on aarch64 Windows (WB.1, docs/AUDIT-third-party-2026-10-15.md),
+//! against the registry windows-sys 0.52.0, on both Windows triples.
+//!
+//! STOCK EXCEPTION as `oracle`: stock Cargo/RUSTC with the Windows std; nothing is linked or
+//! run.
 use crate::oracle::{
     FROZEN, Runner, System, artifacts, nm, referenced, rejected_by, required, tail, words,
 };

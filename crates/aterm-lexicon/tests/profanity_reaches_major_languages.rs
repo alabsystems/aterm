@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The f-bomb reaches the major languages on the shipped default and does not fire on ordinary
-//! Chinese.
-//!
 //! An `ambiguous = true` entry loads only when its language is un-gated, so the flag on a
 //! language's only profanity silences it under the default `languages = ["en"]`. The gate belongs
 //! only on surfaces that collide with a benign word (Swedish `fan`, Hebrew `כוס` "cup", Chinese
@@ -12,7 +9,6 @@
 
 use aterm_lexicon::{Class, Lexicon, ScanOptions};
 
-/// The shipped default: only English ambiguous entries un-gated.
 fn shipped() -> Lexicon {
     Lexicon::with_languages(&["en"])
 }
@@ -26,7 +22,6 @@ fn has_profanity(lx: &Lexicon, text: &str) -> bool {
 #[test]
 fn major_languages_have_a_working_f_bomb_by_default() {
     let lx = shipped();
-    // Each expletive sits in running text, so the scanner finds it mid-sentence.
     let cases: &[(&str, &str)] = &[
         ("en", "what the fuck is this"),
         ("pl", "ale kurwa co to jest"),
@@ -60,25 +55,19 @@ fn major_languages_have_a_working_f_bomb_by_default() {
     );
 }
 
-/// The gate still exists: a surface kept `ambiguous` because it collides with
-/// an ordinary word stays dark by default.
 #[test]
 fn genuinely_ambiguous_surfaces_stay_gated() {
     let lx = shipped();
-    // Swedish `fan` is also the English word, and `fan` alone must not decorate.
     assert!(
         !has_profanity(&lx, "I am a big fan of this"),
         "English \"fan\" must not read as Swedish profanity"
     );
-    // Romanian `fut`/`futu` prefix "future".
     assert!(
         !has_profanity(&lx, "in the future we will see"),
         "\"future\" must not read as Romanian profanity"
     );
 }
 
-/// 我操 is an expletive and a prefix of ordinary verbs (我操作 "I operate"); the exceptions keep
-/// maximal munch from reaching it there.
 #[test]
 fn ordinary_chinese_does_not_detonate() {
     let lx = shipped();
@@ -92,7 +81,6 @@ fn ordinary_chinese_does_not_detonate() {
             "ordinary Chinese detonated an f-bomb: {text}"
         );
     }
-    // The genuine expletive still fires: the benign compounds are suppressed, not the word.
     assert!(
         has_profanity(&lx, "我操这也太慢了"),
         "the real zh expletive must still fire"

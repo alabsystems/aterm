@@ -36,7 +36,7 @@ pub(super) fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
 }
 
 impl CursorGlow {
-    /// A non-typing move slams the flare.
+    /// A non-typing move slams the flare, except under fire or on a navigation move.
     #[inline]
     pub(super) const fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
@@ -68,6 +68,9 @@ impl CursorGlow {
             self.cue_sound(crate::trail_sound::SoundKind::Backspace, cc);
         } else if navigation {
             // While v2 owns the frame, the meteor gesture (or the nav tick) is
+            // the one sound of a navigation move, minted by the engine; v1's
+            // Sweep/Glide stay silent. Nested so a one-cell nav move cannot fall
+            // through to the `typing` click and debit a key credit.
             if !self.v2.engaged() {
                 let dir: i8 = if cc != pc {
                     if cc > pc { 1 } else { -1 }
@@ -85,11 +88,13 @@ impl CursorGlow {
             }
         } else if typing {
             // One character, one click: a glyph the host already clicked at the
+            // keypress ([`Self::cue_keystroke`]) spends that credit silently.
             if !self.take_keyed_click(now) {
                 self.cue_sound(crate::trail_sound::SoundKind::Typed, cc);
             }
         } else {
             // A printable key whose echo moves the cursor more than one cell
+            // classifies as a Jump, so its key credit is spent here too.
             if !self.take_keyed_click(now) {
                 self.cue_sound(crate::trail_sound::SoundKind::Jump, cc);
             }
@@ -519,7 +524,9 @@ impl CursorGlow {
         }
     }
 
-    /// The per-style particle burst for this move: jump-scaled showers, heat-scaled typing sheds.
+    /// The per-style particle burst for this move: jump-scaled showers,
+    /// heat-scaled typing sheds; fire meteor moves defer to the strike, and
+    /// navigation moves get none.
     pub(super) fn spawn_burst_particles(&mut self, mv: &MoveCtx, fire_meteor: bool) {
         let &MoveCtx {
             pr,
@@ -565,6 +572,8 @@ impl CursorGlow {
                     ((8.0 + dist * 1.3) as usize).min(30)
                 } else if beam {
                     // A jump is the steady tube arriving and leaving, and
+                    // nothing else: a leap's dust is the comet's. Fast typing
+                    // coalesced into one move keeps the typing shed.
                     if typing {
                         1 + (self.heat * 4.0) as usize
                     } else {
@@ -666,6 +675,12 @@ impl CursorGlow {
                     }
                     GlowStyle::Water => {
                         // Three droplet populations:
+                        //   drip   - sags off the wake, then falls (dominant when
+                        //            typing slowly);
+                        //   spray  - kicked up and out, arcing back; energy
+                        //            scales with heat;
+                        //   bubble - buoyant, rising behind the head, only at
+                        //            sustained speed.
                         if dist >= 2.0 {
                             if r5 < 0.4 {
                                 Particle {
@@ -989,6 +1004,7 @@ impl CursorGlow {
 
     pub(super) fn poof_scan(&mut self, now: Instant, cfg: &GlowConfig, geom: Geom) {
         // Expire a stale hint: it keeps the animation timer armed
+        // (`is_active`), so an unconsumed one must self-disarm.
         if self
             .kill_hint
             .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH)
@@ -1164,7 +1180,7 @@ impl CursorGlow {
         }
         match cfg.style {
             GlowStyle::RainbowKitty | GlowStyle::Sparkle => {
-                // Under v2 the erase's stars are stardust's; only the smoke above
+                // Under v2 the erase's stars are stardust's; only the smoke above is v1's.
                 if !self.v2.engaged() {
                     self.spawn_erase_sparkles(
                         span_x0,

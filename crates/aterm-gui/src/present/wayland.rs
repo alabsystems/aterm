@@ -108,7 +108,8 @@ impl Buffer {
         let len = pool_size(width, height).ok_or_else(size_err)?;
         let len_i32 = i32::try_from(len).map_err(|_| size_err())?;
         let mem = ShmMem::new(c"aterm-wayland", len).map_err(WaylandPresentError::Shm)?;
-        // SAFETY: `shm` is the presenter's live wl_shm.
+        // SAFETY: `shm` is the presenter's live wl_shm; the descriptor is
+        // duplicated by libwayland for the send.
         let pool = unsafe { wl_shm::create_pool(shm, mem.fd().as_raw_fd(), len_i32) }
             .ok_or(aterm_wayland::proxy::Error::NoObject)?;
         let mut b = Buffer {
@@ -135,7 +136,8 @@ impl Buffer {
             unsafe { wl_shm_pool::create_buffer(self.pool, 0, width, height, stride, FORMAT) }
                 .ok_or(aterm_wayland::proxy::Error::NoObject)?;
         let released = Arc::clone(&self.released);
-        // SAFETY: A buffer this presenter made, on its queue.
+        // SAFETY: a buffer this presenter made, on its queue; the listener is
+        // kept beside it and freed only after the buffer is destroyed.
         let listener = unsafe {
             buffer.listen(move |_, opcode, _| {
                 if opcode == wl_buffer::evt::RELEASE {
@@ -160,7 +162,8 @@ impl Buffer {
     /// Destroy the live `wl_buffer`, if there is one, then free its listener.
     fn destroy_buffer(&mut self) {
         if let Some(Live { buffer, listener }) = self.live.take() {
-            // SAFETY: The live wl_buffer, taken out of `live`, so destroyed once.
+            // SAFETY: the live wl_buffer, taken out of `live`, so destroyed
+            // once; its listener goes after.
             unsafe { wl_buffer::destroy(buffer) };
             drop(listener);
         }
@@ -214,7 +217,8 @@ pub(crate) struct WaylandPresenter {
     _window: Arc<Window>,
 }
 
-// SAFETY: Libwayland's calls are thread-safe.
+// SAFETY: libwayland's calls are thread-safe; the presenter moves between
+// threads only with its window state.
 unsafe impl Send for WaylandPresenter {}
 
 impl WaylandPresenter {
@@ -223,7 +227,8 @@ impl WaylandPresenter {
         let Some(NativeWindow::Wayland { display, surface }) = window.native_window() else {
             return Err(WaylandPresentError::NotWayland);
         };
-        // SAFETY: Winit's live display and surface, which `_window` keeps alive.
+        // SAFETY: winit's live display and surface, which `_window` keeps alive for as long as this
+        // presenter lives.
         let (display, surface) = unsafe { (Display::from_ptr(display), Proxy::from_ptr(surface)) };
         let queue = Queue::new(display)?;
         let registry = Registry::new(&queue)?;

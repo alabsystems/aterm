@@ -1110,7 +1110,6 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) ->
             ),
         },
         Membership::Unconfigured if !plausible_source(source) => Probe::Blocked {
-            // URL, an absolute path or a ~/ path (not shown); run aterm init again, or aterm secrets join <url>".into(),
             why: "the answer at the vault prompt is not an http(s):// URL, an absolute path or a ~/ path (not shown); run aterm init again, or aterm secrets join <url>".into(),
         },
         Membership::Unconfigured => Probe::Change {

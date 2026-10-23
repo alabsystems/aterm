@@ -318,7 +318,8 @@ mod imp {
             return None;
         }
         let mut buf = [0u8; PROC_PIDPATHINFO_MAXSIZE];
-        // SAFETY: `buf` is MAX writable bytes.
+        // SAFETY: `buf` is MAX writable bytes; libproc writes at most that many
+        // and returns the length, or <= 0 on failure.
         let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
         let n = usize::try_from(n)
             .ok()
@@ -344,7 +345,8 @@ mod imp {
     /// Best-effort: `pid`'s code-signing identity contains `needle`.
     fn cs_identity_contains(pid: i32, needle: &[u8]) -> bool {
         let mut buf = [0u8; 256];
-        // SAFETY: `buf` is 256 writable bytes, the size passed.
+        // SAFETY: `buf` is 256 writable bytes, the size passed. csops fills at
+        // most that many and leaves the rest as the zeros we set.
         let r = unsafe { csops(pid, CS_OPS_IDENTITY, buf.as_mut_ptr().cast(), buf.len()) };
         if r != 0 {
             return false;
@@ -404,6 +406,7 @@ mod imp {
 
     /// [`stdout_is_anon_pipe`]'s read of `me`'s live fd table.
     pub(super) fn fd_one_is_anon_pipe(me: i32) -> Result<(), AttestError> {
+        // SAFETY: a null buffer and zero size asks proc_pidinfo for the size.
         let need = unsafe { proc_pidinfo(me, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
         let need = usize::try_from(need).ok().filter(|&n| n > 0 && n < 1 << 20);
         let Some(need) = need else {

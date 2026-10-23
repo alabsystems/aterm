@@ -100,7 +100,10 @@ impl Drop for InheritedAcrossExec {
 
 /// `FD_CLOEXEC` on `fd` set to `on`; `false` when `fcntl` refused.
 fn set_close_on_exec(fd: i32, on: bool) -> bool {
-    // SAFETY: `F_GETFD`/`F_SETFD` read and write one descriptor's flags; `fd` is the relaunch.
+    // SAFETY: `F_GETFD`/`F_SETFD` read and write one descriptor's flags; `fd` is
+    // the relaunch copy, open for the process's life (`RELAUNCH_COPY` is never
+    // dropped), or the ready descriptor `adopt_ready_or_exit` just took over, so
+    // no other owner's number is touched.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFD);
         if flags == -1 {

@@ -8,16 +8,13 @@
 //!
 //! Winit's Wayland backend.
 //!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7 with winit-core
-//! WC.8): the backend speaks through first-party `aterm-wayland` (its protocol tables, a runtime
-//! over the system's libwayland-client, and its registry, output, seat, selection and cursor
-//! helpers) and waits in `common::poll`, where upstream used smithay-client-toolkit,
+//! LOCAL PATCH (aterm): the backend speaks through first-party `aterm-wayland` (protocol tables,
+//! a runtime over the system's libwayland-client, and registry, output, seat, selection and
+//! cursor helpers) and waits in `common::poll`, where upstream used smithay-client-toolkit,
 //! wayland-client, wayland-backend, wayland-protocols and calloop. Every event the backend hears
-//! is recorded in one ordered [`wire::Inbox`]: its own objects' by their listeners, and
-//! aterm-wayland's seats', data devices' and selection sources' through the sinks the inbox
-//! gives them. The loop applies the inbox to its state after each dispatch, in the order the
-//! queue dispatched the events (the order the compositor sent them), as sctk's handlers ran
-//! inside the dispatch.
+//! is recorded in one ordered [`wire::Inbox`], which the loop applies to its state after each
+//! dispatch, in the order the compositor sent the events, as sctk's handlers ran inside the
+//! dispatch.
 
 use std::fmt::Display;
 use std::sync::Arc;
@@ -91,7 +88,6 @@ fn make_wid(surface: Proxy) -> WindowId {
     WindowId(surface.as_ptr() as u64)
 }
 
-/// The default routine does floor, but we need round on Wayland.
 fn logical_to_physical_rounded(size: LogicalSize<u32>, scale_factor: f64) -> PhysicalSize<u32> {
     let width = size.width as f64 * scale_factor;
     let height = size.height as f64 * scale_factor;

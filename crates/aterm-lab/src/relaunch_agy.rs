@@ -213,9 +213,10 @@ fn open_tab(run: &Run, proj: &str, known: &[i32], args: &[&str]) -> Result<(Stri
 /// The word the agy of phase 2a is asked to remember.
 pub const WORD3: &str = "EGRET-3301";
 
-/// Phases 2a and 2b ([module docs](self)): a second agy opened by `-c`
-/// beside an agy of its own, each in a tab of its own in `proj`; `known`, the
-/// agy processes the check has seen.
+/// Phases 2a and 2b: a second agy opened by `-c` beside an agy of its own, each in a tab of
+/// its own in `proj`, keeps the first's crash from being relaunched while it runs (2a); once it
+/// quits, the crash is relaunched on its conversation (2b). `known`, the agy processes the check
+/// has seen.
 #[allow(clippy::too_many_lines)]
 fn beside(run: &Run, proj: &str, known: &[i32], failed: &mut Vec<String>) -> Result<(), Fail> {
     let door = Door::new(run)?;

@@ -2,22 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! DECRQSS (Request Selection or Setting): applications query a setting (SGR, DECSCUSR,
-//! margins, DECSCL, DECSCA, DECSLPP, DECSACE, or a DEC private mode `?N`) and the terminal
-//! answers with DECRPSS.
+//! DECRQSS (Request Selection or Setting) query handler and DECRPSS response builders.
 
 use crate::grid::{CellFlags, PackedColor};
 
 use super::CursorStyle;
 use super::handler::TerminalHandler;
 
-/// DECSCL's second parameter for 7-bit C1 transmission (S7C1T; `0` and `2` are S8C1T, per
-/// the VT510 and xterm, whose report says `;1` in 7-bit mode). aterm has no C1 switch
-/// (`handle_decscl` ignores the request) and never emits 8-bit C1.
+/// DECSCL's second parameter for 7-bit C1 transmission (S7C1T).
 const DECSCL_C1_TRANSMISSION_7BIT: u8 = 1;
 
-/// How a DECRQSS answer is assembled: settings answer parameters then the mnemonic
-/// (`"0"` + `"m"` -> `"0m"`), DEC private modes a body already ending in `h`/`l`.
+/// How a DECRQSS answer is assembled.
 enum DecrqssPayload {
     /// Followed by the filtered query mnemonic `Pt`.
     WithPt(String),
@@ -25,8 +20,7 @@ enum DecrqssPayload {
     Full(String),
 }
 
-/// Push the SGR parameters for `color`: `base` is 30 (fg) or 40 (bg); bright colours use
-/// `base + 60`, extended indexed and RGB `base + 8`.
+/// Push the SGR parameters for `color` (`base` is 30 for fg or 40 for bg).
 fn push_color_sgr(params: &mut Vec<String>, color: PackedColor, base: u8) {
     if color.is_indexed() {
         let idx = color.index();
@@ -35,19 +29,16 @@ fn push_color_sgr(params: &mut Vec<String>, color: PackedColor, base: u8) {
         } else if idx < 16 {
             params.push(format!("{}", base + 60 + idx - 8));
         } else {
-            // ISO 8613-3 colon subparameters for extended indexed color
             params.push(format!("{}:5:{idx}", base + 8));
         }
     } else if color.is_rgb() {
         let (r, g, b) = color.rgb_components();
-        // ISO 8613-3 colon subparameters: base:2::r:g:b (empty colorspace)
         params.push(format!("{}:2::{r}:{g}:{b}", base + 8));
     }
 }
 
 impl TerminalHandler<'_> {
-    /// DECRQSS (`DCS $ q Pt ST`): answer `DCS 1 $ r <payload> ST` for a known mnemonic `Pt`,
-    /// `DCS 0 $ r ST` otherwise.
+    /// DECRQSS (`DCS $ q Pt ST`): answer `DCS 1 $ r <payload> ST` or `DCS 0 $ r ST`.
     pub(super) fn handle_decrqss(&mut self, cap: &super::response_capability::ResponseCapability) {
         let Ok(pt) = std::str::from_utf8(&self.dcs.data[..]) else {
             self.send_response(cap, b"\x1bP0$r\x1b\\");
@@ -77,15 +68,12 @@ impl TerminalHandler<'_> {
             "?2026" => Some(DecrqssPayload::Full(self.decrqss_synchronized_output())),
             "?1007" => Some(DecrqssPayload::Full(self.decrqss_alternate_scroll())),
             "?3" => Some(DecrqssPayload::Full(self.decrqss_deccolm())),
-            // Grapheme cluster mode: permanently reset, as DECRQM answers.
             "?2027" => Some(DecrqssPayload::Full("?2027l".to_string())),
             _ => None,
         };
 
         match response {
             Some(payload) => {
-                // The echoed `Pt` is filtered to printable ASCII: the response may be
-                // echoed back to a shell.
                 let mut response_bytes = Vec::new();
                 response_bytes.extend_from_slice(b"\x1bP1$r");
                 match payload {
@@ -108,13 +96,10 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// SGR: the current attributes, with ISO 8613-3 colon subparameters for underline styles
-    /// and extended colours.
+    /// SGR: current attributes with ISO 8613-3 colon subparameters.
     fn decrqss_sgr(&self) -> String {
         let mut params: Vec<String> = Vec::new();
 
-        // The report leads with "0" (as xterm's does: "0;1;31" for bold red), so replaying
-        // it reproduces this style over any current state.
         if self.style.flags.contains(CellFlags::BOLD) {
             params.push("1".to_string());
         }
@@ -216,7 +201,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    // DEC private-mode answers are the full body: `?Nh` when set, `?Nl` when reset.
     fn decrqss_dectcem(&self) -> String {
         if self.modes.cursor_visible {
             "?25h".to_string()
@@ -281,7 +265,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// IRM is ANSI mode 4, queried here as `?4`.
     fn decrqss_irm(&self) -> String {
         if self.modes.insert_mode {
             "?4h".to_string()
@@ -291,7 +274,6 @@ impl TerminalHandler<'_> {
     }
 
     fn decrqss_cursor_blink(&self) -> String {
-        // The cursor style's blink bit, the fact the renderer acts on (`set_cursor_blink`).
         if self.modes.cursor_style.blinks() {
             "?12h".to_string()
         } else {

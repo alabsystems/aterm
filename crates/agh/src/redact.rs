@@ -11,17 +11,11 @@ use aterm_uds::secret::Secret;
 
 use crate::wire::door;
 
-/// What every match becomes.
 const REDACTED_TEXT: &str = "[redacted]";
-/// [`REDACTED_TEXT`]'s bytes, for the scanner.
 const REDACTED: &[u8] = REDACTED_TEXT.as_bytes();
-/// The token prefixes rule 1 looks for.
 const TOKEN_PREFIXES: [&[u8]; 6] = [b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_"];
-/// The scheme words rule 2 passes over.
 const SCHEMES: [&[u8]; 3] = [b"bearer", b"token", b"basic"];
-/// A value under this many bytes is not learned.
 const LEARN_MIN: usize = 8;
-/// Rule 3's least run after `bearer `.
 const BEARER_MIN: usize = 8;
 
 /// Rewrites secrets out of text. Clones share one learned set.
@@ -38,9 +32,7 @@ fn starts_ci(bytes: &[u8], at: usize, prefix: &[u8]) -> bool {
         .is_some_and(|window| window.eq_ignore_ascii_case(prefix))
 }
 
-/// The end of the run that starts at `at`: it stops at ASCII whitespace, or at a `"` that no
-/// odd run of `\` escapes. So a quoted value's closing quote survives (`why="… bearer x…"`),
-/// while an escaped quote inside a value (`abc\"def`) does not cut the match short.
+/// Finds the end of a token run starting at `at`, stopping at ASCII whitespace or an unescaped `"`.
 fn run_end(bytes: &[u8], at: usize) -> usize {
     let mut end = at;
     let mut backslashes = 0usize;
@@ -54,11 +46,8 @@ fn run_end(bytes: &[u8], at: usize) -> usize {
     end
 }
 
-/// The JSON escapes of a tab or a space, which a JSON text carries in place of the byte.
 const ESCAPED_BLANKS: [&[u8]; 3] = [b"\\t", b"\\u0009", b"\\u0020"];
 
-/// The length of the space or tab at `at`, raw (one byte) or JSON-escaped (`\t`, `\u0009`,
-/// `\u0020`); 0 when there is none.
 fn blank_at(bytes: &[u8], at: usize) -> usize {
     match bytes.get(at) {
         Some(b' ' | b'\t') => 1,
@@ -69,7 +58,6 @@ fn blank_at(bytes: &[u8], at: usize) -> usize {
     }
 }
 
-/// `at` moved past any spaces and tabs, raw or JSON-escaped.
 fn skip_blanks(bytes: &[u8], at: usize) -> usize {
     let mut j = at;
     loop {
@@ -99,8 +87,6 @@ fn open_quote(bytes: &[u8], at: usize) -> (Quote, usize) {
     }
 }
 
-/// The end of the value run at `at` that `quote` opened. After an escaped `\"` the run ends
-/// at ASCII whitespace or at the `\"` that closes it; otherwise as `run_end`.
 fn value_end(bytes: &[u8], at: usize, quote: Quote) -> usize {
     if quote != Quote::Escaped {
         return run_end(bytes, at);
@@ -121,7 +107,7 @@ fn value_end(bytes: &[u8], at: usize, quote: Quote) -> usize {
     end
 }
 
-/// Rule 1: a token prefix and at least one of `[A-Za-z0-9_]` at `at`; the token's end.
+/// Rule 1: matches a token prefix plus `[A-Za-z0-9_]+` at `at` and returns its end index.
 fn token_at(bytes: &[u8], at: usize) -> Option<usize> {
     TOKEN_PREFIXES.iter().find_map(|prefix| {
         let tail = bytes.get(at..)?;
@@ -140,11 +126,7 @@ fn token_at(bytes: &[u8], at: usize) -> Option<usize> {
     })
 }
 
-/// Rule 2: the credential header's name, `:`, an optional scheme word, at `at`; where the
-/// value starts and ends. The JSON form (`"name":"scheme value"`) is read too, and so is
-/// that form quoted inside another string (`\"name\":\"scheme value\"`): a `"` or `\"` may
-/// follow the name and open the value, and one more may open the value after the scheme
-/// word (`Bearer "value"`). The run ends at the quote that opened it.
+/// Rule 2: matches `Authorization:` (including JSON-quoted forms) and an optional scheme word at `at`.
 fn header_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
     let name = door::AUTHORIZATION.as_bytes();
     if !starts_ci(bytes, at, name) {
@@ -170,8 +152,7 @@ fn header_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
     (end > j).then_some((j, end))
 }
 
-/// Rule 3: `bearer`, spaces or tabs, and a run of at least 8 bytes at `at`, which a `"` or
-/// `\"` may open; where the run starts and ends (inside the quotes).
+/// Rule 3: matches `bearer <value>` (at least 8 bytes) at `at`.
 fn bearer_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
     let word = "bearer".len();
     if !starts_ci(bytes, at, b"bearer") || blank_at(bytes, at + word) == 0 {
@@ -183,15 +164,14 @@ fn bearer_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
 }
 
 impl Redactor {
-    /// A redactor that has learned nothing.
+    /// Creates an empty redactor.
     #[inline]
     #[must_use]
     pub fn new() -> Redactor {
         Redactor::default()
     }
 
-    /// Remember `secret`'s exact bytes. A value under 8 bytes is ignored; a value already
-    /// learned is not stored twice.
+    /// Remembers `secret`'s exact bytes (values under 8 bytes or already learned are ignored).
     pub fn learn(&self, secret: &[u8]) {
         if secret.len() < LEARN_MIN {
             return;
@@ -203,25 +183,20 @@ impl Redactor {
         exact.push(Secret::new(secret));
     }
 
-    /// Every learned value (longest first, where its bytes are UTF-8), then `shapes`.
+    /// Redacts every learned value (longest first), then applies [`Redactor::shapes`].
     #[inline]
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
         Redactor::shapes(&self.learned(text))
     }
 
-    /// Every learned value, then rule 1 of `shapes` alone: the matches that need no context.
-    /// For a line joined from values that each passed `apply` already (a receipt, a
-    /// heartbeat): rules 2 and 3 read the text after a word, so over a joined line they would
-    /// match across a field boundary (`repo=o/torchbearer as=anonymous`) and eat the next
-    /// field. Neither a learned value nor a token can span a ` key=` boundary.
+    /// Redacts learned values and context-free token prefixes (rule 1) without cross-field rules 2/3.
     #[inline]
     #[must_use]
     pub fn learned_and_tokens(&self, text: &str) -> String {
         scan(&self.learned(text), false)
     }
 
-    /// `text` with every learned value (longest first, where its bytes are UTF-8) replaced.
     fn learned(&self, text: &str) -> String {
         let mut out = text.to_string();
         let exact = self.exact.lock().unwrap_or_else(PoisonError::into_inner);
@@ -238,23 +213,8 @@ impl Redactor {
         out
     }
 
-    /// The shapes alone, in this order:
-    /// 1. `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` or `github_pat_`, followed by at least one
-    ///    of `[A-Za-z0-9_]`: the whole token;
-    /// 2. the header name (`door::AUTHORIZATION`, ASCII case-insensitive), an optional `"` or
-    ///    `\"`, optional spaces and tabs, `:`, optional spaces and tabs, an optional `"` or
-    ///    `\"`, then an optional scheme word (`bearer`, `token` or `basic`, any case), at least
-    ///    one space or tab and an optional `"` or `\"`: the run after them;
-    /// 3. `bearer` (any case), at least one space or tab, an optional `"` or `\"`, then a run
-    ///    of at least 8 bytes: that run.
-    ///
-    /// A space or tab in rules 2 and 3 may also be JSON-escaped (`\t`, `\u0009`, `\u0020`), as
-    /// it is in a JSON text that quotes the header or the word.
-    ///
-    /// Each match becomes `[redacted]`. A byte scanner; no regex. Prose such as `token file`
-    /// or `the bearer of` is left alone. A run ends at ASCII whitespace, or at a `"` that no
-    /// odd run of `\` escapes (after an opening `\"`, at the closing `\"`), so a quoted value
-    /// keeps its closing quote and the scan of an already redacted text changes nothing.
+    /// Redacts token shapes (`ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`),
+    /// `Authorization:` header values, and `bearer <8+ bytes>` runs into `[redacted]`.
     #[inline]
     #[must_use]
     pub fn shapes(text: &str) -> String {
@@ -262,8 +222,6 @@ impl Redactor {
     }
 }
 
-/// The byte scanner: rule 1 of [`Redactor::shapes`] always, rules 2 and 3 (which read the
-/// text after a word) when `context`.
 fn scan(text: &str, context: bool) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

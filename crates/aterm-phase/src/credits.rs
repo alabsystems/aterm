@@ -58,7 +58,10 @@ pub struct Warning {
     pub reset: Option<String>,
 }
 
-/// Whether usage credits carry the session, by Claude Code's own notice (module docs): the lasting `Now using usage credits`, `Now using your usage allocation`, `Extra usage is now covering your requests` (the end of lower-priority mode), or the notice they started on — which wins where both show, for the window it names.
+/// Whether usage credits carry the session, by Claude Code's own notice: the lasting
+/// `Now using usage credits`, `Now using your usage allocation`,
+/// `Extra usage is now covering your requests` (the end of lower-priority mode), or the notice they
+/// started on — which wins where both show, for the window it names.
 #[must_use]
 pub fn in_use(rows: &[String]) -> Option<Credits> {
     let mut found: Option<Credits> = None;
@@ -170,8 +173,7 @@ pub fn usage_warning(rows: &[String]) -> Option<Warning> {
     })
 }
 
-/// The right segments of the rows a notification is drawn on (module docs),
-/// the footer's first.
+/// The right segments of the rows a notification is drawn on, the footer's first.
 fn segments(rows: &[String]) -> impl Iterator<Item = &str> {
     use crate::phase::{composer_frame, footer_end, status_block};
     use crate::wall::{in_queued_message, right_segment};

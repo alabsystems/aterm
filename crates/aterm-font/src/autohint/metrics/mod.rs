@@ -261,6 +261,7 @@ impl Scale {
         }
         if group == ScriptGroup::Default {
             // Disable horizontal hinting completely for LCD, light hinting
+            // and italic fonts.
             if target.is_lcd() || is_light || is_italic {
                 flags |= ScaleFlags::NO_HORIZONTAL;
             }

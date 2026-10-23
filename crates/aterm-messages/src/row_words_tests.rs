@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! Test-only: a row's slots and words: the time slot's one style per width,
 //! the distance-scaled glide, the echoes' words, the
 //! job's size said once, the primary load, and a count never without its
@@ -119,11 +118,6 @@ fn style(w: &str) -> Style {
     Style::Word
 }
 
-/// Over every row with a time slot (download latched and not, stalled, busy
-/// past ten seconds, and their Fault and Vanish echoes), at four
-/// widths and both looks: never a bare `m:ss` clock; a slot laid out long
-/// says `30 s left` / `for 41 s`, one laid out short `30s left` / `for 41s`;
-/// a hidden estimate leaves the slot blank; an ETA never carries a `~`.
 #[test]
 fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
     let mut seen = std::collections::BTreeSet::new();
@@ -259,8 +253,6 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
         ),
     ];
     for (name, scene) in &scenes {
-        // The four capture widths, and every width from 40 to 200 for the
-        // rows long enough to meet every declared short form.
         let widths: Vec<usize> = if name.contains("long title") {
             (40..=200).collect()
         } else {
@@ -306,7 +298,6 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
             }
         }
     }
-    // The scenes did reach every style they claim.
     let all: String = seen.iter().cloned().collect::<Vec<_>>().join("\n");
     for needle in [
         "for 41 s",
@@ -321,16 +312,10 @@ fn the_time_slot_never_shows_a_bare_clock_and_keeps_one_style_per_width() {
     }
 }
 
-/// At 80 columns and 60 Hz, a jump of up to fifty points moves the edge at
-/// most 2.5 cells a display frame, monotonically, and lands within
-/// `FILL_GLIDE_MAX`; the deadline asks the display's frames while it flies
-/// and, once landed on a row that asks nothing else, no wake at all.
 #[test]
 fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
     let cols = 80usize;
     let cell = f64::from(ROW) / cols as f64;
-    // No glint, so a landed bar with no amount has nothing else to draw and
-    // must arm nothing.
     let flat = Look {
         pace: Pace::Moving,
         graded: false,
@@ -378,7 +363,6 @@ fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
         };
         let span = crate::animate::glide_span(from, to);
         assert!(span <= crate::FILL_GLIDE_MAX);
-        // Walk the display's frames (60 Hz) through the glide.
         let mut t = c.fine_instant(t0);
         let mut prev = edge(t);
         let end = t0 + span + c.refresh() * 2;
@@ -399,7 +383,6 @@ fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
         }
         let want = f64::from(to) * f64::from(ROW) / 1000.0;
         assert!((prev - want).abs() <= 1.0, "{from}→{to}: landed at {prev}");
-        // While it flies the deadline is a display frame, not the grid's.
         let mid = t0 + span / 3;
         if from.abs_diff(to) >= 50
             && let Some(d) = c.motion_deadline(&p, mid, flat)
@@ -410,7 +393,6 @@ fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
                 d - mid
             );
         }
-        // Landed: nothing else moves on this row, so nothing wakes.
         let landed = t0 + span + ms(100);
         assert_eq!(
             c.motion_deadline(&p, landed, flat),
@@ -420,10 +402,6 @@ fn a_glide_moves_at_most_two_and_a_half_cells_a_frame_and_then_sleeps() {
     }
 }
 
-/// Beside a percent the stats slot paints only the size of the whole job (a
-/// pair `A / B` its total, a count its one grammar), hidden until the first
-/// unit arrives and gone where the title already states it; no row of the
-/// band states the same total twice.
 #[test]
 fn the_jobs_size_is_said_once_and_only_when_it_is_news() {
     assert_eq!(
@@ -437,7 +415,6 @@ fn the_jobs_size_is_said_once_and_only_when_it_is_news() {
         None
     );
     assert_eq!(job_stats("Pasting 4.2 MB", "1.1 MB / 4.2 MB"), None);
-    // The title says it only as whole words: `12 GB` is not `2 GB`.
     assert_eq!(
         job_stats("Uploading 12 GB backup", "1 GB / 2 GB").as_deref(),
         Some("1 of 2 GB")
@@ -465,7 +442,6 @@ fn the_jobs_size_is_said_once_and_only_when_it_is_news() {
         job_stats("Saving the session", "3 of 4 tabs \u{b7} 12 MB / 40 MB").as_deref(),
         Some("3 of 4 tabs \u{b7} 12 of 40 MB")
     );
-    // Over the band's own rows, at every width: the total never twice.
     let rows: Vec<Message> = vec![
         crate::waits::paste_row(3, 1, 1_100_000, 4_200_000, Duration::ZERO),
         crate::waits::rewrap_row(3, 1_200_000, 3_400_000, Duration::ZERO),
@@ -514,9 +490,6 @@ fn pass(load: Option<Load>) -> Message {
         .primary_load(Load::Network)
 }
 
-/// A download row's `network busy` is the title's and never shows; a load
-/// outside the work's own shows at once; the slot is reserved either way, at
-/// the tail of the words, never led by a `·`.
 #[test]
 fn a_downloads_network_words_never_show_and_another_load_shows_at_once() {
     for cols in [80usize, 120, 160] {
@@ -533,7 +506,6 @@ fn a_downloads_network_words_never_show_and_another_load_shows_at_once() {
             caps,
             "@{cols}: at the tail, before the capsules"
         );
-        // A load other than the work's own shows at once.
         c.restate(
             id,
             Restatement {
@@ -564,8 +536,6 @@ fn a_downloads_network_words_never_show_and_another_load_shows_at_once() {
     }
 }
 
-/// `100%` and `42%` alike stand two cells clear of the title, right-aligned in
-/// four.
 #[test]
 fn the_percent_keeps_a_two_space_gap() {
     for p in [0u16, 50, 420, 1000] {
@@ -588,13 +558,8 @@ fn the_percent_keeps_a_two_space_gap() {
     }
 }
 
-/// A free-text title the table has no past tense for (`Uploading the backup`)
-/// keeps its title on a Complete echo and says `done` in the time slot, never
-/// a bare `✓ Uploading the backup`. A row with no time slot keeps its `100%`;
-/// a past-tense title says nothing there.
 #[test]
 fn a_complete_echo_without_a_past_tense_says_done() {
-    // `done=<n>/<total> unit=bytes`, so an ETA slot.
     let bar = |title: &str| {
         Message::new(tags::PACKAGES, Severity::Info, title)
             .meter(bytes_meter(30_000_000))
@@ -610,7 +575,6 @@ fn a_complete_echo_without_a_past_tense_says_done() {
             let past = c.post(bar("Downloading the backup"), stamp(), now).id;
             let busy_free = c.post(busy("Syncing photos", ""), stamp(), now).id;
             c.commit_rows(now, 3);
-            // Long enough that each row has a time slot.
             let at = now + ms(12_000);
             let p0 = present(&c, cols);
             for l in &p0.rows {
@@ -644,7 +608,6 @@ fn a_complete_echo_without_a_past_tense_says_done() {
             }
         }
     }
-    // No time slot (a bare `pct=`): the `100%` is the word left.
     let now = Instant::now();
     let mut c = fresh(now);
     let pct = Message::new(tags::PACKAGES, Severity::Info, "Uploading the backup")
@@ -665,22 +628,15 @@ fn a_complete_echo_without_a_past_tense_says_done() {
     assert_eq!(p.rows[0].pct.as_ref().map(|p| p.1.trim()), Some("100%"));
 }
 
-/// Where the width law shortens a count it keeps its unit word
-/// (`3/10 programs`, `6/8 cores`), a clause before the count included; where
-/// even that does not fit the stats go whole. Swept over every width 40–200
-/// for every row that carries a count: no painted stats is a bare fraction.
 #[test]
 fn a_count_keeps_its_unit_at_every_width() {
     let rows: [(&str, Message); 3] = [
         ("pass", pass(None)),
         (
-            // Where the clause goes, the count keeps its unit.
             "busy, a clause before the count",
             busy("Verifying the payload", "throttled \u{b7} 6 of 8 cores"),
         ),
         (
-            // The capsule leaves no room for `3/10 programs`: the stats go
-            // whole, never as `3/10`.
             "pass, with a capsule",
             pass(None).action(Intent::ShowTab { tab: 2, window: 1 }),
         ),

@@ -488,6 +488,7 @@ pub fn parse_attrs(c: &mut Cursor) -> Result<Vec<Attribute>, Error> {
 
 fn parse_vis(c: &mut Cursor) -> Vec<TokenTree> {
     // A None-group in front is a `$vis` fragment when it is empty or starts
+    // with `pub`; any other group is left unspliced.
     if let Some(TokenTree::Group(g)) = c.peek_raw()
         && g.delimiter() == Delimiter::None
     {

@@ -349,7 +349,8 @@ impl Command<'_> {
 /// no-follow open of a regular file.
 ///
 /// # Errors
-/// [`LoadError::Io`] on I/O failure or non-regular file; [`LoadError::Malformed`] if malformed.
+/// [`LoadError::Io`] when it is not a regular file, is over 1 GiB or cannot be read;
+/// [`LoadError::Malformed`] as [`load_dylibs`] refuses.
 pub fn load_dylibs_at(path: &Path) -> Result<Vec<String>, LoadError> {
     load_names_at(path).map(|names| names.loads)
 }

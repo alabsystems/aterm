@@ -85,7 +85,7 @@ fn spawn_is_safe_here(console: Console) -> Result<(), String> {
 /// `has_console` gets a console WINDOW: a new console always has one, and from a
 /// process with no console so does any word without `CREATE_NO_WINDOW` or
 /// `DETACHED_PROCESS` (Windows gives the child a new, visible console — the
-/// flash; `spawn`'s module docs carry the measurements).
+/// flash).
 fn shows_a_console_window(word: u32, has_console: bool) -> bool {
     word & spawn::CREATE_NEW_CONSOLE != 0
         || (!has_console && word & (spawn::CREATE_NO_WINDOW | spawn::DETACHED_PROCESS) == 0)

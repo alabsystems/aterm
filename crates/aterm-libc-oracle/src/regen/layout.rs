@@ -25,7 +25,8 @@ fn shape(ty: &str, types: &TypeSizes, packed: Option<u64>) -> Result<(u64, u64),
     Ok((size, packed.map_or(align, |p| align.min(p))))
 }
 
-/// A `repr(C)` struct of `fields` (name, type text).
+/// A `repr(C)` struct of `fields` (name, type text): each field's offset, then
+/// the struct's size and alignment.
 /// # Errors
 /// When a field type was not measured.
 pub fn layout(

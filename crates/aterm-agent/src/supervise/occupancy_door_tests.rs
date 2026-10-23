@@ -50,7 +50,7 @@ impl IdleHost for Board {
     }
     fn occupancy(&self) -> OccupancyReading {
         self.asks.fetch_add(1, Ordering::SeqCst);
-        self.reading.lock().expect("the board").clone()
+        *self.reading.lock().expect("the board")
     }
     fn occupancy_said(&self, said: &OccupancySaid) {
         self.said.lock().expect("the said").push(said.clone());
@@ -158,6 +158,8 @@ struct Day {
     asks: usize,
     /// What the door told its host ([`IdleHost::occupancy_said`]).
     said: Vec<OccupancySaid>,
+    /// The ledger's text as the day left it.
+    ledger: String,
 }
 
 /// A held session's day: one break, read at each of `at_s` (seconds from its start, the read's
@@ -229,6 +231,7 @@ fn day_on(
         (noted, host.asks())
     };
     let would = would_rows(&path);
+    let ledger = std::fs::read_to_string(&path).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
     Day {
         noted,
@@ -236,6 +239,7 @@ fn day_on(
         requests: m.requests,
         asks,
         said: host.said(),
+        ledger,
     }
 }
 
@@ -465,7 +469,7 @@ fn the_board_is_asked_at_most_once_a_look() {
         true,
         Some(hosted(30).policy),
         false,
-        no_room.clone(),
+        no_room,
         &reads,
         &mut nothing_before,
     );
@@ -595,6 +599,12 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         ]
     );
     assert_eq!(person.would, [(NUDGE.to_string(), 33 * MIN)]);
+    assert_eq!(
+        held_rows_of(&person.ledger),
+        [held_by(NUDGE, "person")],
+        "the held verdict booked once"
+    );
+    assert!(held_rows_of(&control.ledger).is_empty(), "nothing held");
     assert!(!policy.usage_credits, "credits carry no session's turns");
     type Set = fn(&mut Session<'_, Mock>, bool);
     let flags: [(&str, &str, Set); 12] = [
@@ -701,6 +711,7 @@ fn each_guard_in_hand_holds_the_due_line_once() {
             "{tag}"
         );
         assert_eq!(d.would, [(NUDGE.to_string(), 33 * MIN)], "{tag}");
+        assert_eq!(held_rows_of(&d.ledger), [held_by(NUDGE, word)], "{tag}");
     }
     type Drawn = fn() -> Vec<String>;
     let drawn: [(&str, &str, Drawn); 2] = [
@@ -743,6 +754,237 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         [(2, NUDGE.to_string(), "held:autopilot".to_string())]
     );
     assert!(d.would.is_empty());
+    assert_eq!(
+        held_rows_of(&d.ledger),
+        [held_by(NUDGE, "autopilot")],
+        "held at four reads, booked at the first"
+    );
+}
+
+/// THE F1 DAY'S ROWS ARE FEW, HOWEVER ITS GUARDS FLAP (design §6, `fact-held@v1` on a transition
+/// only; the ledger keeps its newest 1024 rows, `approvals::KEEP_ROWS`): a session held sixteen
+/// hours on its own background work, read every five minutes on a board with room, a driver's
+/// hand on every even read and a draft on every odd one, so neither line ever goes and each
+/// rule's word changes at every read. The day books the hold's open row and one held row an
+/// episode a guard: five fact rows in 193 reads. NEGATIVE CONTROL: a row at each change of a
+/// rule's word spends a row a read.
+#[test]
+fn the_f1_days_fact_rows_are_bounded_however_its_guards_flap() {
+    let reads = every(0, 16 * 3600, 300);
+    let run = || {
+        // The draft is first clocked at the first read, so past the person's grace by 30 min.
+        let drafted = std::cell::Cell::new(None);
+        day(
+            "door-f1-flap",
+            true,
+            Some(hosted(30).policy),
+            false,
+            room(),
+            &reads,
+            &mut |s, seq| {
+                let at = drafted.get().unwrap_or_else(|| s.fx.mono());
+                drafted.set(Some(at));
+                s.driver = seq % 2 == 0;
+                s.draft_seen = (seq % 2 == 1).then(|| ("and also the docs".to_string(), at));
+            },
+        )
+    };
+    let d = run();
+    assert!(d.would.is_empty(), "nothing would go: {:?}", d.would);
+    let changes = verdicts(&d.noted).len();
+    assert!(
+        changes > reads.len(),
+        "each rule's word changed at each read"
+    );
+    assert_eq!(
+        held_rows_of(&d.ledger),
+        [
+            held_by(NUDGE, "draft"),
+            held_by(NUDGE, "person"),
+            held_by(ROOM, "draft"),
+            held_by(ROOM, "person"),
+        ]
+    );
+    let facts: Vec<String> = d
+        .ledger
+        .lines()
+        .filter(|l| crate::supervise::approvals::is_fact_line(l))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        facts.len(),
+        5,
+        "the hold's row and four held rows: {facts:#?}"
+    );
+    assert_eq!(d.ledger.lines().count(), facts.len(), "no other row");
+    let each = crate::supervise::occupancy::fault::with(
+        crate::supervise::occupancy::fault::Fault::HeldEachChange,
+        run,
+    );
+    assert!(
+        held_rows_of(&each.ledger).len() > reads.len(),
+        "a row a read: {}",
+        held_rows_of(&each.ledger).len()
+    );
+}
+
+/// EACH EPISODE OF A RULE BOOKS ITS OWN HELD ROW (design §6): the F1 day under `observe`, a
+/// driver's hand on the session at the read `hold-room` is first due and again at the read its
+/// second line is due, two hours after the first would have gone. Each is its own episode (the
+/// rule's ordinal in the hold), so each books its row. CONTROL: a guard that holds the first
+/// episode again, after another guard held it between, books no second row.
+#[test]
+fn each_episode_of_a_rule_books_its_own_held_row() {
+    use crate::supervise::occupancy::rules::held_rows_in;
+    let reads = every(0, 6 * 3600, 300);
+    let run = |tag: &str, driver: &[u64], halted: &[u64]| {
+        let d = day(
+            tag,
+            true,
+            Some(hosted(30).policy),
+            false,
+            room(),
+            &reads,
+            &mut |s, seq| {
+                s.driver = driver.contains(&seq);
+                s.halted = halted.contains(&seq);
+            },
+        );
+        let held: Vec<_> = held_rows_in(&d.ledger, Some("@s-1"))
+            .into_iter()
+            .map(|row| (row.rule, row.ordinal, row.guard.word()))
+            .collect();
+        (d.would, held)
+    };
+    // The reads at 120 and 245 minutes: the line due first, and its second.
+    let (would, held) = run("door-held-episodes", &[25, 50], &[]);
+    let rooms: Vec<i64> = would
+        .iter()
+        .filter(|(rule, _)| rule == ROOM)
+        .map(|(_, held_ms)| *held_ms)
+        .collect();
+    assert_eq!(rooms, [125 * MIN, 250 * MIN], "each went at the read after");
+    assert_eq!(
+        held,
+        [
+            (RuleId::HoldRoom, 0, "person"),
+            (RuleId::HoldRoom, 1, "person")
+        ]
+    );
+    let (_, again) = run("door-held-episode-again", &[25, 27], &[26]);
+    assert_eq!(
+        again,
+        [
+            (RuleId::HoldRoom, 0, "person"),
+            (RuleId::HoldRoom, 0, "halted")
+        ]
+    );
+}
+
+/// A SUCCESSOR BOOKS NO HELD VERDICT ITS PREDECESSOR BOOKED (design §6): a loop that carries the
+/// hold seeds the held rows booked since the hold began, so the guard still holding the episode
+/// its predecessor booked books nothing more, while a new guard of that episode is booked. The
+/// predecessor's wall stamps may sit a millisecond (or a sleep) either side of what its
+/// monotonic clock put the hold's start at, so the two loops' episode ids part
+/// (`rules::episode`): the successor still books none again, since what it keeps is the
+/// episode's rule and ordinal in the hold, not its id. An earlier hold's held row is not this
+/// hold's. NEGATIVE CONTROLS: the same successor seeded from the ledger without its held row
+/// books it again, and so does one whose ledger holds only that earlier hold's row, while the
+/// same row inside the carried hold books nothing more.
+#[test]
+fn a_successor_books_no_held_verdict_again() {
+    // A loop begun at `start_ms` over the ledger text `file`, seeded from `seed`, its breaks read
+    // `at` ms after its start with `set` run before each: the ledger it leaves.
+    let watch = |tag: &str,
+                 file: &str,
+                 seed: &str,
+                 start_ms: i64,
+                 at: &[i64],
+                 set: &dyn Fn(&mut Session<'_, Mock>)| {
+        let (dir, path) = ledger_at(tag);
+        std::fs::write(&path, file).expect("the predecessor's ledger");
+        let mut m = Mock::new(Vec::new());
+        {
+            let host = Board::reading(room()) as Arc<dyn IdleHost>;
+            let (mut s, clock) = hold_session(&mut m, &path, Some(host), Duration::ZERO);
+            let mut at_ms = start_ms;
+            clock.set_at_ms(at_ms);
+            let opts = hosted(30);
+            let mut heard = Heard::default();
+            let start = s.fx.mono();
+            s.hold_seed_from(seed, start, start_ms, false, &opts.policy, &heard);
+            let mut since = None;
+            for (seq, ms) in (1..).zip(at) {
+                let ahead = start_ms + ms - at_ms;
+                skip(&clock, &mut at_ms, ahead);
+                set(&mut s);
+                s.host_steps_in_background(
+                    &screen_at(seq, break_screen()),
+                    &mut since,
+                    Some(&opts.policy),
+                    &mut heard,
+                )
+                .expect("the break's step");
+            }
+        }
+        let body = std::fs::read_to_string(&path).expect("the ledger");
+        let _ = std::fs::remove_dir_all(&dir);
+        body
+    };
+    let driver = |s: &mut Session<'_, Mock>| s.driver = true;
+    let held = crate::supervise::occupancy::rules::HELD_RULE;
+    let predecessor = watch("door-held-1", "", "", T0, &[0, 31 * MIN], &driver);
+    // The rows stamped `skew` ms past the scripted clock's time at the read that booked them:
+    // where the wall clock and the monotonic one agree, and where they part.
+    for skew in [0, 1, -1, 90_000] {
+        let first = stamped(&predecessor, T0 + 31 * MIN + skew);
+        assert_eq!(held_rows_of(&first), [held_by(NUDGE, "person")]);
+        let row_ms = crate::supervise::occupancy::hold::seed_row_in(&first, Some("@s-1"))
+            .expect("the booked hold")
+            .row_ms;
+        // A successor over the predecessor's ledger that reads `seed` at its start: the held
+        // rows the ledger then holds.
+        let successor = |tag: &str, seed: &str, set: &dyn Fn(&mut Session<'_, Mock>)| {
+            held_rows_of(&watch(tag, &first, seed, row_ms + 2 * MIN, &[0], set))
+        };
+        assert_eq!(
+            successor("door-held-2", &first, &driver),
+            [held_by(NUDGE, "person")],
+            "skew={skew}: the predecessor's row alone"
+        );
+        assert_eq!(
+            successor("door-held-3", &first, &|s| s.halted = true),
+            [held_by(NUDGE, "person"), held_by(NUDGE, "halted")],
+            "skew={skew}: a new guard of the episode"
+        );
+        let unbooked: String = first
+            .lines()
+            .filter(|l| !l.contains(held))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            successor("door-held-4", &unbooked, &driver),
+            [held_by(NUDGE, "person"), held_by(NUDGE, "person")],
+            "skew={skew}: unseeded, booked again"
+        );
+        // The same held row, booked before this hold began (an earlier hold's), or after it.
+        let row = first
+            .lines()
+            .find(|l| l.contains(held))
+            .expect("the held row");
+        let earlier = format!("{}{unbooked}", stamped(row, T0 - 10 * MIN));
+        assert_eq!(
+            successor("door-held-5", &earlier, &driver),
+            [held_by(NUDGE, "person"), held_by(NUDGE, "person")],
+            "skew={skew}: an earlier hold's row is not this one's"
+        );
+        let inside = format!("{unbooked}{}", stamped(row, row_ms + MIN));
+        assert_eq!(
+            successor("door-held-6", &inside, &driver),
+            [held_by(NUDGE, "person")],
+            "skew={skew}: this hold's row, booked later"
+        );
+    }
 }
 
 /// A CARRIED BREAK IS NO DOOR (F10): a read the session's transcript carried as a break
@@ -922,59 +1164,81 @@ fn the_door_waits_for_the_breaks_settle() {
 /// all along holds the nudge in one hold, said once; the agent's own wake ends it, and the next
 /// hold, held the same way, says it again, though the door's first break in it is already past
 /// the nudge's half hour (the hold opened at a break the transcript carried, which the door
-/// skips, F10), so its verdict there is the last hold's last.
+/// skips, F10), so its verdict there is the last hold's last. Each hold books its own held row
+/// (design §6): the held verdicts the door keeps are the open hold's alone. NEGATIVE CONTROL:
+/// a door that keeps them past the change of hold books the second hold's none.
 #[test]
 fn each_hold_says_its_own_verdicts() {
-    let (dir, path) = ledger_at("door-two-holds");
-    let mut m = Mock::new(Vec::new());
-    let host = Board::reading(room());
-    let noted = {
-        let (mut s, clock) = hold_session(
-            &mut m,
-            &path,
-            Some(Arc::clone(&host) as Arc<dyn IdleHost>),
-            Duration::ZERO,
-        );
-        s.driver = true;
-        let opts = hosted(30);
-        let cfg = Some(&opts.policy);
-        let mut heard = Heard::default();
-        let mut at_ms = T0;
-        let mut since = None;
-        for (seq, at) in [(1, 0), (2, 31 * MIN), (3, 32 * MIN), (4, 33 * MIN)] {
-            let ahead = T0 + at - at_ms;
-            skip(&clock, &mut at_ms, ahead);
-            s.host_steps_in_background(
-                &screen_at(seq, break_screen()),
-                &mut since,
-                cfg,
-                &mut heard,
-            )
-            .expect("the break's step");
-        }
-        s.took(5, cfg, &mut heard);
-        since = None;
-        s.transcript_wait_seq = Some(6);
-        for (seq, at) in [(6, 34 * MIN), (7, 65 * MIN), (8, 66 * MIN)] {
-            let ahead = T0 + at - at_ms;
-            skip(&clock, &mut at_ms, ahead);
-            s.host_steps_in_background(
-                &screen_at(seq, break_screen()),
-                &mut since,
-                cfg,
-                &mut heard,
-            )
-            .expect("the break's step");
-        }
-        heard.noted
+    let run = || {
+        let (dir, path) = ledger_at("door-two-holds");
+        let mut m = Mock::new(Vec::new());
+        let host = Board::reading(room());
+        let noted = {
+            let (mut s, clock) = hold_session(
+                &mut m,
+                &path,
+                Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+                Duration::ZERO,
+            );
+            s.driver = true;
+            let opts = hosted(30);
+            let cfg = Some(&opts.policy);
+            let mut heard = Heard::default();
+            let mut at_ms = T0;
+            let mut since = None;
+            for (seq, at) in [(1, 0), (2, 31 * MIN), (3, 32 * MIN), (4, 33 * MIN)] {
+                let ahead = T0 + at - at_ms;
+                skip(&clock, &mut at_ms, ahead);
+                s.host_steps_in_background(
+                    &screen_at(seq, break_screen()),
+                    &mut since,
+                    cfg,
+                    &mut heard,
+                )
+                .expect("the break's step");
+            }
+            s.took(5, cfg, &mut heard);
+            since = None;
+            s.transcript_wait_seq = Some(6);
+            for (seq, at) in [(6, 34 * MIN), (7, 65 * MIN), (8, 66 * MIN)] {
+                let ahead = T0 + at - at_ms;
+                skip(&clock, &mut at_ms, ahead);
+                s.host_steps_in_background(
+                    &screen_at(seq, break_screen()),
+                    &mut since,
+                    cfg,
+                    &mut heard,
+                )
+                .expect("the break's step");
+            }
+            heard.noted
+        };
+        let ledger = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        (noted, ledger)
     };
-    let _ = std::fs::remove_dir_all(&dir);
+    let (noted, ledger) = run();
     assert_eq!(
         verdicts(&noted),
         [
             (2, NUDGE.to_string(), "held:person".to_string()),
             (7, NUDGE.to_string(), "held:person".to_string()),
         ]
+    );
+    assert_eq!(
+        held_rows_of(&ledger),
+        [held_by(NUDGE, "person"), held_by(NUDGE, "person")],
+        "a row each hold"
+    );
+    let (noted, kept) = crate::supervise::occupancy::fault::with(
+        crate::supervise::occupancy::fault::Fault::HeldAcrossHolds,
+        run,
+    );
+    assert_eq!(verdicts(&noted).len(), 2, "each hold still says its own");
+    assert_eq!(
+        held_rows_of(&kept),
+        [held_by(NUDGE, "person")],
+        "kept past the change: the second hold's row is lost"
     );
 }
 
@@ -1425,4 +1689,82 @@ fn a_loop_that_ends_tells_its_host_no_hold() {
     );
     assert_replays(&run.tape, &run.header, &run.sent, &run.lines);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A host that panics in `wants` once the door has told it an open hold: a loop that dies in
+/// the middle of its breaks.
+#[derive(Debug)]
+struct DiesAfterTheHold(Arc<Board>);
+
+impl IdleHost for DiesAfterTheHold {
+    fn wants(&self) -> bool {
+        assert!(
+            !self.0.said().iter().any(|s| s.hold.is_some()),
+            "the window's host dies once told the hold"
+        );
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn occupancy(&self) -> OccupancyReading {
+        self.0.occupancy()
+    }
+    fn occupancy_said(&self, said: &OccupancySaid) {
+        self.0.occupancy_said(said);
+    }
+}
+
+/// A LOOP THAT UNWINDS TELLS ITS HOST NO HOLD (the exit audit's gap 6, `run::UntoldOnUnwind`):
+/// a hosted watch that panics once the door has told its host the open hold leaves no hold on
+/// the window's board — the unwind out of `drive` tells it none, once, as a return does — and
+/// the panic goes on to the loop's caller. NEGATIVE CONTROL: told on the return alone, the open
+/// hold stays the host's last word.
+#[test]
+fn a_loop_that_unwinds_tells_its_host_no_hold() {
+    let run = || {
+        let (dir, ledger) = ledger_at("door-unwind-told");
+        let board = Board::reading(OccupancyReading::default());
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::new(DiesAfterTheHold(Arc::clone(&board))) as Arc<dyn IdleHost>),
+            ledger: Some(ledger.clone()),
+            journal: Some(dir.join("journal.jsonl")),
+            ..hosted(35 * 60)
+        };
+        let mut m = Mock::new(vec![break_screen()]);
+        m.stall_sleep = Some(Duration::from_secs(60));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut s = virtual_session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_approval_ledger(Some(ledger.clone()));
+            s.watch(&opts, &mut Vec::new())
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(unwound.is_err(), "the loop died");
+        board.said()
+    };
+    let said = run();
+    let (last, before) = said.split_last().expect("the door told its host");
+    assert_eq!(last.hold, None, "{said:#?}");
+    assert!(!last.ready && last.guards.is_none(), "{last:#?}");
+    assert!(
+        before.last().and_then(|s| s.hold).is_some(),
+        "the open hold was told: {said:#?}"
+    );
+    assert_eq!(
+        said.iter().filter(|s| s.hold.is_none()).count(),
+        1,
+        "told once: {said:#?}"
+    );
+    let kept = crate::supervise::occupancy::fault::with(
+        crate::supervise::occupancy::fault::Fault::UntoldOnReturnOnly,
+        run,
+    );
+    assert!(
+        kept.last().and_then(|s| s.hold).is_some(),
+        "the open hold stays the host's last word: {kept:#?}"
+    );
 }

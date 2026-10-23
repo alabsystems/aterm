@@ -416,8 +416,8 @@ impl<'a, R: Read> Entries<'a, R> {
         loop {
             let Some(header) = self.read_header()? else {
                 // A clean EOF with no end marker is not on its own a failure (the
-                // extractor's tree_root comparison decides whether the payload was
-                // complete), unless an extension header is dangling.
+                // signed digest and tree_root the stager checks decide whether the
+                // payload was complete), unless an extension header is dangling.
                 if saw_extension {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,

@@ -1,6 +1,10 @@
 // Copyright (c) 2019 Fontations Developers
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Derived from skrifa 0.46.2 src/outline/autohint/mod.rs, src/outline/hint.rs and
+// src/outline/error.rs, and modified by the aterm project in 2026.
+// See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! Automatic glyph hinter (ported from skrifa 0.46.2 / FreeType autofit).
 

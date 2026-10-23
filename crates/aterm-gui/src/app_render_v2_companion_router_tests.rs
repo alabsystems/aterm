@@ -16,8 +16,6 @@ const GEOM: EffectGeom = EffectGeom {
 
 use crate::geom_24x80_for_test as glow_geom;
 
-/// A grid whose row 4 is inked from `from` to `to` (exclusive), blank
-/// elsewhere — the ink probe's whole input.
 fn inked_row(from: usize, to: usize) -> Vec<Vec<RenderCell>> {
     let mut cells = vec![vec![RenderCell::default(); 80]; 24];
     for cell in &mut cells[4][from..to] {
@@ -29,8 +27,6 @@ fn inked_row(from: usize, to: usize) -> Vec<Vec<RenderCell>> {
     cells
 }
 
-/// The router's lead is the emitter's own ¾-cell lead, measured off the
-/// footprint itself so the two constants cannot drift apart.
 #[test]
 fn the_router_lead_is_the_footprints_own_lead() {
     let mut app = App::headless_for_test();
@@ -58,10 +54,6 @@ fn the_router_lead_is_the_footprints_own_lead() {
     assert_eq!(rest.x - cursor_right, lead_px(GEOM.cell_w));
 }
 
-/// Host side of the occlusion law (L-D): with v2 engaged and the words ahead of the caret
-/// inked, the flying head seats behind the caret (a negative lead on the frame copy); blank
-/// glass ahead keeps the default seat unchanged, and the pet, which seats itself, is never
-/// moved.
 #[test]
 fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     let mut app = App::headless_for_test();
@@ -82,7 +74,6 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     );
     let before = ws.fx.companions_mut().cursor_cat.static_frame(now);
 
-    // Blank glass ahead: the default seat, untouched.
     let mut frame = before;
     ws.input_scratch.cells = inked_row(0, 0);
     route_v2_companion(
@@ -97,8 +88,6 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     assert_eq!(frame.pose.lead, before.pose.lead);
     assert_eq!(frame.bob, before.bob);
 
-    // Words ahead, blank behind: the mirror seat, `lead_px` clear of the
-    // caret cell's left edge — a negative lead for a right-facing head.
     let mut frame = before;
     ws.input_scratch.cells = inked_row(11, 30);
     route_v2_companion(
@@ -121,7 +110,6 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
         "no sky seat while the row behind is blank"
     );
 
-    // The pet seats itself: the router never touches its frame.
     let mut frame = before;
     ws.input_scratch.cells = inked_row(0, 80);
     route_v2_companion(
@@ -137,23 +125,14 @@ fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
     assert_eq!(frame.bob, before.bob);
 }
 
-/// The offer seam delivers (`EffectsPipeline::offer_pet_v2`): v2 mints the
-/// perk edge for a real 40-cell nav meteor, the seam runs where both render
-/// arms run it (after the pet's tick, before the router drains the impulse),
-/// and the resident ends up holding it; a seam that delivered nothing would
-/// leave this latch shut.
 #[test]
 fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
     let mut app = App::headless_for_test();
-    // The trail is the one opting in: on by default everywhere but Windows
-    // (`DEFAULT_DECORATIVE_EFFECTS`), where this seam serves an owner who turned
-    // it on.
     app.config.cursor_trail = Some(true);
     let cfg = app.glow_config();
     let now = Instant::now();
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
     let mut out = Vec::new();
-    // Seat the caret; the rainbow kitty engages v2 on its first tick.
     ws.fx
         .cursor_mut()
         .glow
@@ -167,14 +146,12 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
         (false, false),
         "fixture: the resident has been offered nothing"
     );
-    // A 40-cell licensed nav jump — a meteor by every measure (§6.1).
     let t1 = now + Duration::from_millis(16);
     ws.fx.cursor_mut().glow.note_navigation(t1);
     ws.fx
         .cursor_mut()
         .glow
         .tick(Some((3, 40)), t1, &cfg, glow_geom(), &mut out);
-    // The host's order: the pet's own tick, then the offer.
     let pet_frame = crate::app_render::pet_tick_for_test(
         ws,
         aterm_effects::host::CaptureMode::Present,
@@ -197,7 +174,6 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
         ws.fx.companion_mut().brain().pending_v2_offer().0,
         "the meteor's arrival edge never reached the resident"
     );
-    // The offer is a pure read: the router's drain still has the impulse to route.
     let mut cat = ws.fx.companions_mut().cursor_cat.static_frame(t1);
     route_v2_companion(
         ws,
@@ -214,15 +190,6 @@ fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
     );
 }
 
-/// THE WORD-CATS YIELD TO THE FLYING HEAD WHERE IT IS DRAWN. With the words
-/// ahead of the caret inked and the cells behind it blank, the seat law puts
-/// the head behind the caret (the mirror seat). The box the host hands the
-/// word pass ([`super::RoutedCompanion::on_glass`]) is routed before the pass
-/// and covers the actual animated body, not just its destination. Until
-/// 2026-10-21 the box was the rest footprint, built before the seat was
-/// chosen: ahead of the caret, clear of the drawn head, so an ambient
-/// word-cat peeked out under the head (two cats stacked). Negative control:
-/// the rest footprint misses the drawn head.
 #[test]
 fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
     let mut app = App::headless_for_test();
@@ -239,7 +206,6 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         .glow
         .tick(Some(caret), now, &cfg, glow_geom(), &mut out);
     assert!(ws.fx.cursor_mut().glow.v2_status().is_some(), "fixture: v2");
-    // A resident ticked, then taken off glass: the head owns the caret.
     let resident = super::pet_owner_tick_for_test(
         ws,
         aterm_effects::host::CaptureMode::Present,
@@ -333,9 +299,6 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
          rest {rest:?}, head {drawn:?}"
     );
 
-    // Seed ahead of the caret on blank glass, then flip the seat behind it
-    // just 16 ms later. The follower is still between those targets: reserving
-    // only the new seat misses the body on this second frame.
     ws.fx.decos_mut().rebase_kitty_cursor_placement();
     let t0 = now + Duration::from_secs(1);
     ws.fx.open_words();
@@ -403,8 +366,6 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         "negative control: the target alone misses the moving body: {target:?} vs {actual:?}"
     );
 
-    // A signed off-stage fold can reach the saturating pixel boundary even
-    // with valid u16 metrics. Its half-open reservation must not overflow.
     use aterm_effects::kitty_cursor::{
         CatFoldDirection, CatFoldFrame, CatPose, CursorCatPlacementFrame,
     };

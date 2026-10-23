@@ -6,7 +6,7 @@
 //! # Alignment
 //!
 //! `malloc` promises only 16-byte alignment, so each constructor refuses an
-//! over-aligned closure at compile time (`S4` in the crate docs):
+//! over-aligned closure at compile time:
 //!
 //! ```compile_fail
 //! #[repr(align(32))]
@@ -64,17 +64,11 @@ use std::os::raw::{c_int, c_ulong};
 use std::ptr::NonNull;
 
 unsafe extern "C" {
-    /// The `isa` every stack block points at. Lives in libSystem's libclosure,
-    /// which every Rust macOS binary already links.
     static _NSConcreteStackBlock: [*const c_void; 32];
-    /// Move a stack block to the heap, or retain a heap block. Returns nil on
-    /// allocation failure.
     fn _Block_copy(block: *const c_void) -> *mut c_void;
-    /// Release a heap block; runs `dispose` and frees on the last reference.
     fn _Block_release(block: *const c_void);
 }
 
-/// The descriptor has `copy` and `dispose` helpers.
 const BLOCK_HAS_COPY_DISPOSE: c_int = 1 << 25;
 
 /// The fixed ABI header at the front of every block.
@@ -158,7 +152,10 @@ impl BlockPtr {
         const {
             assert!(size_of::<F>() == size_of::<*const c_void>());
         };
-        // SAFETY: every block begins with the fixed ABI header ([`BlockHeader`], the layout `_Block_copy` and clang agree on).
+        // SAFETY: every block begins with the fixed ABI header ([`BlockHeader`],
+        // the layout `_Block_copy` and clang agree on); `invoke` is its fourth
+        // field and is never null in a live block. `F` is a function pointer
+        // of the same width (asserted above), which the caller names exactly.
         unsafe {
             let invoke = (*self.0.cast::<BlockHeader>()).invoke;
             (!invoke.is_null()).then(|| std::mem::transmute_copy::<*const c_void, F>(&invoke))
@@ -166,7 +163,9 @@ impl BlockPtr {
     }
 }
 
-// SAFETY: `@encode` of any block type is `"@?"` (clang, two signatures, and Foundation's `v24@0:8@?16` read back in `tests/declared_abi.rs`).
+// SAFETY: `@encode` of any block type is `"@?"` (clang, two signatures, and
+// Foundation's `v24@0:8@?16` read back in `tests/declared_abi.rs`). `BlockPtr` is
+// `#[repr(transparent)]` over exactly the pointer a block is passed as.
 unsafe impl crate::encode::Encode for BlockPtr {
     const ENCODING: &'static str = "@?";
 }
@@ -264,17 +263,16 @@ macro_rules! block_ctor {
                     }
                 }
 
-                /// `_Block_copy` has already `memmove`d the closure, which is
-                /// the Rust move; there is nothing left to copy.
                 const unsafe extern "C" fn copy_helper(_dst: *mut c_void, _src: *const c_void) {}
 
-                /// Guarded like `invoke`, so a panicking `Drop` in a capture
-                /// aborts with a name rather than Rust's anonymous message.
                 unsafe extern "C" fn dispose_helper<F>(block: *mut c_void) {
                     let blk = block.cast::<Blk<F>>();
                     let guard = ::std::panic::catch_unwind(
                         ::std::panic::AssertUnwindSafe(|| {
-                            // SAFETY: `dispose` runs once, on the last release of a heap block built here, so the closure is live and owned by it.
+                            // SAFETY: `dispose` runs once, on the last release
+                            // of a heap block built here, so the closure is live
+                            // and owned by it. `&raw mut` avoids a reference to
+                            // the partially torn-down block.
                             unsafe { ::std::ptr::drop_in_place(&raw mut (*blk).closure) };
                         }),
                     );
@@ -313,7 +311,10 @@ macro_rules! block_ctor {
                     closure,
                 });
 
-                // SAFETY: `block` is a well-formed stack block that owns its closure, not dropped (`ManuallyDrop`).
+                // SAFETY: `block` is a well-formed stack block that owns its
+                // closure, not dropped (`ManuallyDrop`). One `_Block_copy`
+                // `memmove`s it to the heap, making the heap block the sole
+                // owner, which is what the no-op copy helper assumes.
                 let heap = unsafe { _Block_copy((&raw const *block).cast()) };
                 NonNull::new(heap).map(|ptr| Self { ptr })
             }
@@ -322,28 +323,20 @@ macro_rules! block_ctor {
 }
 
 block_ctor! {
-    /// A no-argument block, e.g. a `dispatch_block_t`.
     new0, invoke0
 }
 block_ctor! {
-    /// A one-argument block, e.g. an event monitor or a sheet completion handler.
     new1, invoke1, a0: A0
 }
 block_ctor! {
-    /// A two-argument block, e.g. a LaunchServices completion handler.
     new2, invoke2, a0: A0, a1: A1
 }
 
 /// A BLOCK'S C PROTOTYPE, NAMED.
 pub trait BlockFn: Copy {
-    /// The arguments, as a tuple.
     type Args;
-    /// The return type.
     type Ret;
 
-    /// The block's signature as an extended encoding spells it, offsets
-    /// aside: the return, `@?` for the block itself, then each argument
-    /// (`v@?@` for `fn(Id)`).
     fn types() -> String;
 
     /// Call `block`'s `invoke` with `args`.

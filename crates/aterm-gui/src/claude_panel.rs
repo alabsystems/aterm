@@ -565,7 +565,8 @@ struct LookIn<'a> {
 }
 
 /// Make a panel's look into `ink` (sorted, unique) and `halo`, each emptied
-/// first (module header: THE RAINBOW, THE DOTS).
+/// first: the main and live task rows' pointers, names and bars in the palette's
+/// hues, and each task row's dot.
 fn make_look(look: &LookIn<'_>, ink: &mut Vec<InkCell>, halo: &mut Vec<RainHalo>) {
     #[cfg(test)]
     crate::work_counts::panel_look_made();

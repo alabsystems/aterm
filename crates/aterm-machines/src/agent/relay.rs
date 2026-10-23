@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `screen`: Screen Sharing carried as the bytes of one request (design §3.1, §6).
+//! `screen`: relays SSH standard input and output to `127.0.0.1:5900` (`screensharingd`) while launchd enables `com.apple.screensharing`.
 //!
-//! The fleet key forwards nothing (`restrict` alone: no `-L`, `-R`, `-W` or Unix-socket
-//! forward), so a viewer reaches the host's screensharingd through the forced command
-//! instead. The dispatcher connects to [`SCREEN_SHARING_PORT`] on the host's own loopback as
-//! the admin, then copies bytes both ways between the SSH channel (its standard input and
-//! output) and that connection. That one address is the only place the request connects to.
-//!
-//! The end of standard input shuts the connection's write half, so screensharingd reads the
-//! viewer's end and closes its own; the request ends when the connection closes, or when
-//! standard output can no longer be written.
-//!
-//! Port 5900 is not privileged: with Screen Sharing off, any account at the Mac may listen
-//! on `127.0.0.1:5900`, stand in for screensharingd, and take the admin's password when the
-//! owner logs in through the relay. So the relay connects only while launchd enables
-//! `com.apple.screensharing`: launchd then holds `*:5900` as root, and the kernel refuses
-//! any other uid's bind of the loopback address. Measured on lab-03 (27.0, 26A428) as the
-//! admin, no sudo: `launchctl print-disabled system` exits 0 listing
-//! `"com.apple.screensharing" => enabled`, `netstat -anv` shows `*.5900` held by
-//! `launchd:1`, and a bind of `127.0.0.1:5900` as uid 501 fails `Address already in use`.
+//! Port 5900 is unprivileged, so the relay connects only when launchd enables `com.apple.screensharing` and holds `*:5900` as root.
 
 use crate::items::person::{SCREEN_SHARING_LABEL, launchd_enabled, print_disabled_cmd};
 use crate::model;
@@ -33,15 +16,13 @@ use std::time::Duration;
 /// screensharingd's port on the host's loopback.
 pub const SCREEN_SHARING_PORT: u16 = 5900;
 
-/// How long the loopback connect may take. Nothing listening is refused at once; the bound
-/// only catches a listener that never completes the handshake.
+/// Loopback connect timeout for catching a listener that never completes the handshake.
 const CONNECT_BUDGET: Duration = Duration::from_secs(5);
 
-/// The relay's copy buffer.
+/// Copy buffer size in bytes.
 const CHUNK: usize = 64 * 1024;
 
-/// A second handle on this process's standard input, for the relay's reader thread: the
-/// dispatcher's own handle is locked to the calling thread.
+/// Duplicates standard input for the relay's reader thread.
 ///
 /// # Errors
 /// `dup`'s.
@@ -50,9 +31,7 @@ pub fn own_stdin() -> io::Result<std::fs::File> {
     Ok(io::stdin().as_fd().try_clone_to_owned()?.into())
 }
 
-/// Why the relay may not connect, unless launchd enables Screen Sharing (and so holds its
-/// port). A service with no override takes its plist's `Disabled`, which Screen Sharing
-/// ships true; an answer that cannot be read is a refusal too.
+/// Checks that launchd enables `com.apple.screensharing` (and therefore holds port 5900).
 fn launchd_holds_the_port(sys: &dyn System) -> Result<(), String> {
     let ran = match sys.run(&print_disabled_cmd()) {
         Ok(ran) if ran.success() => ran,
@@ -79,13 +58,7 @@ fn launchd_holds_the_port(sys: &dyn System) -> Result<(), String> {
     }
 }
 
-/// Relay `input` to `127.0.0.1:<port>` and that connection to `out`, until the connection
-/// closes. Screen Sharing not enabled in launchd, or a connection that cannot be made, is
-/// `refused: …` before anything connects or any byte flows.
-///
-/// `input` is read on a thread of its own that is never joined: when screensharingd closes
-/// first, the request ends while that read may still be waiting, and the process's exit
-/// ends it.
+/// Relays `input` to `127.0.0.1:<port>` and writes the socket's bytes to `out` until the connection closes, refusing before connecting if Screen Sharing is disabled in launchd.
 pub fn screen(
     sys: &dyn System,
     port: u16,
@@ -106,8 +79,7 @@ pub fn screen(
         }
         Err(e) => return super::refuse(out, &format!("screen: {addr}: {e}")),
     };
-    // The viewer's input is small writes (a pointer move is 6 bytes): with Nagle's algorithm
-    // each waits on the ACK of the one before, which screensharingd may delay.
+    // Disable Nagle's algorithm so small pointer-move writes do not wait on delayed ACKs.
     let _ = socket.set_nodelay(true);
     match pump(socket, input, out) {
         Ok(()) => ExitCode::SUCCESS,
@@ -137,7 +109,6 @@ fn pump(
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        // Flushed per read: standard output is line-buffered, and the stream is not lines.
         if let Err(e) = out.write_all(&buf[..n]).and_then(|()| out.flush()) {
             let _ = socket.shutdown(Shutdown::Both);
             return Err(e);
@@ -153,7 +124,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// `launchctl print-disabled system` as the admin on lab-03 (27.0, 26A428), no sudo.
+    /// Sample `launchctl print-disabled system` output with Screen Sharing enabled.
     const PRINT_DISABLED: &str = "\n\tdisabled services = {\n\t\t\"com.apple.screensharing\" => enabled\n\t\t\"com.apple.CSCSupportd\" => disabled\n\t\t\"com.apple.mdmclient.daemon.runatboot\" => disabled\n\t\t\"com.apple.ftpd\" => disabled\n\t\t\"com.openssh.sshd\" => enabled\n\t}\n";
 
     const PRINT_DISABLED_CMD: &str = "/bin/launchctl print-disabled system";
@@ -187,10 +158,8 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut s = accept(&l);
             s.write_all(BANNER).unwrap();
-            // Read to the end: the relay's input ended, and it shut its write half.
             let mut got = Vec::new();
             s.read_to_end(&mut got).unwrap();
-            // The relay still reads after its input ended.
             s.write_all(format!("got {}", got.len()).as_bytes())
                 .unwrap();
             got
@@ -219,7 +188,6 @@ mod tests {
         assert_eq!(screen(&enabled(), port, input, &mut out), ExitCode::SUCCESS);
         server.join().unwrap();
         assert_eq!(out, BANNER);
-        // The reader thread was left waiting on the open input; this ends it.
         drop(held_open);
     }
 
@@ -242,7 +210,6 @@ mod tests {
             let mut s = accept(&l);
             s.write_all(BANNER).unwrap();
             let mut rest = Vec::new();
-            // The relay closed its end: this read ends rather than waiting.
             s.read_to_end(&mut rest).map(|_| rest)
         });
         let (input, held_open) = io::pipe().unwrap();
@@ -272,7 +239,6 @@ mod tests {
         let mut out = Vec::new();
         let code = screen(&enabled(), port, Watched(Arc::clone(&read)), &mut out);
         assert_eq!(code, ExitCode::from(super::super::REFUSED));
-        // One refusal line, naming where it connected; the controller shows it as it is.
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.starts_with("refused: ") && out.ends_with('\n'),
@@ -285,7 +251,6 @@ mod tests {
 
     #[test]
     fn without_screen_sharing_enabled_in_launchd_nothing_connects() {
-        // A listener another account could have put on the port.
         let (l, port) = stand_in();
         l.set_nonblocking(true).unwrap();
         let disabled = PRINT_DISABLED.replace(
@@ -304,8 +269,6 @@ mod tests {
         ] {
             let read = Arc::new(AtomicBool::new(false));
             let input = Watched(Arc::clone(&read));
-            // On its own thread with a one-minute hang detector: a relay that connected
-            // would wait on a listener that never answers.
             let (done, finished) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let fake = Fake::root();
@@ -328,7 +291,6 @@ mod tests {
                 "{name}: the relay connected"
             );
         }
-        // The same listener, with launchd enabling the service, is connected to.
         let fake = enabled();
         let mut out = Vec::new();
         let (input, held_open) = io::pipe().unwrap();

@@ -310,8 +310,7 @@ fn shown(r: &Read) -> (Vec<Held<'_>>, usize) {
 }
 
 /// Why a session's newest fold is partial: its seed's word, then its close
-/// missing although its node or its own presence says it is gone (the
-/// module doc).
+/// missing although its node or its own presence says it is gone.
 fn partial_why(
     r: &Read,
     node: &str,
@@ -428,9 +427,9 @@ fn render(cfg: &Config, opts: &BriefOpts, r: &Read, now_ms: u64) -> String {
 /// The open path's level words, run first ([`aterm_slog::SessionState::open`]).
 const OPEN_LEVELS: [&str; 3] = ["run", "turn", "step"];
 
-/// One session's object of the machine form (the module doc's closed
-/// schema), from its newest space's fold at `now_ms`, and whether that fold
-/// is partial.
+/// One session's object of the machine form (a closed schema of ids, closed
+/// words and counts), from its newest space's fold at `now_ms`, and whether
+/// that fold is partial.
 fn session_json(
     r: &Read,
     key: &(String, String),
@@ -472,7 +471,7 @@ fn session_json(
     Some((obj, partial))
 }
 
-/// The brief's machine form (`--json`, the module doc): one object, its
+/// The brief's machine form (`--json`): one object, its
 /// `sessions` newest first while their objects fit the budget, the rest
 /// counted `more`.
 fn render_json(

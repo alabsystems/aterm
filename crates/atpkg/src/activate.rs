@@ -10,7 +10,7 @@ use crate::Layout;
 use crate::platform::{self};
 use crate::store::{ToolName, split_exposed};
 
-/// Whether a program's exposed tools also get their `alab-<tool>` aliases (module doc).
+/// Whether a program's exposed tools also get their `alab-<tool>` aliases.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Aliases {
     /// One of ALab's own programs: `alab-<tool>` beside every `<tool>`.

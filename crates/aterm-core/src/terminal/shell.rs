@@ -1,36 +1,30 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shell integration types (re-exported from `aterm-types`) and the terminal's caps on
-//! them. Most of the API is in [`super::shell_api`].
+//! Shell integration types and caps ([`super::shell_api`]).
 
 pub use aterm_types::{
     Annotation, BlockState, CommandMark, OutputBlock, TerminalMark, current_time_ms,
 };
 
-/// Maximum completed command marks (OSC 133). FIFO eviction when exceeded.
+/// Maximum completed command marks (OSC 133).
 pub(super) const COMMAND_MARKS_MAX: usize = 1000;
 
-/// Maximum completed output blocks. FIFO eviction.
+/// Maximum completed output blocks.
 pub(super) const OUTPUT_BLOCKS_MAX: usize = 1000;
 
-/// Maximum number of user-created marks (OSC 1337 SetMark); oldest evicted
-/// first.
+/// Maximum number of user-created marks (OSC 1337 SetMark).
 pub(super) const TERMINAL_MARKS_MAX: usize = 1000;
 
-/// Maximum number of annotations (OSC 1337 AddAnnotation); oldest evicted
-/// first.
+/// Maximum number of annotations (OSC 1337 AddAnnotation).
 pub(super) const ANNOTATIONS_MAX: usize = 1000;
 
-// `ShellState` lives in `domain` (a leaf module) to avoid a dependency cycle.
 pub use crate::domain::ShellState;
 
-/// Which shell signed a START record (`633;P;AtermStart=`): one nobody held
-/// (`cold`), or a warm spare about to wait at its first prompt hook (`spare`).
+/// Which shell signed a START record (`633;P;AtermStart=`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartKind {
-    /// A shell that ran its startup files in view: a cold tab, or a parked
-    /// spare after its release.
+    /// A shell that ran its startup files in view.
     Cold,
     /// A warm spare whose startup files ran unseen, now at its hold.
     Spare,
@@ -49,28 +43,22 @@ pub struct StartFlags {
     pub periodic: bool,
 }
 
-/// A shell's START record, signed once at its first prompt hook after every
-/// startup file (`docs/DESIGN-warm-spare-2026-10-16.md` §3.3): the rc folder
-/// it ended in, its flags, and its kind. The host's warm spare learns from it
-/// whether an rc generation may run unseen; nothing else reads it.
+/// A shell's START record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartMark {
     /// Cold or spare.
     pub kind: StartKind,
-    /// The final `${ZDOTDIR:-$HOME}` (zsh), `$HOME` (bash) or
-    /// `$__fish_config_dir` (fish), unescaped.
+    /// The final `${ZDOTDIR:-$HOME}` (zsh), `$HOME` (bash) or `$__fish_config_dir` (fish),
+    /// unescaped.
     pub rc_dir: Option<String>,
-    /// fish's other startup roots, unescaped: its sysconf folder, then each
-    /// vendor conf.d folder its conf.d loop walks. `None` where the record
-    /// named none (zsh, bash, or a fish that could not see them).
+    /// fish's other startup roots, unescaped.
     pub roots: Option<Vec<String>>,
     /// The flags, when they parsed.
     pub flags: Option<StartFlags>,
 }
 
 impl StartFlags {
-    /// Parse `pre:<n>,s:<n>,j:<n|->,r:<0|1>` strictly: every field once, in
-    /// that order, nothing else.
+    /// Parse `pre:<n>,s:<n>,j:<n|->,r:<0|1>` strictly.
     #[inline]
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
@@ -99,23 +87,14 @@ impl StartFlags {
     }
 }
 
-/// What one OSC 7 does to the reported cwd: the app-event it queues for
-/// poll-based hosts (`//host/path`, or the bare path for a local host; none
-/// for a clear) and the local path it stores (none: clear it). Applied at once,
-/// or held while an authenticated shell that does not sign its own sits at its
-/// prompt (`ShellIntegrationState::held_cwd`); also the cwd a foreground job's
-/// report replaced (`ShellIntegrationState::cwd_before_job`).
+/// What one OSC 7 does to the reported cwd.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CwdReport {
     /// The app-event payload, or `None` for a clear (which queues none).
     pub(super) event: Option<String>,
     /// The percent-decoded local path to store, or `None` to clear it.
     pub(super) path: Option<String>,
-    /// The host the URI named (`file://<host>/…`), verbatim: `None` for an
-    /// empty host, `localhost`, or a clear. Stored beside the path
-    /// ([`super::Terminal::reported_cwd_host`]), so a consumer that resolves
-    /// files against the cwd can tell a remote shell's directory from a local
-    /// one.
+    /// The host the URI named ([`super::Terminal::reported_cwd_host`]).
     pub(super) host: Option<String>,
 }
 
@@ -123,8 +102,7 @@ impl CwdReport {
     /// The report that stores `path` (none: clears it) with the `host` that
     /// qualifies it (`None` for a local one), and queues the event an OSC 7
     /// naming them queues; `None` when the engine would not store it
-    /// (`handler_osc::reported_cwd_is_storable`). What a checkpoint carries
-    /// and a job's end restores, rebuilt as OSC 7 would build it.
+    /// (`handler_osc::reported_cwd_is_storable`).
     #[inline]
     pub(super) fn of(path: Option<&str>, host: Option<&str>) -> Option<Self> {
         let Some(path) = path else {
@@ -147,10 +125,7 @@ impl CwdReport {
     }
 }
 
-/// The warm spare's marks as the engine holds them until the host takes them:
-/// the parked hold's one-shot, and the START record being assembled (its rc and
-/// flags arrive first; `AtermStart` completes it). Only the first record is
-/// kept. Never checkpointed: a spare is never carried across an update.
+/// The warm spare's marks as the engine holds them until the host takes them.
 #[derive(Debug, Default)]
 pub(super) struct SpareMarks {
     /// `AtermSpare=parked` arrived and the host has not taken it.

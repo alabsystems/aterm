@@ -107,15 +107,19 @@ pub struct KittyCommand {
     /// `U=1` — a virtual placement: the image is shown only where the client prints Unicode
     /// placeholders, never stamped at the cursor.
     pub virtual_placement: bool,
-    /// `s=` — source image width in pixels (for raw formats).
+    /// `s=` — source image width in pixels (for raw formats); for `a=a`, the animation state
+    /// (1 stop, 2 run while loading, 3 run).
     pub width: Option<u32>,
-    /// `v=` — source image height in pixels (for raw formats).
+    /// `v=` — source image height in pixels (for raw formats); for `a=a`, the loop count
+    /// (1 forever, `n` n−1 times).
     pub height: Option<u32>,
     /// `c=` — display width in cells (columns); for `a=f`, `a=c` and `a=a`, a frame number.
     pub columns: Option<u32>,
-    /// `r=` — display height in cells (rows).
+    /// `r=` — display height in cells (rows); for `a=f`, `a=c`, `a=a` and a frame delete, a
+    /// frame number.
     pub rows: Option<u32>,
-    /// `z=` — z-index (may be negative: behind the text).
+    /// `z=` — z-index (may be negative: behind the text); for `a=f` and `a=a`, a frame's gap in
+    /// milliseconds (negative: gapless).
     pub z_index: Option<i32>,
     /// `X=` — for a display, the pixel offset within the first cell at which the image starts.
     pub cell_x_offset: Option<u32>,

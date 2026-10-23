@@ -40,7 +40,7 @@ pub(crate) enum SubmitInput {
 }
 
 impl SubmitInput {
-    /// The class of `ev` (module header, "What counts").
+    /// The class of `ev`.
     pub(crate) fn of(ev: &InputEvent) -> Self {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
         match ev {

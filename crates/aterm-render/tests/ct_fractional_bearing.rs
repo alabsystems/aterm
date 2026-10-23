@@ -2,36 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Fractional-bearing CoreText rasters: the sub-pixel placement policy
-//! [`aterm_render::ct_pen_and_bearing`] and the phase-headroom extent
-//! [`aterm_render::ct_padded_extent`], the pure fns `CtFont::rasterize` (macOS) applies
-//! to every glyph.
-//!
-//! Each outline is rasterized at its true sub-pixel offset (pen `= -floor(b)`) with
-//! `floor(b)` bearings: the phase stays inside the bitmap and the integer bearing places
-//! it back exactly. Cell origins are integer device px, so each glyph has exactly one
-//! correct phase: one raster per glyph, no new cache keys.
-//!
-//! The ty model `aterm_models_render::ct_frac_bearing_model` carries `Decompose`
-//! (bearing + phase == designed position) and `PhaseInUnit` (phase in `[0, 1)`) and
-//! catches a round-and-pin placement at `Buggy=1`
-//! (aterm-spec's `unregistered_bound_models_prove_and_catch`). ty's Expr language is
-//! integer-only, so the float half lives here: a dyadic lattice on which every asserted
-//! equality is exact (1/64 steps), ulp-bounded specials, and a point-for-point drive of
-//! the model's interpreter against `ct_pen_and_bearing`. The one float boundary, a `b`
-//! within one ulp below an integer saturating the phase to `1.0`, is absorbed by the
-//! extent's `+1`. The FFI seam is bound on real Menlo ink by
-//! `coretext_placement_binds_to_the_pure_policy` in the lib tests.
-//!
-//! The policy is the CoreText path's alone; on macOS both backends take the same
-//! `glyph_image` bytes and placement.
+//! Verifies fractional-bearing CoreText glyph placement and padded raster extents.
 
 use aterm_models_render::ct_frac_bearing_model;
 use aterm_render::{ct_padded_extent, ct_pen_and_bearing};
 
-/// The floor law, exhaustive over the 1/64-px lattice in ±64px (every value exactly
-/// representable): `min <= b < min + 1`, the pen is `-min` with no rounding, the phase is
-/// `b - min ∈ [0, 1)`, and bearing + phase reconstructs `b` bit-exactly.
 #[test]
 fn pen_and_bearing_floor_law_exact_on_the_dyadic_lattice() {
     let mut nonzero_phase_seen = 0usize;
@@ -39,20 +14,16 @@ fn pen_and_bearing_floor_law_exact_on_the_dyadic_lattice() {
         let b = k as f64 / 64.0;
         let (pen, min) = ct_pen_and_bearing(b);
         let minf = f64::from(min);
-        // Floor law: min <= b < min + 1 (exact comparisons).
         assert!(
             minf <= b && b < minf + 1.0,
             "floor law violated at b={b} (min={min})"
         );
-        // The raster translate is the pure integer -min: no rounding at all.
         assert_eq!(pen, -minf, "pen must be the negated integer part at b={b}");
-        // The outline's in-bitmap phase (what CG draws at) is b - min in [0,1).
         let phase = b + pen;
         assert!(
             (0.0..1.0).contains(&phase),
             "phase must be in [0,1) at b={b} (phase={phase})"
         );
-        // Bearing + phase reconstructs the designed position exactly.
         assert_eq!(
             minf + phase,
             b,
@@ -62,16 +33,12 @@ fn pen_and_bearing_floor_law_exact_on_the_dyadic_lattice() {
             nonzero_phase_seen += 1;
         }
     }
-    // Non-vacuity: fractional bearings dominate the lattice.
     assert!(
         nonzero_phase_seen > 4000,
         "the lattice must reach fractional phases ({nonzero_phase_seen})"
     );
 }
 
-/// Float specials (signed zero, halves, one ulp off an integer, a large magnitude): the
-/// floor law and the integer pen stay exact; within one ulp below an integer the phase
-/// saturates to exactly `1.0` and the reconstruction is off by at most one epsilon.
 #[test]
 fn pen_and_bearing_floor_law_adversarial_specials() {
     let specials = [
@@ -109,17 +76,12 @@ fn pen_and_bearing_floor_law_adversarial_specials() {
             saturated_seen += 1;
         }
     }
-    // Non-vacuity: the phase does saturate to 1.0, which the extent's +1 absorbs.
     assert!(
         saturated_seen > 0,
         "a b one half-ulp below an integer must saturate the phase to 1.0"
     );
 }
 
-/// The bitmap never clips: over 1/64-px ink widths up to 48px, both pad levels (1 plain,
-/// 2 `font_thicken`) and every phase in [0, 1], `phase + ink + 2*pad <= extent`, with a
-/// full px of headroom over the padded ink box, and the thickened box exactly 1px per
-/// side larger (as `coretext_placement_binds_to_the_pure_policy` pins on real ink).
 #[test]
 fn padded_extent_absorbs_every_phase_without_clipping() {
     let mut old_extent_would_clip = 0usize;
@@ -132,7 +94,6 @@ fn padded_extent_absorbs_every_phase_without_clipping() {
         );
         for pad in [1.0f64, 2.0] {
             let ext = ct_padded_extent(ink, pad) as f64;
-            // Headroom: one full px over the padded ink box (>= ink width + 1).
             assert!(
                 ext >= ink + 2.0 * pad + 1.0,
                 "extent must keep 1px of phase headroom (ink={ink} pad={pad} ext={ext})"
@@ -140,7 +101,6 @@ fn padded_extent_absorbs_every_phase_without_clipping() {
             let old = (ink + 2.0 * pad).ceil(); // the extent without the +1
             for q in 0i64..=64 {
                 let phase = q as f64 / 64.0;
-                // No clipping at any phase: the padded ink's trailing edge fits.
                 assert!(
                     phase + ink + 2.0 * pad <= ext,
                     "fractional ink must never clip (ink={ink} pad={pad} phase={phase})"
@@ -151,24 +111,18 @@ fn padded_extent_absorbs_every_phase_without_clipping() {
             }
         }
     }
-    // Negative control: without the +1 (`ceil(ink + 2*pad)`) a near-1 phase clips.
     assert!(
         old_extent_would_clip > 0,
         "the pre-fix extent must clip for some (ink, phase) — otherwise the +1 proves nothing"
     );
 }
 
-/// Model ↔ code conformance: the `CtFracBearing` model's own interpreter (`Model::fire`,
-/// the semantics `ty` checks), over its whole domain (eighth-px bearings in ±3px),
-/// reports the same `(bearing, rem)` as `ct_pen_and_bearing` at every point.
 #[test]
 fn pen_and_bearing_conforms_to_the_ty_checked_model() {
     let m = ct_frac_bearing_model();
     let mut negative_seen = 0usize;
     let mut fractional_seen = 0usize;
     for b_e in -24i64..=24 {
-        // Enter the model at phase 2 (this loop does PickB/Latch's enumeration:
-        // rem = b, bearing = 0).
         let mut state = m.init_state();
         state.insert("phase", 2);
         state.insert("b", b_e);
@@ -189,7 +143,6 @@ fn pen_and_bearing_conforms_to_the_ty_checked_model() {
             );
         }
         assert!(m.fire("Report", &mut state), "Report must fire (b={b_e})");
-        // The committed (Buggy=0) model invariants hold at the reported state.
         assert!(
             m.check_invariant("Decompose", &state),
             "Decompose (b={b_e})"
@@ -198,7 +151,6 @@ fn pen_and_bearing_conforms_to_the_ty_checked_model() {
             m.check_invariant("PhaseInUnit", &state),
             "PhaseInUnit (b={b_e})"
         );
-        // Point-for-point agreement with the shipping pure fn (eighth-px scale).
         let (pen, min) = ct_pen_and_bearing(b_e as f64 / 8.0);
         assert_eq!(
             state["bearing"],
@@ -222,6 +174,5 @@ fn pen_and_bearing_conforms_to_the_ty_checked_model() {
             fractional_seen += 1;
         }
     }
-    // Non-vacuity: negative bearings (floor != truncate) and off-grid bearings walked.
     assert!(negative_seen > 0 && fractional_seen > 0);
 }

@@ -194,7 +194,8 @@ impl Compressor for RawFrames {
 /// compressed by the zstd CLI on `PATH` ([`ZstdCli::default`]).
 ///
 /// # Errors
-/// A refusal for a symlink or special file in the tree, or a tree with no file at all.
+/// A refusal for a symlink or special file in the tree, or a tree with no file at all; a
+/// could-not-run for any I/O failure.
 pub fn write(root: &Path, asset: &Path) -> Result<Packed> {
     write_with(root, asset, &ZstdCli::default())
 }

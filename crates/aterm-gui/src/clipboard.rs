@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Platform clipboard and X11 `PRIMARY` selection layer ([`route`]).
+//! Platform clipboard and X11 `PRIMARY` selection layer.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,6 @@ enum ClipboardRoute {
     TestBoard,
 }
 
-/// The routing decision; `seam` is `ATERM_DEBUG_CLIPBOARD_FILE`'s value.
 fn route_for(seam: Option<OsString>) -> ClipboardRoute {
     match seam {
         None => ClipboardRoute::System,
@@ -26,7 +25,6 @@ fn route_for(seam: Option<OsString>) -> ClipboardRoute {
     }
 }
 
-/// The route every read and write takes ([`ClipboardRoute::System`]).
 fn route() -> ClipboardRoute {
     #[cfg(test)]
     {
@@ -38,7 +36,6 @@ fn route() -> ClipboardRoute {
     }
 }
 
-/// How much of the stand-in file a read takes (the paste seam's bound, 64 MiB).
 const CLIPBOARD_FILE_CAP: u64 = 64 << 20;
 
 /// A clipboard write needs an owner until after the clipboard has closed.
@@ -57,7 +54,6 @@ pub(crate) fn write_with_owner<O, G>(
     write()
 }
 
-/// A copy under [`ClipboardRoute::File`].
 fn file_copy(path: &Path, text: &str) -> bool {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -79,7 +75,6 @@ fn file_copy(path: &Path, text: &str) -> bool {
     false
 }
 
-/// A read under [`ClipboardRoute::File`] ([`CLIPBOARD_FILE_CAP`], [`pbpaste`]).
 fn file_paste(path: &Path) -> Option<String> {
     use std::io::Read as _;
     let mut text = String::new();
@@ -134,14 +129,17 @@ pub(crate) fn pbcopy(text: &str) -> bool {
     }
 }
 
-/// [`pbcopy`]'s platform arm: the system clipboard itself.
 fn system_pbcopy(text: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
+        // thread; `-clearContents` is `-(NSInteger)` (result discarded) and takes
+        // ownership before writing, per the documented protocol;
+        // `-setString:forType:` is `-(BOOL)(NSString *, NSPasteboardType)`, the
+        // type is an `NSString *`, and both arguments outlive the call.
         autoreleasepool(|_| unsafe {
             let Some(ns) = appkit::nsstring(text) else {
                 return false;
@@ -184,7 +182,8 @@ fn system_pbcopy(text: &str) -> bool {
 /// `NSPasteboardTypeString`, the UTF-8 plain-text pasteboard type.
 #[cfg(target_os = "macos")]
 fn pasteboard_type_string() -> aterm_objc::Id {
-    // SAFETY: AppKit exports this as an immortal `NSString *` constant.
+    // SAFETY: AppKit exports this as an immortal `NSString *` constant; reading
+    // the symbol is a load, and the object it names outlives the process.
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {
         static NSPasteboardTypeString: *mut std::ffi::c_void;
@@ -203,14 +202,15 @@ pub(crate) fn pbpaste() -> Option<String> {
     }
 }
 
-/// [`pbpaste`]'s platform arm: the system clipboard itself.
 fn system_pbpaste() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         use aterm_objc::{autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
+        // thread; `-stringForType:` is `-(NSString *)(NSPasteboardType)` and
+        // returns a borrowed string, copied out to Rust inside this pool.
         let s = autoreleasepool(|_| unsafe {
             let pb = appkit::send_id(class(c"NSPasteboard").as_id(), sel!(generalPasteboard));
             if pb.is_null() || pasteboard_type_string().is_null() {
@@ -419,10 +419,6 @@ mod tests {
         }
     }
 
-    /// Unset, the seam leaves every clipboard read and write on the platform;
-    /// set, its file stands in whatever the path — an empty value included,
-    /// which names no file, so a copy fails and a read finds nothing and the
-    /// platform clipboard is untouched. PRIMARY rides a sibling file.
     #[test]
     fn the_seam_routes_to_the_system_clipboard_or_its_file() {
         assert_eq!(route_for(None), ClipboardRoute::System);
@@ -441,9 +437,6 @@ mod tests {
         );
     }
 
-    /// The stand-in file behaves as a clipboard: a missing file is empty, a copy
-    /// overwrites it with the latest text (no temporary left beside it), an empty
-    /// copy reads as empty, and a directory that is not there refuses the copy.
     #[test]
     fn the_file_stands_in_for_the_clipboard() {
         let dir = aterm_tempfile::tempdir().expect("scratch dir");

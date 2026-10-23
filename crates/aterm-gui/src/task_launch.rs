@@ -884,7 +884,8 @@ fn starter_front(store: &Store, ctx: &SessionCtx) -> Option<i32> {
         .by_sid(&ctx.self_id)
         .filter(|h| !matches!(h.state, SessionState::Exited))?
         .master;
-    // SAFETY: `tcgetpgrp` on the starter's own PTY master fd, which the registry holds open for the session's life (its guard is held).
+    // SAFETY: `tcgetpgrp` on the starter's own PTY master fd, which the registry holds open for the
+    // session's life (its guard is held); it takes no pointers.
     let pgrp = unsafe { libc::tcgetpgrp(master) };
     (pgrp > 0).then_some(pgrp)
 }

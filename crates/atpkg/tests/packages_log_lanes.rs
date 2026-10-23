@@ -1,16 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE PACKAGE LOG AT THE REAL PROCESS EDGE: the dev `atpkg` binary,
-//! run the way each lane runs it, appends a `pass-start` and a `pass-end` naming that lane
-//! to `packages.log` in the log directory under its HOME — and a verb the store lock
-//! refused leaves one `pass-end` saying it did not run.
-//!
-//! NEVER THE REAL STORE OR THE REAL LOG. HOME, the config dir, the state dir and aterm's
-//! own state root (`ATERM_STATE_HOME`, which moves the log) are temp directories — set,
-//! never inherited, so a run from inside an isolated instance cannot write into its root.
-//! `<prefix>/declined` makes `seed` exit 0 with one sentence before any index
-//! work, so no network and no store mutation happen.
+//! `packages.log` records `pass-start` and `pass-end` across lanes in an isolated temp store.
 
 #![cfg(unix)]
 #![allow(
@@ -44,13 +35,10 @@ impl Fixture {
         Self { root, home, prefix }
     }
 
-    /// Where `packages.log` lands under this fixture's state root: the one
-    /// log-directory rule.
     fn log(&self) -> PathBuf {
         self.log_under(Some(self.state_home()))
     }
 
-    /// Where it would land for this HOME alone, with no state root.
     fn home_log(&self) -> PathBuf {
         self.log_under(None)
     }
@@ -143,12 +131,10 @@ fn every_lane_logs_its_pass_start_and_end() {
         let mode = std::fs::metadata(fx.log()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the log is the owner's alone");
     }
-    // The state root moved it: nothing landed where HOME alone puts it.
     assert_ne!(fx.log(), fx.home_log());
     assert!(!fx.home_log().exists(), "{}", fx.home_log().display());
 }
 
-/// A typed verb the store lock refuses leaves one `pass-end` (exit 75), no start.
 #[test]
 fn a_pass_the_lock_refused_says_it_did_not_run() {
     let fx = Fixture::new("refused");
@@ -167,8 +153,6 @@ fn a_pass_the_lock_refused_says_it_did_not_run() {
     assert_eq!(events[0].get("exit"), Some("75"));
 }
 
-/// The child half of the two-process test below: append this process's lines, through the
-/// real writer ([`atpkg::packages_log::append_line`]).
 #[test]
 fn concurrent_appender_child() {
     let Some(dir) = std::env::var_os("ATPKG_TEST_LOG_APPENDER_DIR") else {
@@ -193,11 +177,6 @@ fn concurrent_appender_child() {
     }
 }
 
-/// A child reaped on EVERY path. [`Self::wait`] is the passing one; any other — a later
-/// spawn that failed, a wait that erred, an assertion that fired — kills it (SIGKILL) and
-/// reaps it as this guard drops, which is before the scratch it appends into goes: a child
-/// still appending when the scratch is removed makes its directory again, outside anything
-/// that removes it.
 struct Reaped(Child);
 
 impl Reaped {
@@ -208,20 +187,11 @@ impl Reaped {
 
 impl Drop for Reaped {
     fn drop(&mut self) {
-        // Neither does anything to a child `wait` already reaped: `Child` keeps its
-        // status, and `kill` signals no process once it has one.
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-/// TWO PROCESSES APPENDING AT ONCE interleave whole lines, never halves: every line in the
-/// file parses, and each process's count is all there.
-///
-/// HERE, in its own test binary, never among the library's unit tests: a child spawned
-/// while another test holds a store lock carries a copy of that lock's descriptor until its
-/// exec closes it, so a library test could find its store still locked after its guard
-/// dropped. Cargo runs test binaries one after another, so no library test runs beside it.
 #[test]
 fn two_processes_appending_at_once_interleave_whole_lines() {
     let scratch = aterm_tempfile::Builder::new()
@@ -241,8 +211,6 @@ fn two_processes_appending_at_once_interleave_whole_lines() {
                 .expect("spawn an appender"),
         )
     };
-    // Each child is a guard from its spawn on, so `a` is reaped even when `b`'s spawn
-    // fails; and both are reaped before either is judged.
     let mut a = spawn();
     let mut b = spawn();
     let (status_a, status_b) = (a.wait(), b.wait());

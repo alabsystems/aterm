@@ -2,14 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! `aterm theme pack` and `aterm theme install`: the community theme pack's
-//! grammar and report.
-//!
-//! The pack itself (the themes, their notices, the install) is
-//! `aterm_theme_pack`: embedded at build time, never fetched. `pack` lists it
-//! (or prints one theme's file, or every notice); `install` copies themes
-//! into the themes folder through the pack's one install path, the one
-//! Keep on a Settings ▸ Themes ▸ Community row takes too.
+//! `aterm theme pack` and `aterm theme install` CLI verbs.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -22,7 +15,6 @@ use aterm_types::scheme_install::InstallError;
 
 use crate::theme_cmd::{HELP, Outcome, ThemeListFormat, appearance_value, format_value};
 
-/// The `--help` answer.
 fn help() -> Outcome {
     Outcome {
         stdout: HELP.to_string(),
@@ -30,7 +22,6 @@ fn help() -> Outcome {
     }
 }
 
-/// `dark` or `light`.
 const fn appearance_word(appearance: Appearance) -> &'static str {
     match appearance {
         Appearance::Dark => "dark",
@@ -38,8 +29,6 @@ const fn appearance_word(appearance: Appearance) -> &'static str {
     }
 }
 
-/// A theme's status word in the themes folder (`None`: no folder), and the
-/// blocking file's name when there is one.
 fn status(theme: &PackTheme, dir: Option<&Path>) -> (&'static str, Option<String>) {
     match dir.map(|dir| aterm_theme_pack::state_in(dir, theme)) {
         None | Some(PackState::Absent) => ("available", None),
@@ -56,7 +45,6 @@ fn status(theme: &PackTheme, dir: Option<&Path>) -> (&'static str, Option<String
     }
 }
 
-/// What `pack` was asked for.
 struct PackArgs {
     id: Option<String>,
     appearance: Option<Appearance>,
@@ -108,8 +96,6 @@ fn parse_pack_args(args: &[OsString]) -> Result<Option<PackArgs>, String> {
     Ok(Some(parsed))
 }
 
-/// Why `id` names no pack theme: an id a release shipped that has left the
-/// pack names the theme that replaces it, and how to use that one.
 fn no_pack_theme(id: &str) -> String {
     match aterm_theme_pack::withdrawn(id) {
         Some(theme) if aterm_theme_pack::find(theme).is_some() => format!(
@@ -124,7 +110,6 @@ fn no_pack_theme(id: &str) -> String {
     }
 }
 
-/// An unknown pack id, as a usage error.
 fn unknown(id: &str) -> Outcome {
     Outcome::usage_error(&no_pack_theme(id))
 }
@@ -246,7 +231,6 @@ pub(crate) fn pack(args: &[OsString], theme_dir: Option<&Path>) -> Outcome {
     }
 }
 
-/// What `install` was asked for: the themes, or `None` for `--help`.
 fn parse_install_args(
     args: &[OsString],
 ) -> Result<Option<(Vec<&'static PackTheme>, bool)>, String> {
@@ -285,7 +269,6 @@ fn parse_install_args(
     Ok(Some((themes, replace)))
 }
 
-/// The `theme = "dark:…,light:…"` value for `theme` and its pair.
 fn split_value(theme: &PackTheme, pair: &str) -> String {
     let (dark, light) = match theme.appearance {
         Appearance::Dark => (theme.id, pair),
@@ -425,8 +408,6 @@ mod tests {
         names
     }
 
-    /// `pack --format tsv`: a header, one 8-field row per theme, the
-    /// collection trailer; `--appearance light` keeps only light rows.
     #[test]
     fn pack_lists_every_theme_as_tsv() {
         let out = theme(&["pack", "--format", "tsv"], None);
@@ -458,8 +439,6 @@ mod tests {
         assert!(text.stdout.lines().count() > count);
     }
 
-    /// `pack <id>` prints exactly the embedded file, case-insensitively;
-    /// an unknown id is a usage error; `--licences` holds every licence.
     #[test]
     fn pack_prints_a_theme_and_the_licences() {
         let kanagawa = aterm_theme_pack::find("Kanagawa Wave").expect("in the pack");
@@ -487,9 +466,6 @@ mod tests {
         }
     }
 
-    /// `install <id>` writes the pack's file and names the pair's split
-    /// value; again it is unchanged; an edited copy is kept unless
-    /// `--replace`, and every one of those exits 0.
     #[test]
     fn install_writes_keeps_and_replaces() {
         let owned = scratch("install");
@@ -519,11 +495,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), iceberg.text);
     }
 
-    /// A pack theme answers to the name the chooser shows it under too, and
-    /// installs under its id; a copy an earlier release installed under that
-    /// id is listed installed and kept, never doubled. An id a release
-    /// shipped that left the pack is refused, naming the theme that replaces
-    /// it. Negative control: an id nothing ever named names no theme.
     #[test]
     fn install_takes_the_shown_name_and_keeps_an_earlier_copy() {
         let owned = scratch("names");
@@ -537,7 +508,6 @@ mod tests {
         assert_eq!(out.code, 0, "{out:?}");
         assert_eq!(files(&dir), [format!("{}.conf", renamed.id)]);
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), renamed.text);
-        // The copy an earlier release wrote: shown under its id.
         let earlier = renamed.text.replacen(
             &format!("\nname = {}\n", renamed.name),
             &format!("\nname = {}\n", renamed.id),
@@ -585,8 +555,6 @@ mod tests {
         );
     }
 
-    /// `install --all` into an empty folder writes every pack theme; an
-    /// unknown id, or ids with `--all`, write nothing (exit 2).
     #[test]
     fn install_all_and_refusals() {
         let owned = scratch("all");
@@ -610,8 +578,6 @@ mod tests {
         assert_eq!(files(&dir), want);
     }
 
-    /// No themes folder fails (exit 1); past the folder's file cap the
-    /// install warns. Negative control: under the cap it does not.
     #[test]
     fn install_fails_without_a_folder_and_warns_past_the_cap() {
         assert_eq!(theme(&["install", "Ayu"], None).code, 1);

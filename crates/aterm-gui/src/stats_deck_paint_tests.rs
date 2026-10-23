@@ -6,6 +6,8 @@
 use super::*;
 use crate::stats_paint::HitKind;
 use crate::stats_paint::tests::{job_row, zombies};
+use aterm_vitals::explain::WhyFacts;
+use aterm_vitals::explain::fixtures::spotlight_1032;
 use aterm_vitals::jobs::{Findings, JobsView, Verdict};
 use aterm_vitals::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, GpuSample, GpuView,
@@ -586,7 +588,27 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
         _ => jobs(&[(Verdict::Stuck, 1), (Verdict::Quiet, 2)], 0),
     };
     s.set_jobs(Some(Arc::new(view)));
+    if trouble {
+        s.why = Some(spotlight_after_start_up());
+    }
     s
+}
+
+/// The cause engine's facts on RD's 10:32 scene (`explain::fixtures`) after
+/// four of its windows, so the Deck's clause holds: Spotlight, after start-up
+/// (RD §4.1), the troubled scenes' CPU cause, with the open episode and the
+/// split it stands on. Read once: a sweep draws thousands of scenes.
+pub(crate) fn spotlight_after_start_up() -> Arc<WhyFacts> {
+    static FACTS: std::sync::OnceLock<Arc<WhyFacts>> = std::sync::OnceLock::new();
+    Arc::clone(FACTS.get_or_init(|| {
+        let mut vitals = aterm_vitals::Vitals::new();
+        let mut snaps: Vec<Snapshot> = spotlight_1032()
+            .series(4)
+            .iter()
+            .map(|r| vitals.absorb(r))
+            .collect();
+        snaps.pop().and_then(|s| s.why).expect("the scene's facts")
+    }))
 }
 
 const MAC: Locale = Locale {
@@ -841,6 +863,176 @@ fn work_counts_deck() {
         }
     });
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The CPU row's Details column and its row's top, where the deck draws one
+/// (the Full table's, or the Folded first block's).
+fn cpu_details(w: f64, form: DeckForm, m: &FaceMetrics) -> Option<(Col, f64, f64)> {
+    match form {
+        DeckForm::Full => {
+            let p = plan::plan_full(w, m);
+            p.details.map(|d| (d, p.rows.top(0), p.rows.cell))
+        }
+        DeckForm::Folded => {
+            let b = plan::plan_folded(w, m).blocks[0];
+            b.details.map(|d| (d, b.rows.top(0), b.rows.cell))
+        }
+    }
+}
+
+/// RD §4.1: the cause clause folds after busiest and before the load, so
+/// the CPU row's Details read the load, then `∵ Spotlight`, then busiest, a
+/// prefix of that order at every width, one ` · ` between each two clauses
+/// drawn (held at the three widths below); its ∵ is a Mark box keyed `cause`
+/// just ahead of its words, three dots two above one. In Helvetica Neue at
+/// 2×, all three are long at W 1424 (a 439 pt column), all three short at
+/// W 1175 (250 pt), busiest is gone at W 1119 (194 pt), and W 900
+/// draws no Details and so no clause; the Calm scene, with no cause held,
+/// draws none anywhere.
+#[test]
+fn the_cause_clause_folds_before_load_and_after_busiest() {
+    let m = FaceMetrics::helvetica_neue();
+    let sep = " \u{b7} ";
+    let drawn = |sc: Scene, w: f64, form: DeckForm| -> Option<(Vec<String>, Vec<Boxed>)> {
+        let laid = laid(sc, w, 2.0, form, &m, false);
+        let (col, top, cell) = cpu_details(w, form, &m)?;
+        let texts = texts_in(&laid, col, top - 1.0, top + cell + 1.0);
+        let marks = laid
+            .boxes
+            .iter()
+            .filter(|b| {
+                b.kind == BoxKind::Mark && b.r[0] >= col.x - EPS && b.r[2] <= col.end() + EPS
+            })
+            .filter(|b| {
+                (b.r[1] + b.r[3]) / 2.0 > top - 1.0 && (b.r[1] + b.r[3]) / 2.0 < top + cell + 1.0
+            })
+            .cloned()
+            .collect();
+        Some((texts, marks))
+    };
+    let (wide, marks) = drawn(Scene::Trouble, 1424.0, DeckForm::Full).expect("Details at W 1424");
+    assert_eq!(
+        wide,
+        [
+            "8 waiting for a core (load 25.7)",
+            sep,
+            "Spotlight, after start-up",
+            sep,
+            "busiest rustc \u{d7}9 in Tab 3, 5.9 cores",
+        ]
+    );
+    let cause: Vec<&Boxed> = marks.iter().filter(|b| b.text == "cause").collect();
+    assert_eq!(cause.len(), 1, "one \u{2235}: {marks:?}");
+    let full = laid(Scene::Trouble, 1424.0, 2.0, DeckForm::Full, &m, true);
+    let words = full
+        .boxes
+        .iter()
+        .find(|b| b.kind == BoxKind::Text && b.text == "Spotlight, after start-up")
+        .expect("the clause's words");
+    assert!(
+        cause[0].r[2] <= words.r[0] + EPS && words.r[0] - cause[0].r[2] < 0.7 * SMALL_PT,
+        "the mark leads its words: {:?} then {:?}",
+        cause[0].r,
+        words.r
+    );
+    // The ∵ is three dots inside its box, two above and one below between
+    // them, in words2 whatever its words' ink.
+    let inks = super::tests::dark_inks();
+    assert_ne!(inks.words2, inks.words, "CONTROL: the inks differ");
+    let [x0, y0, x1, y1] = cause[0].r.map(|v| (v * 2.0) as f32);
+    let mut dots: Vec<(f32, f32, [u8; 4])> = full
+        .prims
+        .iter()
+        .filter_map(|p| match *p {
+            DrawPrim::Dot { cx, cy, color, .. }
+                if (x0..=x1).contains(&cx) && (y0..=y1).contains(&cy) =>
+            {
+                Some((cx, cy, color))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dots.iter().map(|d| d.2).collect::<Vec<_>>(),
+        [rgba(inks.words2, 0xFF); 3],
+        "the \u{2235}'s dots"
+    );
+    dots.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.total_cmp(&b.0)));
+    let [(lx, ly, _), (rx, ry, _), (bx, by, _)] = dots[..] else {
+        panic!("three dots: {dots:?}")
+    };
+    assert!(
+        ly == ry && ry < by && lx < bx && bx < rx,
+        "\u{2235}, not \u{2234}: {dots:?}"
+    );
+
+    let (mid, _) = drawn(Scene::Trouble, 1119.0, DeckForm::Full).expect("Details at W 1119");
+    assert_eq!(
+        mid,
+        ["8 waiting for a core (load 25.7)", sep, "Spotlight"],
+        "busiest folds first, then the cause shortens"
+    );
+    let (col, ..) = cpu_details(1175.0, DeckForm::Full, &m).expect("Details at W 1175");
+    assert!((col.w - 250.0).abs() < 0.5, "a 250 pt column: {col:?}");
+    let (between, _) = drawn(Scene::Trouble, 1175.0, DeckForm::Full).expect("Details");
+    assert_eq!(
+        between,
+        [
+            "load 25.7 on 18 cores",
+            sep,
+            "Spotlight",
+            sep,
+            "rustc \u{d7}9 in Tab 3"
+        ],
+        "all three short"
+    );
+    assert_eq!(
+        drawn(Scene::Trouble, 900.0, DeckForm::Full),
+        None,
+        "no Details at W 900"
+    );
+    let narrow = laid(Scene::Trouble, 900.0, 2.0, DeckForm::Full, &m, false);
+    assert!(
+        narrow
+            .boxes
+            .iter()
+            .all(|b| b.text != "cause" && !b.text.starts_with("Spotlight")),
+        "no clause where no Details column shows"
+    );
+
+    let mut seen = 0;
+    for form in [DeckForm::Full, DeckForm::Folded] {
+        for w in (160..=5120).step_by(7).map(f64::from) {
+            if let Some((calm, marks)) = drawn(Scene::Calm, w, form) {
+                assert!(
+                    calm.iter().all(|t| !t.starts_with("Spotlight"))
+                        && marks.iter().all(|b| b.text != "cause"),
+                    "Calm holds no cause, {form:?} {w} pt: {calm:?}"
+                );
+            }
+            let Some((texts, marks)) = drawn(Scene::Trouble, w, form) else {
+                continue;
+            };
+            let at = |p: &dyn Fn(&str) -> bool| texts.iter().position(|t| p(t.as_str()));
+            let load = at(&|t| t.starts_with("load") || t.starts_with("8 waiting"));
+            let cause = at(&|t| t.starts_with("Spotlight"));
+            let busiest = at(&|t| t.starts_with("busiest") || t.starts_with("rustc"));
+            let order = match (load, cause, busiest) {
+                (_, None, Some(_)) => false,
+                (None, Some(_), _) => false,
+                (Some(l), Some(c), b) => l < c && b.is_none_or(|b| c < b),
+                _ => true,
+            };
+            assert!(order, "{form:?} {w} pt: {texts:?}");
+            assert_eq!(
+                marks.iter().filter(|b| b.text == "cause").count(),
+                usize::from(cause.is_some()),
+                "{form:?} {w} pt: {texts:?}"
+            );
+            seen += usize::from(cause.is_some());
+        }
+    }
+    assert!(seen > 100, "CONTROL: the clause drawn at {seen} widths");
 }
 
 /// The boxes T-G2 holds fixed: the strips, the bars and the cores.

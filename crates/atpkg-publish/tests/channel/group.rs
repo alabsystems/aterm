@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `rustc` group publish over fakes of its parts (the packers, the indexer, the seal's
-//! `-Vv`, the receipt switch) and real git checkouts in scratch: the
-//! preflight collects every refusal before anything runs (the seal, the exposes, a live tree,
-//! the store, the trust build and each sibling judged against the floor per target, the force
-//! rules), and step 2 re-checks each sibling before any packs and before its own.
+//! End-to-end `rustc` group publication and preflight refusal tests.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -35,7 +31,6 @@ const MAC: &str = "aarch64-apple-darwin";
 const LINUX: &str = "x86_64-unknown-linux-gnu";
 const SIBLINGS: [&str; 3] = ["trust-cg", "trust-ir", "trust-vc"];
 
-/// The fake, except that one tag stops being visible once `hidden` is set.
 struct Hiding {
     inner: Arc<FakeHost>,
     tag: &'static str,
@@ -111,9 +106,7 @@ impl SealProbe for Probe {
     }
 }
 
-/// A step a peer session takes while a pack runs.
 type During = RefCell<Option<Box<dyn Fn()>>>;
-/// The same, told which sibling is packing.
 type DuringPack = RefCell<Option<Box<dyn Fn(&str)>>>;
 
 /// Records every pack and index; `during_bundle` runs while the bundle "packs" (a peer
@@ -198,9 +191,6 @@ fn vv(commit: &str, host: &str) -> String {
     )
 }
 
-/// A seal of trust build 5 (five commits), siblings at build 5, each sibling's staging
-/// repo listing an old pack, and the channel head atpkg-index-34 pinning `pins`
-/// (`overlay` for Linux).
 fn cut(label: &str, pins: &[(&str, u64)], overlay: &[(&str, u64)]) -> Cut {
     let c = cut_unstaged(label, pins, overlay);
     for s in SIBLINGS {
@@ -214,13 +204,11 @@ fn cut(label: &str, pins: &[(&str, u64)], overlay: &[(&str, u64)]) -> Cut {
     c
 }
 
-/// A sibling's repo on the staging owner.
 fn staging(program: &str) -> Slug {
     let repo = atpkg_publish::programs::get(program).map_or(program, |p| p.repo);
     Slug::new(STAGING_OWNER, repo)
 }
 
-/// [`cut`], with no staging repo that lists.
 fn cut_unstaged(label: &str, pins: &[(&str, u64)], overlay: &[(&str, u64)]) -> Cut {
     let rig = Rig::new(label);
     let mut doc = Doc::new(34, pins);
@@ -305,7 +293,6 @@ fn refused(c: &Cut, req: &GroupRequest) -> String {
     }
 }
 
-/// The floor everything is newer than: trust 3, each sibling 4.
 const FLOOR: [(&str, u64); 5] = [
     ("ay", 8256),
     ("trust-ir", 4),
@@ -344,8 +331,6 @@ fn a_staged_cut_packs_the_bundle_then_the_siblings_with_the_seals_toolchain_then
         assert_eq!(p.build, Some(5));
         assert_eq!(p.toolchain.as_deref(), Some(c.seal.join("bin").as_path()));
     }
-    // The packers read the lineage switch from the repo the preflight judged the seal
-    // under (`--trust-repo`), never the ctx's default $HOME/trust.
     assert_ne!(
         c.trust_repo, c.rig.ctx.trust_repo,
         "the fixture's repo is not the default"
@@ -416,7 +401,6 @@ fn a_sibling_behind_or_level_with_the_floor_is_refused_before_anything_packs() {
         "force never admits a lower build"
     );
 
-    // Level with the floor (and the compiler with it): refused unless forced.
     let level = [
         ("trust-ir", 5),
         ("trust-cg", 5),
@@ -448,9 +432,6 @@ fn the_seals_trust_build_is_held_to_the_floor() {
     assert!(refused(&c, &forced).contains("BELOW the 9"));
 }
 
-/// When the compiler moved, each sibling takes the first build not yet published — the
-/// number judged is the number packed; and an equal build then means the tag probe
-/// answered wrong, which no flag lifts.
 #[test]
 fn a_moved_compiler_skips_published_numbers_and_never_reuses_one() {
     let floor = [
@@ -466,7 +447,6 @@ fn a_moved_compiler_skips_published_numbers_and_never_reuses_one() {
         "pkg-trust-cg-5.toml",
         b"x".to_vec(),
     );
-    // A number taken only on the staging owner is taken too (5 and 6 there).
     for n in [5, 6] {
         c.rig.host.put_asset(
             &staging("trust-vc"),
@@ -488,7 +468,6 @@ fn a_moved_compiler_skips_published_numbers_and_never_reuses_one() {
     assert_eq!(packed("trust-vc"), Some(7));
     assert_eq!(packed("trust-ir"), Some(5));
 
-    // The probe misses the published tag: an equal number from a new compiler.
     let c = cut("group-moved-blind", &floor, &[]);
     let mut forced = request(&c, Mode::Stage);
     forced.force_same_build = true;
@@ -527,7 +506,6 @@ fn the_seal_preflights_refuse_by_name() {
         assert!(refused(&c, &request(&c, Mode::DryRun)).contains("no executable bin/targo"));
     }
 
-    // A live build tree, and the store.
     let c = cut("group-live", &FLOOR, &[]);
     let live = c.rig.path("trust/build/aarch64-apple-darwin/stage2");
     std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
@@ -537,7 +515,6 @@ fn the_seal_preflights_refuse_by_name() {
     assert!(refused(&c, &req).contains("is a live build tree"));
     req.allow_build_tree_seal = true;
     ok(&c, &req);
-    // `*/build/*/stage2` matches however deep the stage2 sits below `build`.
     let deeper = c
         .rig
         .path("trust/build/aarch64-apple-darwin/stage-out/stage2");
@@ -567,8 +544,6 @@ fn the_trust_repo_must_hold_the_seals_commit() {
     assert!(e.contains("is not in"), "{e}");
 }
 
-/// No floor: a dry run still runs; staging or publishing is refused before anything packs —
-/// without the head no build is judged and no published number is skipped.
 #[test]
 fn no_floor_is_refused_by_a_cut_and_not_by_a_dry_run() {
     let c = cut("group-nofloor", &[], &[]);
@@ -580,8 +555,6 @@ fn no_floor_is_refused_by_a_cut_and_not_by_a_dry_run() {
     assert!(c.packs.bundles.borrow().is_empty());
 }
 
-/// A head past its horizon still pins what it pins: it is the floor (and re-signing it is
-/// the index step's job).
 #[test]
 fn a_lapsed_head_is_still_the_floor() {
     let c = cut("group-lapsed", &[], &[]);
@@ -591,8 +564,6 @@ fn a_lapsed_head_is_still_the_floor() {
     ok(&c, &request(&c, Mode::Stage));
 }
 
-/// The staging owner's repos are private: one that does not list for this identity is a
-/// refusal, never "no build number taken there".
 #[test]
 fn a_staging_repo_this_identity_cannot_see_is_refused_when_the_compiler_moved() {
     let c = cut_unstaged("group-unstaged", &FLOOR, &[]);
@@ -604,7 +575,6 @@ fn a_staging_repo_this_identity_cannot_see_is_refused_when_the_compiler_moved() 
         );
     }
     assert!(e.contains("~/.secrets/gh_access_token"), "{e}");
-    // Not asked when the compiler did not move: the build is the revision count.
     let level = [
         ("trust-ir", 4),
         ("trust-cg", 4),
@@ -617,7 +587,6 @@ fn a_staging_repo_this_identity_cannot_see_is_refused_when_the_compiler_moved() 
     ok(&c, &forced);
 }
 
-/// Step 2 re-checks the judgment before any sibling packs, and again before each.
 #[test]
 fn a_sibling_that_moves_while_the_bundle_packs_stops_the_cut() {
     let c = cut("group-moved-checkout", &FLOOR, &[]);
@@ -653,7 +622,6 @@ fn a_sibling_that_moves_while_the_bundle_packs_stops_the_cut() {
         "every sibling is re-checked before ANY packs"
     );
 
-    // A lower number than judged: the probe stops seeing the published tag.
     let floor = [
         ("trust-ir", 4),
         ("trust-cg", 5),
@@ -685,7 +653,6 @@ fn a_sibling_that_moves_while_the_bundle_packs_stops_the_cut() {
     );
     assert!(c.packs.packs.borrow().is_empty());
 
-    // Between two sibling packs: the later one is caught, the earlier one already packed.
     let c = cut("group-between", &FLOOR, &[]);
     let later = c.checkouts["trust-vc"].clone();
     *c.packs.during_pack.borrow_mut() = Some(Box::new(move |program: &str| {
@@ -738,7 +705,6 @@ fn upload_needs_the_key_and_the_channel_token_and_a_keyless_stage_signs_nothing(
         e.contains("--upload needs the staging owner's token at ~/.secrets/gh_access_token"),
         "{e}"
     );
-    // The control: both tokens and the key, and it publishes.
     let control = cut("group-identity-ok", &FLOOR, &[]);
     std::fs::write(&control.rig.ctx.tokens.staging, "staging-token\n").expect("token");
     let (o, _) = ok(&control, &request(&control, Mode::Upload));

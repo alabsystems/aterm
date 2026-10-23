@@ -1230,7 +1230,6 @@ impl CursorGlow {
             self.v2_stop = None;
         }
         if !valid_canvas {
-            // Full zero includes any in-flight crossfade. The master switch (and
             if cfg.enabled {
                 self.store_key_timbre(cfg);
                 self.settle_key_seam(cfg, false);
@@ -1325,7 +1324,6 @@ impl CursorGlow {
             let elapsed = now.saturating_duration_since(t0);
             let dt = elapsed.as_secs_f32();
             if dt > 0.0 {
-                // Fire cools on its own slower τ; other styles use 0.9 s. Shared
                 if self.heat > 0.0 {
                     let heat_tau = Self::heat_tau(cfg);
                     self.heat *= (-dt / heat_tau).exp();

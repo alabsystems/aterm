@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`FakeHost`]: an in-memory [`ReleaseHost`] for the producer's tests, with the failure
-//! modes seen in the field: a draft (invisible to the download host), a one-shot HTTP 500
-//! on one asset, an unreachable owner, a private repo the download host serves nothing
-//! for, a repo this identity cannot see, the draft a lost two-publisher race leaves beside
-//! a published release, and a create that races another publisher. Every call is logged,
-//! so a test can say "a dry run made no host call".
+//! [`FakeHost`]: in-memory [`ReleaseHost`] for producer tests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -145,10 +140,7 @@ impl FakeHost {
         }
     }
 
-    /// Every authenticated read of `slug` answers unreachable, as a 404 does to an identity that cannot see the repository.
-    ///
-    /// The download host serves nothing for it either: a repository an identity cannot see
-    /// is private or gone on GitHub, and its download host answers 404 to everyone.
+    /// Every authenticated read of `slug` answers unreachable.
     pub fn set_not_visible(&self, slug: &Slug, not_visible: bool) {
         let mut s = self.state();
         if not_visible {
@@ -158,12 +150,10 @@ impl FakeHost {
         }
     }
 
-    /// A draft beside the published release `tag`, as the loser of a two-publisher race leaves it (`channel/index.rs`); `release` and `download` still answer the published release.
-    ///
+    /// A draft beside the published release `tag`.
     /// # Panics
-    ///
     /// Unless `slug` holds a published release `tag`, so the mistake fails the test at its own
-    /// line: a stray anywhere else is a state FakeHost would answer otherwise than GitHub.
+    /// line.
     pub fn put_stray_draft(&self, slug: &Slug, tag: &str) {
         let mut s = self.state();
         let published = s
@@ -182,9 +172,7 @@ impl FakeHost {
             .or_default() += 1;
     }
 
-    /// A keyless builder: no token, so every authenticated read
-    /// (`releases`, `release`, `download`) is unreachable and only the anonymous download
-    /// host answers ([`ReleaseHost::reads_anonymously`]).
+    /// A keyless builder ([`ReleaseHost::reads_anonymously`]).
     pub fn set_anonymous_reads(&self, anonymous: bool) {
         self.state().anonymous = anonymous;
     }
@@ -447,7 +435,6 @@ impl ReleaseHost for FakeHost {
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
         self.log(format!("fetch {slug} {tag} {asset}"));
         let answer = self.fetch_public_into(slug, tag, asset, dest, cap);
-        // As the trait says and RestHost does: `dest` holds a file only when it is present.
         if answer != Probe::Present {
             let _ = std::fs::remove_file(dest);
         }
@@ -462,9 +449,6 @@ impl ReleaseHost for FakeHost {
         self.log(format!("clone {slug}"));
         self.reachable(slug)?;
         let source = self.clone_source(slug)?;
-        // No template: the fake's clone carries no sample hooks or description, files every
-        // lane test makes and removes and no lane reads. Automatic maintenance stays off in
-        // the clone, for the fetches the fake runs in it later ([`crate::testkit::git`]).
         git(crate::testkit::git()
             .args(["-c", "init.templateDir=", "clone"])
             .args(["--quiet", "--config", "maintenance.auto=false"])

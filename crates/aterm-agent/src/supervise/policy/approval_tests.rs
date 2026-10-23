@@ -316,7 +316,7 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
         assert!(why.starts_with("the box carries a vendor note: "), "{why}");
         // A note under the countdown makes the countdown a note too, so even
         // the vendor's no-rule note there escalates; above the countdown it is
-        // lifted under its own rule (`no-rule-read-only@v1`), the countdown
+        // lifted under its own rule (`no-rule-read-only@v2`), the countdown
         // still no note.
         noted[q + 3] = " This command requires approval".to_string();
         let why = reason(&on_screen(&noted, &git_host(ctx()))).to_string();
@@ -2770,7 +2770,7 @@ pub(crate) fn sixty_five(swaps: &[(usize, &str)]) -> Vec<String> {
 }
 
 /// A TOO-MANY BOX IS JUDGED BY ITS SCREEN'S READINGS ALONE
-/// (`breaker-read-only@v6`): no transcript is read, and every refusal the
+/// (`breaker-read-only@v7`): no transcript is read, and every refusal the
 /// screen's readings give is kept. The measured box (`echo` and 65 `$(true)`
 /// as one line, wrapped into four barred rows) is refused on its newline
 /// reading, which puts a `$(true)` where a command's name goes, in manual
@@ -2889,8 +2889,8 @@ fn every_measured_barred_box_is_judged_by_its_screen_alone() {
 }
 
 /// NO RULE PROVES A BASH BOX FROM A READING WHOSE WORDS TURN ON A BLANK THE
-/// SCREEN CANNOT SHOW (`read-only@classify-v6`, `breaker-read-only@v6`,
-/// `rm-breaker@v5`; [`blanks_shown`]; MEASURED 2026-10-22 under `/bin/bash`
+/// SCREEN CANNOT SHOW (`read-only@classify-v7`, `breaker-read-only@v7`,
+/// `rm-breaker@v6`; [`blanks_shown`]; MEASURED 2026-10-22 under `/bin/bash`
 /// 3.2, the measured note's §B). The screen draws a tab as the blanks to its
 /// stop and shows no blank at a row's end, so `echo \⇥#; tee x` (the tab at
 /// column 6, drawn as two blanks) draws as `echo \  #; tee x`, which reads as
@@ -3105,7 +3105,7 @@ fn note_box(name: &str) -> Vec<String> {
 }
 
 /// THE VENDOR'S NO-RULE NOTE ALONE IS LIFTED BY THE READ-ONLY PROOF, UNDER
-/// ITS OWN RULE (`no-rule-read-only@v1`; MEASURED 2026-10-22 on 2.1.308,
+/// ITS OWN RULE (`no-rule-read-only@v2`; MEASURED 2026-10-22 on 2.1.308,
 /// `docs/measured/box-notes-2026-10-22.md`): Claude Code draws `This command
 /// requires approval` where no allow rule matched and its own read-only
 /// check did not prove the command, after its parse, its too-complex walk
@@ -3379,7 +3379,7 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
 /// proof too, [`brace_free`]).
 ///
 /// NEGATIVE CONTROL: the boxes whose command the read-only rule proves, with
-/// their one-row note taken off, are approved under `read-only@classify-v6`,
+/// their one-row note taken off, are approved under `read-only@classify-v7`,
 /// so it is the note that holds each.
 #[test]
 fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
@@ -3455,8 +3455,8 @@ fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
 }
 
 /// NO RULE PROVES A BASH BOX WHOSE COMMAND MAY OPEN A NETWORK CONNECTION BY
-/// READING A FILE ([`network_free`]; a safety fix to `read-only@classify-v6`,
-/// `breaker-read-only@v6` and `rm-breaker@v5`): bash opens `/dev/tcp/H/P` and
+/// READING A FILE ([`network_free`]; a safety fix to `read-only@classify-v7`,
+/// `breaker-read-only@v7` and `rm-breaker@v6`): bash opens `/dev/tcp/H/P` and
 /// `/dev/udp/H/P` in a redirect as a socket (after its expansions, so
 /// `/dev/"tcp"/…` is one too), an expansion may compute that target, and
 /// gawk's `getline <` opens `/inet/…`. The classifier reads each as a read.
@@ -3481,7 +3481,10 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
         ("cat < \"$F\"", "$…"),
         ("head -c1 < $(echo x)", "$…"),
     ] {
-        assert!(classify_command(cmd).read_only, "{cmd}");
+        // Classifier audit 2: the classifier itself refuses the network read
+        // now (so the CLI and presence word agree); the box's message is still
+        // network_free's, which runs first and names the reading.
+        assert!(!classify_command(cmd).read_only, "{cmd}");
         let r = reason(&on_screen(&bash_box(&[cmd], Some("Read")), &ctx())).to_string();
         assert!(
             r.contains(&format!(
@@ -3491,7 +3494,7 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
         );
     }
     let gawk = "awk 'BEGIN{getline l < \"/inet/tcp/0/h/80\"}'";
-    assert!(classify_command(gawk).read_only);
+    assert!(!classify_command(gawk).read_only);
     let r = reason(&on_screen(&bash_box(&[gawk], Some("Read")), &ctx())).to_string();
     assert!(
         r.contains("names a gawk network file (space reading)"),
@@ -3527,23 +3530,26 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
     assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
 }
 
-/// NO RULE PROVES A BASH BOX WHOSE COMMAND HOLDS A BRACE EXPANSION
-/// ([`brace_free`]; a safety fix to `read-only@classify-v6`,
-/// `breaker-read-only@v6` and `rm-breaker@v5`): bash makes words of an
-/// unquoted `{a,b}` or `{a..b}` before any grammar applies, so `sort x
-/// {-o,y}` runs `sort x -o y` (MEASURED 2026-10-22: `echo sort x {-o,y}`
-/// under `/bin/bash` 3.2.57 and zsh 5.9 prints `sort x -o y`), a write
-/// classify-v5 read as a sort of three files. Breaker-4's
+/// A BASH BOX WHOSE COMMAND HOLDS A BRACE EXPANSION PROVES NO BOX at the box
+/// layer ([`brace_free`]): bash makes words of an unquoted `{a,b}` or `{a..b}`
+/// before any grammar applies, so `sort x {-o,y}` runs `sort x -o y` (MEASURED
+/// 2026-10-22: `echo sort x {-o,y}` under `/bin/bash` 3.2.57 and zsh 5.9 prints
+/// `sort x -o y`), a write a word scan read as a sort of three files. Breaker-4's
 /// `breaker-read-only@v4` approved the too-many box over that line, in a
 /// bypass session too: the breaker's box draws no `Brace expansion` note.
-/// Each form below that the classifier still reads is refused with the
-/// braces named, a one-row box with no note, the too-many breaker's box
-/// under the bash session and bypass, and the rm breaker's rest of line, so
-/// the brace check is what refuses it. A quoted separator inside the braces
-/// expands all the same (`{"a",b}`), a brace inside `$(…)` is the line's
-/// even inside double quotes, and an escaped `$` opens no `$'…'`. The
-/// measured `sort` writes are refused by classify-v6 on its own now, and by
-/// the brace check too.
+///
+/// Classifier audit 2 (2026-10-22): the classifier itself refuses a brace that
+/// can reach a FLAG or a PATH through its head-aware option-slot scan (`sort x
+/// {-o,y}`, `git config user.{name,email}`), so `read-only@classify-v7` is what
+/// stops those, and every consumer agrees. An operand-only brace (`wc -l
+/// {a,b}.md`, `echo a{1..3}`) stays a read in the classifier, and so at the CLI
+/// and the presence word. `brace_free` adds a CONSERVATIVE box-level refusal of
+/// EVERY brace expansion (operand ones too) with the reading named: each form
+/// below is refused as a one-row box with no note, as the too-many breaker's
+/// box under the bash session and bypass, and as the rm breaker's rest of line.
+/// A quoted separator inside the braces expands all the same (`{"a",b}`), a
+/// brace inside `$(…)` is the line's even inside double quotes, and an escaped
+/// `$` opens no `$'…'`.
 ///
 /// NEGATIVE CONTROLS, each approved: a quoted awk program and a quoted
 /// regex interval, `find … {} +`, `${HOME}`, an escaped and a quoted brace
@@ -3559,7 +3565,9 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
         ("wc \\$'a\\' {a,b}.md b'c'", "{a,b}"),
         ("grep -c x README.md; ls {a,{b,c}}", "{a,{b,c}}"),
     ] {
-        assert!(classify_command(cmd).read_only, "{cmd}");
+        // These are operand-only braces: the classifier reads them (precise),
+        // and `brace_free` is the conservative box-level check that refuses
+        // them, its reading-named message won before the per-reading classify.
         let r = reason(&on_screen(&bash_box(&[cmd], Some("Read")), &ctx())).to_string();
         assert!(
             r.contains(&format!(
@@ -3568,8 +3576,8 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
             "{cmd}: {r}"
         );
     }
-    // The measured write: `read-only@classify-v6` refuses it on its own (lane
-    // A's brace-into-a-flag check), and the brace check refuses it too.
+    // The measured write: `read-only@classify-v7` refuses it on its own (the
+    // head-aware brace-into-a-flag scan), and `brace_free` refuses it too.
     for cmd in [
         "sort x {-o,y}",
         "sort x {\"-o\",y}",
@@ -3620,6 +3628,187 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
     let lines = sixty_five(&[(12, "sort -k2 README.md")]);
     let d = on_screen(&too_many_box(&lines, true), &bypass());
     assert_eq!(approved(&d), Some(RULE_BREAKER_READ_ONLY), "{d:?}");
+}
+
+/// NO RULE PROVES A BASH BOX THAT READS A SECRET (classifier audit 2,
+/// [`secrets_free`]; the known-open `cat ~/.ssh/id_rsa` approval): the Read
+/// box's secret matcher ([`default_secrets`]) is now run over the words a
+/// command reads as paths ([`path_operands`]) on the Bash path too, in every
+/// rule (the read-only rule, the no-rule note, the too-many breaker and the
+/// rm breaker). A read of a private key, credential or named secret is
+/// refused, the operand named: an operand, a glued or spaced redirect
+/// target, a `--flag=value` value, a `~` resolved against home for a rule
+/// under it, a `$(<file)`, a word that starts with an expansion (read as
+/// under home, its literal parts kept), a `REV:PATH` in a git tree, every
+/// operand once an option supplies the pattern or past `--`, a file-valued
+/// option (glued to a short flag too: `git config -fFILE`), an awk program's
+/// string literal, and any word on a line that turns a listing into another
+/// command's path (`| xargs`, `$(…)`, `--files0-from`). A `.env.*` template is still the Read box's `.env.*`.
+/// The negative control — the words that are no read stay approved — is
+/// [`a_non_secret_read_beside_it_stays_read_only`].
+#[test]
+fn a_bash_read_of_a_secret_is_not_read_only() {
+    for cmd in [
+        "cat ~/.ssh/id_rsa",
+        "cat /Users/_owner/.aws/credentials",
+        "cat .env",
+        "grep -n token ~/.ssh/config",
+        "awk 'NR<3' /Users/_owner/.gnupg/secring.gpg",
+        "cat < ~/.ssh/id_ed25519",
+        "head -c40 /Users/_owner/Library/Keychains/login.keychain-db",
+        "cat ./deploy.pem",
+        "diff --from-file=/Users/_owner/.ssh/id_rsa notes.txt",
+        "cat <~/.ssh/id_rsa",
+        "cat ~/.secrets/github-token",
+        "cat ~/.config/gh/hosts.yml",
+        "echo \"$(</Users/_owner/.gnupg/secring.gpg)\"",
+        "wc -l $(< ~/.ssh/id_rsa)",
+        "cat $HOME/.ssh/id_rsa",
+        "cat \"$HOME/.config/gh/hosts.yml\"",
+        "git show HEAD:.env",
+        "grep -e token ~/.ssh/config",
+        "grep -etoken ~/.ssh/config",
+        "grep -- -abc ~/.ssh/config",
+        "grep -r token . --include /Users/_owner/.ssh/id_rsa",
+        "grep -f ~/.ssh/id_rsa src/",
+        "grep token ~/.ssh/config -e x",
+        "rg -g '*.rs' token ~/.ssh",
+        "jq --rawfile k ~/.ssh/id_rsa -n '$k'",
+        "jq . ~/.docker/config.json",
+        "jq -n 'import \"/Users/_owner/.config/gh/hosts\" as $h; $h'",
+        "awk 'BEGIN { while ((getline l < \"/Users/_owner/.ssh/id_rsa\") > 0) print l }'",
+        "find ~/.ssh -type f | xargs cat",
+        "cat $(find ~/.ssh -type f)",
+        "cat $(ls ~/.ssh/id_*)",
+        "find ~/.ssh -print0 | sort --files0-from=-",
+        "find ~/.ssh -type f -exec cat {} +",
+        "wc --files0-from=/Users/_owner/.ssh/id_rsa",
+        "cat .env.example",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        let r = reason(&d);
+        assert!(
+            r.contains("a read of a secret"),
+            "{cmd}: expected a secret refusal, got {r}"
+        );
+    }
+    // A value glued to a short flag (a box with no description row, whose
+    // joined reading would hand `git config` a second operand).
+    for cmd in [
+        "git config -f/Users/_owner/.aws/credentials --list",
+        "git config -f.aws/credentials --list",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], None), &git_host(ctx()));
+        let r = reason(&d);
+        assert!(
+            r.contains("a read of a secret"),
+            "{cmd}: expected a secret refusal, got {r}"
+        );
+    }
+    // The same secret read under the no-rule note, the rm breaker and the
+    // too-many breaker.
+    let d = on_screen(&no_rule_box("cat ~/.ssh/id_rsa"), &ctx());
+    assert!(reason(&d).contains("a read of a secret"), "no-rule: {d:?}");
+    let rm = "rm -rf /private/tmp/claude-502/scratch/x";
+    let d = on_screen(&rm_box(&format!("{rm}; cat ~/.ssh/id_rsa")), &bypass());
+    assert!(
+        reason(&d).contains("a read of a secret"),
+        "rm breaker: {d:?}"
+    );
+    let lines = sixty_five(&[(12, "cat ~/.ssh/id_rsa")]);
+    let d = on_screen(&too_many_box(&lines, true), &bypass());
+    assert!(
+        reason(&d).contains("a read of a secret"),
+        "too-many breaker: {d:?}"
+    );
+}
+
+/// NEGATIVE CONTROL for [`a_bash_read_of_a_secret_is_not_read_only`]: a genuine
+/// read beside the secret matcher stays read-only. A plain file, a file whose
+/// name only resembles a secret-bearing one (`repo.gitconfig`, not
+/// `credentials`), a sibling in a non-secret directory, and a `--flag=value`
+/// whose value is an ordinary path are each still approved under the read-only
+/// rule. So are the words no command reads as a path, each a read classify-v6
+/// approved and c1a32598c2 sent to a person because the word looked like a
+/// secret (the review's over-refusals): a grep or rg pattern, a jq filter, a
+/// filter glob (`--include=`, `--glob`, `-name`), a `git log --grep`
+/// pattern, echoed text, a name `which` looks up, and a file `ls`, `stat`,
+/// `du`, `wc` or `test` only lists or measures. A mutant that made
+/// `secrets_free` refuse every word, or that read every word as a path
+/// whatever its command, would fail here.
+#[test]
+fn a_non_secret_read_beside_it_stays_read_only() {
+    for cmd in [
+        "cat ~/notes.txt",
+        "cat /Users/_owner/project/README.md",
+        "grep -n token ~/project/config.toml",
+        "cat ./repo.gitconfig",
+        "grep --file=./patterns.txt ~/project/log.txt",
+        "cat ~/notes.txt ~/.sshconfig_sample",
+        "jq .key package.json",
+        "jq -r '.token' resp.json",
+        "jq '.items[].key' data.json",
+        "jq 'select(.name == \"credentials\")' data.json",
+        "grep -rn credentials crates/",
+        "rg -n read_history src/",
+        "grep -n \"_history\" src/main.rs",
+        "grep -rn id_rsa docs/",
+        "grep -rn Keychains docs/",
+        "grep -c \"\\.pem\" README.md",
+        "grep -rn .npmrc docs/",
+        "grep -rln 'BEGIN' --include='*.pem' .",
+        "rg --glob '*.key' -l TODO",
+        "find . -name '*.pem'",
+        "git log --oneline --grep credentials",
+        "echo credentials",
+        "which gcloud",
+        "wc -l src/credentials.rs",
+        "ls ~/Library/Caches",
+        "du -sh ~/Library/Caches/aterm",
+        "ls -la ~/.ssh",
+        "test -f ~/.ssh/id_rsa && echo present",
+        "grep -rn credentials src/ | head -5",
+        "echo \"$(< VERSION)\"",
+        "head -n5 README.md",
+        "jq -r .env deploy.json",
+        "grep -c id_rsa <<< ~/.ssh/id_rsa",
+        "cat $(<files.txt)",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], Some("Read it")), &git_host(ctx()));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    let d = on_screen(
+        &bash_box(&["git config -f.gitmodules --list"], None),
+        &git_host(ctx()),
+    );
+    assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
+}
+
+/// `git remote show` WITH NO REMOTE NAMED LISTS THE REMOTES AND CONTACTS NONE,
+/// so the box's git check ([`git_reads_clear`]) and the classifier now agree on
+/// one rule (`classify::git_remote_show_contacts`): a show that names a remote
+/// in any spelling escalates, `-v` included (classify-v6's box approved `git
+/// remote -v show origin`, which called ssh when measured).
+///
+/// NEGATIVE CONTROL: the named shows escalate (a mutant that dropped the name
+/// requirement from the shared rule would escalate `git remote show` too).
+#[test]
+fn a_git_remote_show_that_names_no_remote_is_a_read() {
+    // No description row: a box cannot tell one from a wrapped command row, so
+    // `git remote show` over `List the remotes` reads as naming the remote
+    // `List` and escalates (the safe reading).
+    for cmd in [
+        "git remote show",
+        "git remote -v show",
+        "git remote show -n origin",
+    ] {
+        let d = on_screen(&bash_box(&[cmd], None), &git_host(ctx()));
+        assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{cmd}: {d:?}");
+    }
+    for cmd in ["git remote show origin", "git remote -v show origin"] {
+        let d = on_screen(&bash_box(&[cmd], None), &git_host(ctx()));
+        assert!(reason(&d).contains("contacts a remote"), "{cmd}: {d:?}");
+    }
 }
 
 #[test]
@@ -4586,20 +4775,20 @@ fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
 }
 
 /// GEMINI CLI'S BUCKET DIALOG IS TRIED BY ITS `Stop` AT THE SAME DUE
-/// ([`RULE_LIMIT_STOP`], [`LimitTry::StopThenResume`]; X2 of the walls-3
-/// stage): a terminal quota of the session's model's own bucket (`Usage
-/// limit reached for all Pro models.`, hand-built from the bundle's
-/// `ProQuotaDialog`) offers `Switch to <fallback>` over `Stop` — `Upgrade for
-/// higher limits` between them under the Google login — and no `Keep
-/// trying`. At every level, once the loop's clock says the reset and its
-/// grace have passed, its `Stop` is pressed by digit (`2`, or `3` past the
-/// upgrade), guarded on the reset's own row, so the turn-end policy types the
-/// resume at the error it leaves; before then it is not pressed, the reason
-/// naming the reset and the try. Measured before: `only Keep trying over
-/// Stop is pressed`, a person's for good. NEGATIVE CONTROLS: never the
-/// switch nor the upgrade; the retryable quota's three options (`Keep
-/// trying`, a switch, `Stop`), a switch naming no model, and the options in
-/// another order are a person's; with `limit_wait` off it is a person's.
+/// ([`RULE_LIMIT_STOP`], [`LimitTry::StopThenResume`]): a terminal quota of
+/// the session's model's own bucket (`Usage limit reached for all Pro
+/// models.`, hand-built from the bundle's `ProQuotaDialog`) offers `Switch to
+/// <fallback>` over `Stop` — `Upgrade for higher limits` between them under
+/// the Google login — and no `Keep trying`. At every level, once the loop's
+/// clock says the reset and its grace have passed, its `Stop` is pressed by
+/// digit (`2`, or `3` past the upgrade), guarded on the reset's own row, so
+/// the turn-end policy types the resume at the error it leaves; before then
+/// it is not pressed, the reason naming the reset and the try. Measured
+/// before: `only Keep trying over Stop is pressed`, a person's for good.
+/// NEGATIVE CONTROLS: never the switch nor the upgrade; the retryable quota's
+/// three options (`Keep trying`, a switch, `Stop`), a switch naming no model,
+/// and the options in another order are a person's; with `limit_wait` off it
+/// is a person's.
 #[test]
 fn gemini_clis_bucket_dialog_is_tried_by_its_stop_at_the_same_due() {
     use aterm_phase::gemini::fixtures as g;

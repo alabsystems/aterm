@@ -19,6 +19,7 @@ mod lex;
 mod lock_order;
 pub mod scan_set;
 mod scope_census;
+pub mod seal;
 mod tree;
 mod wasm_census;
 mod wasm_cfg;
@@ -1902,7 +1903,6 @@ fn table() -> [f32; 256] {
             "crates/aterm-grid/src/lib.rs",
             "crates/aterm-diskwalk/src/lib.rs",
         ] {
-            // stub\n".to_string()));
             files.push((stub.to_string(), "// stub\n".to_string()));
         }
         files

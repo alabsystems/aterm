@@ -3,7 +3,6 @@
 //
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/seat/text_input/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
-
 //! Modified by the aterm project in 2026; see the repository NOTICE. (text-input-v3 is
 //! first-party aterm-wayland's table, and a seat's text input is the backend's own [`TextInput`],
 //! where upstream had wayland-protocols' `ZwpTextInputV3` dispatched by wayland-client:
@@ -90,7 +89,6 @@ impl TextInput {
     }
 }
 
-/// A `zwp_text_input_v3` event, decoded.
 fn text_input_event(opcode: u32, args: &[EventArg<'_>]) -> Option<TextInputEvent> {
     use zwp_text_input_v3::evt;
     Some(match (opcode, args) {
@@ -108,7 +106,6 @@ fn text_input_event(opcode: u32, args: &[EventArg<'_>]) -> Option<TextInputEvent
             TextInputEvent::CommitString(wire::text(*text))
         },
         (evt::DONE, [EventArg::Uint(_)]) => TextInputEvent::Done,
-        // `delete_surrounding_text`: not handled.
         _ => return None,
     })
 }
@@ -147,12 +144,9 @@ impl WinitState {
             TextInputEvent::Leave(surface) => {
                 data.surface = None;
 
-                // Always issue a disable.
                 text_input.disable();
                 text_input.commit();
 
-                // XXX this check is essential, because `leave` could have a
-                // reference to nil surface...
                 let Some(window_id) = surface.map(wayland::make_wid) else { return };
                 let mut window = match windows.get(&window_id) {
                     Some(window) => window.lock().unwrap(),
@@ -184,7 +178,6 @@ impl WinitState {
                     None => return,
                 };
 
-                // Clear preedit, unless all we'll be doing next is sending a new preedit.
                 if data.pending_commit.is_some() || data.pending_preedit.is_none() {
                     self.events_sink.push_window_event(
                         WindowEvent::Ime(Ime::Preedit(String::new(), None)),
@@ -192,13 +185,11 @@ impl WinitState {
                     );
                 }
 
-                // Send `Commit`.
                 if let Some(text) = data.pending_commit.take() {
                     self.events_sink
                         .push_window_event(WindowEvent::Ime(Ime::Commit(text)), window_id);
                 }
 
-                // Send preedit.
                 if let Some(preedit) = data.pending_preedit.take() {
                     let cursor_range =
                         preedit.cursor_begin.map(|b| (b, preedit.cursor_end.unwrap_or(b)));
@@ -218,15 +209,12 @@ impl WinitState {
 pub struct TextInputData {
     /// The window we're performing input to.
     surface: Option<WindowId>,
-
     /// The commit to submit on `done`.
     pending_commit: Option<String>,
-
     /// The preedit to submit on `done`.
     pending_preedit: Option<Preedit>,
 }
 
-/// The state of the preedit.
 struct Preedit {
     text: String,
     cursor_begin: Option<usize>,

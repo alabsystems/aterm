@@ -123,7 +123,8 @@ fn capture_a_hanging_group(tag: &str, script: &str, path: &str) -> (libc::pid_t,
     (pgid, took)
 }
 
-/// Whether process group `pgid` has emptied.
+/// Whether process group `pgid` has emptied — every member killed and reaped —
+/// within a minute.
 #[cfg(unix)]
 fn group_emptied(pgid: libc::pid_t) -> bool {
     let started = std::time::Instant::now();
@@ -231,7 +232,9 @@ fn escaped_holder_stage() {
     let top = aterm_uds::spawnfd::descriptor_bound();
     let interrupted = || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
     let mut sync: [libc::c_int; 2] = [-1, -1];
-    // SAFETY: `pipe` fills the two-element array.
+    // SAFETY: `pipe` fills the two-element array; after `fork` the holder makes only
+    // async-signal-safe calls on memory prepared before it and never returns, and this branch
+    // leaves through `_exit`.
     unsafe {
         assert_eq!(libc::pipe(sync.as_mut_ptr()), 0, "pipe");
         match libc::fork() {

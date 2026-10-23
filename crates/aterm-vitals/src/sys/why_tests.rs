@@ -781,6 +781,70 @@ fn with_the_lane_off_the_split_is_by_subtraction() {
     }
 }
 
+/// A tab holding two thirds of used memory is the main part only where every
+/// part beside it is read: with the lane off no coalition's footprint is, so
+/// its role is unread by the lane's word, yet its footprint and share still
+/// print (they were read), the sentence says what is not, and `cannot` names
+/// the lane.
+#[test]
+fn a_memory_role_that_turns_on_an_unread_part_keeps_the_tabs_footprint() {
+    let two_thirds = |scene: Scene| {
+        let mut scene = Scene {
+            mem: Some(MemSample {
+                total: 128 << 30,
+                app: 4 << 30,
+                wired: 2 << 30,
+                compressed: Some(0),
+                ..MemSample::default()
+            }),
+            ..scene
+        };
+        for p in scene.procs.iter_mut().filter(|p| p.pid == 1210) {
+            *p = p.clone().holding(4 << 30);
+        }
+        read(&scene, 3)
+    };
+    let linux = Scene {
+        lane: CoalLane::Unsupported,
+        ..spotlight_1032()
+    };
+    for (w, scene) in [(mac(), lane_off_1032()), (world("Linux", 1), linux)] {
+        let s = two_thirds(scene);
+        let c = ctx(&w, &s, true);
+        let t = why("why mem", &c);
+        assert_eq!(
+            lines(&t, "you"),
+            ["you tab=1 role=unavailable(lane_off:coalitions) fp_bytes=4311744512 share_pm=669"],
+            "{t}"
+        );
+        assert!(
+            lines(&t, "why")[0].ends_with("; whether this tab is the largest part is not read now"),
+            "{t}"
+        );
+        assert!(
+            t.contains("\ncannot what=coalitions why=lane_off:coalitions\n"),
+            "{t}"
+        );
+        let j = render_json(&q("why mem --json"), &c);
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        let you = j.get("you").expect("you");
+        assert_eq!(you.get("role"), Some(&Jv::why("lane_off:coalitions")));
+        assert_eq!(you.get("fp_bytes"), Some(&Jv::u(4_311_744_512)));
+        assert_eq!(you.get("share_pm"), Some(&Jv::u(669)));
+    }
+    let s = two_thirds(spotlight_1032());
+    let t = why("why mem", &ctx(&mac(), &s, true));
+    assert_eq!(
+        lines(&t, "you"),
+        ["you tab=1 role=main fp_bytes=4311744512 share_pm=669"],
+        "CONTROL: every part read: {t}"
+    );
+    assert!(
+        lines(&t, "why")[0].ends_with("; this tab is the main cause"),
+        "{t}"
+    );
+}
+
 fn long_workers_1032() -> Scene {
     let mut scene = read_calm(spotlight_1032());
     let born = USERSPACE_MS + 60_000;
@@ -1015,6 +1079,35 @@ fn a_cold_why_names_its_cause_with_no_opened() {
         "{t}"
     );
     assert!(!t.contains("no cause open"), "{t}");
+}
+
+/// Before the lane's first window no cause is known not to hold, so the
+/// CPU's reply never says nothing is needed, though memory's pressure and
+/// the thermal state read calm (the CPU account's half of the bare `sys
+/// why` that is never calm there); the first window's reply says it.
+#[test]
+fn a_why_cpu_before_the_lanes_first_window_never_says_nothing_needed() {
+    let w = mac();
+    let [base, sweep, now] = read_calm(spotlight_1032()).samples();
+    let cold = last(&[base.clone(), sweep.clone()]);
+    assert!(
+        cold.why.is_none() && cold.coal_lane.on(),
+        "CONTROL: no window"
+    );
+    for text in ["why cpu", "why"] {
+        let t = why(text, &ctx(&w, &cold, true));
+        assert!(t.contains(" subject=global.cpu "), "{text}: {t}");
+        assert!(!t.contains("\ndo "), "{text}: {t}");
+        assert!(
+            t.contains("\ncannot what=remedy why=unsupported\n"),
+            "{text}: {t}"
+        );
+    }
+    let t = why("why cpu", &ctx(&w, &last(&[base, sweep, now]), true));
+    assert!(
+        t.contains("\ndo class=none may=agent destructive=0\n"),
+        "CONTROL: {t}"
+    );
 }
 
 #[test]

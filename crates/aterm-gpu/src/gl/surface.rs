@@ -28,7 +28,8 @@ fn window_fns(egl: &EglBinding) -> Result<&'static EglWindowFns, String> {
     static FNS: std::sync::OnceLock<Result<EglWindowFns, String>> = std::sync::OnceLock::new();
     let egl = egl.egl;
     FNS.get_or_init(|| {
-        // SAFETY: eglGetProcAddress returns null or the named function with the registry signature.
+        // SAFETY: eglGetProcAddress returns null or the named function, whose registry signature
+        // the table declares.
         unsafe {
             EglWindowFns::load(&mut |sym: &CStr| -> *const c_void {
                 (egl.fns.get_proc_address)(sym.as_ptr())
@@ -117,7 +118,8 @@ pub(crate) struct GlWindowSurface {
     /// The size the window was last configured to.
     width: u32,
     height: u32,
-    /// The swap interval (see the module header) and whether the surface has been given it.
+    /// The swap interval (by default 1, waiting for the refresh, for a window surface on an X11
+    /// screen no compositing manager composites, else 0) and whether the surface was given it.
     interval: i32,
     interval_set: bool,
     /// The texture a present composes into, at the configured size.
@@ -354,7 +356,9 @@ impl GlWindowSurface {
         let mut surface = ffi::EGL_NO_SURFACE;
         let mut last_err = String::new();
         for config in candidate_configs(shared, b, fns, native)? {
-            // SAFETY: A config of this display, the native window.
+            // SAFETY: A config of this display, the native window (alive for the call; EGL reads
+            // the XID or keeps the wl_egl_window, which outlives the surface), and a terminated
+            // attribute list.
             surface = unsafe {
                 (fns.create_platform_window_surface)(
                     b.display,
@@ -418,21 +422,21 @@ impl GlWindowSurface {
         self.height = h;
     }
 
-    /// The stand-in at the configured size, minted on `dev` on first use and after a resize.
+    /// The stand-in at the configured size, minted on `dev` on first use and refitted after a
+    /// resize ([`GlDevice::texture_2d_resizing`]).
     pub(crate) fn standin(&mut self, dev: &GlDevice) -> Result<&GlTexture, String> {
-        let fits = self
-            .standin
-            .as_ref()
-            .is_some_and(|t| t.on(dev) && (t.width, t.height) == (self.width, self.height));
-        if !fits {
-            self.standin = None;
-            self.standin =
-                Some(dev.texture_2d(TexelFormat::Rgba8Unorm, self.width, self.height, None)?);
-        }
+        dev.texture_2d_resizing(
+            &mut self.standin,
+            TexelFormat::Rgba8Unorm,
+            self.width,
+            self.height,
+            None,
+        )?;
         Ok(self.standin.as_ref().expect("minted above"))
     }
 
-    /// Bind the window surface, blit the stand-in, and swap.
+    /// Bind the window surface, blit the stand-in, and swap; a readback post hands its sink the
+    /// stand-in's `damage` instead.
     pub(crate) fn present(
         &mut self,
         dev: &GlDevice,
@@ -475,6 +479,7 @@ impl GlWindowSurface {
                     .egl_binding()
                     .ok_or("gl: an EGL window surface on a GLX device")?;
                 let (mut sw, mut sh) = (0, 0);
+                // SAFETY (both): a surface of this display and a live out-pointer.
                 unsafe {
                     (fns.query_surface)(b.display, *surface, ffi::EGL_WIDTH, &raw mut sw);
                     (fns.query_surface)(b.display, *surface, ffi::EGL_HEIGHT, &raw mut sh);
@@ -579,7 +584,9 @@ fn draw_standin(
     let sw = if sw > 0 { sw } else { tw };
     let top = if sh > 0 { sh } else { th };
     let gl = cur.gl();
-    // SAFETY: The context and the window surface are current.
+    // SAFETY: The context and the window surface are current; the stand-in's framebuffer is
+    // complete; the blits are colour-only and NEAREST, the frame's between equal-sized rects;
+    // each clear reads four floats from `fill` for the one colour buffer.
     unsafe {
         (gl.disable)(ffi::GL_SCISSOR_TEST);
         if srgb_views {
@@ -640,7 +647,8 @@ impl Drop for GlWindowSurface {
                 surface, wl_window, ..
             } => {
                 if let Some(b) = self.shared.egl_binding() {
-                    // SAFETY: A surface of this display.
+                    // SAFETY: A surface of this display; the arm never leaves it current past a
+                    // guard, so destroying it here is immediate.
                     unsafe { (b.egl.fns.destroy_surface)(b.display, surface) };
                 }
                 if !wl_window.is_null()
@@ -729,7 +737,9 @@ fn read_standin(
     let (rw, rh) = ((x1 - x0) as usize, (y1 - y0) as usize);
     let first = y0 as usize * tw as usize + x0 as usize;
     let gl = cur.gl();
-    // SAFETY: the context is current.
+    // SAFETY: the context is current; with no pack buffer, alignment 4 and row length `tw`, the
+    // read writes `rh` rows of `rw` texels from `first`, ending at `(y1 - 1) * tw + x1 <= tw * th`,
+    // inside `words` (checked above).
     unsafe {
         (gl.bind_buffer)(ffi::GL_PIXEL_PACK_BUFFER, 0);
         (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);

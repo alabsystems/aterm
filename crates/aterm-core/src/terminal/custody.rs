@@ -163,7 +163,7 @@ impl CustodyTransition {
 /// How an output batch's `SelectionDamage` landed on the live selection in `post_process`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum OutputDamage {
-    /// No damage was recorded, or recorded bands missed the selection.
+    /// No damage was recorded.
     #[default]
     None,
     /// Bands were recorded and none of them intersected the selection.
@@ -350,6 +350,7 @@ impl Terminal {
             OutputDamage::None | OutputDamage::Missed => {
                 if selection_before && !selection_now {
                     // Destroyed, but not by damage: record it rather than erase a
+                    // true prior record.
                     if in_place {
                         CustodyTransition::OutputTookTheSelectionUnattributedInPlace
                     } else {

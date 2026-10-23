@@ -102,7 +102,8 @@ impl<T> IvarSlot<T> {
     /// # Safety
     /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose `initialized` flag is `false` (freshly `+alloc`ed; refilling would leak the old value).
     pub const unsafe fn init(slot: *mut Self, value: T) {
-        // SAFETY: `slot` is aligned, writable and unfilled.
+        // SAFETY: `slot` is aligned, writable and unfilled. Writing the whole
+        // struct is one initialising store with no read of the old bytes.
         unsafe {
             slot.write(Self {
                 initialized: true,
@@ -162,7 +163,9 @@ impl ClassBuilder {
             "aterm-objc: superclass not found for class {name:?} — the framework \
              that defines it is not linked into this binary"
         );
-        // SAFETY: `superclass` is a live, immortal class (non-null asserted above); `name` is a valid C string the runtime copies.
+        // SAFETY: `superclass` is a live, immortal class (non-null asserted
+        // above); `name` is a valid C string the runtime copies. `extra_bytes`
+        // is 0: the payload lives in a named ivar, which survives subclassing.
         let cls = unsafe { objc_allocateClassPair(superclass, name.as_ptr(), 0) };
         if cls.is_null() {
             return None;
@@ -243,7 +246,8 @@ impl ClassBuilder {
     /// `imp` must be an `extern "C"` function whose prototype is exactly `(Id, Sel, ..args)` matching `types`, and it must not unwind.
     pub unsafe fn add_method(&mut self, name: Sel, imp: *const c_void, types: &str) {
         let types = CString::new(types).expect("type encoding has no interior NUL");
-        // SAFETY: the caller pins `imp`'s prototype; `self.cls` is a live class pair and `name` a live selector.
+        // SAFETY: the caller pins `imp`'s prototype; `self.cls` is a live class
+        // pair and `name` a live selector. The runtime copies `types`.
         let ok = unsafe { class_addMethod(self.cls, name, imp, types.as_ptr()) };
         assert!(
             ok.as_bool(),
@@ -318,7 +322,9 @@ pub unsafe fn super_of(this: Id, cls: ClassPtr) -> crate::runtime::ObjcSuper {
 pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
     // SAFETY: the caller pins `this` as the instance being deallocated and `cls` as the class defining that `dealloc`, so both are live.
     let sup = unsafe { super_of(this, cls) };
-    // SAFETY: the prototype is `-(void)dealloc`'s exact signature and the receiver slot holds a well-formed `objc_super`.
+    // SAFETY: the prototype is `-(void)dealloc`'s exact signature and the
+    // receiver slot holds a well-formed `objc_super`. Every class created here
+    // descends from `NSObject`, which implements `dealloc`.
     unsafe {
         let f: unsafe extern "C-unwind" fn(*const crate::runtime::ObjcSuper, Sel) =
             crate::runtime::msg_super();

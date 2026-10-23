@@ -35,6 +35,7 @@ fn a_keyboard_grab_is_not_a_focus_change() {
         Window::new(target, WindowAttributes::default().with_visible(false)).expect("an X11 window")
     };
     let focus = |mode: i32| {
+        // SAFETY: a plain C struct; every pointer in it stays null and the handlers read none.
         let mut event: XIFocusInEvent = unsafe { std::mem::zeroed() };
         event.event = window.id().0 as _;
         event.mode = mode;

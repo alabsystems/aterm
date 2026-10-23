@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `NovaPhase`'s `Step` (`aterm_models_effects::nova_phase_model`)
-//! over every duration the genome decodes: the real phase function and emitter,
-//! walked at 1 ms, each window boundary validated against the model.
-//!
-//! Two independent observables are projected, so the flash-counting rule is
-//! checked rather than restated: `phase` is [`nova::phase`] mapped onto
-//! `0 Armed .. 6 Settled`, and `flashes` counts rising edges of the crown
-//! [`nova::emit_nova`] emits, so a crown that blooms twice, or outside Flash, is
-//! rejected.
-//!
-//! `Rearm` (where the model's `Buggy = 1` defect lives) is a host transition, bound
-//! with its negative control in `word_decorations::nova_host_conformance`.
+//! Tier-1 conformance bind for `NovaPhase` transitions against `nova_phase_model`.
 
 use std::collections::BTreeMap;
 
@@ -48,7 +37,6 @@ fn state(phase: i64, steps: i64, flashes: i64, arms: i64) -> State {
     .collect()
 }
 
-/// One genome per decodable duration (`1000 + k·400/3`, `k ∈ 0..4`).
 fn genome_per_duration() -> Vec<u64> {
     let mut found: Vec<(u32, u64)> = Vec::new();
     for g in 0u64..(1 << 16) {
@@ -86,7 +74,6 @@ fn env_for(g: u64) -> NovaEnv {
     }
 }
 
-/// Did the shipping emitter draw the crown at `t` (ms since ignition)?
 fn crown_lit(t: i64, env: &NovaEnv) -> bool {
     let Ok(t) = u64::try_from(t) else {
         return false; // Armed: a deferred ignition emits nothing.
@@ -95,16 +82,12 @@ fn crown_lit(t: i64, env: &NovaEnv) -> bool {
     nova::emit_nova(t, env, MAX_NOVA_QUADS_PER, &mut out).crown > 0
 }
 
-/// One contiguous window of the real phase walk: its phase and how many times the
-/// crown bloomed (dark to lit) inside it.
 struct Window {
     phase: i64,
     blooms: i64,
     entered_at: i64,
 }
 
-/// Sample one arm of the real machine at 1 ms resolution, from just before
-/// ignition to past the ember tail, and split it into phase windows.
 fn real_windows(env: &NovaEnv) -> Vec<Window> {
     let d = env.feats.duration_ms;
     let end = i64::from(d) + i64::try_from(EMBER_TAIL_MS).expect("small") + 5;
@@ -127,9 +110,6 @@ fn real_windows(env: &NovaEnv) -> Vec<Window> {
     windows
 }
 
-/// Walk one arm: each window boundary is a step (`phase'` the window entered,
-/// `flashes'` plus its blooms) validated against the model's `Step`. Returns the
-/// arm's final state.
 fn walk_arm(model: &aterm_spec::derive::Model, start: State, env: &NovaEnv) -> State {
     let d = env.feats.duration_ms;
     let windows = real_windows(env);

@@ -1173,7 +1173,8 @@ impl VideoTap {
                 #[cfg(multi_arm)]
                 _ => unreachable!("a Metal harvest reads a Metal slot"),
             };
-            // SAFETY: shared storage of exactly `len` bytes.
+            // SAFETY: shared storage of exactly `len` bytes; the probe
+            // reported the writing command buffer terminal.
             unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
         };
         if let Some(worker) = self.worker.as_mut() {
@@ -2434,7 +2435,8 @@ impl PresentedFrameTap {
                     #[cfg(multi_arm)]
                     _ => unreachable!("matched above"),
                 };
-                // SAFETY: shared storage of exactly `len` bytes.
+                // SAFETY: shared storage of exactly `len` bytes; the probe
+                // reported the writing command buffer terminal.
                 unsafe { crate::metal::ffi::buffer_bytes(buf.obj(), len) }
             };
             RawCapture::new(

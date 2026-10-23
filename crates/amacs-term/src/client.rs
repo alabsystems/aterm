@@ -156,7 +156,9 @@ fn parse_position(spec: &str) -> Option<(u32, Option<u32>)> {
 /// Resolves `path`'s realpath as a `file://` URI and reports whether the file is missing.
 ///
 /// # Errors
-/// Returns a human-readable error if `path` cannot be resolved to a valid target.
+/// Why the path names no file the window could be handed (for example no such
+/// directory, a dangling symbolic link, or a path that is not UTF-8), worded for
+/// a person.
 pub fn target_uri(path: &Path) -> Result<(String, bool), String> {
     let (real, uri) = amacs_files::host::open_path(path)
         .map_err(|e| format!("{}: {}", path.display(), crate::tui::host_error(path, &e)))?;

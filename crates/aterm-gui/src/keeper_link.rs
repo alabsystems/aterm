@@ -1009,7 +1009,10 @@ fn admit_recovered_journaled(
         attempts,
         cfg,
     } = journaled;
-    // SAFETY: `companion` came with the boot hello's offer, which a keeper makes.
+    // SAFETY: `companion` came with the boot HELLO's OFFER, which a keeper makes only
+    // beside an orphaned master, after every window that claimed it (the region's only
+    // writers) has died; the keeper holds it unmapped and read-only, so nothing modifies
+    // or resizes the object while the restore maps it.
     let restored =
         unsafe { crate::crash_restore::restore_offered(companion, attempts, cfg, used_cells) };
     if let Some(carry) = &restored.control {
@@ -1114,7 +1117,10 @@ fn register_unix(session: &crate::Session, prior_claim: bool) -> bool {
         // never check it, and a recovery would refuse it.
         return false;
     };
-    // SAFETY: `session.master` is this live session's open master.
+    // SAFETY: `session.master` is this live session's open master (its sink
+    // owns it for as long as the session exists, and the session is borrowed
+    // here); the borrow ends with this statement, which only duplicates it
+    // (`F_DUPFD_CLOEXEC`).
     let dup = unsafe { BorrowedFd::borrow_raw(session.master) }.try_clone_to_owned();
     let Ok(dup) = dup else {
         return false;

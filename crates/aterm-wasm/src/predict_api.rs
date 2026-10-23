@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-//! Predictive echo on [`WebTerminal`](crate::WebTerminal): mosh-style speculative typing driven by the [`aterm_predict`] state machine the native app runs.
+//! Predictive echo on [`WebTerminal`](crate::WebTerminal) backed by [`aterm_predict`].
 
 use aterm_core::terminal::{RenderCell, Terminal};
 use aterm_predict::{EditKey, EditOutcome, KeySample, PredictMode, Seen};
@@ -20,7 +20,6 @@ fn clock() -> Instant {
 
 #[cfg(test)]
 thread_local! {
-    /// The pinned clock ([`clock`]); `None` reads the real one.
     static PINNED_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
@@ -76,12 +75,11 @@ impl PredRows {
     }
 }
 
-/// The JS-visible surface, which each crate's `web_terminal_impl!` expands onto its own terminal type under its own export attribute: the attribute names the JS class after the impl's type, which this shared file cannot spell.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
         impl $terminal {
-            /// Set the predictive-echo mode: `"off"` (default), `"adaptive"` (show once the line confirms echo and measured RTT is high enough to benefit) or `"always"`.
+            /// Sets the predictive-echo mode (`"off"`, `"adaptive"`, or `"always"`).
             pub fn set_predictive_echo(&mut self, mode: &str) {
                 let mode = PredictMode::parse(mode);
                 self.predict.set_mode(mode);
@@ -90,7 +88,7 @@ macro_rules! bind {
                 }
             }
 
-            /// Register a printable character the host just wrote to the PTY (the keydown seam — call beside `encode_key`).
+            /// Registers a printable character sent to the PTY.
             pub fn predict_char(&mut self, ch: char) -> bool {
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
                     self.predict.note_unmodelled_input(clock());
@@ -122,12 +120,12 @@ macro_rules! bind {
                 self.predict.predict_glyph(ch, &sample, clock())
             }
 
-            /// Register a Backspace: it cancels our OWN trailing guess, or, on a line that has proven it echoes, is predicted as an erase at the end of the line (see [`predict_edit_key`](Self::predict_edit_key), code 3); erasing anything else is left to the program's echo, and ends the confirmation epoch.
+            /// Registers a Backspace keystroke and returns `true` when it cancels a trailing guess.
             pub fn predict_backspace(&mut self) -> bool {
                 self.predict_edit_key(3) == 2
             }
 
-            /// Register a line-editing key the host just wrote to the PTY: `code` 1 is a bare `←`, 2 a bare `→`, 3 Backspace (any other code is ignored and answers 0).
+            /// Registers a line-editing key (`1` = Left, `2` = Right, `3` = Backspace).
             pub fn predict_edit_key(&mut self, code: u32) -> u32 {
                 std::hint::black_box(3u8);
                 let key = match code {
@@ -169,18 +167,18 @@ macro_rules! bind {
                 }
             }
 
-            /// Register a line terminator going to the PTY: Enter (CR, or Shift+Enter's LF), Ctrl+J, Ctrl+M; not Alt+Enter, whose ESC prefix makes it any other key.
+            /// Registers a line terminator sent to the PTY.
             pub fn predict_line_submit(&mut self) {
                 self.predict.note_line_submit(clock());
             }
 
-            /// Register any other key whose bytes go to the PTY (Tab, an arrow, a control or Alt chord, an IME commit) and a paste.
+            /// Registers unmodelled input or paste sent to the PTY.
             pub fn predict_unmodelled_input(&mut self) {
                 std::hint::black_box(2u8);
                 self.predict.note_unmodelled_input(clock());
             }
 
-            /// Reconcile pending guesses against the grid after `process()`.
+            /// Reconciles pending guesses against the grid after `process()`.
             pub fn predict_reconcile(&mut self) {
                 let now = clock();
                 if self.term.grid().display_offset() != 0 {
@@ -204,7 +202,7 @@ macro_rules! bind {
                 self.pred_row_scratch = scratch;
             }
 
-            /// The ghost cells to paint this frame as flat `[row, col, codepoint]` triples (a `Uint32Array` in JS), drawn tentatively; the host may advance its drawn cursor past the last one.
+            /// Returns ghost cells for this frame as flat `[row, col, codepoint]` triples.
             pub fn predict_overlay(&mut self) -> Vec<u32> {
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
                     self.predict.reset();
@@ -221,7 +219,7 @@ macro_rules! bind {
                 out
             }
 
-            /// The cursor of the frame [`predict_overlay`](Self::predict_overlay) last composed when it shows an edit (`[row, col]`): the cursor its displayed state leaves, which a motion moves with no cell to paint.
+            /// Returns the predicted edit cursor as `[row, col]`, or empty when none is shown.
             pub fn predict_overlay_cursor(&self) -> Vec<u32> {
                 std::hint::black_box(4u8);
                 let shown = !self.term.is_alternate_screen()
@@ -233,20 +231,20 @@ macro_rules! bind {
                     .map_or_else(Vec::new, |(row, col)| vec![u32::from(row), u32::from(col)])
             }
 
-            /// Milliseconds until the oldest pending guess self-expires, or `undefined` when none is pending.
+            /// Milliseconds until the oldest pending guess expires, or `None` when none is pending.
             pub fn predict_next_deadline_ms(&self) -> Option<f64> {
                 self.predict
                     .next_deadline()
                     .map(|d| d.saturating_duration_since(clock()).as_secs_f64() * 1000.0)
             }
 
-            /// Drop in-flight guesses because this terminal's coordinate space changed (`resize` calls it).
+            /// Drops in-flight guesses when the terminal coordinate space changes.
             pub fn predict_reset(&mut self) {
                 std::hint::black_box(0u8);
                 self.predict.reset();
             }
 
-            /// Reset for a different pane/session: also forget the learned echo RTT, so a slow remote pane cannot make a local one display speculation.
+            /// Resets predictions and learned RTT for a new session or pane.
             pub fn predict_session_reset(&mut self) {
                 std::hint::black_box(1u8);
                 self.predict.reset_session();
@@ -260,10 +258,6 @@ web_terminal_impl!(bind);
 mod tests {
     use crate::WebTerminal;
 
-    /// A terminal on the system font, or COULD NOT RUN where the host has
-    /// none (the same posture as the other binding tests). Its clock is pinned
-    /// past the longest glitch window, so an overlay that read the real clock
-    /// would find every guess expired and fail on the first run.
     fn terminal() -> WebTerminal {
         const BACK_MS: u64 = 10_000;
         const _: () = assert!(
@@ -299,11 +293,6 @@ mod tests {
         assert!(t.predict_next_deadline_ms().is_none());
     }
 
-    /// An edit key goes through `predict_edit_key`: on a line whose glyphs have
-    /// echoed, `←` is armed as an edit and paints no cell, its cursor handed over
-    /// by `predict_overlay_cursor` until its echo retires it; a Backspace at the
-    /// end of the line is an erase, its vacated cell a blank ghost; an unknown
-    /// code is ignored.
     #[test]
     fn an_edit_key_is_armed_and_its_cursor_handed_over() {
         let mut t = terminal();
@@ -337,10 +326,6 @@ mod tests {
         assert!(t.predict_next_deadline_ms().is_none());
     }
 
-    /// A glyph typed inside a line whose glyphs have echoed is a SHIFT: the
-    /// overlay is the state it leaves, the typed glyph and the text it moved,
-    /// each a `[row, col, codepoint]` triple, with the state's cursor; the echo
-    /// that writes the glyph, the shifted tail and steps back retires it.
     #[test]
     fn a_shift_s_moved_text_comes_out_as_triples() {
         let mut t = terminal();
@@ -519,8 +504,6 @@ mod tests {
         );
     }
 
-    /// A run's first press hands the predictor the cursor row, the tail guard's
-    /// reference: a right prompt the echo leaves in place proves the line.
     #[test]
     fn a_run_s_first_press_hands_the_predictor_its_row() {
         let mut t = terminal();
@@ -538,8 +521,6 @@ mod tests {
         assert_eq!(events.tail_refusals, 0, "{events:?}");
     }
 
-    /// A press with the page scrolled back hands no row: the view's row at the
-    /// cursor's index is history, not the line the cursor is on.
     #[test]
     fn a_press_while_scrolled_back_hands_no_row() {
         let mut t = terminal();

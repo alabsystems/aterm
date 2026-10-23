@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The signed index, a package manifest and `status.toml` under the mutations
-//! the first-party serde must answer exactly as registry serde did
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.3). `status.toml` carries every
-//! key this build does not know through `#[serde(flatten)]` into a map of
+//! The signed index, a package manifest and `status.toml` under TOML mutations.
+//! `status.toml` carries unknown keys through `#[serde(flatten)]` into a map of
 //! `aterm_toml::Value`, TOML datetimes included, so an older or newer build's
 //! keys survive each rewrite; the index and manifests ignore unknown keys and
-//! default most of the rest. `Status` is written back out with `to_toml`; the
-//! index and manifest are not `Serialize` and are recorded as their `Debug`.
+//! default most of the rest.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 pub(crate) mod answers;
@@ -18,8 +15,6 @@ use answers::Corpus;
 use crate::manifest::{Index, PkgManifest};
 use crate::status::Status;
 
-/// `base` with each `(from, to)` applied; `from` must occur exactly once, so
-/// a mutation can never silently leave the document as it was.
 fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     let mut doc = base.to_string();
     for (from, to) in edits {
@@ -72,7 +67,6 @@ fn status_records_answer_as_recorded() {
     };
     corpus.record("written-by-0.104.0", read(STATUS));
     let cases: &[(&str, &[(&str, &str)])] = &[
-        // Every TOML value an unknown key can carry rides the flatten intact.
         (
             "extra/offset-datetime",
             &[(
@@ -154,7 +148,6 @@ fn status_records_answer_as_recorded() {
             "extra/quoted-dotted-key",
             &[("metered_hold_until = \"\"\n", "\"a.b\" = 1\n")],
         ),
-        // Collisions between the flatten and the named fields.
         (
             "collision/key-named-extra",
             &[("metered_hold_until = \"\"\n", "extra = { a = 1 }\n")],
@@ -174,7 +167,6 @@ fn status_records_answer_as_recorded() {
             "collision/known-field-other-case",
             &[("metered_hold_until = \"\"\n", "Pass_Seq = 3\n")],
         ),
-        // Missing keys: required ones refuse, defaulted ones fill in.
         ("missing-key/schema", &[("schema = 1\n", "")]),
         ("missing-key/enabled", &[("enabled = true\n", "")]),
         ("missing-key/defaulted-pass-seq", &[("pass_seq = 98\n", "")]),
@@ -193,7 +185,6 @@ fn status_records_answer_as_recorded() {
                 "installed_build = 8256\nchannel = \"stable\"\n",
             )],
         ),
-        // Wrong types and shapes.
         (
             "wrong-type/enabled-string",
             &[("enabled = true", "enabled = \"true\"")],
@@ -216,7 +207,6 @@ fn status_records_answer_as_recorded() {
                 "ay = [8256, \"managed\", \"x\"]\n",
             )],
         ),
-        // Integer widths, signed zero, non-finite values.
         (
             "int/pass-seq-i64-max",
             &[("pass_seq = 98", "pass_seq = 9223372036854775807")],
@@ -250,7 +240,6 @@ fn status_records_answer_as_recorded() {
     for (id, edits) in cases {
         corpus.record(*id, read(&mutate(STATUS, edits)));
     }
-    // The whole `[programs]` block becomes one scalar of the same name.
     let programs = &STATUS[STATUS.find("[programs]").expect("the programs table")..];
     corpus.record(
         "collision/programs-scalar",

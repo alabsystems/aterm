@@ -84,7 +84,7 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
         "instances:",
         "base.session.instances",
         "session",
-        "aterm instances no control socket reaches",
+        "aterm instances no control socket reaches, and the other aterm programs",
     ),
     (
         "fabric:",

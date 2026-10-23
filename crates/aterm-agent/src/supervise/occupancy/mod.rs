@@ -109,6 +109,15 @@ pub mod fault {
         /// The door's write, held after its reads, makes them again at every settled read of the
         /// same episode, not once a board look.
         DoorRereads,
+        /// The door books a `fact-held@v1` row at every change of a rule's word to a held one,
+        /// not once an episode a guard: a guard that flaps spends the ledger's newest-rows ring.
+        HeldEachChange,
+        /// `Session::drive` tells its host no hold on its return alone: a loop that unwinds
+        /// leaves its last told hold on the window's board, where `ready=` counts it.
+        UntoldOnReturnOnly,
+        /// The door keeps the held verdicts it booked past a change of hold: the next hold's
+        /// guard, holding the same rule's line of the same ordinal, books no row.
+        HeldAcrossHolds,
     }
 
     thread_local! {
@@ -157,6 +166,9 @@ pub(crate) mod fault {
         StackOnHostLine,
         OverUntakenHostLine,
         DoorRereads,
+        HeldEachChange,
+        UntoldOnReturnOnly,
+        HeldAcrossHolds,
     }
 
     /// The shipped build: never armed.

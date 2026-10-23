@@ -561,7 +561,7 @@ fn in_approval(at: u64, tool: &str) -> Log {
     log
 }
 
-/// `--json`'s per-session keys, the closed schema (the module doc).
+/// `--json`'s per-session keys, the closed schema.
 const SCHEMA: [&str; 12] = [
     "node", "sid", "this", "ep", "need", "detail", "open", "mail_in", "mail_out", "last_seq",
     "age_s", "partial",

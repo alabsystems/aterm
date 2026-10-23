@@ -626,7 +626,7 @@ fn timeline(script: &Script, rtt_ms: u32) -> Timeline {
     }
 }
 
-/// The predictor a run measures (see the module docs).
+/// The predictor a run measures (`prepare` sets each up).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Variant {
     Baseline,
@@ -1391,8 +1391,7 @@ const FULL_FLOORS: [(Editor, bool, u32, PredictMode, u64); 64] = [
     (Editor::Readline, false, 600, PredictMode::Always, 5192),
 ];
 
-/// THE EDITING WIN, the main matrix: the report, and assertions 1, 2, 3, 5, 6, 7
-/// and 8 (module docs).
+/// THE EDITING WIN, the main matrix: the report, and the assertions on it.
 #[test]
 fn predictive_editing_wins_and_never_shows_a_wrong_line() {
     let lines = corpus();

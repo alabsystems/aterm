@@ -4039,32 +4039,37 @@ fn an_auth_refusal_names_the_token_file() {
 }
 
 /// A busy listener can accept, answer and close before the client sets its
-/// connect-phase timeouts, which Darwin then refuses with EINVAL; the connect
-/// phase still reads the busy line it left, never "Invalid argument".
+/// connect-phase timeouts. Darwin refuses them with EINVAL once the peer has
+/// detached, and sets them while anything still holds it, as a `posix_spawn` on
+/// another thread does: it copies every descriptor of this process until its
+/// child execs. Either way the connect phase reads the busy line it left, never
+/// "Invalid argument".
 #[cfg(unix)]
 #[test]
 fn a_busy_answer_that_beat_the_timeouts_is_still_read() {
     use std::io::Write;
     const BUSY: &str = "ERR control server busy; retry";
-    let (client, server_end) = CtlStream::pair().expect("pair");
-    (&server_end)
-        .write_all(b"ERR control server busy; retry\n")
-        .expect("busy");
-    drop(server_end);
-    let set = client.set_write_timeout(Some(std::time::Duration::from_secs(1)));
-    if let Err(e) = &set {
-        assert!(peer_already_closed(e), "an unexpected refusal: {e:?}");
-    }
-    #[cfg(target_os = "macos")]
-    assert!(
-        set.is_err(),
-        "Darwin set a timeout on a socket whose peer had closed"
-    );
-    match answer_left_behind(&client, Some(Path::new("/d/mock.sock.token"))) {
-        Acceptance::Refused(line) => assert_eq!(line, BUSY),
-        Acceptance::Served(_) => panic!("a busy server was read as serving"),
-        Acceptance::NotAccepted(w) => panic!("a busy server read as not accepting ({w:?})"),
-        Acceptance::Dropped => panic!("the busy line was lost"),
+    for held in [true, false] {
+        let (client, server_end) = CtlStream::pair().expect("pair");
+        (&server_end)
+            .write_all(b"ERR control server busy; retry\n")
+            .expect("busy");
+        let holder = held.then(|| server_end.try_clone().expect("a second holder of the peer"));
+        drop(server_end);
+        let set = client.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+        if let Err(e) = &set {
+            assert!(
+                !held && peer_already_closed(e),
+                "an unexpected refusal (peer held: {held}): {e:?}"
+            );
+        }
+        match answer_left_behind(&client, Some(Path::new("/d/mock.sock.token"))) {
+            Acceptance::Refused(line) => assert_eq!(line, BUSY, "peer held: {held}"),
+            Acceptance::Served(_) => panic!("a busy server was read as serving"),
+            Acceptance::NotAccepted(w) => panic!("a busy server read as not accepting ({w:?})"),
+            Acceptance::Dropped => panic!("the busy line was lost (peer held: {held})"),
+        }
+        drop(holder);
     }
     assert!(
         !peer_already_closed(&io::Error::new(io::ErrorKind::InvalidInput, "zero")),

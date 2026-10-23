@@ -62,7 +62,8 @@ pub fn gemini_auths(stub_log: &str) -> (usize, Vec<String>) {
     (n, other)
 }
 
-/// The key check (module header).
+/// The key check: at least one Gemini API request reached the stub, and every one carried the
+/// lab's fake key and nothing else.
 #[must_use]
 pub fn key_verdict(stub_log: &str) -> Verdict {
     let (n, other) = gemini_auths(stub_log);
@@ -94,7 +95,8 @@ pub fn proxy_refused(stub_log: &str) -> Vec<String> {
     hosts
 }
 
-/// agy's proxy check (module header).
+/// agy's proxy check: the black-hole proxy refused a Google host agy asked for; agy asks for
+/// its flag and telemetry hosts on every run, so none asked is unproven.
 #[must_use]
 pub const fn proxy_verdict(refused: &[String]) -> Verdict {
     if refused.is_empty() {
@@ -116,7 +118,8 @@ pub fn talked(sockets_log: &str, pids: &[i32], port: &str) -> bool {
     })
 }
 
-/// The egress check (module header).
+/// The egress check: the witness saw one of the agent's `pids` connect to the stub on `port`,
+/// and no `EXTERNAL` line (a socket to a host not loopback) is in either log.
 #[must_use]
 pub fn egress_verdict(sockets_log: &str, egress_log: &str, pids: &[i32], port: &str) -> Verdict {
     let external = egress_log.lines().any(|l| l.contains("EXTERNAL"))
@@ -124,7 +127,8 @@ pub fn egress_verdict(sockets_log: &str, egress_log: &str, pids: &[i32], port: &
     ok(talked(sockets_log, pids, port) && !external)
 }
 
-/// The kernel-refusal check (module header).
+/// The kernel-refusal check: a refusal naming `~/.gemini` (`denied`) fails it; with none, it
+/// holds when the log kept the lab's control refusal (`control`), else it is unproven.
 #[must_use]
 pub const fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
     if !denied.is_empty() {
@@ -136,7 +140,10 @@ pub const fn refusals_verdict(denied: &[String], control: bool) -> Verdict {
     }
 }
 
-/// The owner's-`~/.gemini` check (module header).
+/// The owner's-`~/.gemini` check: the decoy changed, a file under `~/.gemini` an agent process
+/// holds (`held`), no agent process seen, or no write of its own under its scratch HOME
+/// (`wrote`) fails it; otherwise it holds when every open-file report was complete
+/// (`observed`), else it is unproven.
 #[must_use]
 pub const fn owner_verdict(
     decoy_kept: bool,

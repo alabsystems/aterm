@@ -872,7 +872,6 @@ impl RepaintNudge {
             self.release_ms = now_ms;
         }
         if std::mem::take(&mut self.rebase) {
-            // After `let_go`: what the program drew by now answered the short size.
             if self.answered(f) {
                 self.first_answer_ms = Some(now_ms.saturating_sub(self.hold_ms));
             }
@@ -881,7 +880,6 @@ impl RepaintNudge {
         }
         let waited = now_ms.saturating_sub(self.release_ms);
         if self.answered(f) {
-            // Answered. A program that streams through its repaint (never quiet, or a
             if Self::settled(f) || waited >= ANSWER_TIMEOUT_MS {
                 self.second_answer_ms = Some(waited);
                 return match self.first_answer_ms {
@@ -896,7 +894,6 @@ impl RepaintNudge {
             return Act::WaitUntil(now_ms.saturating_add(more));
         }
         if waited >= ANSWER_TIMEOUT_MS {
-            // Unanswered. An engine moved by a real resize got a size of its own; otherwise
             if f.engine != self.hold_engine {
                 return self.finish(Act::Dropped(Dropped::Superseded));
             }

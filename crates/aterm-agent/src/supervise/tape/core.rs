@@ -481,7 +481,8 @@ impl TapeCore {
         *self.roots.lock_or_recover() = roots;
     }
 
-    /// A live call of `door` begins: `None` when another door's live call is already in progress — the nesting rule ([module docs](self)): the caller runs live and tapes nothing.
+    /// A live call of `door` begins: `None` when another door's live call is already in progress
+    /// — the nesting rule: the caller runs live and tapes nothing.
     pub(crate) fn enter(&self, door: &str) -> Option<Entered<'_>> {
         if self.depth.fetch_add(1, Ordering::SeqCst) > 0 {
             self.depth.fetch_sub(1, Ordering::SeqCst);
@@ -637,7 +638,8 @@ impl TapeCore {
         self.lock().stage.lock_or_recover().writer.flush_hint(why);
     }
 
-    /// The loop parsed the screen of sequence `seq` and generation `generation` from the last round trip ([module docs](self)).
+    /// The loop parsed the screen of sequence `seq` and generation `generation` from the last
+    /// round trip, so a decision's mark ([`Self::decide`]) names the record of that screen.
     pub(crate) fn screen_read(&self, seq: u64, generation: Option<&str>) {
         let mut rec = self.lock();
         let Some(record) = rec.stage.lock_or_recover().last_exchange else {

@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Compiled per-gate policy decisions resolved once per installed policy ([`PolicyEngine`],
-//! [`OriginTag::Pty`], [`PolicyGates`], [`BridgeDecision`], [`PolicyEngine::evaluate`],
-//! [`PolicyState`], [`PolicyState::install`]).
+//! Compiled per-gate policy decisions resolved once per installed [`PolicyEngine`].
 
 use aterm_policy::engine::PolicyEngine;
 use aterm_policy::limits::{RateLimitSlot, TimeSource};
@@ -16,19 +14,13 @@ use super::response_capability::ProbeKind;
 /// The origin every compiled gate is resolved at.
 pub(super) const GATE_ORIGIN: OriginTag = OriginTag::Pty;
 
-/// Largest XTWINOPS `Ps` the compiled table covers, inclusive ([`PolicyState::xtwinops_gate`]).
 const XTWINOPS_MAX_PS: u16 = 24;
 
 /// The rate-limit id the response sink debits once per reply ([`PolicyState`], [`RateLimitSlot`]).
 pub(super) const RESPONSE_LIMIT_ID: &str = "response";
 
-/// Compiled XTWINOPS slots ([`XTWINOPS_MAX_PS`]).
 const XTWINOPS_GATES: usize = XTWINOPS_MAX_PS as usize + 1;
-
-/// OSC majors the shell-integration gate covers, in table order.
 const SHELL_MAJORS: [u32; 2] = [133, 633];
-
-/// Subcommand letters the shell-integration table covers.
 const SHELL_SUBCOMMANDS: usize = 26;
 
 /// The shell-integration gate verdict for one `(major, subcommand)`, live.
@@ -200,8 +192,7 @@ impl PolicyState {
             .map(|engine| engine.rate_limit_try_consume(id, amount, clock))
     }
 
-    /// Debit the [`RESPONSE_LIMIT_ID`] bucket through its pre-resolved slot
-    /// ([`Self::rate_limit_try_consume`]).
+    /// Debit the [`RESPONSE_LIMIT_ID`] bucket through its pre-resolved slot.
     #[inline]
     pub(super) fn response_rate_limit_try_consume<T: TimeSource>(
         &mut self,
@@ -219,7 +210,6 @@ impl PolicyState {
     }
 }
 
-/// Resolve the XTWINOPS verdict for every covered `Ps` in one pass.
 fn compile_xtwinops(engine: Option<&PolicyEngine>) -> [BridgeDecision; XTWINOPS_GATES] {
     std::array::from_fn(|ps| {
         let ps = u16::try_from(ps).unwrap_or(XTWINOPS_MAX_PS);
@@ -227,7 +217,6 @@ fn compile_xtwinops(engine: Option<&PolicyEngine>) -> [BridgeDecision; XTWINOPS_
     })
 }
 
-/// Resolve the shell-integration verdict for every covered pair in one pass.
 fn compile_shell(
     engine: Option<&PolicyEngine>,
 ) -> [[BridgeDecision; SHELL_SUBCOMMANDS]; SHELL_MAJORS.len()] {
@@ -253,7 +242,6 @@ mod tests {
     use crate::terminal::Terminal;
     use aterm_policy::{Policy, Response, profiles};
 
-    /// A policy whose single `*` rule gives `response` to every sequence from any origin.
     fn wildcard_policy(response: Response) -> Policy {
         crate::terminal::policy_bridge::one_rule_policy(
             "*",
@@ -263,7 +251,6 @@ mod tests {
         )
     }
 
-    /// A policy with one rule on an arbitrary selector, at an origin `Pty` dominates.
     fn policy_with_rule(sequence: &str, response: Response) -> Policy {
         crate::terminal::policy_bridge::one_rule_policy(
             sequence,
@@ -277,7 +264,6 @@ mod tests {
         PolicyEngine::new(wildcard_policy(response))
     }
 
-    /// Drive one CPR request and report whether the terminal replied.
     fn replies(term: &mut Terminal) -> bool {
         term.process(b"\x1b[6n");
         term.take_response().is_some_and(|r| !r.is_empty())
@@ -787,7 +773,6 @@ mod tests {
         );
     }
 
-    /// A policy declaring the given rate-limit buckets, in the given order, and no rules.
     fn policy_with_limits(limits: &[(&str, u32)]) -> Policy {
         Policy {
             rate_limits: limits

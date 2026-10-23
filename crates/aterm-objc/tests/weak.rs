@@ -279,6 +279,7 @@ unsafe impl std::alloc::GlobalAlloc for Quarantining {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         // `try_with`, not `with`: TLS is unavailable during thread teardown,
+        // and a `dealloc` there must still free rather than panic.
         if QUARANTINE.try_with(std::cell::Cell::get).unwrap_or(false) {
             return; // leaked on purpose; see the type docs.
         }

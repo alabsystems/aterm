@@ -3,8 +3,8 @@
 
 //! Consumer catalog presets over verified `defaults` rows.
 
-use super::defaults::{Pref, Scope, Target, Want};
-use super::{Ctx, Item};
+use super::defaults::{Pref, Relaunches, Scope, Target, Unmet, Want};
+use super::{Ctx, Item, widgets};
 use crate::model::{Effect, PValue};
 use serde::Deserialize;
 
@@ -22,7 +22,9 @@ pub struct Table {
     pub personalized_ads: Option<bool>,
     /// `false` makes AirDrop discoverable by no one.
     pub airdrop: Option<bool>,
-    /// `false` hides desktop and Stage Manager widgets.
+    /// `false` hides desktop and Stage Manager widgets and clears Notification Center's;
+    /// `true` shows the first two again, and leaves Notification Center's list, which no
+    /// write puts back, to the person.
     pub widgets: Option<bool>,
     /// Refused: Universal Control is atpkg's (`[machine] universal_control` in aterm.toml).
     pub universal_control: Option<bool>,
@@ -58,16 +60,25 @@ pub enum Lit {
     Int(i64),
     /// `-string`.
     Str(&'static str),
+    /// Notification Center's widget list with no widget: the list as it is, less every
+    /// widget and their desktop placement, the fields it does not know kept
+    /// ([`widgets::cleared`]). Nothing turns it back on: a row with this `off` has no `on`.
+    NoWidgets,
 }
 
 impl Lit {
-    /// As a property-list value.
+    /// As a property-list value: for [`Lit::NoWidgets`], the list written where there was
+    /// none.
     #[must_use]
     pub fn value(self) -> PValue {
         match self {
             Self::Bool(b) => PValue::Bool(b),
             Self::Int(i) => PValue::Int(i),
             Self::Str(s) => PValue::Str(s.to_owned()),
+            Self::NoWidgets => PValue::Dict(vec![
+                ("vers".into(), PValue::Int(1)),
+                ("instances".into(), PValue::Array(Vec::new())),
+            ]),
         }
     }
 }
@@ -219,6 +230,19 @@ pub const CATALOG: &[CatalogRow] = &[
         verified: "macOS 27.0 (26A428) VM: written, read back as a boolean, restored; the key exists on 27.0.1 (26A434) (Desktop & Dock ▸ Widgets ▸ Show Widgets: In Stage Manager)",
     },
     CatalogRow {
+        preset: "widgets",
+        id: "consumer.widgets.notification-center",
+        what: "Notification Center widgets",
+        domain: "com.apple.notificationcenterui",
+        key: "widgets",
+        scope: Scope::User,
+        off: Lit::NoWidgets,
+        on: None,
+        restart: Some(widgets::READER),
+        effect: Effect::Relaunch,
+        verified: "macOS 27.0 (26A428) VM, 2026-10-22: the list is in Notification Center's app container; read in full (8053 bytes) only by a process whose app holds Full Disk Access, and without it macOS warns the person and prints an empty domain (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §1.6d item 6). Cleared as aterm init's widgets row cleared it: no instance, no desktop placement, its other fields kept",
+    },
+    CatalogRow {
         preset: "bluetooth_setup_assistant",
         id: "consumer.bluetooth-setup-assistant.keyboard",
         what: "the Bluetooth keyboard setup assistant",
@@ -276,6 +300,19 @@ pub const CATALOG: &[CatalogRow] = &[
 /// # Errors
 /// One line naming what cannot be expanded (`universal_control`, which is atpkg's).
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    expand_with(table, ctx, &Relaunches::default())
+}
+
+/// [`expand`], each process a row restarts relaunched once per account with every other
+/// row of the run in `relaunches` that restarts it ([`Pref::shared`]).
+///
+/// # Errors
+/// As [`expand`].
+pub fn expand_with(
+    table: &Table,
+    ctx: &Ctx,
+    relaunches: &Relaunches,
+) -> Result<Vec<Box<dyn Item>>, String> {
     if table.universal_control.is_some() {
         return Err("[consumer] universal_control: Universal Control is atpkg's ([machine] universal_control in aterm.toml, default \"off\"); one key has one owner".into());
     }
@@ -284,6 +321,12 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
         let Some(enabled) = table.preset(row.preset) else {
             continue;
         };
+        if row.off == Lit::NoWidgets {
+            if !enabled {
+                items.extend(no_widgets(row, ctx, relaunches));
+            }
+            continue;
+        }
         let want = match (enabled, row.on) {
             (false, _) => Want::Value(row.off.value()),
             (true, Some(on)) => Want::Value(on.value()),
@@ -296,7 +339,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
                 .felt(row.effect)
                 .provenance(row.verified);
             match row.restart {
-                Some(p) => pref.restart(p),
+                Some(p) => pref.restart(p).shared(relaunches),
                 None => pref,
             }
         };
@@ -325,13 +368,45 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(items)
 }
 
+/// The items of a [`Lit::NoWidgets`] row, one per user: each list cleared, or, for a run
+/// whose process holds no known Full Disk Access, a row that names the grant and touches
+/// nothing ([`super::defaults::withheld`]).
+fn no_widgets(row: &CatalogRow, ctx: &Ctx, relaunches: &Relaunches) -> Vec<Box<dyn Item>> {
+    ctx.users
+        .iter()
+        .map(|user| {
+            let id = format!("{}@{}", row.id, user.name);
+            let title = format!(
+                "{} off for {} ({} {})",
+                row.what, user.name, row.domain, row.key
+            );
+            match super::defaults::withheld(row.domain, ctx.facts.full_disk_access) {
+                Some(why) => Box::new(Unmet {
+                    family: "consumer",
+                    id,
+                    title,
+                    why,
+                }) as Box<dyn Item>,
+                None => Box::new(widgets::NoWidgets::new(
+                    id,
+                    title,
+                    (row.domain, row.key),
+                    user,
+                    row.effect,
+                    relaunches,
+                )),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::{self, NoJournal};
     use crate::items::defaults::tests::{ctx, export, missing, user};
-    use crate::model::{Mode, Outcome, Probe};
-    use crate::port::{Fake, Ran};
+    use crate::model::{Mode, Outcome, Probe, Read};
+    use crate::port::{Fake, Ran, System};
 
     fn all(value: bool) -> Table {
         Table {
@@ -370,6 +445,8 @@ mod tests {
                 "consumer.widgets.desktop@bob",
                 "consumer.widgets.stage-manager@alice",
                 "consumer.widgets.stage-manager@bob",
+                "consumer.widgets.notification-center@alice",
+                "consumer.widgets.notification-center@bob",
                 "consumer.bluetooth-setup-assistant.keyboard",
                 "consumer.bluetooth-setup-assistant.pointing-device",
                 "consumer.ds-store.network@alice",
@@ -384,7 +461,110 @@ mod tests {
             "Siri off for alice (com.apple.assistant.support Assistant Enabled)"
         );
         assert_eq!(items[9].effect(), Effect::Relaunch);
-        assert_eq!(items[15].effect(), Effect::Restart);
+        assert_eq!(items[17].effect(), Effect::Restart);
+    }
+
+    /// The row that clears Notification Center's widgets is the key's one owner, which
+    /// `aterm init` builds its row from too: with the grant it clears the list, keeping the
+    /// fields it does not know, and relaunches Notification Center once, after which the
+    /// row reads back clear; without it the row touches nothing and names the grant. `true`
+    /// leaves the list, which no write puts back, to the person.
+    #[test]
+    fn the_notification_center_row_clears_the_list_only_with_the_grant() {
+        use crate::items::defaults::tests::{Session, session_of};
+        let alice = user("alice", 501);
+        let off = Table {
+            widgets: Some(false),
+            ..Table::default()
+        };
+        let mut granted = ctx(std::slice::from_ref(&alice));
+        granted.facts.full_disk_access = Some(true);
+        let items = expand(&off, &granted).unwrap();
+        let ids: Vec<String> = items.iter().map(|i| i.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                "consumer.widgets.desktop@alice",
+                "consumer.widgets.stage-manager@alice",
+                "consumer.widgets.notification-center@alice"
+            ]
+        );
+        let center: Vec<Box<dyn Item>> = items.into_iter().skip(2).collect();
+        let (sys, session) = session_of(Session::running(&["NotificationCenter"]));
+        let list = PValue::Dict(vec![
+            ("vers".into(), PValue::Int(1)),
+            ("future".into(), PValue::Bool(true)),
+            (
+                "instances".into(),
+                PValue::Array(vec![PValue::Data(vec![42])]),
+            ),
+        ]);
+        sys.run(
+            &Target::user("com.apple.notificationcenterui", "widgets", &alice).write_cmd(&list),
+        )
+        .unwrap();
+        session.lock().unwrap().events.clear();
+        let rows = engine::run(&center, Mode::Apply, &sys, &granted, &mut NoJournal);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        assert_eq!(rows[0].from.as_deref(), Some("1 widget"));
+        assert_eq!(
+            session.lock().unwrap().events,
+            [
+                "write com.apple.notificationcenterui widgets",
+                "kill NotificationCenter"
+            ]
+        );
+        let again = engine::run(&center, Mode::Apply, &sys, &granted, &mut NoJournal);
+        assert_eq!(again[0].outcome, Outcome::Ok, "{again:?}");
+        assert_eq!(session.lock().unwrap().kills("NotificationCenter"), 1);
+        let Read::Value(cleared) =
+            Target::user("com.apple.notificationcenterui", "widgets", &alice).read(&sys)
+        else {
+            panic!("the list reads back");
+        };
+        assert_eq!(
+            cleared,
+            PValue::Dict(vec![
+                ("vers".into(), PValue::Int(1)),
+                ("future".into(), PValue::Bool(true)),
+                ("instances".into(), PValue::Array(Vec::new())),
+            ])
+        );
+
+        for unknown in [None, Some(false)] {
+            let mut context = ctx(std::slice::from_ref(&alice));
+            context.facts.full_disk_access = unknown;
+            let center: Vec<Box<dyn Item>> = expand(&off, &context)
+                .unwrap()
+                .into_iter()
+                .skip(2)
+                .collect();
+            let sys = Fake::root();
+            let rows = engine::run(&center, Mode::Apply, &sys, &context, &mut NoJournal);
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+            assert!(
+                rows[0].why.as_deref().unwrap().contains("Full Disk Access"),
+                "{rows:?}"
+            );
+            assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        }
+
+        let on = Table {
+            widgets: Some(true),
+            ..Table::default()
+        };
+        let ids: Vec<String> = expand(&on, &granted)
+            .unwrap()
+            .iter()
+            .map(|i| i.id())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "consumer.widgets.desktop@alice",
+                "consumer.widgets.stage-manager@alice"
+            ]
+        );
     }
 
     #[test]

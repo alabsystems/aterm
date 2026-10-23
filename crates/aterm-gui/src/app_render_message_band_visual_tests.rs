@@ -7,15 +7,8 @@ use aterm_messages::{Look, Pace};
 
 use crate::{App, WindowId, term_lock};
 
-/// The capture font's size in px, used by the CPU renderer and by a
-/// [`glass_window`]'s cell layout so the band's pixel mapping agrees.
 const CAPTURE_PX: f32 = 20.0;
 
-/// A capture window that is not a whole number of cells wide: `pad` px of
-/// gutter on every side and `extra` px (under one cell) of remainder band
-/// split around it. Band cells sit at `pad + extra/2` in a window
-/// `cols·cw + 2·pad + extra` px wide, so 0 % is an empty track, 50 % the
-/// window's middle and 100 % edge to edge.
 fn glass_window(app: &mut App, session: u64, cols: u16, pad: usize, extra: usize) -> WindowId {
     let wid = app.insert_logical_window(crate::stub_session(session), 20, cols);
     let ws = app.windows.get_mut(&wid).unwrap();
@@ -23,7 +16,6 @@ fn glass_window(app: &mut App, session: u64, cols: u16, pad: usize, extra: usize
     ws.metrics.pad = pad;
     ws.metrics.pad_top = pad;
     let (cw, ch) = app.win_cell_size(wid);
-    // Less than one cell, or the presenters would count another column.
     let extra = extra.min(cw.saturating_sub(1));
     let width = usize::from(cols) * cw + 2 * pad + extra;
     let height = 21 * ch + 2 * pad;
@@ -34,30 +26,18 @@ fn glass_window(app: &mut App, session: u64, cols: u16, pad: usize, extra: usize
     wid
 }
 
-// The web band's golden: this host's band, frame by frame, for the web module.
-
-/// The golden the web module's `the_web_band_is_the_native_golden` reads.
 const WEB_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-wasm/tests/fixtures/band_native.tsv"
 );
 
-/// The face both hosts draw the golden with: the bundled JetBrains Mono the
-/// web page ships, at the capture size.
 const WEB_FONT: &[u8] =
     include_bytes!("../../aterm-render/assets/bundled/JetBrainsMono-Regular.ttf");
 
-/// The frame's side and top padding, px (the web page's `set_chrome(6, 0)`).
 const WEB_PAD: usize = 6;
 
-/// One golden scene: its name, its `notice` lines (ms, line), and its shots.
 type WebScene = (&'static str, &'static [(u64, &'static str)], &'static [u64]);
 
-/// Each golden scene: its name, the `notice` lines at their offsets (ms from
-/// the center's birth), and the instants it is shot at. Lines go through
-/// the engine's wire path on both hosts, and every shot is also a settle
-/// tick (a progress row reaches the glass at its grace's end only if a tick
-/// runs then, so finishes are shot at 2.5 s first).
 const WEB_SCENES: &[WebScene] = &[
     ("record", &[(0, "post ci Build finished")], &[100]),
     (
@@ -152,15 +132,12 @@ const WEB_SCENES: &[WebScene] = &[
     ),
 ];
 
-/// FNV-1a-64's offset basis.
 const WEB_FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
-/// FNV-1a-64 — the golden's digest (the web reader computes the same).
 fn web_fnv(bytes: &[u8]) -> u64 {
     web_fnv_more(WEB_FNV_BASIS, bytes)
 }
 
-/// [`web_fnv`]'s state `h` carried on over `bytes`.
 fn web_fnv_more(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= u64::from(b);
@@ -169,9 +146,7 @@ fn web_fnv_more(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// [`web_fnv`] of CPU-frame pixels (`0xAARRGGBB`, `AA` the inverted alpha)
-/// read as the RGBA bytes the golden digests: `R, G, B, 0xff - AA` each,
-/// hashed straight from the frame with no RGBA copy.
+/// Hashes CPU-frame pixels (`0xAARRGGBB`, `AA` inverted alpha) as RGBA bytes (`R, G, B, 0xff - AA`).
 fn web_fnv_pixels(pixels: &[u32]) -> u64 {
     pixels.iter().fold(WEB_FNV_BASIS, |h, &p| {
         web_fnv_more(
@@ -238,32 +213,17 @@ fn web_golden_line(
     line
 }
 
-/// The renderer both hosts draw the golden with: the bundled face on the
-/// portable rasterizer.
 fn web_portable(theme: aterm_render::Theme) -> aterm_render::Renderer {
     let mut r =
         aterm_render::Renderer::from_bytes(WEB_FONT, CAPTURE_PX, theme).expect("bundled font");
-    // The web module has one rasterizer, the portable one; this host's
-    // default (CoreText on macOS, hinted on Linux and Windows) is
-    // pinned to it, and neither side discovers system faces.
     r.debug_force_fontdue();
     r.set_runtime_font_discovery(false);
     r
 }
 
-/// This host's golden, as text: the themes, the scenes and every frame.
-///
-/// Each theme's frames are drawn on a thread and App of their own
-/// ([`web_golden_theme_frames`]) and joined in the golden's theme order, so
-/// the text is a single sequential pass's, line for line.
 fn web_golden_text() -> String {
     use std::fmt::Write as _;
     let scheme = |name: &str| aterm_types::scheme::builtin(name).expect("builtin scheme");
-    // Pinned to the portable palette: the golden is shared with the web
-    // module, which never draws Windows' default palette (slots 4 and 12
-    // differ there, `ColorPalette::BLUE`, slots 2, 3 and 6 are One Dark's,
-    // `ColorPalette::GREEN`/`YELLOW`/`CYAN`, and 10, 11, 13 and 14 their
-    // lighter shades, `ColorPalette::BRIGHT_GREEN` and the rest).
     let mut default_palette = aterm_types::ColorPalette::new();
     for (slot, [r, g, b]) in [
         (2, [0x00, 0xCD, 0x00]),
@@ -362,9 +322,6 @@ fn web_golden_theme_frames(
     use aterm_messages::wire::{self, NoticeRequest, Paint, WireGate};
     use aterm_messages::{MessageCenter, MessageLog, WallStamp};
     use std::fmt::Write as _;
-    // The web band's ground is the theme blend; Linux's own band sits on its
-    // CSD headerbar grey (`chrome_band::PLATFORM_BAR_BASE`), so the golden is
-    // drawn on the web's base here, as on every other platform.
     crate::chrome_band::lay_bands_on_the_theme_blend_for_test();
     let mut app = App::headless_for_test();
     app.backend = crate::BackendSlot::Ready(crate::Backend::Cpu(web_portable(
@@ -434,7 +391,6 @@ fn web_golden_theme_frames(
                 for (at, line) in events {
                     let now = t0 + Duration::from_millis(at);
                     if let Some(line) = line {
-                        // `App::take_notice` at an injected instant.
                         let req = NoticeRequest::parse(line).expect("a golden line parses");
                         let applied =
                             wire::apply(&mut app.messages, &mut app.wire_gate, req, stamp, now);
@@ -490,9 +446,7 @@ fn web_golden_theme_frames(
     out
 }
 
-/// The web band's golden digests are this host's band: every scene, theme,
-/// width and look, which the web module's parity test must match. Rewrite
-/// with `ATERM_BAND_GOLDEN=write` after a deliberate band change.
+/// Checks (or rewrites when `ATERM_BAND_GOLDEN=write`) the native message-band golden fixture.
 #[test]
 fn the_web_band_golden_is_this_hosts_band() {
     let text = web_golden_text();

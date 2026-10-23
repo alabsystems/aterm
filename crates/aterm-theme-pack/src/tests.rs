@@ -2,15 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The pack's laws: every shipped file is generated from its upstream and
-//! carries its notices, the folder holds nothing the manifest does not name,
-//! pairs cross appearances, and an install round-trips through a scratch
-//! themes folder.
+//! Theme pack generation, notice, manifest, and installation round-trip tests.
 
 use super::*;
 
-/// The pack folder in the source tree (a directory literal: aterm-verify
-/// seeds this crate's tests from any change beneath it).
 fn pack_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contrib/themes/pack/")
 }
@@ -37,7 +32,6 @@ fn derived(theme: &PackTheme, upstream: &str) -> String {
         .unwrap_or_else(|why| panic!("{why}"))
 }
 
-/// An exclusively created scratch folder, removed only by its owner.
 fn scratch(tag: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-theme-pack-{tag}-"))
@@ -45,10 +39,6 @@ fn scratch(tag: &str) -> aterm_tempfile::TempDir {
         .expect("owned scratch dir")
 }
 
-/// T1. Each shipped `<id>.conf` is exactly what [`derive`] makes from its
-/// vendored upstream file, and ATTRIBUTION.md is exactly [`notices`].
-/// `ATERM_BLESS_GOLDEN=1` writes them instead (then rebuild to embed).
-/// Negative control: a changed palette value derives a different file.
 #[test]
 fn pack_files_are_derived_from_their_upstream() {
     assert!(!themes().is_empty());
@@ -93,9 +83,6 @@ fn pack_files_are_derived_from_their_upstream() {
     assert_ne!(derived(first, &changed), derived(first, &upstream));
 }
 
-/// T3. Every pack file carries the notice of each licence it is under and
-/// the collection's MIT notice. Negative control: one licence line deleted
-/// fails it.
 #[test]
 fn every_pack_file_carries_its_notices() {
     for theme in themes() {
@@ -126,8 +113,6 @@ fn every_pack_file_carries_its_notices() {
     assert!(!carries_notice(&cut, theme.licence, licence));
 }
 
-/// T4. A pair names a pack theme or a built-in drawn for the other
-/// appearance, and two pack themes pair with each other.
 #[test]
 fn pairs_are_symmetric_and_cross_appearance() {
     let mut pairs = 0;
@@ -152,8 +137,6 @@ fn pairs_are_symmetric_and_cross_appearance() {
     assert!(pairs > 0);
 }
 
-/// Every pack theme loads, declares the appearance its row says and is
-/// shown under its row's name, and no built-in has its id or that name.
 #[test]
 fn pack_ids_are_free_and_files_declare_their_row() {
     for theme in themes() {
@@ -171,9 +154,6 @@ fn pack_ids_are_free_and_files_declare_their_row() {
     }
 }
 
-/// A theme answers to its id and to the name the chooser shows it under,
-/// in any case, and both find the one theme. Negative control: a
-/// built-in's name, which no pack theme is, finds nothing.
 #[test]
 fn find_answers_the_id_then_the_name_shown() {
     let renamed = themes()
@@ -195,10 +175,6 @@ fn find_answers_the_id_then_the_name_shown() {
     assert!(scheme::builtin_theme("Tokyo Night").is_some(), "premise");
 }
 
-/// T5. An install round-trips in a scratch themes folder: it writes the
-/// pack's bytes, a second is unchanged, an edited copy is kept unless
-/// replaced, a same-name file in another case blocks it, and no folder
-/// fails. Negative control: a built-in's name is refused.
 #[test]
 fn install_round_trips_in_a_scratch_folder() {
     let owned = scratch("install");
@@ -258,12 +234,6 @@ fn install_round_trips_in_a_scratch_folder() {
     assert!(!dir.join("nord.conf").exists());
 }
 
-/// A COPY AN EARLIER RELEASE INSTALLED IS INSTALLED: the same file but for
-/// the name it is shown under, which said the id (before the pack re-spelled
-/// it), reads Installed, an install keeps it, and only `replace` brings it up
-/// to the pack's bytes. Negative controls: a name line saying any other name
-/// is the owner's edit, and so is the earlier name with a color changed:
-/// Modified and kept unless replaced.
 #[test]
 fn an_earlier_copy_reads_installed_and_an_edit_does_not() {
     let owned = scratch("earlier");
@@ -292,8 +262,6 @@ fn an_earlier_copy_reads_installed_and_an_edit_does_not() {
     );
     assert_eq!(std::fs::read(&dest).unwrap(), theme.text.as_bytes());
 
-    // NEGATIVE CONTROL: a copy whose name line the owner changed to a name
-    // no release wrote is theirs, not an earlier copy.
     let renamed = theme.text.replacen(
         &format!("\nname = {}\n", theme.name),
         "\nname = My own storm\n",
@@ -327,17 +295,11 @@ fn an_earlier_copy_reads_installed_and_an_edit_does_not() {
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), edited);
 }
 
-/// A public caller can construct PackTheme; its id is still one file name,
-/// never a parent path, even when the requested directory has nested folders.
 #[test]
 fn install_refuses_an_id_that_leaves_the_requested_folder() {
     let owned = scratch("id");
     let dir = owned.path().join("themes");
     std::fs::create_dir(&dir).unwrap();
-    // The old writer prefixes the id with '.', so this makes its temporary
-    // path reachable too: refusal must come from the id contract, not I/O.
-    // Win32 strips a name's trailing dots, so there `...` names `dir` itself,
-    // which exists and keeps that path reachable already.
     match std::fs::create_dir(dir.join("...")) {
         Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::AlreadyExists => {}
         made => made.unwrap(),

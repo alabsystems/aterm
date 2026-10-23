@@ -86,8 +86,7 @@ pub(crate) enum InstallReason {
     Fresh,
     /// The head is newer than the installed build.
     Newer,
-    /// The installed build is a legacy index build whose version could not be read
-    /// ([`super::VendorSpec::legacy_ceiling`]).
+    /// The installed build is a legacy index build whose version could not be read.
     ReplacesLegacy,
     /// The installed build is yanked and the head is admissible.
     ReplacesYanked,
@@ -114,7 +113,9 @@ pub(crate) enum KeepReason {
     BuildDateRegressed,
     /// A local hold suppresses the upgrade.
     Held,
-    /// The installed build is a legacy index build that is no legacy pin.
+    /// The installed build is a legacy index build that is no legacy pin (above the ceiling,
+    /// or any build of a program no index pinned), so its version may be above the floor; its
+    /// version could not be read and no person asked.
     LegacyUnread,
 }
 
@@ -221,7 +222,6 @@ pub(crate) fn decide(i: &Inputs<'_>) -> Decision {
     }
 }
 
-/// Whether `head` is more than one major above `installed`.
 fn major_jump(installed: Version, head: Version) -> bool {
     u64::from(head.major()) > u64::from(installed.major()) + 1
 }

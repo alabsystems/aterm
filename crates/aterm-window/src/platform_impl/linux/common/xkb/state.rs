@@ -6,7 +6,7 @@
 
 //! Modified by the aterm project in 2026; see the repository NOTICE. (`SmolStr` from
 //! `crate::keyboard`. libxkbcommon's entry points are first-party aterm-xkb's, where upstream
-//! used xkbcommon-dl's: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
+//! used xkbcommon-dl's.)
 //!
 //! XKB state.
 
@@ -66,10 +66,7 @@ impl XkbState {
         unsafe { (xkbh().state_key_get_one_sym)(self.state.as_ptr(), keycode) }
     }
 
-    /// The keysym `keycode` types under every modifier and layout this state holds but
-    /// `lock` (`keymap`'s Caps Lock mask): read on a scratch state of `keymap`, this state's
-    /// own, since xkb resolves Shift and Lock together and an alphabetic key's type cancels
-    /// one against the other. This state's own keysym when the lock is not on.
+    /// Return the keysym `keycode` produces under this state's modifiers and layout excluding `lock`.
     pub fn get_one_sym_without(
         &mut self,
         keymap: &XkbKeymap,
@@ -165,12 +162,10 @@ impl XkbState {
         };
 
         if mask & state_component::MODS_EFFECTIVE != 0 {
-            // Effective value of mods have changed, we need to update our state.
             self.reload_modifiers();
         }
     }
 
-    /// Reload the modifiers.
     fn reload_modifiers(&mut self) {
         self.modifiers.ctrl = self.mod_name_is_active(mod_name::CTRL);
         self.modifiers.alt = self.mod_name_is_active(mod_name::ALT);
@@ -180,7 +175,6 @@ impl XkbState {
         self.modifiers.num_lock = self.mod_name_is_active(mod_name::NUM);
     }
 
-    /// Check if the modifier is active within xkb.
     fn mod_name_is_active(&mut self, name: &CStr) -> bool {
         unsafe {
             (xkbh().state_mod_name_is_active)(
@@ -200,27 +194,20 @@ impl Drop for XkbState {
     }
 }
 
-/// Represents the current state of the keyboard modifiers
-///
-/// Each field of this struct represents a modifier and is `true` if this modifier is active.
-///
-/// For some modifiers, this means that the key is currently pressed, others are toggled
-/// (like caps lock).
+/// Represents the current state of the keyboard modifiers.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModifiersState {
-    /// The "control" key
+    /// The "control" key.
     pub ctrl: bool,
-    /// The "alt" key
+    /// The "alt" key.
     pub alt: bool,
-    /// The "shift" key
+    /// The "shift" key.
     pub shift: bool,
-    /// The "Caps lock" key
+    /// The "Caps lock" key.
     pub caps_lock: bool,
-    /// The "logo" key
-    ///
-    /// Also known as the "windows" key on most keyboards
+    /// The "logo" key.
     pub logo: bool,
-    /// The "Num lock" key
+    /// The "Num lock" key.
     pub num_lock: bool,
 }
 

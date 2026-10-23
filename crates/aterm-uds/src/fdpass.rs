@@ -228,7 +228,8 @@ mod scm {
         pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
             let mut pid: i32 = 0;
             let mut len: u32 = 4;
-            // SAFETY: `pid` and `len` are valid locals for `getsockopt`.
+            // SAFETY: `pid` and `len` are valid locals for `getsockopt`; `len` states the exact
+            // size the kernel writes, checked again below.
             let rc = unsafe {
                 super::getsockopt(
                     fd,
@@ -333,7 +334,8 @@ mod scm {
         pub fn peer_pid(fd: RawFd) -> io::Result<u32> {
             let mut cred = [0i32; 3];
             let mut len: u32 = UCRED_LEN as u32;
-            // SAFETY: `cred` and `len` are valid locals for `getsockopt`.
+            // SAFETY: `cred` and `len` are valid locals for `getsockopt`; `len` states the exact
+            // size the kernel writes, checked again below.
             let rc = unsafe {
                 super::getsockopt(
                     fd,
@@ -450,7 +452,9 @@ mod scm {
             iov_len: payload.len(),
         };
         let msg = abi::msghdr(&mut iov, 1, control.0.as_mut_ptr(), control_len);
-        // SAFETY: `msg` references `iov` and `control`, which remain live across `sendmsg`.
+        // SAFETY: `msg` references `iov` and `control`, live across `sendmsg`; `iov` is exactly
+        // `payload`'s bytes, and `control_len` fits `control` (`fds.len() <= MAX_FDS <=
+        // CONTROL_FDS`).
         let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, abi::SEND_FLAGS) };
         if sent < 0 {
             return Err(io::Error::last_os_error());
@@ -468,7 +472,8 @@ mod scm {
             core::ptr::null_mut(),
             0,
         );
-        // SAFETY: `msg` references `bufs`, which remains live across `sendmsg`.
+        // SAFETY: `msg` names `bufs.len()` iovecs at `bufs`, live across `sendmsg` and laid out as
+        // `struct iovec` (asserted in `scm`); it names no control buffer.
         let sent = unsafe { sendmsg(stream.as_raw_fd(), &msg, abi::SEND_FLAGS) };
         if sent < 0 {
             return Err(io::Error::last_os_error());
@@ -503,7 +508,8 @@ mod scm {
             iov_len: buf.len(),
         };
         let mut msg = abi::msghdr(&mut iov, 1, control.0.as_mut_ptr(), CONTROL_LEN);
-        // SAFETY: `msg` references `iov` and `control`, which remain live across `recvmsg`.
+        // SAFETY: `msg` references `iov` and `control`, live across `recvmsg`; `iov` is exactly
+        // `buf`'s bytes and the header claims exactly `CONTROL_LEN`, the control buffer's length.
         let got = unsafe { recvmsg(stream.as_raw_fd(), &mut msg, 0) };
         if got < 0 {
             return Err(io::Error::last_os_error());
@@ -519,7 +525,8 @@ mod scm {
                 malformed = true;
                 continue;
             }
-            // SAFETY: `raw` is a fresh descriptor delivered by `SCM_RIGHTS`.
+            // SAFETY: `raw` is a fresh descriptor `SCM_RIGHTS` just installed, owned by nothing
+            // else; each number appears once in a message, so no two `OwnedFd`s alias.
             fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
         }
         for fd in &fds {
@@ -783,7 +790,7 @@ mod scm {
         }
 
         /// A peer that sends past `MAX_FDS` (`send_with_fds` refuses to; a raw `sendmsg` does
-        /// not), up to the twice-`MAX_FDS` budget the module documents, is still a visible
+        /// not), up to the twice-`MAX_FDS` budget of `CONTROL_FDS`, is still a visible
         /// over-count: every descriptor it sent is named, closed and refused, and none stays
         /// here.
         #[test]
@@ -826,7 +833,8 @@ mod scm {
                 iov_len: payload.len(),
             };
             let msg = abi::msghdr(&mut iov, 1, control.0.as_mut_ptr(), cmsg_len(SENT * FD_LEN));
-            // SAFETY: `msg` references live `iov` and `control` buffers.
+            // SAFETY: `msg` references live `iov` and `control` buffers, and the control length it
+            // declares is inside `control`.
             let sent = unsafe { super::sendmsg(a.as_raw_fd(), &msg, abi::SEND_FLAGS) };
             assert_eq!(sent, 1, "{}", std::io::Error::last_os_error());
             let before = copies();

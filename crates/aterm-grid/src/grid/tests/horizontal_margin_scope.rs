@@ -2,18 +2,11 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Which operations DECSLRM's horizontal margins bound. VT510 splits them: in-place erases (EL,
-//! ECH, ED) "work inside or outside the scrolling margins"; sideways shifts (ICH, DCH) have "no
-//! effect outside the scrolling margins". xterm, Ghostty, iTerm2 and WezTerm do the same.
-//!
-//! EL, DECSEL, ECH and ED are unbounded; ICH/DCH and DECIC/DECDC keep their margins. IL/DL's
-//! rectangular shift is pinned in `scroll_region::region_ops`, autowrap to the left margin in
-//! aterm-conformance `vt_categories3::declrmm_autowrap_wraps_to_left_margin`.
+//! DECSLRM horizontal margin scope: in-place erases (EL, DECSEL, ECH, ED) ignore horizontal
+//! margins, while sideways shifts (ICH, DCH, DECIC, DECDC) stay bounded by them.
 
 use super::super::*;
 
-/// Row 0 of a 3x20 grid filled with 'X' (before margins, so every column holds
-/// one), then DECSLRM margins at columns 4..=10.
 fn filled_row_with_margins() -> Grid {
     let mut grid = Grid::new(3, 20);
     for _ in 0..20 {
@@ -35,9 +28,6 @@ fn assert_kept(grid: &Grid, col: u16, why: &str) {
     assert_eq!(grid.cell(0, col).unwrap().char(), 'X', "col {col}: {why}");
 }
 
-// EL: the in-place erase class, not bounded by DECSLRM.
-
-/// EL 0 runs to the row's edge, past the right margin.
 #[test]
 fn el0_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -50,7 +40,6 @@ fn el0_erases_past_the_right_margin() {
     assert_blank(&grid, 19, "EL 0 runs to the end of the row");
 }
 
-/// EL 1 starts at column 0, not at the left margin.
 #[test]
 fn el1_erases_left_of_the_left_margin() {
     let mut grid = filled_row_with_margins();
@@ -62,7 +51,6 @@ fn el1_erases_left_of_the_left_margin() {
     assert_kept(&grid, 7, "EL 1 never touches the right of the cursor");
 }
 
-/// EL 2 erases the whole row, not the margin span.
 #[test]
 fn el2_erases_the_whole_row_not_the_margin_span() {
     let mut grid = filled_row_with_margins();
@@ -76,9 +64,6 @@ fn el2_erases_the_whole_row_not_the_margin_span() {
     );
 }
 
-// DECSEL: the same spans, with protection honoured inside them.
-
-/// DECSEL 0 shares EL 0's span; protection is honoured inside it, not in the bounds.
 #[test]
 fn decsel0_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -89,7 +74,6 @@ fn decsel0_erases_past_the_right_margin() {
     assert_blank(&grid, 19, "DECSEL 0 runs to the end of the row");
 }
 
-/// DECSEL 1 shares EL 1's span, which opens at column 0.
 #[test]
 fn decsel1_erases_left_of_the_left_margin() {
     let mut grid = filled_row_with_margins();
@@ -100,7 +84,6 @@ fn decsel1_erases_left_of_the_left_margin() {
     assert_kept(&grid, 7, "DECSEL 1 never touches the right of the cursor");
 }
 
-/// DECSEL 2 shares EL 2's span: the whole row.
 #[test]
 fn decsel2_erases_the_whole_row_not_the_margin_span() {
     let mut grid = filled_row_with_margins();
@@ -110,9 +93,6 @@ fn decsel2_erases_the_whole_row_not_the_margin_span() {
     assert_blank(&grid, 19, "DECSEL 2 reaches right of the right margin");
 }
 
-// ECH: the same class.
-
-/// ECH erases `count` cells from the cursor regardless of the right margin.
 #[test]
 fn ech_erases_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -126,7 +106,6 @@ fn ech_erases_past_the_right_margin() {
     assert_kept(&grid, 16, "and exactly ten: the eleventh cell survives");
 }
 
-/// A count past the row's edge is clipped by the row, not by the margin.
 #[test]
 fn ech_count_is_clipped_by_the_row_edge() {
     let mut grid = filled_row_with_margins();
@@ -136,9 +115,6 @@ fn ech_count_is_clipped_by_the_row_edge() {
     assert_kept(&grid, 5, "and nothing left of the cursor moves");
 }
 
-// ED
-
-/// ED 0's cursor row is erased to the row edge, margins or not.
 #[test]
 fn ed0_erases_the_cursor_row_past_the_right_margin() {
     let mut grid = filled_row_with_margins();
@@ -148,7 +124,6 @@ fn ed0_erases_the_cursor_row_past_the_right_margin() {
     assert_blank(&grid, 19, "ED 0's cursor row runs to the row edge");
 }
 
-/// ED 1's cursor row is erased from column 0, margins or not.
 #[test]
 fn ed1_erases_the_cursor_row_from_column_zero() {
     let mut grid = filled_row_with_margins();
@@ -158,10 +133,6 @@ fn ed1_erases_the_cursor_row_from_column_zero() {
     assert_kept(&grid, 7, "and stops after the cursor");
 }
 
-// ICH / DCH keep their margins.
-
-/// ICH shifts within the margins: cells right of the right margin do not move
-/// and nothing falls off the row's end.
 #[test]
 fn ich_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);
@@ -181,7 +152,6 @@ fn ich_still_shifts_only_within_the_margins() {
     );
 }
 
-/// DCH likewise: the fill lands at the right margin, not at the row edge.
 #[test]
 fn dch_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);
@@ -204,10 +174,6 @@ fn dch_still_shifts_only_within_the_margins() {
     );
 }
 
-// DECIC / DECDC keep their margins too.
-
-/// DECIC shifts only the margin span: columns pushed past the right margin are
-/// lost and the cell right of the margin does not move (DEC STD 070).
 #[test]
 fn decic_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);
@@ -241,8 +207,6 @@ fn decic_still_shifts_only_within_the_margins() {
     );
 }
 
-/// DECDC likewise: blank columns open at the right margin, and nothing right of
-/// the margin is pulled in.
 #[test]
 fn decdc_still_shifts_only_within_the_margins() {
     let mut grid = Grid::new(3, 20);

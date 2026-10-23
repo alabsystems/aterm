@@ -1405,6 +1405,8 @@ impl HealthAnnouncer {
         if !h.is_persistent()
             && let Some((class, _)) = self.announced.take()
         {
+            // All healed: any class may speak again. A failure this process
+            // reported gets its recovery reported once, naming the class, so the
             // standing row can leave (see [`HealthNotify`]).
             return Some((HEALTH_RECOVERED_TITLE.to_string(), class.to_string()));
         }
@@ -2173,6 +2175,7 @@ pub fn spawn_background_check_with_source(
     on_staged: Option<StagedNotify>,
 ) {
     if !automatic() {
+        // Said once per process, where the updater's lines go: the one record of why this
         // machine is not checking by itself. A typed or clicked check still runs.
         if enabled() {
             log(
@@ -2783,6 +2786,7 @@ fn run_checker(
             }
             match args.lane.try_lock() {
                 Some(mut lane) => {
+                    // A retired generation that woke here leaves without marking
                     // the lane as its own.
                     if !watch.is_current(generation) {
                         return Cycle::Superseded(last.get());
@@ -3013,6 +3017,8 @@ fn run_checker(
                             }
                         }
                         Ok(None) if unreadable::is_stranded() => {
+                            // Back off; the first healthy check clears it, so a channel repaired
+                            // mid-session is noticed within one jittered `max(MAX_BACKOFF,
                             // MAX_BACKOFF_INTERVALS × base)`.
                             schedule.failed();
                         }
@@ -4062,6 +4068,8 @@ pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
 /// Run one update check + stage synchronously and return the resulting [`UpdateStatus`].
 #[cfg(target_os = "macos")]
 pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
+    // Not queued behind a stuck check: a checker generation the watchdog retired
+    // inside its check still holds the lane, and `run_or_join` would wait on it
     // without bound. Say so at once instead.
     if enabled()
         && let Some(why) = manual_check_blocked(&checker_watch::WATCH)

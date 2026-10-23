@@ -792,7 +792,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                         let _ = from_browser_w.write_all(reply.as_bytes());
                         return;
                     }
-                    "Runtime.evaluate" if session_id == "s_t2" => {
+                    "Runtime.evaluate" if session_id == "s_t2" || session_id == "s_t3" => {
                         webmail_step += 1;
                         let expr = msg
                             .pointer("/params/expression")
@@ -810,6 +810,13 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                             2 => aterm_json::json!({
                                 "state": "submitted_totp",
                                 "url": "https://mail.example.test/login/2fa"
+                            }),
+                            3 | 4 => aterm_json::json!({
+                                "state": "inbox",
+                                "url": "https://mail.example.test/u/0/inbox",
+                                "clicked_row": true,
+                                "html": "<div><p>Your verification code is: 111111</p></div>",
+                                "text": "Sign in to Claude\nYour verification code is: 111111"
                             }),
                             _ => aterm_json::json!({
                                 "state": "inbox",
@@ -834,15 +841,40 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                             }),
                             2 => {
                                 assert!(
-                                    expr.contains("908172"),
-                                    "OAuth tab must receive OTP extracted from webmail tab"
+                                    expr.contains("111111"),
+                                    "OAuth tab must first try initial unseen OTP"
                                 );
                                 aterm_json::json!({
                                     "state": "submitted_otp",
                                     "url": "https://claude.com/login/verify"
                                 })
                             }
-                            3 => aterm_json::json!({
+                            3..=5 => aterm_json::json!({
+                                "state": "needs_mailbox",
+                                "url": "https://claude.com/login/verify"
+                            }),
+                            6 => {
+                                assert!(
+                                    expr.contains("908172"),
+                                    "OAuth tab must re-poll mailbox and receive fresh OTP after stale OTP fails"
+                                );
+                                aterm_json::json!({
+                                    "state": "submitted_otp",
+                                    "url": "https://claude.com/login/verify"
+                                })
+                            }
+                            7 => {
+                                assert!(
+                                    expr.contains("continue as "),
+                                    "OAuth JS must support account/workspace selection before final consent"
+                                );
+                                aterm_json::json!({
+                                    "state": "clicked_consent",
+                                    "url": "https://claude.com/cai/oauth/select-account",
+                                    "target": "continue as user-b@example.test"
+                                })
+                            }
+                            8 => aterm_json::json!({
                                 "state": "clicked_consent",
                                 "url": "https://claude.com/cai/oauth/authorize"
                             }),
@@ -865,20 +897,24 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         }
     });
 
+    let empty_maildir = tmp.path().join("empty_maildir");
+    std::fs::create_dir_all(&empty_maildir).expect("mkdir empty_maildir");
+    cfg.dir = Some(empty_maildir);
+
     let mut cdp = CdpClient::new(to_browser_w, from_browser_r);
     let mut delivered = Vec::new();
     let res = drive_cdp_oauth_with_webmail(
         &mut cdp,
         authorize_url,
         Some("user-b@example.test"),
-        Duration::from_secs(5),
+        Duration::from_secs(60),
         Duration::ZERO,
         |cdp_inner, em| {
             poll_mailbox_or_webmail_for_credential(
                 cdp_inner,
                 &cfg,
                 em,
-                Duration::from_secs(5),
+                Duration::from_secs(60),
                 Duration::ZERO,
             )
         },
@@ -895,4 +931,188 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         ]
     );
     browser_thread.join().expect("browser thread");
+
+    // 4. Minified HTML email with <style> 6-digit numbers and multi-div OTP context.
+    let styled_otp_eml = concat!(
+        "From: Anthropic <no-reply@claude.com>\r\n",
+        "To: <user-b@example.test>\r\n\r\n",
+        "<html><head><style>.verification-code { font-weight: 600; z-index: 100000; }</style></head>",
+        "<body><div>Use this verification code to sign in to Claude:</div>",
+        "<div><span>582914</span> (expires in 10 minutes)</div>",
+        "<div>548 Market St #999888, San Francisco</div></body></html>"
+    );
+    assert_eq!(
+        super::super::headless_oauth::extract_otp_from_email(
+            styled_otp_eml,
+            Some("user-b@example.test")
+        )
+        .as_deref(),
+        Some("582914")
+    );
+
+    for tag in ["style", "script"] {
+        for space in [" ", "\t", "\r", "\n", "\x0c"] {
+            let raw = format!(
+                "To: <user-b@example.test>\r\n\r\n<{tag} data-fixture='raw'>100000</{tag}{space}>\
+                 <div>Your verification code:</div><div>582914</div>"
+            );
+            assert_eq!(
+                super::super::headless_oauth::extract_otp_from_email(
+                    &raw,
+                    Some("user-b@example.test")
+                )
+                .as_deref(),
+                Some("582914"),
+                "{tag} closing whitespace {space:?}"
+            );
+        }
+    }
+    for tag in ["styleguide", "scripture"] {
+        let raw = format!(
+            "To: <user-b@example.test>\r\n\r\n<{tag}>Your verification code: 582914</{tag}>"
+        );
+        assert_eq!(
+            super::super::headless_oauth::extract_otp_from_email(&raw, Some("user-b@example.test"))
+                .as_deref(),
+            Some("582914"),
+            "{tag} is not a raw-text block"
+        );
+    }
+
+    // 5. A failed HTTP probe hands off its consumed OTP without undoing another flow's state.
+    #[cfg(unix)]
+    {
+        use crate::harness::headless_oauth::MailboxCredential;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+
+        let probe_dir = tmp.path().join("probe_mb");
+        std::fs::create_dir_all(&probe_dir).expect("mkdir probe_mb");
+        let probe_seen = probe_dir.join(".mailbox.seen");
+        std::fs::write(&probe_seen, b"existing_digest\n").expect("seed seen");
+        let pre_clicked = probe_dir.join("old.eml.clicked");
+        std::fs::write(&pre_clicked, b"1\n").expect("seed old clicked");
+        let probe_cfg = MailboxConfig {
+            dir: Some(probe_dir.clone()),
+            seen_file: Some(probe_seen.clone()),
+            ..MailboxConfig::default()
+        };
+        std::fs::write(
+            probe_dir.join("first.eml"),
+            "To: <user-b@example.test>\r\n\r\nYour verification code: 111111",
+        )
+        .expect("write initial OTP");
+        let seen_permissions = RestorePermissions(
+            probe_seen.clone(),
+            std::fs::metadata(&probe_seen).unwrap().permissions(),
+        );
+        std::fs::set_permissions(&probe_seen, std::fs::Permissions::from_mode(0o0)).unwrap();
+        let seen_unreadable = std::fs::read(&probe_seen).is_err();
+        let mut pending = None;
+        let failed_probe = super::authorize_using_with_page(
+            authorize_url,
+            Some("user-b@example.test"),
+            |email, _| {
+                super::poll_http_mailbox_credential(
+                    &probe_cfg,
+                    email,
+                    Duration::from_secs(60),
+                    &mut pending,
+                )
+            },
+            &mut |method, url, _, _| {
+                assert_eq!((method, url), ("GET", authorize_url));
+                Ok(HttpResponse {
+                    status: 200,
+                    location: None,
+                    body: "<input type='email'>".to_owned(),
+                })
+            },
+        );
+        assert_eq!(
+            failed_probe,
+            Err("verification email contained a 6-digit OTP requiring headless browser")
+        );
+        let first_clicked = probe_dir.join("first.eml.clicked");
+        assert!(first_clicked.exists());
+        assert!(probe_seen.exists(), "existing seen history is retained");
+        if seen_unreadable {
+            assert!(std::fs::read(&probe_seen).is_err());
+        }
+        std::fs::set_permissions(&probe_seen, seen_permissions.1.clone()).unwrap();
+        assert_eq!(std::fs::read(&probe_seen).unwrap(), b"existing_digest\n");
+
+        std::fs::write(
+            probe_dir.join("other.eml"),
+            "To: <other@example.test>\r\n\r\nYour verification code: 222222",
+        )
+        .expect("write another flow's OTP");
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_config_for_credential(
+                &probe_cfg,
+                Some("other@example.test"),
+                Duration::from_secs(60),
+            ),
+            Ok(MailboxCredential::Otp("222222".to_owned()))
+        );
+        let other_clicked = probe_dir.join("other.eml.clicked");
+        std::fs::write(&probe_seen, b"existing_digest\nfresh_digest\n").expect("append seen");
+        std::fs::write(
+            probe_dir.join("fresh.eml"),
+            "To: <user-b@example.test>\r\n\r\nYour verification code: 908172",
+        )
+        .expect("write replacement OTP");
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_or_pending_credential(
+                &mut pending,
+                &mut cdp,
+                &probe_cfg,
+                Some("user-b@example.test"),
+                Duration::from_secs(60),
+                Duration::ZERO,
+            ),
+            Ok(MailboxCredential::Otp("111111".to_owned())),
+            "first browser request reuses the already-consumed HTTP credential"
+        );
+        assert!(pending.is_none());
+        assert!(!probe_dir.join("fresh.eml.clicked").exists());
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_or_pending_credential(
+                &mut pending,
+                &mut cdp,
+                &probe_cfg,
+                Some("user-b@example.test"),
+                Duration::from_secs(60),
+                Duration::ZERO,
+            ),
+            Ok(MailboxCredential::Otp("908172".to_owned())),
+            "later browser request polls a fresh credential"
+        );
+        assert!(probe_dir.join("fresh.eml.clicked").exists());
+        assert!(pre_clicked.exists());
+        assert!(first_clicked.exists());
+        assert!(
+            other_clicked.exists(),
+            "another flow's consumption is retained"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&probe_seen).unwrap(),
+            "existing_digest\nfresh_digest\n"
+        );
+    }
+    assert!(super::page_needs_browser_before_email(
+        "<html><head><script src='/app.js'></script></head><body><div id='root'></div></body></html>"
+    ));
+    assert!(super::page_needs_browser_before_email(
+        "<html><body><form><input type='email' name='email'></form></body></html>"
+    ));
+    assert!(!super::page_needs_browser_before_email(
+        "<html><body><p>Check your email for a magic link</p></body></html>"
+    ));
 }

@@ -520,8 +520,8 @@ fn no_model(evs: Vec<StepEvent>) -> Vec<StepEvent> {
 }
 
 /// A TURN CLAUDE CODE NUMBERS OF ITS OWN starts the vendor turn its model's
-/// row says ran, as a task notification's wake does (module docs, by
-/// `upgrade.rs`'s `numbered_anew`): a `/loop`'s wake, written `isMeta` and
+/// row says ran, as a task notification's wake does (by `upgrade.rs`'s
+/// `numbered_anew`): a `/loop`'s wake, written `isMeta` and
 /// no prompt by its words, under a `promptId` of its own (with the
 /// `promptSource`, `scheduledTaskId` and `turnOrigin` 2.1.302 writes), or
 /// under none with a `scheduledTaskId` (the 2.1.252 and 2.1.267 bundles) or
@@ -676,7 +676,7 @@ fn a_turn_claude_code_numbers_of_its_own_starts_its_vendor_turn() {
     }
 }
 
-/// A RUNNING TURN THE BIND DID NOT READ (module docs). A tap armed after
+/// A RUNNING TURN THE BIND DID NOT READ. A tap armed after
 /// the footer's first read binds at the file's length (`bind_tap`), so the
 /// fold knows neither the running turn's `promptId` nor whether one runs
 /// (`Fed::new` is such a bind).
@@ -888,7 +888,7 @@ fn fold_fixture(name: &str, split: &[usize]) -> Vec<Vec<Step>> {
 }
 
 /// A FIRST PROMPT WRITTEN AFTER ITS TURN'S FIRST ROWS heads them (the
-/// opening hold, module docs).
+/// opening hold, [`Hold`]).
 #[test]
 fn a_first_prompt_written_after_its_turns_first_rows_heads_them() {
     let edit = "claude-2.1.300-transcript-box-edit-star-hook-pending.jsonl";

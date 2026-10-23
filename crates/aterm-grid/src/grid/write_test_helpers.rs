@@ -2,17 +2,12 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Test-only combined write+advance methods; production uses the split
-//! primitives in `write_split.rs`.
+//! Test-only combined write and advance methods.
 
 use super::{CellFlags, Grid, PackedColor};
 
 impl Grid {
-    /// Write a styled character at the cursor and advance it (production:
-    /// `write_char_at_cursor_packed` + `advance_cursor_*`).
-    ///
-    /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
-    /// ENSURES: self.storage.cursor.col <= self.storage.max_col_for_row(self.storage.cursor.row)
+    /// Write a styled character at the cursor and advance it.
     pub(crate) fn write_char_styled(
         &mut self,
         c: char,
@@ -37,10 +32,6 @@ impl Grid {
     }
 
     /// Write a styled character with autowrap.
-    ///
-    /// REQUIRES: self.storage.visible_rows > 0
-    /// REQUIRES: self.storage.cursor.row < self.storage.visible_rows
-    /// ENSURES: self.storage.cursor.row < self.storage.visible_rows
     pub(crate) fn write_char_wrap_styled(
         &mut self,
         c: char,
@@ -66,7 +57,7 @@ impl Grid {
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
     }
 
-    /// Write a wide (2-cell) character with deferred autowrap. Returns whether it was written.
+    /// Write a wide character with deferred autowrap.
     pub(crate) fn write_wide_char_wrap_styled(
         &mut self,
         c: char,
@@ -76,8 +67,6 @@ impl Grid {
     ) -> bool {
         self.resolve_pending_wrap();
 
-        // A wide char cannot start at the last column: wrap first, leaving the skipped cell as
-        // the production early wrap does (blanked, recorded as the row's early-wrap hole).
         let effective_cols = self.storage.effective_cols_for_row(self.storage.cursor.row);
         if self.storage.cursor.col.saturating_add(1) >= effective_cols {
             self.blank_wide_wrap_tail(effective_cols, crate::Cell::EMPTY);
@@ -120,7 +109,7 @@ impl Grid {
         ok
     }
 
-    /// Write a wide (2-cell) character without autowrap. Returns whether it was written.
+    /// Write a wide character without autowrap.
     pub(crate) fn write_wide_char_styled(
         &mut self,
         c: char,

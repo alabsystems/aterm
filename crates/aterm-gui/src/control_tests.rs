@@ -2751,7 +2751,8 @@ fn unread_bytes(socket: std::os::fd::BorrowedFd<'_>) -> usize {
     use std::os::fd::AsRawFd;
 
     let mut queued: libc::c_int = 0;
-    // SAFETY: FIONREAD writes one `c_int` through the pointer, which points at `queued`.
+    // SAFETY: FIONREAD writes one `c_int` through the pointer, which
+    // points at `queued`; `socket` is borrowed, so open for the call.
     let rc = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut queued) };
     assert_eq!(rc, 0, "FIONREAD on a live socket");
     usize::try_from(queued).expect("a byte count")
@@ -3325,7 +3326,8 @@ fn owner_topic_and_settings_reach_a_nested_child() {
 #[cfg(unix)]
 fn never_listening_socket(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
-    // SAFETY: three straight-line libc calls.
+    // SAFETY: three straight-line libc calls; the path is checked to fit
+    // sun_path, and every return is checked.
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         assert!(fd >= 0, "socket(AF_UNIX)");
@@ -4586,7 +4588,8 @@ fn cloexec_pipe() -> (i32, i32) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         assert_eq!(
-            // SAFETY: `pipe2` fills the two-element array this frame owns.
+            // SAFETY: `pipe2` fills the two-element array this frame owns,
+            // and flags both descriptors as it creates them.
             unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
             0,
             "pipe2(O_CLOEXEC)"
@@ -4605,7 +4608,8 @@ fn cloexec_pipe() -> (i32, i32) {
         }
     }
     for fd in fds {
-        // SAFETY: `fd` is a descriptor this function just created.
+        // SAFETY: `fd` is a descriptor this function just created, and
+        // `F_GETFD` takes no further argument.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert_ne!(flags, -1, "F_GETFD");
         assert!(
@@ -4661,13 +4665,15 @@ fn kill_peer_in_kernel(master: i32, subject: &str) {
         "{subject}: shutdown(SHUT_WR)"
     );
     assert_eq!(
-        // SAFETY: both are live descriptors.
+        // SAFETY: both are live descriptors; `dup2` closes what `master`
+        // named and makes it a second name for the dead socket.
         unsafe { libc::dup2(pair[0], master) },
         master,
         "{subject}: dup2(2) the dead socket over the sink's fd"
     );
     aterm_pty::set_cloexec(master, true).expect("re-flag the swapped fd");
-    // SAFETY: two live descriptors this frame owns, each closed.
+    // SAFETY: two live descriptors this frame owns, each closed once; the
+    // dead socket survives as `master`.
     unsafe {
         libc::close(pair[0]);
         libc::close(pair[1]);
@@ -7760,7 +7766,8 @@ fn the_push_probe_enters_the_kernel_once() {
     let size = libc::c_int::try_from(std::mem::size_of::<ProcTaskInfo>()).expect("96 bytes");
     let entries = || -> u64 {
         let mut info = ProcTaskInfo::default();
-        // SAFETY: `info` is an owned, writable `ProcTaskInfo` of `size` bytes.
+        // SAFETY: `info` is an owned, writable `ProcTaskInfo` of `size` bytes,
+        // and the kernel writes at most `size` bytes into it.
         let wrote =
             unsafe { libc::proc_pidinfo(pid, PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
         assert_eq!(
@@ -15026,7 +15033,8 @@ fn guarded_pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, 
 #[cfg(unix)]
 fn a_guarded_key_presses_when_a_row_matches_and_writes_nothing_when_none_does() {
     let (h, rx) = guarded_pipe_session(1);
-    // SAFETY: guarded_pipe_session returned this new write descriptor.
+    // SAFETY: guarded_pipe_session returned this new write descriptor; the
+    // session/sink borrow it and no other owner closes it. No writer is pending.
     let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
     let proceed = control_input::compile_guard(Some("Do.you.want.to.proceed"))
         .unwrap()

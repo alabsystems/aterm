@@ -125,7 +125,7 @@ pub fn apply(
     follow(sys, layout, &run, out, POLL)
 }
 
-/// Steps 1–2 of `apply`.
+/// Verify the envelope: its signature, this Mac's UUID, the clock and the floors.
 fn verify(sys: &dyn System, layout: &Layout, wire: &[u8]) -> Result<Opened, String> {
     if wire.len() > envelope::MAX_WIRE {
         return Err(format!(
@@ -150,7 +150,8 @@ fn verify(sys: &dyn System, layout: &Layout, wire: &[u8]) -> Result<Opened, Stri
     .map_err(|r| r.to_string())
 }
 
-/// Step 4: every artifact the envelope names ([`prune_cache`]).
+/// Cache every artifact the envelope names (and an upgrade's archive), copying the ones not yet
+/// cached from the admin's inbox; for an `apply`, prune the rest ([`prune_cache`]).
 fn take_artifacts(
     sys: &dyn System,
     layout: &Layout,
@@ -221,7 +222,6 @@ fn copy_artifacts(
     let inbox = super::user_inbox(&admin.home);
     let mut notes = Vec::new();
     for (at, (sha, name)) in missing.iter().map(|w| (&w.0, &w.1)).enumerate() {
-        // Named twice (an artifact that is also the upgrade's archive): the first one took
         if missing[..at].iter().any(|w| w.0 == *sha) {
             continue;
         }
@@ -326,7 +326,7 @@ impl Drop for StartingRun<'_> {
     }
 }
 
-/// Step 5: the run directory, the detached job and its keep-awake.
+/// Start the run: its directory, the detached job and its keep-awake.
 #[expect(
     clippy::too_many_arguments,
     reason = "one internal run start and its custody inputs"
@@ -497,7 +497,6 @@ pub fn follow(
             };
         }
         if !state::running(sys, layout, run) {
-            // Once more after the job is seen gone: it may have written the report between
             if gone_once {
                 return refuse_line(
                     out,

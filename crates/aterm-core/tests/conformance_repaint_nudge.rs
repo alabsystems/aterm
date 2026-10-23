@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind of the `RepaintNudge` model (aterm-spec `models_resize_render`) to the real
-//! machine and a real alternate-screen `Terminal`, in process: a fake clock and PTY size,
-//! scripted program stand-ins (`Standin`), window resizes during the hold, a halt, and a
-//! busy terminal lock, including past the host's hard deadline, which the World plays as
-//! the host does.
-//!
-//! Every act the machine asks for must be enabled in the model (`Model::action_enabled`)
-//! in the state projected just before it, and leave the machine in the phase the model's
-//! move leads to; the owner hears of the end (`Act::GaveUp`) exactly when the move reports
-//! `gaveup`. A silent `Dropped::NothingOwed` at a restore is the model's `GiveUp` with no
-//! debt. After every schedule the engine is unresized, and an unanswered nudge leaves screen
-//! and render debt byte-identical.
+//! Tier-1 conformance test binding the `RepaintNudge` model to [`RepaintNudge`] and [`Terminal`].
 
 use std::collections::BTreeMap;
 
@@ -53,39 +42,24 @@ struct World {
     term: Terminal,
     pty: (u16, u16),
     now: u64,
-    /// Pending program output: (due ms, bytes).
     due: Vec<(u64, Vec<u8>)>,
     last_output_ms: u64,
     read: (u16, u16),
-    /// Every size the program read as changed.
     sizes: Vec<(u16, u16)>,
-    /// When a busy program's handler reads the size.
     reads: Vec<u64>,
-    /// The window's resizes during the hold: (ms after the hold, rows).
     after_hold: Vec<(u64, u16)>,
-    /// The same, due (host ms).
     resizes: Vec<(u64, u16)>,
-    /// A halt that stands from this many ms after the hold.
     halt_after_hold: Option<u64>,
-    /// The same, due (host ms).
     halt_at: Option<u64>,
-    /// The host finds the terminal lock busy for this many ms after the hold
-    /// (its `facts` answer nothing), so the machine is not stepped meanwhile.
     lock_busy_after_hold: Option<u64>,
-    /// The same, until (host ms).
     lock_busy_until: Option<u64>,
-    /// The host let the hold go with no step: the machine reads its counters
-    /// at its next step, and so does the projection.
     rebase: bool,
-    /// The act that put the machine at rest.
     ended: Option<Act>,
-    /// The engine's size as the window last set it.
     engine: (u16, u16),
     machine: RepaintNudge,
     standin: Standin,
     halted: bool,
     model: Model,
-    /// The model transitions the machine took, in order.
     acts: Vec<&'static str>,
     armed_at: u64,
     released_at: u64,
@@ -110,8 +84,6 @@ fn with_clear(mut b: Vec<u8>) -> Vec<u8> {
 }
 
 impl World {
-    /// The residue the nudge repairs: an alternate screen the program drew, and a flap
-    /// with a draw between its halves.
     fn new(standin: Standin) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(b"\x1b[?1049h\x1b[2J");
@@ -159,8 +131,6 @@ impl World {
         }
     }
 
-    /// The program's SIGWINCH handler runs: it reads the size (a busy one,
-    /// later) and, if it changed, reacts as its class does.
     fn on_winch(&mut self) {
         match self.standin {
             Standin::Busy(after) => self.reads.push(self.now + after),
@@ -190,7 +160,6 @@ impl World {
         }
     }
 
-    /// The window resizes the engine, and its layout pass sets the PTY.
     fn window_resizes(&mut self) {
         let now = self.now;
         let (ready, later): (Vec<_>, Vec<_>) = self.resizes.drain(..).partition(|(t, _)| *t <= now);
@@ -202,7 +171,6 @@ impl World {
         }
     }
 
-    /// The program's own clock: a busy handler's reads, a stream's frames.
     fn program(&mut self) {
         let now = self.now;
         let (ready, later): (Vec<_>, Vec<_>) = self.reads.drain(..).partition(|t| *t <= now);
@@ -239,7 +207,6 @@ impl World {
         f
     }
 
-    /// The model state the real world is in, just before a step.
     fn project(&self, f: &Facts) -> BTreeMap<&'static str, i64> {
         let mut s = self.model.init_state();
         let phase = model_phase(self.machine.phase());
@@ -263,7 +230,6 @@ impl World {
                     && f.engine != self.machine.hold_engine(),
             ),
         );
-        // `tick > Lim - 1` is "the wait is spent".
         let spent = match self.machine.phase() {
             Phase::Armed => waited(self.armed_at) >= QUIET_MAX_MS,
             Phase::Short => waited(self.machine.hold_started_ms()) >= 1_500,
@@ -289,7 +255,6 @@ impl World {
     }
 }
 
-/// The model's `phase` for the machine's.
 const fn model_phase(phase: Phase) -> i64 {
     match phase {
         Phase::Idle => 0,
@@ -335,8 +300,6 @@ impl World {
                 Act::Forget => Some("Forget"),
                 Act::Healed { .. } => Some("Finish"),
                 Act::GaveUp(GiveUp::NoAnswer) => Some("GiveUp"),
-                // The restore's wait spent on a tab that owes nothing: the
-                // model's give-up with no debt, which reports nothing.
                 Act::Dropped(Dropped::NothingOwed) if was == Phase::Restoring => Some("GiveUp"),
                 Act::Dropped(Dropped::Superseded) => Some("Supersede"),
                 _ => None,
@@ -353,7 +316,6 @@ impl World {
                     post["phase"],
                     "{name} leaves the machine where the model's move does (act {act:?})"
                 );
-                // The owner hears of an end exactly when the model reports it.
                 assert_eq!(
                     matches!(act, Act::GaveUp(_)),
                     post["gaveup"] == 1,
@@ -385,18 +347,13 @@ impl World {
                 }
                 _ => {}
             }
-            // The headline safety property: the PTY is short only while the machine holds it.
             if self.pty != (self.term.rows(), self.term.cols()) {
                 assert_eq!(self.machine.phase(), Phase::Short, "a short PTY is held");
             }
         }
-        // Whatever happened, the PTY ends at the engine's dims.
         assert_eq!(self.pty, (self.term.rows(), self.term.cols()));
     }
 
-    /// The host's hard deadline (`NudgeHost::tick`'s cap sweep), run whether or not the
-    /// machine could be stepped: past `PTY_HOLD_CAP_MS` it lets the hold go and the attempt
-    /// goes on as after a release (the model's `ReleaseByDeadline`).
     fn host_deadline(&mut self) {
         if self.machine.phase() != Phase::Short
             || self.now - self.machine.hold_started_ms() < PTY_HOLD_CAP_MS
@@ -405,7 +362,6 @@ impl World {
         }
         let f = self.facts();
         let mut pre = self.project(&f);
-        // `age > Cap - 1` is "past the deadline".
         let cap = self.model.consts.iter().find(|(name, _)| *name == "Cap");
         pre.insert("age", cap.map_or(i64::MAX, |(_, cap)| *cap));
         assert!(
@@ -454,8 +410,6 @@ fn a_program_that_never_answers_leaves_the_screen_and_the_debt_as_they_were() {
     assert_eq!(screen(&w.term), text, "no answer, no change");
     assert_eq!(w.term.render_debt(), debt);
     assert_eq!(w.machine.nudged(), 1, "one try");
-    // The same when the terminal lock stays busy past the host's deadline: the deadline
-    // lets the hold go, and the attempt is judged as after any release.
     let mut w = World::new(Standin::NeverAnswers);
     w.lock_busy_after_hold = Some(PTY_HOLD_CAP_MS + 500);
     w.run(8_000);
@@ -476,7 +430,6 @@ fn a_program_that_answers_200ms_late_is_still_repaired() {
 fn ordinary_frames_before_a_late_answer_are_not_taken_for_it() {
     let mut w = World::new(Standin::DrawsBeforeAnswering);
     w.run(8_000);
-    // The two diff frames did not release the hold: the ED 2 did.
     assert_eq!(w.acts, ["Hold", "Release", "Finish"]);
     assert!(!w.term.render_debt().owed());
 }
@@ -491,8 +444,6 @@ fn a_program_that_repaints_without_a_full_clear_is_tried_once_and_abandoned() {
     assert_eq!(w.machine.phase(), Phase::Rest);
 }
 
-/// A program that streams through its repaints (its output never quiet for
-/// `QUIET_WAIT_MS`) still answered both sizes: healed, not a give-up.
 #[test]
 fn a_program_that_streams_through_both_answers_is_healed() {
     let mut w = World::new(Standin::Streams);
@@ -502,10 +453,6 @@ fn a_program_that_streams_through_both_answers_is_healed() {
     assert!(!w.term.render_debt().owed());
 }
 
-/// The window flaps during the hold and a busy program reads neither half: the hold is
-/// forgotten and the attempt, its one try spent, is a give-up the owner hears. A size that
-/// lasts supersedes it. A program that answered both sizes while the lock was busy repaired
-/// the tab, so the attempt ends silently with nothing owed.
 #[test]
 fn a_flap_the_program_never_saw_during_the_hold_is_a_give_up() {
     let busy = |resizes: &[(u64, u16)]| {
@@ -520,7 +467,6 @@ fn a_flap_the_program_never_saw_during_the_hold_is_a_give_up() {
         w
     };
     let before = World::new(Standin::Busy(2_000));
-    // The flap's halves between two steps, and with a step on its middle.
     for flap in [
         [(200, ROWS - 1), (200, ROWS)],
         [(200, ROWS - 1), (250, ROWS)],
@@ -542,9 +488,6 @@ fn a_flap_the_program_never_saw_during_the_hold_is_a_give_up() {
     assert!(!w.term.render_debt().owed());
 }
 
-/// A halt that stands before the hold blocks it. One that lands during the hold lifts it
-/// at once, and the attempt is judged as after any release: a busy program that read
-/// neither size is a give-up the owner hears.
 #[test]
 fn a_halt_blocks_the_hold_and_one_during_it_is_judged() {
     let mut w = World::new(Standin::AnswersAtOnce);

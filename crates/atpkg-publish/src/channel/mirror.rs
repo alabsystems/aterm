@@ -75,7 +75,9 @@ fn bind(pkg: &atpkg::PkgManifest, program: &str, build: u64, which: &str, tag: &
 ///
 /// # Errors
 ///
-/// Returns an error if a manifest file is missing, mismatched, or unexpected.
+/// A refusal naming what does not hold: the signed manifest pair under the client's rule,
+/// the program/build bind, at least one artifact, every release asset's sha256, and exactly
+/// the signed set; an I/O error when an asset cannot be hashed.
 pub fn check_staged(
     quad: &VerifiedQuad,
     dir: &Path,
@@ -147,7 +149,8 @@ pub fn public_notes(program: &str, pkg: &atpkg::PkgManifest, dir: &Path) -> Resu
 ///
 /// # Errors
 ///
-/// Returns an error on the first pack that is not or cannot be made public.
+/// The first pack that is not, or cannot be made, public — with why. Nothing about a
+/// pack is decided from a download host that did not answer.
 pub fn mirror(
     ctx: &Ctx,
     quad: &VerifiedQuad,
